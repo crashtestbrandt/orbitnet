@@ -96,6 +96,17 @@ write token.
 
 The cost is installing Godot and Rust per job, which the caches make cheap.
 
+## `native/.gdignore`
+
+`native/` carries an empty `.gdignore`. In *this* repo it is inert — the workspace sits at the repository
+root, and the root is not a Godot project, so nothing would scan it anyway.
+
+It is kept for two reasons. It makes the mirror from the upstream game repo (`just orbitnet-export`)
+**idempotent** — there, `native/` lives *inside* the addon and the file is load-bearing, so dropping it here
+would mean every export re-introduced a file the repo had deliberately deleted, and `git status` would never
+come back clean. And it means that if anyone ever does open the repository root as a Godot project, a
+10k-LOC cargo workspace is not scanned as game content.
+
 ## Adding a platform
 
 1. Add a `[libraries]` entry to `addons/orbitnet_native/orbitnet.gdextension` (both `debug` and `release`
