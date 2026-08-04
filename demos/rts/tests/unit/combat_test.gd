@@ -1,76 +1,80 @@
 extends UnitTest
 ## Combat: acquisition, range and damage.
 
-func _positions(values: Array[Vector3]) -> PackedVector3Array:
-	var out: PackedVector3Array = PackedVector3Array()
-	for value: Vector3 in values:
-		out.push_back(value)
-	return out
+# A world containing ONLY the units a test places.
+#
+# The obvious fixture -- size the arrays to UNIT_COUNT and mark everything alive -- is wrong, and wrong in a
+# way that quietly passes some assertions: an unplaced unit sits at the ORIGIN and counts as a living enemy,
+# so a search from the origin finds a phantom at distance 0 and every "nearest" answer is that phantom. Zero
+# is the "does not exist" liveness value, so building the mask empty and placing only what the case is about
+# makes the world contain exactly what the test says it contains.
+var _positions: PackedVector3Array = PackedVector3Array()
+var _alive: PackedByteArray = PackedByteArray()
 
-# A world where every id is alive. Seat is derived from the id (seat-major layout), so the ids chosen below
-# decide which side each unit is on -- which is exactly how the server derives ownership too.
-func _alive(count: int) -> PackedByteArray:
-	var out: PackedByteArray = PackedByteArray()
-	out.resize(count)
-	out.fill(1)
-	return out
+func _reset() -> void:
+	_positions = PackedVector3Array()
+	_positions.resize(RtsConfig.UNIT_COUNT)
+	_alive = PackedByteArray()
+	_alive.resize(RtsConfig.UNIT_COUNT)   # all zero -- nobody exists until placed
 
+func _place(id: int, at: Vector3) -> void:
+	_positions[id] = at
+	_alive[id] = 1
+
+func _kill(id: int) -> void:
+	_alive[id] = 0
+
+# Seat is derived from the id (seat-major layout), so the ids a test picks decide which side each unit is on
+# -- exactly how the server derives ownership.
 func _seat1(offset: int) -> int:
 	return RtsConfig.first_id_of_seat(1) + offset
 
 func test_acquires_the_nearest_enemy() -> void:
-	var positions: PackedVector3Array = PackedVector3Array()
-	positions.resize(RtsConfig.UNIT_COUNT)
-	positions[0] = Vector3.ZERO                       # seat 0
-	positions[_seat1(0)] = Vector3(10.0, 0.0, 0.0)    # seat 1, far
-	positions[_seat1(1)] = Vector3(4.0, 0.0, 0.0)     # seat 1, near
-	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, positions, _alive(RtsConfig.UNIT_COUNT), 20.0)
+	_reset()
+	_place(0, Vector3.ZERO)                       # seat 0, the searcher
+	_place(_seat1(0), Vector3(10.0, 0.0, 0.0))    # seat 1, far
+	_place(_seat1(1), Vector3(4.0, 0.0, 0.0))     # seat 1, near
+	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, _positions, _alive, 20.0)
 	assert_eq(target, _seat1(1), "the closer enemy is chosen")
 
 func test_never_acquires_a_friendly() -> void:
-	var positions: PackedVector3Array = PackedVector3Array()
-	positions.resize(RtsConfig.UNIT_COUNT)
-	positions[0] = Vector3.ZERO
-	positions[1] = Vector3(1.0, 0.0, 0.0)             # a much closer FRIENDLY
-	positions[_seat1(0)] = Vector3(9.0, 0.0, 0.0)
-	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, positions, _alive(RtsConfig.UNIT_COUNT), 20.0)
+	_reset()
+	_place(0, Vector3.ZERO)
+	_place(1, Vector3(1.0, 0.0, 0.0))             # a much closer FRIENDLY
+	_place(_seat1(0), Vector3(9.0, 0.0, 0.0))
+	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, _positions, _alive, 20.0)
 	assert_eq(target, _seat1(0), "friendly fire is not merely discouraged, it is unreachable")
 
 func test_never_acquires_a_corpse() -> void:
-	var positions: PackedVector3Array = PackedVector3Array()
-	positions.resize(RtsConfig.UNIT_COUNT)
-	positions[0] = Vector3.ZERO
-	positions[_seat1(0)] = Vector3(2.0, 0.0, 0.0)     # dead
-	positions[_seat1(1)] = Vector3(8.0, 0.0, 0.0)     # alive
-	var alive: PackedByteArray = _alive(RtsConfig.UNIT_COUNT)
-	alive[_seat1(0)] = 0
-	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, positions, alive, 20.0)
+	_reset()
+	_place(0, Vector3.ZERO)
+	_place(_seat1(0), Vector3(2.0, 0.0, 0.0))     # nearer, but about to die
+	_place(_seat1(1), Vector3(8.0, 0.0, 0.0))
+	_kill(_seat1(0))
+	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, _positions, _alive, 20.0)
 	assert_eq(target, _seat1(1), "a dead unit is not a target")
 
 func test_range_is_respected() -> void:
-	var positions: PackedVector3Array = PackedVector3Array()
-	positions.resize(RtsConfig.UNIT_COUNT)
-	positions[_seat1(0)] = Vector3(30.0, 0.0, 0.0)
-	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, positions, _alive(RtsConfig.UNIT_COUNT), 20.0)
+	_reset()
+	_place(_seat1(0), Vector3(30.0, 0.0, 0.0))
+	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, _positions, _alive, 20.0)
 	assert_eq(target, -1, "an enemy beyond acquire range is not acquired")
 
 func test_ties_break_on_the_lower_id() -> void:
 	# Not arbitrary: with a float comparison, two equidistant targets would otherwise be picked by iteration
 	# order -- stable today, and exactly the kind of implicit dependency that breaks when anything reorders.
-	var positions: PackedVector3Array = PackedVector3Array()
-	positions.resize(RtsConfig.UNIT_COUNT)
-	positions[_seat1(3)] = Vector3(5.0, 0.0, 0.0)
-	positions[_seat1(9)] = Vector3(5.0, 0.0, 0.0)
-	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, positions, _alive(RtsConfig.UNIT_COUNT), 20.0)
+	_reset()
+	_place(_seat1(3), Vector3(5.0, 0.0, 0.0))
+	_place(_seat1(9), Vector3(5.0, 0.0, 0.0))
+	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, _positions, _alive, 20.0)
 	assert_eq(target, _seat1(3), "the lower id wins a tie")
 
 func test_acquisition_ignores_height() -> void:
 	# The sim is planar. A y difference must not affect distance, or a unit standing on a decorative box would
 	# be harder to acquire than one beside it.
-	var positions: PackedVector3Array = PackedVector3Array()
-	positions.resize(RtsConfig.UNIT_COUNT)
-	positions[_seat1(0)] = Vector3(5.0, 40.0, 0.0)
-	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, positions, _alive(RtsConfig.UNIT_COUNT), 10.0)
+	_reset()
+	_place(_seat1(0), Vector3(5.0, 40.0, 0.0))
+	var target: int = Combat.nearest_enemy(Vector3.ZERO, 0, _positions, _alive, 10.0)
 	assert_eq(target, _seat1(0), "distance is measured on the plane")
 
 # --- range and damage ------------------------------------------------------------------------------

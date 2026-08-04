@@ -5,11 +5,18 @@ func test_a_single_unit_goes_exactly_where_you_clicked() -> void:
 	assert_vec_almost_eq(Formation.slot_offset(0, 1), Vector3.ZERO, 0.0001,
 		"a one-unit order has no formation to speak of")
 
-func test_the_first_unit_is_always_on_the_click() -> void:
-	for count: int in [1, 2, 5, 24, 48]:
-		assert_vec_almost_eq(Formation.slot_offset(0, count), Vector3.ZERO, 0.0001,
-			"index 0 lands on the target in a %d-unit order, so a click always sends SOMETHING exactly there"
-			% count)
+func test_an_odd_square_puts_its_middle_unit_exactly_on_the_click() -> void:
+	# 25 units is a 5x5 block, so slot 12 IS the target. This is the strongest form of "something lands where
+	# you pointed" that actually holds: a block with an EVEN column count has no centre slot, which is why the
+	# guarantee is stated over the centroid rather than over any individual unit.
+	assert_vec_almost_eq(Formation.slot_offset(12, 25), Vector3.ZERO, 0.0001,
+		"the middle slot of a 5x5 block is the click")
+
+func test_index_zero_is_a_real_slot_not_a_special_case() -> void:
+	# Special-casing index 0 onto the target would hand it the same destination as the centre slot -- two
+	# units ordered to one point, which is exactly what formations exist to prevent.
+	assert_true(Formation.slot_offset(0, 25) != Formation.slot_offset(12, 25),
+		"index 0 and the centre slot are different places")
 
 func test_slots_are_distinct() -> void:
 	# The whole point: 24 units ordered to one place must not be 24 units ordered to the SAME place, or they

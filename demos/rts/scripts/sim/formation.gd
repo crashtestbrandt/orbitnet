@@ -21,9 +21,18 @@ const SLOT_SPACING: float = 2.4
 ## Lays out a centred grid, rows across X and columns along Z, widest-first: a 24-unit order becomes a 5x5
 ## block minus one, which reads as a formation rather than a queue. The grid is axis-aligned rather than
 ## rotated to the approach direction -- rotating it looks better and costs an extra input (which way is the
-## group coming from) that the server would have to derive from state the order does not carry.
+## group is coming from) that the server would have to derive from state the order does not carry.
+##
+## WHAT IS GUARANTEED IS THE CENTROID, NOT ANY INDIVIDUAL UNIT. It is tempting to special-case index 0 onto
+## the click so that something always lands exactly where the player pointed -- and that is wrong twice. It
+## collides with the grid's own centre slot, handing two units the same destination (which is the whole
+## problem this function exists to avoid); and it cannot hold in general anyway, because a block with an even
+## number of columns has no centre slot for anything to land on. The group centres on the click; with an odd
+## square, the middle unit happens to sit exactly on it.
 static func slot_offset(index: int, count: int) -> Vector3:
-	if count <= 1 or index <= 0:
+	# A negative index is nonsense input, not a slot -- degrade to the target rather than to a mirrored
+	# position off the far side of the block. Index 0 is a REAL slot; see above.
+	if count <= 1 or index < 0:
 		return Vector3.ZERO
 	# ceili, not int(ceil(...)): ceil() takes and returns Variant (it accepts vectors), so int(ceil(x))
 	# passes a Variant to a typed constructor -- banned, and a parse error under this project's settings.
