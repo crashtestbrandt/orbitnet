@@ -41,10 +41,10 @@ environment for no benefit here.
 | `just native-install` | Build, install this host's binary into `addons/orbitnet_native/bin/`, and re-sync it into every project. |
 | `just native-check` | All of the above, in the order CI runs them. |
 
-**Always the release profile.** Godot selects the `.gdextension`'s `template_debug` entry whenever a project
-runs *from source* — which is every dev run, every probe and every CI job. A cargo *debug* build there would
-be 10–50× slower and would poison every performance number anyone took from a dev run. Both descriptor
-entries therefore point at one release artifact.
+**Always the release profile.** Godot selects the `template_debug` entry whenever a project runs *from
+source* — every dev run, every probe, every CI job. A cargo *debug* build there would be 10–50× slower and
+would poison every performance number taken from a dev run, so both descriptor entries point at one release
+artifact.
 
 Two profile settings are load-bearing:
 
@@ -88,24 +88,15 @@ for local development and must not be committed.
 
 ## CI runs on GitHub-hosted runners
 
-Not self-hosted, and this is a security property rather than a preference. **A public repository must never
-point fork-PR CI at a self-hosted runner**: a fork PR can modify the workflow file, and a self-hosted runner
-would execute that modified workflow on your machine with your filesystem and your credentials. Every
-workflow here also uses `pull_request` rather than `pull_request_target`, so a fork PR gets no secrets and no
-write token.
+A security property, not a preference. **A public repository must never point fork-PR CI at a self-hosted
+runner**: a fork PR can modify the workflow file, and the runner would execute it on your machine with your
+filesystem and credentials. Every workflow uses `pull_request` rather than `pull_request_target`, so a fork PR
+gets no secrets and no write token. The cost is installing Godot and Rust per job, which the caches make
+cheap.
 
-The cost is installing Godot and Rust per job, which the caches make cheap.
-
-## `native/.gdignore`
-
-`native/` carries an empty `.gdignore`. In *this* repo it is inert — the workspace sits at the repository
-root, and the root is not a Godot project, so nothing would scan it anyway.
-
-It is kept for two reasons. It makes the mirror from the upstream game repo (`just orbitnet-export`)
-**idempotent** — there, `native/` lives *inside* the addon and the file is load-bearing, so dropping it here
-would mean every export re-introduced a file the repo had deliberately deleted, and `git status` would never
-come back clean. And it means that if anyone ever does open the repository root as a Godot project, a
-10k-LOC cargo workspace is not scanned as game content.
+`native/` carries an empty `.gdignore`. Inert here — the root is not a Godot project — but it means that if
+anyone does open the root as one, a 10k-LOC cargo workspace is not scanned as game content, and it keeps a
+mirror into a project that *does* nest `native/` inside the addon idempotent.
 
 ## Adding a platform
 

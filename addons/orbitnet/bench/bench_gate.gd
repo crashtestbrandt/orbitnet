@@ -45,8 +45,8 @@ static func percentile(values: Array[float], q: float) -> float:
 	if sorted.size() == 1:
 		return sorted[0]
 	var rank: float = clampf(q, 0.0, 1.0) * float(sorted.size() - 1)
-	var lo: int = int(floor(rank))
-	var hi: int = int(ceil(rank))
+	var lo: int = floori(rank)
+	var hi: int = ceili(rank)
 	var frac: float = rank - float(lo)
 	return lerpf(sorted[lo], sorted[hi], frac)
 

@@ -46,7 +46,7 @@ const MODE_SERVER: i64 = 2;
 const MODE_HOST: i64 = 3;
 
 const SERVER_PEER: i32 = 1;
-/// Seconds between clock probes, matching the old backend's sync cadence.
+/// Seconds between clock probes.
 const PING_INTERVAL: f64 = 0.25;
 /// Ticks between forced full-state blocks per entity (phase-offset by entity id).
 const FULL_STATE_INTERVAL: u64 = 16;
@@ -1709,7 +1709,7 @@ impl OrbitNet {
             };
             let mut bound = sync.bind_mut();
             // Reject input for entities this sender does not own: the input node's authority is
-            // the anti-forgery check, same as the old backend's sanitize step.
+            // the anti-forgery check.
             let owner = bound.input_owner_peer();
             if owner != sender {
                 drop(bound);

@@ -1,11 +1,9 @@
 # API reference
 
-The whole public surface. `Net` is an autoload; everything else is a `class_name` you can construct.
+`Net` is an autoload; everything else is a `class_name` you can construct.
 
-Everything here is safe to call **OFFLINE**: the facade no-ops, factories return inert handles, and metrics
-return zeros. That is what lets a game wire its netcode unconditionally.
-
----
+Everything here is safe to call **OFFLINE**: the facade no-ops, factories return inert handles, metrics return
+zeros. That is what lets a game wire its netcode unconditionally.
 
 ## `Net` — the facade
 
@@ -69,20 +67,14 @@ func make_rollback(root: Node) -> NetRollbackHandle     # bare handle; you regis
 
 `register_rollback_body` is the one to use. It sets up the server-authoritative split in one call:
 
-- `root`'s authority is the **server**, so the server owns every body's state.
-- `input_node`'s authority is the **owning client**, so each client authors only its own input — the backend
-  validates the sender against that authority, which is the anti-forgery check.
-- Splitting them **requires input to live on its own node**, because authority is a per-node property.
-- `predict` is true on the owning client (local prediction) *and* on the server (authoritative simulation),
-  false on a client watching someone else's body.
+- `root`'s authority is the **server** — it owns every body's state.
+- `input_node`'s authority is the **owning client** — each client authors only its own input, and the backend
+  validates the sender against that authority. That is the anti-forgery check.
+- Splitting them **requires input on its own node**, because authority is a per-node property.
+- `predict` is true on the owning client *and* on the server, false on a client watching someone else's body.
 
-Your `root` then implements:
-
-```gdscript
-func _rollback_tick(delta: float, tick: int, is_fresh: bool) -> void:
-```
-
-Called on every peer that predicts this body. See [protocol.md](protocol.md) for what `is_fresh` guarantees.
+`root` then implements `_rollback_tick(delta: float, tick: int, is_fresh: bool)`, called on every peer that
+predicts it. See [protocol.md](protocol.md#is_fresh) for what `is_fresh` guarantees.
 
 ### Resim-depth and diagnostics knobs
 
@@ -116,18 +108,17 @@ Net.perf_summary()   -> String
 
 ### ⚠️ AOI culls the rollback lane only
 
-`set_aoi_radius()` iterates **rollback entities**, anchors on the entity whose *input* authority is that
-peer, takes its first `Vector3` **State**-role property as the centre, and filters the other rollback
-entities against it (enter at the radius, leave at 1.25× — hysteresis so boundary entities do not flicker).
+`set_aoi_radius()` iterates **rollback entities**, anchors on the entity whose *input* authority is that peer,
+takes its first `Vector3` **State** property as the centre, and filters the other rollback entities against it.
 
-Three consequences people discover the hard way:
+Three consequences people find the hard way:
 
 1. **State-lane entities always replicate.** If your bandwidth is a thousand server-driven objects, AOI does
    nothing for you today.
-2. **A peer with no rollback body has no anchor**, and the backend correctly falls back to "everything is in
-   interest". Interest management therefore requires at least one rollback entity per peer — which is
-   exactly why the RTS demo puts the command cursor on the rollback lane.
-3. **The anchor is the first `Vector3` State property**, so register your position first.
+2. **A peer with no rollback body has no anchor**, and the backend falls back to "everything is in interest".
+   Interest management therefore requires at least one rollback entity per peer — which is why the RTS demo
+   puts the command cursor on that lane.
+3. **The anchor is the first `Vector3` State property**, so register position first.
 
 ---
 
@@ -184,13 +175,13 @@ runs only on the applying peer: the server, or the local peer offline (with send
 
 Rules that are not optional:
 
-- **Give the node a stable name.** The RPC routes by node path; every peer must build it identically.
-- **Resolve *who* from `sender_id`**, never from the payload. `sender_id` comes from the transport and cannot
-  be authored by the sender.
-- **A payload parameter must stay untyped `Dictionary`.** It crosses the RPC boundary, where Godot decodes it
-  as a plain Dictionary — a `Dictionary[String, Variant]` annotation would *reject* the wire-decoded value.
-  Read fields into typed locals inside the handler.
-- **Rate-limit per sender.** `request()` is a reliable RPC and the client controls how often it calls one.
+- **Stable node name.** The RPC routes by node path; every peer must build it identically.
+- **Resolve *who* from `sender_id`**, never from the payload — it comes from the transport and cannot be
+  authored by the sender.
+- **Keep the payload parameter untyped `Dictionary`.** Godot decodes it as a plain Dictionary at the RPC
+  boundary, so a `Dictionary[String, Variant]` annotation would *reject* the wire value. Read fields into
+  typed locals inside the handler.
+- **Rate-limit per sender.** `request()` is reliable and the client controls how often it calls one.
 - **A handler runs OUTSIDE the tick**, so anything it writes belongs on the **state** lane.
 
 ## `NetTransport`

@@ -14,13 +14,14 @@ extends Node
 ##      inherently flaky, whereas a centroid drifting apart means replication has genuinely failed.
 ##   5. A FORGED order -- submitted on another seat's channel -- changes nothing. The unit it named must
 ##      never see its sequence move.
-##   6. Worst observed STALENESS, in ticks, stays under bound. This is the only assertion that catches units
-##      silently starving past the send budget: with more entities than fit in one frame the backend serves
-##      them stalest-first, so over-subscription does not drop anyone, it ages everyone. Measured here on the
-##      RECEIVING side by watching how long a unit goes without its replicated state changing.
+##   6. The worst REFRESH INTERVAL of an actively-moving unit stays under bound -- the longest gap between
+##      consecutive updates. This is what catches units silently starving past the send budget: with more
+##      entities than fit in one frame the backend serves them stalest-first, so over-subscription does not
+##      drop anyone, it ages everyone.
 ##
-## Note on 6: the facade does not publish a staleness metric (a library-side counter is filed as an issue),
-## so this measures it from the outside, which is what a consumer would have to do today.
+## Note on 6: the facade publishes no state-lane health metric, so this is measured from the outside, which
+## is what a consumer has to do today. Measuring it as "ticks since this unit last changed" would be wrong --
+## a stationary unit would report the whole run length. See _track_refresh_interval.
 
 const _ORDER_AT_S: float = 3.0
 const _FORGE_AT_S: float = 4.5
@@ -29,9 +30,12 @@ const _ORDER_UNIT_COUNT: int = 8
 ## The id the CLIENT will illegally try to order. Deliberately in seat 0's block and outside the range the
 ## host legitimately orders, so a moved sequence can only mean the forgery was accepted.
 const _FORGED_ID: int = 40
-## Ticks of staleness to tolerate. 96 units at ~46 per frame is a ~2-tick rotation; 20 leaves room for
+## Ticks of refresh interval to tolerate. 96 units at ~46 per frame is a ~2-tick rotation; 20 leaves room for
 ## scheduling noise on a loaded CI runner while still failing a genuine starvation.
 const _MAX_STALENESS_TICKS: int = 20
+## The window in which the ordered units are provably in motion: after the order lands, before they arrive.
+const _MEASURE_FROM_S: float = _ORDER_AT_S + 1.0
+const _MEASURE_UNTIL_S: float = _ORDER_AT_S + 6.0
 
 var _main: RtsMain = null
 var _elapsed: float = 0.0
@@ -62,7 +66,7 @@ func _physics_process(delta: float) -> void:
 	if _main.net.state() != RtsNet.State.PLAYING:
 		return
 	_elapsed += delta
-	_track_staleness()
+	_track_refresh_interval()
 
 	if not _ordered and _elapsed >= _ORDER_AT_S and Net.is_server():
 		_issue_real_order()
@@ -102,29 +106,50 @@ func _issue_forged_order() -> void:
 	world.submit_order(0, OrderValidator.VERB_MOVE, ids, Vector3(0.0, 0.0, -30.0))
 	print("RTS-PROBE forged an order on seat 0's channel while holding seat %d" % seat)
 
-# --- staleness --------------------------------------------------------------------------------------
-func _track_staleness() -> void:
+# --- refresh interval --------------------------------------------------------------------------------
+# The longest GAP BETWEEN CONSECUTIVE UPDATES of a unit that is actively being updated.
+#
+# The obvious formulation -- "ticks since this unit's position last changed" -- measures the wrong thing, and
+# measures it confidently. A unit standing still never changes position, so it accumulates the entire run
+# length and reports hundreds of ticks of "staleness" while the netcode is behaving perfectly. Only 8 of 96
+# units are under orders here; the other 88 are stationary by design.
+#
+# Recording only ON a change fixes it: a stationary unit produces no second sample and contributes nothing,
+# while a moving unit yields exactly the round-robin interval the send budget governs. On the server that is
+# ~1 tick (it writes every tick); on a client it is the stalest-first rotation, and it is what climbs if
+# entities starve.
+#
+# Measured over the ORDERED units only, inside a window where they are provably in motion -- after the order
+# lands and before they arrive and legitimately stop. Outside that window a "gap" would just be a unit that
+# had nothing to say.
+#
+# NOTE: this is an outside-in approximation. A true per-entity staleness counter belongs in the library
+# (filed as a gap: the facade publishes no state-lane health metrics), and a consumer cannot see the
+# difference between "not sent" and "sent, unchanged" without it.
+func _track_refresh_interval() -> void:
 	var world: WorldDirector = _main.net.world
 	var tick: int = Net.current_tick()
 	if tick <= 0:
+		return
+	if _elapsed < _MEASURE_FROM_S or _elapsed > _MEASURE_UNTIL_S:
 		return
 	if _last_position.size() != world.units.size():
 		_last_position.resize(world.units.size())
 		_last_change_tick.resize(world.units.size())
 		for id: int in world.units.size():
-			_last_change_tick[id] = tick
-	for id: int in world.units.size():
+			_last_change_tick[id] = -1
+	for offset: int in _ORDER_UNIT_COUNT:
+		var id: int = RtsConfig.first_id_of_seat(0) + offset
 		var unit: UnitBody = world.units[id]
 		if unit == null or not unit.is_alive():
-			# A dead unit legitimately stops changing; counting it would report the respawn timer as
-			# staleness. Reset its clock instead.
-			_last_change_tick[id] = tick
+			_last_change_tick[id] = -1   # a corpse says nothing; do not bridge a gap across its death
 			continue
-		if unit.position.distance_squared_to(_last_position[id]) > 0.000001:
-			_last_position[id] = unit.position
-			_last_change_tick[id] = tick
+		if unit.position.distance_squared_to(_last_position[id]) <= 0.000001:
 			continue
-		_worst_staleness = maxi(_worst_staleness, tick - _last_change_tick[id])
+		_last_position[id] = unit.position
+		if _last_change_tick[id] >= 0:
+			_worst_staleness = maxi(_worst_staleness, tick - _last_change_tick[id])
+		_last_change_tick[id] = tick
 
 # --- the verdict --------------------------------------------------------------------------------------
 func _report() -> void:
@@ -161,11 +186,11 @@ func _report() -> void:
 				% [_forged_seq_before, after])
 	print("RTS-PROBE forged_rejected=%d" % (1 if forged_ok else 0))
 
-	# 6: staleness.
-	print("RTS-PROBE worst_staleness_ticks=%d" % _worst_staleness)
+	# 6: the refresh interval.
+	print("RTS-PROBE worst_refresh_interval_ticks=%d" % _worst_staleness)
 	if _worst_staleness > _MAX_STALENESS_TICKS:
-		failures.push_back("worst staleness %d ticks exceeds the %d-tick bound -- units are starving past the "
-			% [_worst_staleness, _MAX_STALENESS_TICKS] + "send budget")
+		failures.push_back("worst refresh interval %d ticks exceeds the %d-tick bound -- units are starving "
+			% [_worst_staleness, _MAX_STALENESS_TICKS] + "past the send budget")
 
 	if failures.is_empty():
 		print("RTS-PROBE-RESULT role=%s PASS" % role)

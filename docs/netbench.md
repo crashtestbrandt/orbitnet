@@ -1,181 +1,141 @@
-# netbench — the OrbitNet netcode test bench
+# netbench
 
-**netbench** is OrbitNet's answer to a hard question: *how do you regularly test netcode when you can't gather
-more than a couple of real players on real machines?* It is the indie form of the AAA layered test bench —
-a below-reliability packet conditioner, a fleet of real headless clients driven by bots through the real input
-path, per-tick metric gates, session record/replay, and a multi-machine orchestrator — all shipped inside the
-`addons/orbitnet/` addon so OrbitNet is a self-contained netcode layer, not just a rollback facade.
+Test netcode under real-world network conditions without gathering real players.
 
-Everything lives under `addons/orbitnet/bench/` (game-side classes) and `tools/netbench/` (the shell harnesses).
+```sh
+just netbench 4 congested_wifi   # 4 bots through a conditioned link, tick-domain gates
+just netbench 4 clean            # the control
+just netbench 4 worst_case       # the 250 ms design ceiling
+```
+
+A run launches a dedicated server, a UDP impairment relay, and N headless bot clients that join **through**
+the relay. Each bot drives the real input path, streams per-tick metrics to a CSV, and self-evaluates a gate.
+Exit code is the verdict.
 
 ## The one rule that shapes the design
 
-**Impairment is injected at the raw-UDP layer, BELOW ENet's reliability.** A dropped datagram there forces ENet's
-real retransmit, a reordered one exercises its ordering buffers, a delayed one drives the backend's ping/pong
-clock sync —
-the honest behaviour every reference conditioner has (Source `net_fakelag`, Unreal `PacketSimulationSettings`,
-Unity's simulator stage, Valve SNS `FakePacket*`). Dropping a "reliable" packet *above* the reliability layer is a
-lie (it is permanently lost, nothing retransmits), so wrapping the `MultiplayerPeer` is **not** how netbench
-conditions the wire. Two honest paths instead:
+**Impair the link BELOW the reliability layer.** ENet ships no conditioner, and wrapping the peer would sit
+*above* retransmit — you would be measuring your own simulated loss being repaired, not the netcode's response
+to real loss. The relay is a separate process forwarding raw UDP, so drops, delays, duplicates and reorders
+happen where they would on a real network.
 
-- **ENet** (the CI/dev transport): an external **UDP relay** process (`relay_main.gd`) sits between client and
-  server. A client just joins the relay's port — `NetManager.join` / `net.join` already accept any address:port,
-  so no game code changes.
-- **Steam**: SteamNetworkingSockets' built-in `FakePacket*` config values, applied below its SNP reliability,
-  driven live by the `net.sim_*` console cvars (see *Console conditioner* below).
+**Everything is measured in the tick domain**, never in render-frame jerk. A frame-domain measurement conflates
+the renderer with the network and cannot be compared across machines. That is the single most common way a
+netcode bench lies.
 
-## Quick start
+## Pointing it at your game
 
-```sh
-just netbench 4 clean            # control run: 4 bots, no impairment (isolates harness/engine overhead)
-just netbench 4 congested_wifi   # the everyday bad case: 50ms + 50ms jitter + 2% loss
-just netbench 4 worst_case 30    # the 250ms design ceiling (Overwatch's lag-comp bound), 30s window
-just netbench 6 mobile_4g 20 7 wander   # 6 bots, LTE profile, 20s, seed 7, 'wander' policy
+netbench needs four things from a game, and `BenchSubject` is those four things:
+
+```gdscript
+extends BenchSubject
+class_name MyBenchSubject
+
+func is_ready() -> bool                     # session live and simulating
+func local_body() -> Node                   # the locally-owned body, or null
+func apply_input(frame: Dictionary) -> void # feed one tick-pure frame
+func sample(body: Node) -> Dictionary       # optional per-tick game metrics
 ```
 
-`just netbench <CLIENTS> [PROFILE] [SECONDS] [SEED] [POLICY]` launches a dedicated server, one impairment relay,
-and N headless bot clients that join **through** the relay. Each client drives the real input path, streams
-per-tick metrics to a CSV, and self-evaluates a tick-domain gate. The run passes when every client passes; the
-artifact directory (per-client CSVs + logs) is printed at the end. It is deliberately **not** in `just check` —
-it is multi-process and timing-sensitive, a nightly/on-demand lane, never a per-PR gate.
+Then attach the probe during session bring-up:
 
-## What a run asserts (tick-domain gates)
-
-Gates are distribution-based and tick-domain — never render-frame jerk (the S8 lesson, and AAA practice). The
-numbers come from the facade's `perf_metrics()` / `clock_metrics()` — live in **every** build (no debug-monitor
-gating), with RTT/offset sampled by the backend's ping/pong clock sync. From `bench_gate.gd`, per client:
-
-| Gate | Asserts | Notes |
-|---|---|---|
-| **sample count** | the run produced data | a client that never connected FAILs, never vacuously passes |
-| **RTT reflects injection** | p50 RTT ≈ the profile's ~2× one-way latency | the *"the conditioner is live and observed"* check — without it a silent no-op relay passes everything on a clean link |
-| **clock discipline** | mean \|stretch−1\| bounded, **scaled by profile** | decoupled tick pacing stretches within `max_time_stretch` (1.05) — coupled mode pins stretch at exactly 1.0 and absorbs error as rare whole-tick slews — and a severe link legitimately rides near that envelope, so the bound scales; a truly thrashing clock still fails |
-| **reconcile convergence** | hard-snap rate ≤ 25% | the real *"prediction still works"* signal; a snap storm means prediction never catches up |
-| resim depth | **reported, not gated** | under latency the resim window legitimately deepens (#214 cost), bounded by `history_limit`; broken prediction shows up as snaps, not depth |
-
-Thresholds scale with the profile: `clean` is held to the tightest bar; `worst_case` legitimately shows more
-RTT/jitter/stretch. A verified run looks like:
-
-```
-client1: BENCH-RESULT PASS profile=worst_case samples=594 | worst_case: 250/25ms loss=5.0% ...
-  BENCH-GATE PASS RTT p50 637.5ms within [250,750]ms of injected ~500ms (conditioner observed)
-  BENCH-GATE PASS mean |clock stretch - 1| 0.0470 <= 0.0600 (clock not thrashing; bound scales with the profile)
-  BENCH-GATE PASS reconcile snap rate 0.000 (0 over 594 ticks) <= 0.25
-  BENCH-GATE INFO resim depth p50=31 p95=67 ticks (cost under latency; bounded by history_limit 128)
+```gdscript
+if BenchProbe.enabled():
+    var probe := BenchProbe.new()
+    probe.subject = MyBenchSubject.new()
+    add_child(probe)
 ```
 
-## Condition profiles
+The frame is a plain `Dictionary` in a neutral vocabulary (`translate`, `rotate`, `aim_dir`, `aim_held`,
+`fire`) because the bench cannot name a game's input type. Keys a game does not use are ignored; keys it needs
+that a policy never sets keep the game's own default — so the vocabulary can grow without invalidating
+recorded tapes. An **empty** frame means "release": stop overriding and hand the body back to live input.
 
-The catalog (`net_profiles.gd`) is the single source of truth, read by the relay, the Steam conditioner, and the
-gates. All numbers are **one-way** (RTT ≈ 2×), calibrated from Unity's Network Simulator presets, Overwatch's
-250ms lag-comp ceiling, and Gears of War 3's practice of forcing the conditioner on in playtest builds.
+`demos/rts/` implements this in ~90 lines, mapping `translate` onto a command cursor and `fire` onto issuing
+orders — so the same policies drive an RTS and a shooter unchanged.
 
-| profile | one-way / jitter | loss | use |
-|---|---|---|---|
-| `clean` | 0 / 0 | 0% | control (isolates harness overhead) |
-| `lan` | 1 / 0 | 0% | wired LAN floor |
-| `broadband` | 30 / 10 | 0.5% | healthy home fiber/cable |
-| `congested_wifi` | 50 / 50 | 2% | the everyday bad case (default) — **default your playtest builds to this** |
-| `mobile_4g` | 100 / 20 | 4% | LTE (mobile roadmap) |
-| `mobile_3g` | 300 / 30 | 7% | degraded cellular |
-| `cross_region` | 150 / 15 | 1% | distant but well-provisioned server |
-| `worst_case` | 250 / 25 | 5% | the design ceiling a shooter must still function at |
-| `worst_case_burst` | 250 / 25 | Gilbert-Elliott | bursty loss (drops runs of packets) — stresses retransmit differently than uniform loss |
-| `torture` | 450 / 50 | 10% | deliberate programmer-pain (never a gate) |
+## What a run asserts
 
-Sweep a single knob without a catalog entry via the relay's `--relay-latency/jitter/loss/dup/reorder/reorder_ms`.
+| Gate | Bound |
+|---|---|
+| **Sample count** | ≥ 30. An empty run **fails** — a client that never connected must not vacuously pass. |
+| **Measured RTT** | lands near the profile's injected round trip, proving the conditioner is live and observed |
+| **Clock discipline** | mean \|stretch − 1\| within a bound that **scales with the profile** — a severe link legitimately rides nearer the cap |
+| **Reconcile snaps** | ≤ 25% of ticks. Some snaps are normal under loss; a storm means prediction never converges. |
+| **Resim depth** | **reported, not gated.** It legitimately deepens under latency and is bounded by `history_limit`; broken prediction shows up as snaps, not depth. |
+
+Each gate prints `PASS`/`FAIL` with the measured value and the bound, so a failing artifact is
+self-diagnosing.
+
+## Profiles
+
+One source of truth: `addons/orbitnet/bench/net_profiles.gd`.
+
+| | latency / jitter / loss |
+|---|---|
+| `clean` | 0 / 0 / 0 — the control. A run that fails here is a harness bug, not a netcode finding. |
+| `lan` | 1 / 0 / 0 |
+| `broadband` | 30 / 10 / 0.5% |
+| `congested_wifi` | 50 / 50 / 2% — the everyday bad case; jitter is the story, not mean latency |
+| `mobile_4g` | 100 / 20 / 4% |
+| `cross_region` | 150 / 15 / 1% |
+| `mobile_3g` | 300 / 30 / 7% |
+| `worst_case` | 250 / 25 / 5% — the ceiling a shooter is designed to still function at |
+| `worst_case_burst` | same latency, **bursty** (Gilbert–Elliott) loss instead of uniform |
+| `torture` | 450 / 50 / 10% — past the design envelope; expect failures, that is the point |
+
+The scheduler is **seeded and deterministic**: the same seed replays the same link exactly, which is what makes
+two runs comparable. Different seeds give different links, so a fleet is not one correlated waveform.
 
 ## Bot policies
 
-`bench_policy.gd` — pure, deterministic functions of (time, seed), fed to the body via `set_scripted_input` (the
-same tick-pure seam the determinism/net/load probes drive). `idle`, `strafe` (default), `orbit`, `wander`,
-`strafe_fire` (adds held-aim burst fire, so the weapon authority + shot replication join the load). A per-seed
-phase offset spreads a fleet out of lockstep so N bots aren't one correlated waveform.
+`idle` · `strafe` · `orbit` · `wander` · `strafe_fire`
 
-## Record & replay (regression fixtures)
+Each is a **pure function** of `(policy, elapsed, seed)` → one input frame. Deliberately simple, cyclic and
+motion-rich so a client generates continuous input, state churn and events — not to play well. The per-seed
+phase offset spreads a fleet out of lockstep while keeping each bot reproducible.
 
-Capture a session's per-tick input stream and replay it later under any profile — Riot's Server Network Recording
-pattern. The tape is the exact per-net-tick owner input that drove the sim and was replicated (`InputTape`, a
-lossless `var_to_bytes` codec).
+## Record and replay
 
 ```sh
-# record a bot (or a human) session:
-godot --headless --path . -- --join=127.0.0.1:47810 --bench --bench-bot=strafe \
-    --bench-record=/tmp/run.obnt --bench-duration=8
-# replay it (drives the body from the tape) under a different profile, with metrics:
-godot --headless --path . -- --join=127.0.0.1:47810 --bench --bench-replay=/tmp/run.obnt \
-    --bench-metrics=/tmp/replay.csv --bench-profile=worst_case --bench-duration=8
+# capture a bot (or a human) session as a fixture
+godot --path <project> -- --bench --bench-bot=wander --bench-record=user://tape.obnt --bench-duration=30
+
+# replay it under a different profile, with metrics
+godot --path <project> -- --bench --bench-replay=user://tape.obnt \
+      --bench-metrics=user://run.csv --bench-profile=worst_case --bench-duration=30
 ```
 
-Record and replay are both keyed to the **net tick** (not the physics frame), so they stay cadence-consistent
-under the net/physics decouple. To record a *human* session, run a normal client with `--bench --bench-record=…`
-and no bot.
+A tape is `{magic, version, frames}` through `var_to_bytes` — lossless, game-agnostic, and forward-compatible
+(an unknown key rides through untouched). Decoding rejects a non-tape blob rather than misparsing it, and
+never instantiates objects.
 
-## Multi-machine (the Gauntlet)
+## Flags
 
-`tools/netbench/gauntlet.sh` is one SSH controller that drives a server host + bot-client hosts, then collects and
-evaluates every peer's artifacts — Unreal Gauntlet's architecture (SSH as the device transport, fixed hostnames as
-the rendezvous), Riot BVS's shape at 1% scale. **Not** a GitHub-Actions job mesh (Actions has no live inter-job
-networking). Pair with **Tailscale**: MagicDNS gives stable hostnames + NAT traversal, so cross-site machines on
-different OSes join one session by name (and the real WAN is free realism — measure it, don't assume it).
+All after `--`:
+
+| | |
+|---|---|
+| `--bench` | enable the probe (the others are inert without it) |
+| `--bench-bot=<policy>` | drive the body with a `BenchPolicy` |
+| `--bench-seed=<int>` | motion phase seed — vary per client to de-correlate a fleet |
+| `--bench-metrics=<path>` | stream per-tick metrics to CSV and evaluate the gate on finish |
+| `--bench-record=<path>` / `--bench-replay=<path>` | tape capture / playback (replay wins over a bot) |
+| `--bench-duration=<s>` | finish, print the verdict, quit. Measured from the **first spawn**, so a slow connect does not starve the sample count. |
+| `--bench-profile=<name>` | the profile this client runs under, for the RTT gate |
+
+## Multi-machine
 
 ```sh
-# controlled conditions (relay on the server host):
-SERVER_HOST=box-a CLIENT_HOSTS="box-b box-c" RELAY=1 PROFILE=congested_wifi CLIENTS_PER_HOST=2 \
-    just netbench-gauntlet
-# realism spot-check (raw WAN between machines, no relay):
-SERVER_HOST=box-a CLIENT_HOSTS="box-b box-c" RELAY=0 just netbench-gauntlet
-# see the exact plan without touching any host:
-SERVER_HOST=box-a CLIENT_HOSTS="box-b box-c" GAUNTLET_DRYRUN=1 just netbench-gauntlet
+SERVER_HOST=… CLIENT_HOSTS="…" just netbench-gauntlet
 ```
 
-It needs real reachable hosts with passwordless SSH + Godot 4.7 (so it cannot run in a single-box CI sandbox —
-that is what `just netbench` is for). Waits are poll-until-condition with deadlines (never bare sleeps, the Riot
-rule); teardown sweeps game processes by cmdline on every host.
+One SSH controller drives a server host plus bot-client hosts. Needs reachable hosts, passwordless SSH and
+Godot on each. `GAUNTLET_DRYRUN=1` prints the plan without touching anything.
 
-## Console conditioner (`net.sim_*`)
+## What it deliberately does not do
 
-The live in-process conditioner surface, for the **Steam** transport: on a Steam build these drive
-SteamNetworkingSockets' `FakePacket*` config below reliability. On ENet they store their values but tell you
-to condition the wire through the relay (ENet has no honest in-process seam).
-
-```
-net.sim_profile congested_wifi   # apply a catalog profile live
-net.sim_latency 120              # or tune individual knobs (one-way ms; loss/dup/reorder are [0,1])
-net.sim_status                   # show the active path (Steam in-process vs ENet relay) + current params
-net.sim_off                      # clear
-```
-
-These are distinct from `net.lag_sim` / `net.loss_sim`, which only perturb the owned body's pose to eyeball the
-reconcile smoother — they do **not** touch the wire.
-
-## Architecture (files)
-
-Pure cores are unit-tested (`tests/unit/*_test.gd`, run by `just test`); the socket/scene/network shells are
-exercised by the live bench run.
-
-| file | role | tested by |
-|---|---|---|
-| `net_profile.gd` / `net_profiles.gd` | the condition record + catalog | `net_profiles_test.gd` |
-| `packet_impairment.gd` | pure drop/delay/dup/reorder scheduler (seeded, deterministic) | `packet_impairment_test.gd` |
-| `relay_main.gd` | the UDP relay `MainLoop` (`-s` entry) — one impairment pair per client | live (`bench.sh`) |
-| `bench_policy.gd` | pure bot behaviours | `bench_policy_test.gd` |
-| `bench_bot.gd` | Node driver: policy → `set_scripted_input` each tick | live |
-| `input_tape.gd` | lossless record/replay codec | `input_tape_test.gd` |
-| `bench_metrics.gd` | per-tick CSV recorder + gate runner | live |
-| `bench_gate.gd` | pure pass/fail evaluation | `bench_gate_test.gd` |
-| `bench_probe.gd` | the `--bench` harness entry; wires bot/metrics/record/replay from CLI flags | live |
-| `net_conditioner.gd` | `net.sim_*` facade → Steam `FakePacket*` (below reliability) | live (Steam build) |
-
-CLI flags (all after `--`): `--port=<n>` (host/dedicated); `--join=addr:port`; `--bench` + `--bench-bot=`,
-`--bench-seed=`, `--bench-metrics=`, `--bench-record=`, `--bench-replay=`, `--bench-profile=`, `--bench-duration=`.
-
-## What netbench deliberately does NOT do
-
-- **No protocol-level fake clients.** Real headless clients are affordable at session scale (4–16) and strictly
-  higher fidelity; fake clients only exist to load-test platform services at farm scale (Riot's 2M-player harness).
-- **No render-domain gates.** Every gate is a facade metric read at a net tick.
-- **No PR gate.** netbench is a nightly/on-demand lane. Per the project rule, the per-PR `net-check.yml` stays
-  minimal; adopt Riot's promotion rule (a new gate runs green for a week before it may block anything).
-- **No Steam headless CI.** Steam needs a logged-in client per machine (Spacewar 480 is restricted), so the Steam
-  transport gets a semi-manual two-machine tailnet smoke; ENet stays the CI transport.
+- **It is not a PR gate.** The numbers depend on the machine. CI gates correctness; this measures behaviour.
+- **It does not assert cross-client determinism.** The server is authoritative; bots need only be
+  reproducible.
+- **It does not simulate bandwidth caps or NAT.** Latency, jitter, loss, duplication and reordering only.

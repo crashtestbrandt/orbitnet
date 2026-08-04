@@ -1,6 +1,6 @@
 //! Render interpolation between net ticks.
 //!
-//! `OrbitInterpolator` is the drop-in for the old backend's TickInterpolator: purely local, no
+//! `OrbitInterpolator` is purely local: no
 //! wire traffic. Each tick loop it rotates the declared properties' values (`from ← to`,
 //! `to ← live`), re-applies `from`, and then every render frame applies the blend
 //! `from → to` at the tick clock's sub-tick factor. Player bodies do NOT use this — they render

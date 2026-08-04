@@ -156,7 +156,7 @@ mod platform {
                     0o644 as libc::c_uint,
                 );
                 if fd >= 0 {
-                    write_all(fd, b"\n=== spaceman native crash ===\nsignal: ");
+                    write_all(fd, b"\n=== orbitnet native crash ===\nsignal: ");
                     let mut buf = [0u8; 24];
                     write_all(fd, render_u64(sig as u64, &mut buf));
                     write_all(fd, b"\npid: ");
@@ -326,7 +326,7 @@ mod platform {
                 );
                 if file != INVALID_HANDLE_VALUE {
                     SetFilePointer(file, 0, std::ptr::null_mut(), FILE_APPEND_END);
-                    write_all(file, b"\n=== spaceman native crash ===\ncode: ");
+                    write_all(file, b"\n=== orbitnet native crash ===\ncode: ");
                     let record = (*info).exception_record;
                     let code = if record.is_null() {
                         0

@@ -17,7 +17,7 @@ pub const MIN_TICKRATE_HZ: u32 = 1;
 
 /// Highest tick rate OrbitNet will run at.
 ///
-/// Matches the clamp the Spaceman console has always applied to `net.tickrate`.
+/// A sane range for a network tick; the facade clamps identically so a runtime knob round-trips.
 pub const MAX_TICKRATE_HZ: u32 = 240;
 
 /// Default ceiling on how many simulation ticks a single frame may run.

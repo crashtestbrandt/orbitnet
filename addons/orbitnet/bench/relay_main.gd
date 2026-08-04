@@ -66,7 +66,7 @@ func _initialize() -> void:
 		_should_quit = true
 		return
 	_bound = true
-	# The `bound` marker the harness waits on before launching clients (mirrors loadtest's "LOAD: bound").
+	# The `bound` marker the harness waits on before launching clients.
 	print("RELAY: bound listen=%d target=%s:%d seed=%d dur=%ds | %s" % [
 		_listen_port, _target_host, _target_port, _base_seed,
 		int(_duration_ms / 1000), _profile.describe()])

@@ -110,7 +110,7 @@ impl DirtyWindow {
 /// Per-body resimulation scheduling.
 ///
 /// Bodies are kept in a [`BTreeMap`] so a plan is emitted in a stable, id-ordered sequence. Replay
-/// order must not vary run to run: Spaceman gates on a bit-exact resim through Jolt, and a
+/// order must not vary run to run: a consumer may gate on a bit-exact resim, and a
 /// nondeterministic iteration order would show up there as a phantom desync.
 #[derive(Debug, Clone, Default)]
 pub struct ResimPlanner {

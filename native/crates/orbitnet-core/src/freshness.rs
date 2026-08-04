@@ -1,12 +1,11 @@
-//! Input-novelty freshness — the #67 fix.
+//! Input-novelty freshness.
 //!
-//! Netfox's `is_fresh` means "this `(node, tick)` pair has not been visited before" — a visitation
-//! high-water mark. When the server predicts tick `T` with no input and *then* receives the
-//! client's real input for `T`, it resimulates with `is_fresh = false` even though that resim is
-//! the **first time the real input was seen**. Game code that must fire an effect exactly once per
-//! real input (weapon shots, one-shot interactions) ends up carrying its own workarounds, like
-//! `weapon_authority.gd`'s `_resolved_shot_seq` high-water marks and its non-replicated 256-tick
-//! `_held_cat_log`.
+//! The naive definition of `is_fresh` — "this `(node, tick)` pair has not been visited before", a
+//! visitation high-water mark — is wrong in a way that costs game code real complexity. When the
+//! server predicts tick `T` with no input and *then* receives the client's real input for `T`, it
+//! resimulates with `is_fresh = false` even though that resim is the **first time the real input
+//! was seen**. Anything that must fire exactly once per real input (a weapon shot, a one-shot
+//! interaction) then has to carry its own high-water marks and non-replicated tick logs.
 //!
 //! [`FreshnessLedger`] keys freshness on input **novelty** instead. Each tick carries a
 //! [`Confidence`]: `Predicted` (no input at all), `Extrapolated` (input carried forward from an
@@ -17,7 +16,7 @@
 //! passes precede the packet, the resim that first carries the real input still reads fresh.
 //!
 //! [`MemoRing`] is the companion `commit_once`/tick-memo primitive: a tick-indexed ring of small
-//! key→value pair lists that replaces the hand-rolled `_held_cat_log`. A body memos one to three
+//! key→value pair lists, replacing any hand-rolled equivalent. A body memos one to three
 //! keys per tick, so lookups are small-N linear scans rather than a `HashMap` — and eviction
 //! reuses each slot's `Vec` via `clear()`, keeping the steady state allocation-free.
 

@@ -13,7 +13,8 @@
 #   4. The two peers agree about where seat 0's army is, by CENTROID, within a couple of metres.
 #      Deliberately not a per-unit hash: peers observe different ticks by construction.
 #   5. A forged foreign-seat order changed nothing.
-#   6. Worst observed staleness stayed under bound (units are not starving past the send budget).
+#   6. The worst refresh interval of an actively-moving unit stayed under bound -- i.e. no unit is starving
+#      past the send budget.
 #
 # NO --fixed-fps. The backend's clock sync paces off the WALL clock; --fixed-fps stalls the ping/pong so the
 # client never finishes its handshake and the probe times out looking like a netcode failure. Free-running

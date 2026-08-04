@@ -3,7 +3,7 @@
 //! When the net tick is *coupled* to the physics tick (both 120 Hz), pacing the tick loop off a
 //! stretched wall clock is exactly wrong: any stretch != 1.0 slides tick boundaries across physics
 //! frames, so some frames run zero net ticks and others run two — visible judder, inherited from
-//! netfox's stretch-under-`sync_to_physics` behaviour. The coupled-mode rule is the opposite: pin
+//! stretching the clock under `sync_to_physics`. The coupled-mode rule is the opposite: pin
 //! stretch to 1.0, run exactly one tick per physics frame, and absorb clock error as a rare,
 //! deliberate *slew* — a single frame that runs zero or two ticks. [`CoupledSlew`] decides when:
 //! only once the offset exceeds a threshold comfortably past the 0.5-tick rounding boundary (so
