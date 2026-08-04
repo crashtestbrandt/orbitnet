@@ -1,0 +1,169 @@
+name: release
+
+# Cut a release from a `v*` tag: build the extension on all three platforms, COMMIT the refreshed binaries
+# to main, build the Asset Library zip, and publish a GitHub Release.
+#
+# This is the only workflow that writes to the repository, and the only one that grows history. Committing
+# binaries here rather than on every push is what keeps a no-LFS repository small enough to stay pleasant to
+# clone -- see the header of addons/orbitnet_native/orbitnet.gdextension for why LFS is not an option for an
+# addon distributed through the Asset Library.
+#
+# The commit lands on the DEFAULT BRANCH, not on the tag: a tag is immutable and already points at the
+# source the binaries were built from, while main is what a `git clone` gets. The tag's release assets carry
+# the same binaries, so a user has both paths.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. v0.2.0). Manual runs do not commit or publish.'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true   # a partial set of binaries must never be committed
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: liborbitnet.linux.x86_64.so
+            built: native/target/release/liborbitnet.so
+          - os: windows-latest
+            artifact: orbitnet.windows.x86_64.dll
+            built: native/target/release/orbitnet.dll
+          - os: macos-latest
+            artifact: liborbitnet.macos.universal.dylib
+            built: native/target/release/liborbitnet.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: release-${{ matrix.os }}
+
+      - name: Build (macOS universal)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cd native
+          cargo build --release -p orbitnet-godot --target x86_64-apple-darwin
+          cargo build --release -p orbitnet-godot --target aarch64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/liborbitnet.dylib \
+            target/x86_64-apple-darwin/release/liborbitnet.dylib \
+            target/aarch64-apple-darwin/release/liborbitnet.dylib
+
+      - name: Build
+        if: matrix.os != 'macos-latest'
+        shell: bash
+        run: cd native && cargo build --release -p orbitnet-godot
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          cp "${{ matrix.built }}" "staged/${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staged/${{ matrix.artifact }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the only place in this repo that needs it: commit binaries + create a release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+          merge-multiple: true
+
+      - name: Install the binaries
+        run: |
+          set -euo pipefail
+          mkdir -p addons/orbitnet_native/bin
+          cp incoming/liborbitnet.linux.x86_64.so        addons/orbitnet_native/bin/
+          cp incoming/orbitnet.windows.x86_64.dll        addons/orbitnet_native/bin/
+          cp incoming/liborbitnet.macos.universal.dylib  addons/orbitnet_native/bin/
+          ls -l addons/orbitnet_native/bin
+          # A pointer, a truncated download, or an empty file here would ship a release that cannot load.
+          for f in addons/orbitnet_native/bin/*; do
+            test -s "$f" || { echo "::error::$f is empty"; exit 1; }
+          done
+
+      - name: Stamp the plugin version from the tag
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
+            version="${{ github.event.inputs.version }}"
+            version="${version#v}"
+          fi
+          sed -i "s/^version=\".*\"$/version=\"${version}\"/" addons/orbitnet/plugin.cfg
+          grep '^version=' addons/orbitnet/plugin.cfg
+
+      - name: Build the Asset Library zip
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p build
+          # The payload is exactly the two addon directories -- what a user installs and nothing else.
+          # The licences ride along inside it, because an addon installed from a zip carries no repository
+          # with it and a user who cannot find the terms will assume the worst.
+          cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
+          zip -qr "build/orbitnet-${version}.zip" addons/orbitnet addons/orbitnet_native
+          rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT \
+                addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
+          unzip -l "build/orbitnet-${version}.zip" | tail -3
+
+      - name: Commit the refreshed binaries
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add addons/orbitnet_native/bin addons/orbitnet/plugin.cfg
+          if git diff --cached --quiet; then
+            echo "binaries unchanged; nothing to commit"
+            exit 0
+          fi
+          git commit -m "release: extension binaries and plugin version for ${GITHUB_REF_NAME}"
+          git push origin HEAD:main
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/orbitnet-*.zip
+            addons/orbitnet_native/bin/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **Asset Library:** download `orbitnet-*.zip` below and use *AssetLib → Install from file*, then
+            enable **OrbitNet** in *Project → Project Settings → Plugins*.
+
+            **Manual:** copy `addons/orbitnet/` and `addons/orbitnet_native/` from the zip into your project.
+            Both directories are required — `Net` without the extension is a facade over nothing.
+
+            The binaries are plain files, not Git LFS pointers: they work straight out of the zip.
+
+            OrbitNet is 0.x. The `Net` facade is the stable surface; everything behind it may change.

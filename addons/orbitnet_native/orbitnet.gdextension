@@ -1,0 +1,53 @@
+; OrbitNet — Rust GDExtension descriptor. THE NETCODE BACKEND: the Net facade
+; (addons/orbitnet/net.gd) drives the OrbitNet / OrbitRollbackSynchronizer / OrbitStateSynchronizer /
+; OrbitInterpolator classes this library registers, and net.gd is the only file allowed to name them.
+; Sources live in native/ (a cargo workspace at the repo root, deliberately OUTSIDE the shipped addon);
+; `just native-install` rebuilds this host's binary into bin/.
+;
+; THE BINARIES ARE PLAIN GIT BLOBS, NOT GIT LFS. Two independent reasons, both fatal:
+;   1. The Godot Asset Library installs an addon from a repository TARBALL. LFS content arrives in a
+;      tarball as POINTER FILES -- a few hundred bytes of text -- so dlopen fails with "invalid ELF
+;      header" behind a confusing parse cascade, and the user has no way to tell that from a broken
+;      build. An addon distributed through AssetLib cannot use LFS for the thing it ships.
+;   2. GitHub's free LFS allowance is 1 GiB of storage and 1 GiB/month of bandwidth ACCOUNT-WIDE, not
+;      per-repo. A public addon's download volume is unbounded by construction.
+; The trade-off is accepted deliberately: ~4 MB per platform in git history, refreshed only on release
+; tags (release.yml), never on every push to main. binaries.yml builds all three platforms on every
+; native/** change and uploads them as workflow ARTIFACTS, so main is always proven to build without
+; growing history.
+;
+; ONE FILE PER PLATFORM, both template entries pointing at it. template_debug and template_release were
+; already byte-identical: both are built with cargo's *release* profile, and only cargo FEATURES would
+; distinguish them. Godot selects the template_debug entry when a project runs from source -- which is
+; every CI probe, every `just rts`, and every dev run -- so shipping a cargo debug build there would be
+; 10-50x slower and would poison every performance measurement taken from a dev run. Two names for one
+; artifact only doubled the git weight.
+;
+; compatibility_minimum is 4.4, not the version the demos are developed against: a gdext extension loads
+; in any Godot at or above the API it was built against, so a 4.4 baseline stays usable by public
+; projects on older 4.x releases. Raise it only with a matching bump to the `api-4-4` feature in
+; native/crates/orbitnet-godot/Cargo.toml -- they must agree.
+;
+; reloadable is false deliberately. A netcode singleton owns sockets, tick state and history; hot reload
+; is the least-exercised corner of the toolchain and there is no benefit to trading robustness for it.
+
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = "4.4"
+reloadable = false
+
+[libraries]
+
+linux.debug.x86_64 = "res://addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so"
+linux.release.x86_64 = "res://addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so"
+windows.debug.x86_64 = "res://addons/orbitnet_native/bin/orbitnet.windows.x86_64.dll"
+windows.release.x86_64 = "res://addons/orbitnet_native/bin/orbitnet.windows.x86_64.dll"
+macos.debug = "res://addons/orbitnet_native/bin/liborbitnet.macos.universal.dylib"
+macos.release = "res://addons/orbitnet_native/bin/liborbitnet.macos.universal.dylib"
+
+; No linux arm64 entry: nothing builds it yet. Adding one is a matrix entry in release.yml plus a line
+; here -- the Rust is arch-agnostic.
+; No web entries: Godot's web export cannot load a GDExtension at all.
+; No android/ios entries yet; mobile lands with the export-preset pass (ENet over UDP needs no protocol
+; change, so this is a build-matrix question, not a netcode one).

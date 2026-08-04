@@ -1,0 +1,25 @@
+# Normalize line endings so a Windows checkout does not turn every shell script into CRLF (which makes
+# `#!/usr/bin/env bash` fail with a baffling "bad interpreter" error).
+* text=auto eol=lf
+
+*.sh          text eol=lf
+*.gd          text eol=lf
+*.rs          text eol=lf
+*.md          text eol=lf
+*.toml        text eol=lf
+*.yml         text eol=lf
+*.cfg         text eol=lf
+*.godot       text eol=lf
+*.tscn        text eol=lf
+*.gdextension text eol=lf
+justfile      text eol=lf
+
+# --- binaries -------------------------------------------------------------------------------------
+# DELIBERATELY NOT GIT LFS. The Godot Asset Library installs an addon from a repository TARBALL, where
+# LFS content arrives as pointer FILES -- so dlopen fails with "invalid ELF header" and the user has no
+# way to tell that from a broken build. GitHub's free LFS allowance is also account-wide (1 GiB storage,
+# 1 GiB/month bandwidth), which a public addon's download volume blows through. These are ~4 MB plain
+# blobs per platform, refreshed only on release tags. See addons/orbitnet_native/orbitnet.gdextension.
+*.so  binary
+*.dll binary
+*.dylib binary

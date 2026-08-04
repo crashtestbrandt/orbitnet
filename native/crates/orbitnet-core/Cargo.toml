@@ -1,0 +1,13 @@
+[package]
+name = "orbitnet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OrbitNet core — engine-agnostic rollback netcode primitives"
+
+# Deliberately ZERO dependencies, and deliberately NO dependency on `godot`.
+# Everything here is a pure function of plain data so it runs under `cargo test`
+# in milliseconds and can be reused outside Godot.
+[dependencies]

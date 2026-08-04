@@ -1,0 +1,35 @@
+[package]
+name = "orbitnet-godot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OrbitNet — Godot 4 GDExtension binding"
+
+[lib]
+# The GDExtension itself. The name drives the shared-library filename referenced by
+# addon/orbitnet.gdextension.
+name = "orbitnet"
+crate-type = ["cdylib"]
+
+[dependencies]
+orbitnet-core = { workspace = true }
+
+# Built against the 4.4 API rather than 4.7. gdext extensions load in any Godot at or above the API
+# they were built against, so a 4.4 baseline runs on Spaceman's 4.7 while staying usable by public
+# projects on older 4.x. It also avoids the `api-custom` feature, which would drag libclang/bindgen
+# into the Nix dev shell for no benefit here.
+#
+# Pinned exactly, not with a caret: gdext is 0.x and its API moves between releases.
+#
+# Full codegen (the default) is kept deliberately. Trimming it builds faster but drops classes
+# outside the core set, and the next milestone needs `SceneMultiplayer` — which is exactly the kind
+# of class a lean build omits.
+godot = { version = "=0.5.4", features = ["api-4-4"] }
+
+# POSIX signal handling for the native crash handler (crash.rs). Already in the tree transitively via
+# godot-ffi, so making it direct pulls nothing new; Windows uses raw `extern "system"` kernel32
+# declarations instead of a second dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,41 @@
+# --- synced addon copies (build artifacts of tools/sync-addons.sh) ---------------------------------
+# The CANONICAL addon lives at the repo root. Every Godot project here gets a mirror-copy, which must
+# never be committed and must never be edited -- `just addon-drift` fails if a copy diverges.
+harness/addons/
+demos/*/addons/
+harness/tests/support/
+demos/*/tests/support/
+
+# --- Godot ----------------------------------------------------------------------------------------
+.godot/
+*.translation
+# Godot writes these next to a project when exporting or importing; none of it is source.
+export_presets.cfg.bak
+
+# --- Rust -----------------------------------------------------------------------------------------
+native/target/
+**/*.rs.bk
+
+# --- build outputs ---------------------------------------------------------------------------------
+build/
+dist/
+
+# --- local tooling ---------------------------------------------------------------------------------
+.godot-nix/
+.direnv/
+result
+result-*
+# Machine-specific MCP / editor configuration.
+.mcp.json
+.vscode/
+.idea/
+
+# --- OS --------------------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- bench artifacts -------------------------------------------------------------------------------
+# netbench writes CSVs and input tapes per run; they are outputs, not fixtures. A tape you WANT to keep
+# as a regression asset should be committed deliberately, under a path this does not match.
+bench-out/
+*.bench.csv

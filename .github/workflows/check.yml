@@ -1,0 +1,136 @@
+name: check
+
+# The PR gate. Deliberately small and deliberately in this order: the two gates that need no Godot at all
+# run first (a grep and a cargo run), so the common failures report in seconds rather than after a Godot
+# download.
+#
+# GITHUB-HOSTED RUNNERS, NOT SELF-HOSTED. A public repository must never point fork-PR CI at a self-hosted
+# runner: a fork PR can change the workflow, and a self-hosted runner executes it on your machine with your
+# filesystem. The cost is installing Godot per job, which the cache below makes cheap.
+#
+# `pull_request`, NOT `pull_request_target`, for the same family of reasons: fork PRs get no secrets and no
+# write token, which is exactly right for a gate that only needs to read the diff.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: 4.4.1-stable
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No Godot needed for either of these.
+      # Called directly rather than through `just`: the recipes are one line each and a hosted runner has
+      # no `just` installed, so adding one would be a dependency bought for nothing.
+      - name: Addon drift
+        run: tools/sync-addons.sh --check
+
+      - name: Facade boundary (net-check)
+        run: tools/net-check.sh
+
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: fmt
+        run: cd native && cargo fmt --all --check
+      - name: clippy
+        run: cd native && cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cd native && cargo test --workspace
+
+  godot:
+    runs-on: ubuntu-latest
+    needs: [gates, native]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the Godot binary
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}
+
+      - name: Install Godot
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/godot
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}"
+          curl -fsSL -o /tmp/godot.zip "${base}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q -o /tmp/godot.zip -d ~/godot
+          mv ~/godot/Godot_v${GODOT_VERSION}_linux.x86_64 ~/godot/godot
+          chmod +x ~/godot/godot
+
+      - name: Put Godot on PATH
+        run: echo "$HOME/godot" >> "$GITHUB_PATH"
+
+      # The addon must be mirrored into each project before anything can load. Doing it here rather than
+      # committing the copies is what keeps one canonical source in the tree.
+      - name: Sync the addon into every project
+        run: tools/sync-addons.sh
+
+      # The committed binary is a plain git blob, so a fresh checkout already has a working extension --
+      # nothing to fetch, nothing to build. That is the whole point of the no-LFS policy: if this step were
+      # needed, an AssetLib user would need it too, and they have no way to run it.
+      - name: Confirm the extension binary is real (not a pointer, not empty)
+        run: |
+          set -euo pipefail
+          lib=addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so
+          test -s "$lib" || { echo "::error::$lib is missing or empty"; exit 1; }
+          if head -c 64 "$lib" | grep -q 'git-lfs.github.com'; then
+            echo "::error::$lib is a Git LFS POINTER, not a library. See the .gdextension header."
+            exit 1
+          fi
+          magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
+          test "$magic" = "7f454c46" || { echo "::error::$lib is not an ELF object (magic=$magic)"; exit 1; }
+          ls -l "$lib"
+
+      - name: Lint (headless project load, warnings-as-errors)
+        run: |
+          tools/lint-gdscript.sh harness
+          tools/lint-gdscript.sh demos/rts
+
+      - name: Unit suites
+        run: |
+          godot --headless --path harness --script tests/support/run_unit_tests.gd
+          godot --headless --path demos/rts --script tests/support/run_unit_tests.gd
+
+      # --skip-build with no local cargo output falls back to the COMMITTED binary, which is what an
+      # Asset Library user receives. That is the version worth smoke-testing here.
+      - name: Extension load smoke (throwaway project, committed binary)
+        run: tools/orbitnet-smoke.sh --skip-build
+
+      - name: Two-peer RTS probe
+        run: tools/rts-probe.sh
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-logs
+          path: |
+            /tmp/rtsprobe-*
+            /tmp/orbitnet-lint*
+          if-no-files-found: ignore
+          retention-days: 7

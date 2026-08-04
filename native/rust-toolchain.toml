@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned to match flake.nix. gdext 0.5 requires >= 1.94.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

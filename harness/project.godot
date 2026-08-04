@@ -1,0 +1,50 @@
+; The OrbitNet HARNESS project.
+;
+; A minimal Godot project whose only job is to exercise the ADDON on its own terms: the addon's own unit
+; suites, and a load smoke that proves the plugin registers `Net` and the extension registers its classes in
+; a project that contains nothing else. It is deliberately NOT a demo -- no game, no scene worth looking at.
+;
+; It exists because a demo is a bad regression gate for a library. A failure in demos/rts could be the demo's
+; fault or the addon's, and you cannot tell without reading both. If a suite here fails, it is the addon.
+;
+; The addon is mirror-copied in by tools/sync-addons.sh; addons/ and tests/support/ are gitignored build
+; artifacts of that copy.
+
+config_version=5
+
+[application]
+
+config/name="OrbitNet Harness"
+config/description="Unit suites and a load smoke for the OrbitNet addon itself."
+run/main_scene="res://scenes/smoke.tscn"
+config/features=PackedStringArray("4.4", "GL Compatibility")
+
+[autoload]
+
+Net="*res://addons/orbitnet/net.gd"
+
+[debug]
+
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/unsafe_method_access=2
+gdscript/warnings/unsafe_cast=2
+gdscript/warnings/unsafe_call_argument=2
+gdscript/warnings/exclude_addons=true
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/orbitnet/plugin.cfg")
+
+[orbitnet]
+
+; The COUPLED configuration, deliberately the opposite of demos/rts. Two projects, two configurations -- which
+; is the whole reason they are separate projects rather than folders in one.
+sync_to_physics=true
+tickrate=60
+history_limit=128
+max_time_stretch=1.05
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

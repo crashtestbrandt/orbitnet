@@ -1,0 +1,84 @@
+name: binaries
+
+# Build the extension for all three platforms whenever the Rust changes, and upload the results as
+# workflow ARTIFACTS. It does NOT commit anything.
+#
+# That is the deliberate half of the no-LFS trade-off. Committing a ~4 MB binary per platform on every push
+# to main would grow history by tens of megabytes a month for changes nobody downloads. Committing them only
+# on release tags (release.yml) keeps the repository small, and this workflow is what makes that safe: main
+# is always PROVEN to build on every platform, even though only tags refresh the committed artifacts.
+#
+# So: a contributor's `native/**` change is verified everywhere immediately, and the committed binaries are
+# refreshed when a version is actually cut.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'native/**'
+      - '.github/workflows/binaries.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: liborbitnet.linux.x86_64.so
+            built: native/target/release/liborbitnet.so
+          - os: windows-latest
+            artifact: orbitnet.windows.x86_64.dll
+            built: native/target/release/orbitnet.dll
+          - os: macos-latest
+            artifact: liborbitnet.macos.universal.dylib
+            built: native/target/release/liborbitnet.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: ${{ matrix.os }}
+
+      # macOS builds BOTH architectures and lipos them together. A single-arch dylib works on the machine
+      # that built it and fails on the other half of the Mac install base, which is the kind of bug that
+      # only shows up in a bug report from a user you cannot reproduce.
+      - name: Build (macOS universal)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cd native
+          cargo build --release -p orbitnet-godot --target x86_64-apple-darwin
+          cargo build --release -p orbitnet-godot --target aarch64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/liborbitnet.dylib \
+            target/x86_64-apple-darwin/release/liborbitnet.dylib \
+            target/aarch64-apple-darwin/release/liborbitnet.dylib
+          lipo -info target/release/liborbitnet.dylib
+
+      - name: Build
+        if: matrix.os != 'macos-latest'
+        shell: bash
+        run: cd native && cargo build --release -p orbitnet-godot
+
+      - name: Stage under the shipped filename
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          cp "${{ matrix.built }}" "staged/${{ matrix.artifact }}"
+          ls -l staged
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: staged/${{ matrix.artifact }}
+          retention-days: 30

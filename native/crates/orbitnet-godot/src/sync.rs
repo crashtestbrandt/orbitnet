@@ -1,0 +1,1163 @@
+//! The per-entity synchronizers.
+//!
+//! [`OrbitRollbackSynchronizer`] owns one entity's replication state: the resolved property
+//! bindings, the packed state/input history rings, the input-confidence ledger (#67), and the
+//! tick-memo ring. It does **not** drive anything — the `OrbitNet` singleton iterates entities in
+//! ascending id order and calls the `pub(crate)` phase methods below, which keeps the whole
+//! rollback loop a flat native iteration instead of the old five-signals-per-tick fan-out.
+//!
+//! [`OrbitStateSynchronizer`] is the no-rollback lane: server-authoritative extract-and-broadcast
+//! with apply-on-receive, so a value set outside the tick loop (a NetCommand handler) is never
+//! clobbered by a rollback restore. Holster containers, health, env sensors, the celestial rig
+//! and NPC poses ride this lane.
+//!
+//! Entity identity is the FNV-1a hash of the synchronizer root's node path, salted per lane. Both
+//! peers derive the same id because the `MultiplayerSpawner` guarantees identical node names —
+//! the same invariant the old backend's node-path RPC routing leaned on, made explicit.
+
+use godot::classes::Node;
+use godot::prelude::*;
+
+use orbitnet_core::codec::{
+    decode_state_block_into, encode_state_block, Reader, StateBlockMeta, Writer,
+};
+use orbitnet_core::{
+    ColumnarHistory, Confidence, FreshnessLedger, MemoRing, PropKind, PropRole, SchemaBuilder,
+};
+
+use crate::binding::{self, PropBinding};
+
+/// What integrating a received authoritative state concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateIntegration {
+    /// The row matched our recorded prediction bit-for-bit — nothing to resimulate.
+    Confirmed,
+    /// The row differed from our prediction at this tick: resimulate from here.
+    Mispredict(u64),
+    /// Applied/buffered for a display-only or future tick — no rollback interaction.
+    Buffered,
+    /// The row could not be integrated (stale beyond history, or no delta base).
+    Rejected,
+}
+
+/// Rollback state + input replication for one entity.
+#[derive(GodotClass)]
+#[class(base=Node)]
+pub struct OrbitRollbackSynchronizer {
+    base: Base<Node>,
+
+    /// Node the declared property paths resolve against. Defaults to this node's parent.
+    #[export]
+    root: Option<Gd<Node>>,
+
+    /// Node that owns the *input* properties.
+    ///
+    /// The server-authoritative split needs input authority to differ from state authority, which
+    /// requires the input to live on its own node. A first-class export rather than a convention.
+    #[export]
+    input_authority_node: Option<Gd<Node>>,
+
+    /// Simulation state entries, each `"NodePath:property"` or a bare `"property"`.
+    #[export]
+    state_properties: PackedStringArray,
+
+    /// Player-intent entries, in the same form.
+    #[export]
+    input_properties: PackedStringArray,
+
+    /// Presentation-only entries: replicated, never restored, never counted as a misprediction.
+    #[export]
+    cosmetic_properties: PackedStringArray,
+
+    /// Whether this peer predicts this entity locally.
+    #[export]
+    enable_prediction: bool,
+
+    /// Display-only exemption: this peer applies received state and never joins the rollback
+    /// loop. The first-class replacement for the old backend's `rollback_exempt` local patch.
+    #[export]
+    exempt: bool,
+
+    // --- resolved at process_settings ---
+    entity_id: u64,
+    state_schema: SchemaBuilder,
+    state_bindings: Vec<PropBinding>,
+    input_schema: SchemaBuilder,
+    input_bindings: Vec<PropBinding>,
+    unresolved: PackedStringArray,
+    rollback_nodes: Vec<Gd<Node>>,
+    /// Whether the local peer authors this entity's input (its own player).
+    input_local: bool,
+    /// Whether the local peer owns this entity's state (the server).
+    state_local: bool,
+
+    // --- runtime ---
+    state_history: ColumnarHistory,
+    input_history: ColumnarHistory,
+    ledger: FreshnessLedger,
+    memo: MemoRing,
+    history_limit: usize,
+    /// Ring of ticks whose `state_history` row is a bit-exact wire row (`u64::MAX` = none). A
+    /// masked delta may only decode against such a base: any locally simulated row is a
+    /// prediction the server did not delta against, and decoding over it corrupts silently.
+    auth_ticks: Vec<u64>,
+    /// Newest authoritative state tick known (received on clients, broadcast tick on the server).
+    latest_state_tick: i64,
+    /// Newest received-and-not-yet-integrated authoritative row (owner reconcile path).
+    pending_state: Option<(u64, Vec<u8>)>,
+    /// Newest received row awaiting the next tick boundary (display path).
+    pending_display: Option<(u64, Vec<u8>)>,
+    /// One past the newest tick simulated at authoritative confidence — the broadcastable tick.
+    latest_auth_sim_tick: u64,
+    /// Newest input tick received from the remote owner (server side).
+    latest_remote_input_tick: i64,
+    /// Whether the most recent simulated tick ran on non-authoritative input.
+    predicted_last: bool,
+    scratch_state: Vec<u8>,
+    scratch_input: Vec<u8>,
+    scratch_wire: Vec<u8>,
+}
+
+#[godot_api]
+impl INode for OrbitRollbackSynchronizer {
+    fn init(base: Base<Node>) -> Self {
+        Self {
+            base,
+            root: None,
+            input_authority_node: None,
+            state_properties: PackedStringArray::new(),
+            input_properties: PackedStringArray::new(),
+            cosmetic_properties: PackedStringArray::new(),
+            enable_prediction: true,
+            exempt: false,
+            entity_id: 0,
+            state_schema: SchemaBuilder::new(),
+            state_bindings: Vec::new(),
+            input_schema: SchemaBuilder::new(),
+            input_bindings: Vec::new(),
+            unresolved: PackedStringArray::new(),
+            rollback_nodes: Vec::new(),
+            input_local: false,
+            state_local: false,
+            state_history: ColumnarHistory::new(0, 1),
+            input_history: ColumnarHistory::new(0, 1),
+            ledger: FreshnessLedger::with_capacity(1),
+            memo: MemoRing::with_capacity(1),
+            history_limit: 128,
+            auth_ticks: Vec::new(),
+            latest_state_tick: -1,
+            pending_state: None,
+            pending_display: None,
+            latest_auth_sim_tick: 0,
+            latest_remote_input_tick: -1,
+            predicted_last: false,
+            scratch_state: Vec::new(),
+            scratch_input: Vec::new(),
+            scratch_wire: Vec::new(),
+        }
+    }
+
+    fn get_configuration_warnings(&self) -> PackedStringArray {
+        let mut warnings = PackedStringArray::new();
+        if self.root.is_none() && self.base().get_parent().is_none() {
+            warnings.push("No root is set and this node has no parent to fall back on.");
+        }
+        if self.state_properties.is_empty() && self.input_properties.is_empty() {
+            warnings.push(
+                "Neither state_properties nor input_properties is set — this synchronizer \
+                 replicates nothing.",
+            );
+        }
+        if !self.unresolved.is_empty() {
+            warnings.push(&format!(
+                "{} declared propert{} could not be resolved; call process_settings() and check the paths.",
+                self.unresolved.len(),
+                if self.unresolved.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+        warnings
+    }
+
+    fn exit_tree(&mut self) {
+        let me = self.to_gd().instance_id_unchecked();
+        crate::orbit_net::unregister_entity(self.entity_id, me);
+    }
+}
+
+#[godot_api]
+impl OrbitRollbackSynchronizer {
+    /// Add a state property. `node` may be a `Node`, a `NodePath`, or a string path; `property`
+    /// is the property name on it. Call [`Self::process_settings`] after the last addition.
+    #[func]
+    fn add_state(&mut self, node: Variant, property: GString) {
+        if let Some(entry) = self.make_entry(&node, &property) {
+            if !self.state_properties.as_slice().contains(&entry) {
+                self.state_properties.push(&entry);
+            }
+        }
+    }
+
+    /// Add an input property, in the same form as [`Self::add_state`].
+    #[func]
+    fn add_input(&mut self, node: Variant, property: GString) {
+        if let Some(entry) = self.make_entry(&node, &property) {
+            if !self.input_properties.as_slice().contains(&entry) {
+                self.input_properties.push(&entry);
+            }
+        }
+    }
+
+    /// Add a cosmetic property: replicated, never restored during rollback, never counted as a
+    /// misprediction. The test for cosmetic is "the simulation never reads it back".
+    #[func]
+    fn add_cosmetic(&mut self, node: Variant, property: GString) {
+        if let Some(entry) = self.make_entry(&node, &property) {
+            if !self.cosmetic_properties.as_slice().contains(&entry) {
+                self.cosmetic_properties.push(&entry);
+            }
+        }
+    }
+
+    /// Resolve the declared properties, build the schemas and histories, and register with the
+    /// OrbitNet singleton. Idempotent; call after any configuration change.
+    #[func]
+    fn process_settings(&mut self) {
+        self.resolve_all();
+        let id = self.entity_id;
+        if id != 0 {
+            crate::orbit_net::register_rollback_entity(id, self.to_gd());
+        }
+    }
+
+    /// Re-resolve which peer owns state and input after an authority change.
+    #[func]
+    fn process_authority(&mut self) {
+        let local_peer = self.local_peer_id();
+        self.state_local = self
+            .resolved_root()
+            .map(|n| n.get_multiplayer_authority() == local_peer)
+            .unwrap_or(false);
+        self.input_local = self
+            .resolved_input_root()
+            .map(|n| n.get_multiplayer_authority() == local_peer)
+            .unwrap_or(false);
+    }
+
+    /// Whether the most recent simulated tick ran on non-authoritative (predicted or
+    /// extrapolated) input.
+    #[func]
+    fn is_predicting(&self) -> bool {
+        self.predicted_last
+    }
+
+    /// The tick of the newest authoritative state known for this entity (-1 before any).
+    #[func]
+    fn get_last_known_state(&self) -> i64 {
+        self.latest_state_tick
+    }
+
+    /// The tick of the newest input known for this entity (-1 before any).
+    #[func]
+    fn get_last_known_input(&self) -> i64 {
+        self.input_history
+            .latest_tick()
+            .map(|t| i64::try_from(t).unwrap_or(i64::MAX))
+            .unwrap_or(-1)
+    }
+
+    /// Record a per-tick memo value, keyed `(tick, key)`.
+    ///
+    /// This is the backend-owned replacement for hand-rolled resim logs (weapon_authority's old
+    /// 256-tick held-catalog dictionary): record on the fresh pass, read back on every replayed
+    /// pass, trimmed with history.
+    #[func]
+    fn memo_set(&mut self, tick: i64, key: i64, value: i64) {
+        if tick >= 0 {
+            self.memo.set(tick as u64, key, value);
+        }
+    }
+
+    /// Read a per-tick memo value, or `fallback` when none was recorded.
+    #[func]
+    fn memo_get(&self, tick: i64, key: i64, fallback: i64) -> i64 {
+        if tick < 0 {
+            return fallback;
+        }
+        self.memo.get(tick as u64, key).unwrap_or(fallback)
+    }
+
+    /// Hash of the resolved state schema. Peers must agree on this exactly.
+    #[func]
+    pub fn schema_hash(&self) -> i64 {
+        i64::from(self.state_schema.hash())
+    }
+
+    /// Hash of the resolved input schema.
+    #[func]
+    pub fn input_schema_hash(&self) -> i64 {
+        i64::from(self.input_schema.hash())
+    }
+
+    /// Bytes one tick of state history occupies for this entity.
+    #[func]
+    fn row_stride(&self) -> i64 {
+        self.state_schema.row_stride() as i64
+    }
+
+    /// How many properties resolved successfully across both schemas.
+    #[func]
+    fn property_count(&self) -> i64 {
+        (self.state_schema.len() + self.input_schema.len()) as i64
+    }
+
+    /// Declared entries that could not be resolved.
+    #[func]
+    fn unresolved_properties(&self) -> PackedStringArray {
+        self.unresolved.clone()
+    }
+
+    /// A human-readable summary, for the console and for debugging.
+    #[func]
+    fn describe(&self) -> GString {
+        GString::from(
+            format!(
+                "OrbitRollbackSynchronizer[{:#018x}]: {} state + {} input props, {} B/tick, \
+                 schema {:#010x}/{:#010x}, {} unresolved, {}",
+                self.entity_id,
+                self.state_schema.len(),
+                self.input_schema.len(),
+                self.state_schema.row_stride(),
+                self.state_schema.hash(),
+                self.input_schema.hash(),
+                self.unresolved.len(),
+                if self.exempt { "exempt" } else { "active" },
+            )
+            .as_str(),
+        )
+    }
+}
+
+impl OrbitRollbackSynchronizer {
+    fn make_entry(&self, node: &Variant, property: &GString) -> Option<GString> {
+        let root = self.resolved_root()?;
+        let prop = property.to_string();
+        if let Ok(target) = node.try_to::<Gd<Node>>() {
+            let path = root.get_path_to(&target).to_string();
+            if path.is_empty() {
+                return None;
+            }
+            return Some(GString::from(format!("{path}:{prop}").as_str()));
+        }
+        let path = node.to_string();
+        if path.is_empty() || path == "." {
+            return Some(GString::from(format!(".:{prop}").as_str()));
+        }
+        Some(GString::from(format!("{path}:{prop}").as_str()))
+    }
+
+    /// The property-resolution root, or `None` once it is gone.
+    ///
+    /// `Option<Gd<Node>>::clone` clones the inner handle, and cloning a handle whose node has been freed
+    /// panics under godot-rust's balanced safeguards — so an export pointing at a since-freed node must be
+    /// filtered, not cloned. Falls back to the parent, matching the editor-configured default.
+    fn resolved_root(&self) -> Option<Gd<Node>> {
+        self.root
+            .as_ref()
+            .and_then(crate::orbit_net::live_handle)
+            .or_else(|| self.base().get_parent())
+    }
+
+    fn resolved_input_root(&self) -> Option<Gd<Node>> {
+        self.input_authority_node
+            .as_ref()
+            .and_then(crate::orbit_net::live_handle)
+            .or_else(|| self.resolved_root())
+    }
+
+    fn local_peer_id(&self) -> i32 {
+        self.base()
+            .get_multiplayer()
+            .map(|m| m.clone().get_unique_id())
+            .unwrap_or(1)
+    }
+
+    fn resolve_all(&mut self) {
+        self.state_schema = SchemaBuilder::new();
+        self.input_schema = SchemaBuilder::new();
+        self.state_bindings.clear();
+        self.input_bindings.clear();
+        self.unresolved = PackedStringArray::new();
+        self.rollback_nodes.clear();
+
+        let state_root = self.resolved_root();
+
+        // EVERY entry — input included — is a state-root-relative path, because that is how the
+        // entries are authored (add_input computes the path from the root). input_authority_node
+        // is purely the AUTHORITY seam: it decides which peer owns the input, never how paths
+        // resolve. Resolving input entries against the input node was the bug that silently
+        // unresolved all fifteen nin_* props and made every body look inputless.
+        binding::resolve_entries(
+            state_root.as_ref(),
+            &self.state_properties,
+            PropRole::State,
+            &mut self.state_schema,
+            &mut self.state_bindings,
+            &mut self.unresolved,
+        );
+        binding::resolve_entries(
+            state_root.as_ref(),
+            &self.cosmetic_properties,
+            PropRole::Cosmetic,
+            &mut self.state_schema,
+            &mut self.state_bindings,
+            &mut self.unresolved,
+        );
+        binding::resolve_entries(
+            state_root.as_ref(),
+            &self.input_properties,
+            PropRole::Input,
+            &mut self.input_schema,
+            &mut self.input_bindings,
+            &mut self.unresolved,
+        );
+
+        // Gather the rollback-aware nodes to simulate: the root plus every descendant that
+        // implements _rollback_tick. `owned=false` so runtime-added children (the input carrier)
+        // are seen too; the has_method filter keeps over-inclusion harmless.
+        if let Some(root) = state_root.clone() {
+            let mut nodes: Vec<Gd<Node>> = Vec::new();
+            if root.has_method("_rollback_tick") {
+                nodes.push(root.clone());
+            }
+            let children = root
+                .find_children_ex("*")
+                .recursive(true)
+                .owned(false)
+                .done();
+            for child in children.iter_shared() {
+                if child.has_method("_rollback_tick") {
+                    nodes.push(child);
+                }
+            }
+            self.rollback_nodes = nodes;
+
+            // Entity identity needs the tree path; out of tree (tests, tools) the synchronizer
+            // stays unregistered until a later process_settings call inside the tree.
+            if root.is_inside_tree() {
+                let path = root.get_path().to_string();
+                self.entity_id = binding::fnv64(format!("R|{path}").as_bytes());
+            }
+        }
+
+        self.process_authority();
+
+        if !self.unresolved.is_empty() {
+            godot_warn!(
+                "OrbitRollbackSynchronizer {}: {} declared propert{} did not resolve: {:?} — \
+                 unresolved entries silently fall off the wire, so fix the path or the type.",
+                self.base().get_path(),
+                self.unresolved.len(),
+                if self.unresolved.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                },
+                self.unresolved
+            );
+        }
+
+        let capacity = self.history_limit.max(2);
+        self.state_history = ColumnarHistory::new(self.state_schema.row_stride(), capacity);
+        self.input_history = ColumnarHistory::new(self.input_schema.row_stride(), capacity);
+        self.ledger = FreshnessLedger::with_capacity(capacity);
+        self.memo = MemoRing::with_capacity(capacity * 2);
+        self.auth_ticks = vec![u64::MAX; capacity];
+        self.latest_state_tick = -1;
+        self.latest_auth_sim_tick = 0;
+        self.latest_remote_input_tick = -1;
+        self.pending_state = None;
+        self.pending_display = None;
+
+        self.base_mut().update_configuration_warnings();
+    }
+
+    // ------------------------------------------------------------------
+    // pub(crate) phase API, driven by OrbitNet
+    // ------------------------------------------------------------------
+
+    /// Stable entity id (0 = unresolved).
+    pub(crate) fn entity_id(&self) -> u64 {
+        self.entity_id
+    }
+
+    /// Adopt the process-wide history depth. Registration hands this over AFTER the node resolved
+    /// (resolution built the rings from the node-local default), so a changed limit must rebuild
+    /// the rings in place — registration precedes any session traffic for the entity, so the drop
+    /// loses nothing.
+    pub(crate) fn set_history_limit(&mut self, limit: usize) {
+        let limit = limit.max(2);
+        if limit == self.history_limit {
+            return;
+        }
+        self.history_limit = limit;
+        self.state_history = ColumnarHistory::new(self.state_schema.row_stride(), limit);
+        self.input_history = ColumnarHistory::new(self.input_schema.row_stride(), limit);
+        self.ledger = FreshnessLedger::with_capacity(limit);
+        self.memo = MemoRing::with_capacity(limit * 2);
+        self.auth_ticks = vec![u64::MAX; limit];
+        self.latest_state_tick = -1;
+        self.latest_auth_sim_tick = 0;
+        self.latest_remote_input_tick = -1;
+        self.pending_state = None;
+        self.pending_display = None;
+    }
+
+    /// Whether the local peer authors this entity's input.
+    pub(crate) fn owns_input(&self) -> bool {
+        self.input_local
+    }
+
+    /// Display-only exemption toggle, driven by the `net.remote_resim` lever.
+    pub(crate) fn set_display_exempt(&mut self, exempt: bool) {
+        self.exempt = exempt;
+    }
+
+    /// The peer id that owns this entity's input node — the anti-forgery check for received
+    /// input frames.
+    pub(crate) fn input_owner_peer(&self) -> i32 {
+        self.resolved_input_root()
+            .map(|n| n.get_multiplayer_authority())
+            .unwrap_or(0)
+    }
+
+    /// Whether the local peer owns this entity's state (is the simulating server).
+    pub(crate) fn owns_state(&self) -> bool {
+        self.state_local
+    }
+
+    /// Whether this peer simulates the entity in the rollback loop.
+    pub(crate) fn simulates(&self) -> bool {
+        !self.exempt && (self.state_local || (self.input_local && self.enable_prediction))
+    }
+
+    /// Whether prediction of remote entities is allowed when un-exempted (`net.remote_resim`).
+    pub(crate) fn predicts_remotely(&self) -> bool {
+        !self.exempt && !self.state_local && !self.input_local && self.enable_prediction
+    }
+
+    /// This entity's frontier position, decoded from the first Vec3 State-role property of its
+    /// newest state row (Spaceman's bodies lead with `net_pos`). `None` when the entity has no
+    /// positional prop or no recorded row yet — the AOI filter then keeps it always-replicated.
+    pub(crate) fn position_hint(&self) -> Option<[f32; 3]> {
+        let prop = self
+            .state_schema
+            .props()
+            .iter()
+            .find(|p| p.kind == PropKind::Vec3 && p.role == PropRole::State)?;
+        let tick = self.state_history.latest_tick()?;
+        let row = self.state_history.row(tick)?;
+        let o = prop.offset;
+        if o + 12 > row.len() {
+            return None;
+        }
+        let f = |i: usize| f32::from_le_bytes([row[i], row[i + 1], row[i + 2], row[i + 3]]);
+        Some([f(o), f(o + 4), f(o + 8)])
+    }
+
+    /// Capture the locally-authored input for `tick` into history.
+    pub(crate) fn capture_local_input(&mut self, tick: u64) {
+        if self.input_bindings.is_empty() {
+            return;
+        }
+        self.scratch_input.resize(self.input_schema.row_stride(), 0);
+        binding::capture_row(&self.input_bindings, &mut self.scratch_input);
+        // Only stamp fresh authority if the row is novel OR the tick is new: re-capturing the
+        // same tick (paused frame) must not re-arm freshness.
+        if self.input_history.row(tick) != Some(self.scratch_input.as_slice())
+            || !self.input_history.has(tick)
+        {
+            self.input_history.write_row(tick, &self.scratch_input);
+            self.ledger.set_confidence(tick, Confidence::Authoritative);
+        }
+    }
+
+    /// Wire stride of one input row (quantized properties shrink it below the native stride).
+    pub(crate) fn input_wire_stride(&self) -> usize {
+        orbitnet_core::quant::wire_row_stride(self.input_schema.props())
+    }
+
+    /// Encode this entity's input block (newest rows, redundancy-armored) as standalone bytes.
+    pub(crate) fn encode_input_block_bytes(
+        &self,
+        frame_tick: u64,
+        redundancy: usize,
+    ) -> Option<Vec<u8>> {
+        let (newest, rows) = self.input_rows_for_send(redundancy)?;
+        let row_refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+        let mut writer = Writer::new();
+        orbitnet_core::codec::encode_input_block(
+            &mut writer,
+            self.input_schema.props(),
+            self.entity_id,
+            frame_tick,
+            newest,
+            &row_refs,
+        );
+        Some(writer.into_inner())
+    }
+
+    /// Collect this entity's newest input rows for the wire, newest first.
+    pub(crate) fn input_rows_for_send(&self, redundancy: usize) -> Option<(u64, Vec<Vec<u8>>)> {
+        let newest = self.input_history.latest_tick()?;
+        let mut rows = Vec::with_capacity(redundancy);
+        for offset in 0..redundancy as u64 {
+            let Some(tick) = newest.checked_sub(offset) else {
+                break;
+            };
+            match self.input_history.row(tick) {
+                Some(row) => rows.push(row.to_vec()),
+                None => break,
+            }
+        }
+        if rows.is_empty() {
+            None
+        } else {
+            Some((newest, rows))
+        }
+    }
+
+    /// Integrate one received input row (server side). Returns the tick if it was novel and in
+    /// the past — the caller marks the resim planner with it.
+    /// Decode one WIRE input row and integrate it (server side).
+    pub(crate) fn integrate_remote_wire_row(&mut self, tick: u64, wire: &[u8]) -> Option<u64> {
+        if wire.len() != self.input_wire_stride() {
+            return None;
+        }
+        let mut native = std::mem::take(&mut self.scratch_wire);
+        native.clear();
+        native.resize(self.input_schema.row_stride(), 0);
+        let decoded =
+            orbitnet_core::quant::decode_row(self.input_schema.props(), wire, &mut native);
+        let result = if decoded.is_some() {
+            self.integrate_remote_input(tick, &native)
+        } else {
+            None
+        };
+        self.scratch_wire = native;
+        result
+    }
+
+    pub(crate) fn integrate_remote_input(&mut self, tick: u64, row: &[u8]) -> Option<u64> {
+        if row.len() != self.input_schema.row_stride() || self.input_history.is_stale(tick) {
+            return None;
+        }
+        let novel = self.input_history.row(tick) != Some(row);
+        if !novel {
+            return None;
+        }
+        self.input_history.write_row(tick, row);
+        self.ledger.set_confidence(tick, Confidence::Authoritative);
+        self.latest_remote_input_tick = self
+            .latest_remote_input_tick
+            .max(i64::try_from(tick).unwrap_or(i64::MAX));
+        Some(tick)
+    }
+
+    /// Encode this entity's state block for one peer.
+    ///
+    /// `reference_tick` is the last tick this peer applied (delta base) — `None` forces full.
+    /// Returns the entity tick the block describes.
+    pub(crate) fn encode_block(
+        &mut self,
+        writer: &mut Writer,
+        scratch: &mut Vec<bool>,
+        frame_tick: u64,
+        reference_tick: Option<u64>,
+    ) -> Option<u64> {
+        let tick = if self.latest_auth_sim_tick > 0 {
+            self.latest_auth_sim_tick
+        } else {
+            frame_tick
+        };
+        let row = self.state_history.row(tick)?.to_vec();
+        let reference = reference_tick.and_then(|ref_tick| {
+            self.state_history
+                .row(ref_tick)
+                .map(|base| (ref_tick, base.to_vec()))
+        });
+        match reference {
+            Some((ref_tick, base)) => encode_state_block(
+                writer,
+                scratch,
+                self.state_schema.props(),
+                self.entity_id,
+                frame_tick,
+                tick,
+                Some((ref_tick, &base)),
+                &row,
+                false,
+            ),
+            None => encode_state_block(
+                writer,
+                scratch,
+                self.state_schema.props(),
+                self.entity_id,
+                frame_tick,
+                tick,
+                None,
+                &row,
+                false,
+            ),
+        }
+        Some(tick)
+    }
+
+    fn mark_auth(&mut self, tick: u64) {
+        if let Some(len) = std::num::NonZeroUsize::new(self.auth_ticks.len()) {
+            self.auth_ticks[(tick % len.get() as u64) as usize] = tick;
+        }
+    }
+
+    fn unmark_auth(&mut self, tick: u64) {
+        if let Some(len) = std::num::NonZeroUsize::new(self.auth_ticks.len()) {
+            let slot = &mut self.auth_ticks[(tick % len.get() as u64) as usize];
+            if *slot == tick {
+                *slot = u64::MAX;
+            }
+        }
+    }
+
+    fn is_auth(&self, tick: u64) -> bool {
+        match std::num::NonZeroUsize::new(self.auth_ticks.len()) {
+            Some(len) => self.auth_ticks[(tick % len.get() as u64) as usize] == tick,
+            None => false,
+        }
+    }
+
+    /// Decode a received state block into this entity, returning what to do about it.
+    pub(crate) fn apply_state_block(
+        &mut self,
+        reader: &mut Reader<'_>,
+        meta: &StateBlockMeta,
+        scratch: &mut Vec<bool>,
+        current_tick: u64,
+    ) -> Result<StateIntegration, orbitnet_core::CodecError> {
+        self.scratch_state.resize(self.state_schema.row_stride(), 0);
+        let mut out = std::mem::take(&mut self.scratch_state);
+        // A masked delta must decode against the row the SERVER deltaed against — a wire row. If
+        // the snapshot carrying the base was lost, the resident row at that tick is our own
+        // prediction and decoding over it corrupts silently; treating it as base-less turns it
+        // into a clean Rejected → WANT_FULL NACK → the server sends a full.
+        let base = meta
+            .reference_tick
+            .filter(|&t| self.is_auth(t))
+            .and_then(|t| self.state_history.row(t).map(<[u8]>::to_vec));
+        let applied = decode_state_block_into(
+            reader,
+            meta,
+            self.state_schema.props(),
+            scratch,
+            base.as_deref(),
+            &mut out,
+        )?;
+        let result = if !applied {
+            StateIntegration::Rejected
+        } else {
+            self.integrate_authoritative_row(meta.tick, &out, current_tick)
+        };
+        self.scratch_state = out;
+        Ok(result)
+    }
+
+    fn integrate_authoritative_row(
+        &mut self,
+        tick: u64,
+        row: &[u8],
+        current_tick: u64,
+    ) -> StateIntegration {
+        let tick_i = i64::try_from(tick).unwrap_or(i64::MAX);
+        if tick_i <= self.latest_state_tick && self.latest_state_tick >= 0 {
+            // Out-of-order or duplicate snapshot; the newer one already integrated.
+            return StateIntegration::Rejected;
+        }
+        self.latest_state_tick = tick_i;
+
+        if !self.simulates() {
+            // Display path: hold the newest row for the next tick boundary, and keep it in
+            // history so a later masked block can delta against it.
+            self.state_history.write_row(tick, row);
+            self.mark_auth(tick);
+            self.pending_display = Some((tick, row.to_vec()));
+            return StateIntegration::Buffered;
+        }
+
+        // Predicting path (owner reconcile, or the un-exempted remote-resim mode).
+        if self.state_history.is_stale(tick) {
+            return StateIntegration::Rejected;
+        }
+        let mispredicted = match self.state_history.row(tick) {
+            Some(recorded) => {
+                // Compare only resim-triggering (State-role) props: a cosmetic difference must
+                // not cost a resimulation.
+                let mut differs = false;
+                for prop in self.state_schema.props() {
+                    if !prop.role.triggers_resim() {
+                        continue;
+                    }
+                    let end = prop.offset + prop.kind.stride();
+                    if recorded.get(prop.offset..end) != row.get(prop.offset..end) {
+                        differs = true;
+                        break;
+                    }
+                }
+                differs
+            }
+            None => true,
+        };
+        self.state_history.write_row(tick, row);
+        self.mark_auth(tick);
+        if !mispredicted {
+            return StateIntegration::Confirmed;
+        }
+        if tick >= current_tick {
+            // The forward simulation will restore this row when it reaches the tick.
+            return StateIntegration::Buffered;
+        }
+        StateIntegration::Mispredict(tick)
+    }
+
+    /// Apply the newest buffered display row (called at the tick-batch boundary).
+    pub(crate) fn apply_pending_display(&mut self) {
+        if let Some((_, row)) = self.pending_display.take() {
+            binding::apply_row(&self.state_bindings, &row, false);
+        }
+    }
+
+    /// Restore state + input for a tick about to be (re)simulated.
+    pub(crate) fn restore_tick(&mut self, tick: u64) {
+        if let Some(row) = self.state_history.row(tick) {
+            binding::apply_row(&self.state_bindings, row, true);
+        }
+        if !self.input_bindings.is_empty() {
+            if let Some((input_tick, row)) = self.input_history.closest_at_or_before(tick) {
+                binding::apply_row(&self.input_bindings, row, true);
+                if input_tick != tick {
+                    self.ledger.set_confidence(tick, Confidence::Extrapolated);
+                }
+            }
+        }
+    }
+
+    /// Consume freshness for a tick about to be simulated, and update the prediction flag.
+    pub(crate) fn begin_sim(&mut self, tick: u64) -> bool {
+        let fresh = self.ledger.begin_sim(tick);
+        self.predicted_last = self.ledger.confidence(tick) != Confidence::Authoritative;
+        fresh
+    }
+
+    /// The nodes whose `_rollback_tick` runs for this entity.
+    pub(crate) fn call_list(&self) -> Vec<Gd<Node>> {
+        self.rollback_nodes
+            .iter()
+            .filter(|n| n.is_instance_valid())
+            .cloned()
+            .collect()
+    }
+
+    /// Capture the post-simulation state of `tick` into history at `tick + 1`.
+    pub(crate) fn record_tick(&mut self, simulated_tick: u64) {
+        let next = simulated_tick + 1;
+        self.scratch_state.resize(self.state_schema.row_stride(), 0);
+        let mut row = std::mem::take(&mut self.scratch_state);
+        binding::capture_row(&self.state_bindings, &mut row);
+        self.state_history.write_row(next, &row);
+        // The row is now locally simulated, not a wire row — a resim replay may have just
+        // overwritten a tick that previously held one.
+        self.unmark_auth(next);
+        // Quantized-state write-back: forward simulation must continue from the canonical
+        // (wire-representable) value the row holds, or replay-from-row would diverge from the
+        // forward pass on every peer.
+        binding::apply_quantized_row(&self.state_bindings, &row);
+        self.scratch_state = row;
+        if self.owns_state() && self.ledger.confidence(simulated_tick) == Confidence::Authoritative
+        {
+            self.latest_auth_sim_tick = self.latest_auth_sim_tick.max(next);
+            self.latest_state_tick = self
+                .latest_state_tick
+                .max(i64::try_from(next).unwrap_or(i64::MAX));
+        }
+    }
+
+    /// Server fallback: an entity with no input props (or the host's own) is always
+    /// authoritative; make its frontier broadcastable each tick.
+    pub(crate) fn mark_inputless_authoritative(&mut self, tick: u64) {
+        if self.input_bindings.is_empty() && self.owns_state() {
+            self.ledger.set_confidence(tick, Confidence::Authoritative);
+        }
+    }
+
+    /// Reset all runtime state (session teardown).
+    pub(crate) fn reset_session(&mut self) {
+        self.state_history.clear();
+        self.input_history.clear();
+        self.ledger.clear();
+        self.memo.clear();
+        self.auth_ticks.fill(u64::MAX);
+        self.latest_state_tick = -1;
+        self.latest_auth_sim_tick = 0;
+        self.latest_remote_input_tick = -1;
+        self.pending_state = None;
+        self.pending_display = None;
+        self.predicted_last = false;
+    }
+}
+
+/// Server-broadcast state with no rollback restore — the OrbitNet StateSync lane.
+#[derive(GodotClass)]
+#[class(base=Node)]
+pub struct OrbitStateSynchronizer {
+    base: Base<Node>,
+
+    /// Node the declared property paths resolve against. Defaults to this node's parent.
+    #[export]
+    root: Option<Gd<Node>>,
+
+    /// Replicated entries, each `"NodePath:property"` or a bare `"property"`.
+    #[export]
+    properties: PackedStringArray,
+
+    entity_id: u64,
+    schema: SchemaBuilder,
+    bindings: Vec<PropBinding>,
+    unresolved: PackedStringArray,
+    state_local: bool,
+    /// The authority's captured frontier row, and each receiver's newest applied tick/row.
+    history: ColumnarHistory,
+    latest_tick: i64,
+    pending: Option<(u64, Vec<u8>)>,
+    scratch: Vec<u8>,
+}
+
+#[godot_api]
+impl INode for OrbitStateSynchronizer {
+    fn init(base: Base<Node>) -> Self {
+        Self {
+            base,
+            root: None,
+            properties: PackedStringArray::new(),
+            entity_id: 0,
+            schema: SchemaBuilder::new(),
+            bindings: Vec::new(),
+            unresolved: PackedStringArray::new(),
+            state_local: false,
+            history: ColumnarHistory::new(0, 1),
+            latest_tick: -1,
+            pending: None,
+            scratch: Vec::new(),
+        }
+    }
+
+    fn exit_tree(&mut self) {
+        let me = self.to_gd().instance_id_unchecked();
+        crate::orbit_net::unregister_entity(self.entity_id, me);
+    }
+}
+
+#[godot_api]
+impl OrbitStateSynchronizer {
+    /// Add a replicated property, in the [`OrbitRollbackSynchronizer::add_state`] form.
+    #[func]
+    fn add_state(&mut self, node: Variant, property: GString) {
+        let Some(root) = self.resolved_root() else {
+            return;
+        };
+        let prop = property.to_string();
+        let entry = if let Ok(target) = node.try_to::<Gd<Node>>() {
+            let path = root.get_path_to(&target).to_string();
+            if path.is_empty() {
+                return;
+            }
+            GString::from(format!("{path}:{prop}").as_str())
+        } else {
+            let path = node.to_string();
+            if path.is_empty() || path == "." {
+                GString::from(format!(".:{prop}").as_str())
+            } else {
+                GString::from(format!("{path}:{prop}").as_str())
+            }
+        };
+        if !self.properties.as_slice().contains(&entry) {
+            self.properties.push(&entry);
+        }
+    }
+
+    /// Resolve the declared properties and register with the OrbitNet singleton.
+    #[func]
+    fn process_settings(&mut self) {
+        self.schema = SchemaBuilder::new();
+        self.bindings.clear();
+        self.unresolved = PackedStringArray::new();
+
+        let root = self.resolved_root();
+        binding::resolve_entries(
+            root.as_ref(),
+            &self.properties,
+            PropRole::State,
+            &mut self.schema,
+            &mut self.bindings,
+            &mut self.unresolved,
+        );
+        if let Some(root) = &root {
+            if root.is_inside_tree() {
+                let path = root.get_path().to_string();
+                self.entity_id = binding::fnv64(format!("S|{path}").as_bytes());
+            }
+        }
+        let local_peer = self
+            .base()
+            .get_multiplayer()
+            .map(|m| m.clone().get_unique_id())
+            .unwrap_or(1);
+        self.state_local = root
+            .map(|n| n.get_multiplayer_authority() == local_peer)
+            .unwrap_or(false);
+        // A short ring: receivers only need the newest applied row as a delta base, plus slack
+        // for reordering.
+        self.history = ColumnarHistory::new(self.schema.row_stride(), 8);
+        self.latest_tick = -1;
+        self.pending = None;
+
+        if self.entity_id != 0 {
+            crate::orbit_net::register_state_entity(self.entity_id, self.to_gd());
+        }
+    }
+
+    /// Hash of the resolved schema.
+    #[func]
+    fn schema_hash(&self) -> i64 {
+        i64::from(self.schema.hash())
+    }
+
+    /// Declared entries that could not be resolved.
+    #[func]
+    fn unresolved_properties(&self) -> PackedStringArray {
+        self.unresolved.clone()
+    }
+
+    fn resolved_root(&self) -> Option<Gd<Node>> {
+        self.root.clone().or_else(|| self.base().get_parent())
+    }
+
+    // ------------------------------------------------------------------
+    // pub(crate) phase API, driven by OrbitNet
+    // ------------------------------------------------------------------
+
+    /// Whether the local peer owns (and therefore broadcasts) this entity.
+    pub(crate) fn owns_state(&self) -> bool {
+        self.state_local
+    }
+
+    /// Capture the live values as the authority's frontier row for `tick`.
+    pub(crate) fn capture_frontier(&mut self, tick: u64) {
+        self.scratch.resize(self.schema.row_stride(), 0);
+        let mut row = std::mem::take(&mut self.scratch);
+        binding::capture_row(&self.bindings, &mut row);
+        self.history.write_row(tick, &row);
+        self.latest_tick = self
+            .latest_tick
+            .max(i64::try_from(tick).unwrap_or(i64::MAX));
+        self.scratch = row;
+    }
+
+    /// Encode this entity's block for one peer (state lane flag set).
+    pub(crate) fn encode_block(
+        &mut self,
+        writer: &mut Writer,
+        scratch: &mut Vec<bool>,
+        frame_tick: u64,
+        reference_tick: Option<u64>,
+    ) -> Option<u64> {
+        let tick = u64::try_from(self.latest_tick).ok()?;
+        let row = self.history.row(tick)?.to_vec();
+        let reference =
+            reference_tick.and_then(|t| self.history.row(t).map(|base| (t, base.to_vec())));
+        match reference {
+            Some((ref_tick, base)) => encode_state_block(
+                writer,
+                scratch,
+                self.schema.props(),
+                self.entity_id,
+                frame_tick,
+                tick,
+                Some((ref_tick, &base)),
+                &row,
+                true,
+            ),
+            None => encode_state_block(
+                writer,
+                scratch,
+                self.schema.props(),
+                self.entity_id,
+                frame_tick,
+                tick,
+                None,
+                &row,
+                true,
+            ),
+        }
+        Some(tick)
+    }
+
+    /// Decode a received block; the row is buffered and applied at the next tick boundary.
+    pub(crate) fn apply_state_block(
+        &mut self,
+        reader: &mut Reader<'_>,
+        meta: &StateBlockMeta,
+        scratch: &mut Vec<bool>,
+    ) -> Result<StateIntegration, orbitnet_core::CodecError> {
+        self.scratch.resize(self.schema.row_stride(), 0);
+        let mut out = std::mem::take(&mut self.scratch);
+        let base = meta
+            .reference_tick
+            .and_then(|t| self.history.row(t).map(<[u8]>::to_vec));
+        let applied = decode_state_block_into(
+            reader,
+            meta,
+            self.schema.props(),
+            scratch,
+            base.as_deref(),
+            &mut out,
+        )?;
+        let result = if !applied {
+            StateIntegration::Rejected
+        } else {
+            let tick_i = i64::try_from(meta.tick).unwrap_or(i64::MAX);
+            if tick_i <= self.latest_tick {
+                StateIntegration::Rejected
+            } else {
+                self.latest_tick = tick_i;
+                self.history.write_row(meta.tick, &out);
+                self.pending = Some((meta.tick, out.clone()));
+                StateIntegration::Buffered
+            }
+        };
+        self.scratch = out;
+        Ok(result)
+    }
+
+    /// Apply the newest buffered row (called at the tick-batch boundary).
+    pub(crate) fn apply_pending(&mut self) {
+        if let Some((_, row)) = self.pending.take() {
+            binding::apply_row(&self.bindings, &row, false);
+        }
+    }
+
+    /// Drop all session-scoped state so a node that outlives the session works in the next one
+    /// (mirrors [`OrbitRollbackSynchronizer::reset_session`]): the new session's ticks restart
+    /// near 0, so a stale `latest_tick` would reject every incoming block forever.
+    pub(crate) fn reset_session(&mut self) {
+        self.history.clear();
+        self.latest_tick = -1;
+        self.pending = None;
+    }
+}

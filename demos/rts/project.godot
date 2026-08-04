@@ -1,0 +1,80 @@
+; OrbitNet RTS demo — a Godot project of its own, NOT a scene folder inside a shared one.
+;
+; The [orbitnet] block below is why. OrbitNet is configured through project settings, and this demo wants
+; the OPPOSITE of a character-shooter's configuration: a net tick decoupled from and much slower than the
+; physics tick, and a short history ring because only the two commander avatars ride the rollback lane. A
+; second demo shaped like a shooter would want sync_to_physics=true at 60 Hz with a 128-tick history. Those
+; cannot coexist in one project.godot, so "several colocated demos" forces several projects. The addon is
+; mirror-copied in by tools/sync-addons.sh; addons/ here is a build artifact and is gitignored.
+
+config_version=5
+
+[application]
+
+config/name="OrbitNet RTS Demo"
+config/description="Skirmish RTS demonstrating OrbitNet's three replication lanes: one rollback entity per player (the commander cursor), every unit on the state lane, and every order as a server-validated command."
+run/main_scene="res://scenes/rts_main.tscn"
+; Declared as 4.4 to match the extension's compatibility_minimum. A newer editor opens it fine (and offers to
+; bump this line); the point is that a 4.4 user is not locked out.
+config/features=PackedStringArray("4.4", "GL Compatibility")
+
+[autoload]
+
+; Written here rather than left to the EditorPlugin because this entry is what makes `Net` exist in an
+; EXPORTED build and under `--headless --script` (the unit-test runner). The plugin adds the same line when
+; enabled in the editor; both must agree.
+Net="*res://addons/orbitnet/net.gd"
+
+[debug]
+
+; The typed-GDScript rules this repo is written to, promoted from warnings to ERRORS. unsafe_method_access is
+; the one that matters most for a netcode addon: it is what forces every backend touch through a typed handle
+; instead of an untyped call on a bare Node, and it is precisely what made NetInterpolatorHandle necessary.
+; If the demo needed an @warning_ignore to compile, the facade would have a hole.
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/unsafe_method_access=2
+gdscript/warnings/unsafe_cast=2
+gdscript/warnings/unsafe_call_argument=2
+; The addon's own unavoidable opaque-Node backend calls live under addons/; exclude that tree from the
+; promotion above so the facade lints. Demo code under scripts/ stays strict. Default is true; pinned explicit.
+gdscript/warnings/exclude_addons=true
+
+[display]
+
+window/size/viewport_width=1600
+window/size/viewport_height=900
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/orbitnet/plugin.cfg")
+
+[orbitnet]
+
+; Read once by addons/orbitnet/net.gd when it creates the backend node.
+;
+; sync_to_physics=false + tickrate=20: an RTS has no per-frame character control to predict, so paying a 60 Hz
+; net tick would triple egress for nothing. RtsNet applies set_net_tick_decoupled(20) explicitly at session
+; start anyway (before the loop auto-starts) -- these values are the offline/default agreement so that a
+; single-player launch and a hosted one step the sim at the same rate.
+sync_to_physics=false
+tickrate=20
+; 64 rather than 128: history is per ROLLBACK entity, and this demo has exactly one per player. A deeper ring
+; would buy nothing and cost memory per commander.
+history_limit=64
+max_time_stretch=1.05
+
+[physics]
+
+; Nothing in this demo is a PhysicsBody. Units are pure math over a plane and an AABB list (UnitSteering),
+; ground picking is Plane.intersects_ray, and the whole sim step is therefore unit-testable with no
+; PhysicsServer at all. The physics tick still runs because _physics_process drives the offline accumulator.
+common/physics_ticks_per_second=60
+3d/default_gravity=0.0
+
+[rendering]
+
+; GL Compatibility, not Forward+: this demo must run on a software GL CI runner and on old hardware, and it
+; renders nothing that needs a clustered renderer -- MultiMeshInstance3D, a few primitive meshes, no shadows
+; worth the name.
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
