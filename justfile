@@ -20,9 +20,17 @@ default:
 sync-addons:
     tools/sync-addons.sh
 
-# Fail if any synced copy has diverged from the canonical source. Part of `check` and of CI.
+# Fail if any synced copy has diverged from the canonical source -- i.e. if someone edited a copy instead
+# of the canonical addon. A LOCAL gate: it needs the copies to exist, so it is meaningless on a fresh
+# checkout where they are gitignored and absent.
 addon-drift:
     tools/sync-addons.sh --check
+
+# Fail if a synced copy was ever COMMITTED. That would create a second source of truth which silently
+# diverges from the canonical addon, and it is the failure this layout exists to prevent -- so it is the
+# variant CI runs, where nothing can have drifted because nothing has been synced yet.
+addon-tracked:
+    tools/sync-addons.sh --check-tracked
 
 # =====================================================================================================
 # gates
@@ -63,7 +71,7 @@ rts-probe:
     GODOT="{{godot}}" tools/rts-probe.sh
 
 # Everything a PR must pass, in the order that fails fastest first.
-check: addon-drift net-check native-test lint test rts-probe
+check: addon-tracked addon-drift net-check native-test lint test rts-probe
 
 # =====================================================================================================
 # the native backend (Rust)

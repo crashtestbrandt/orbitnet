@@ -20,8 +20,17 @@
 # everywhere.
 #
 # Usage:
-#   tools/sync-addons.sh            mirror the addon into every project (destructive, idempotent)
-#   tools/sync-addons.sh --check    report drift and exit non-zero; changes nothing (CI + `just check`)
+#   tools/sync-addons.sh                  mirror into every project (destructive, idempotent)
+#   tools/sync-addons.sh --check          report drift and exit non-zero; changes nothing
+#   tools/sync-addons.sh --check-tracked  fail if git TRACKS a synced copy; changes nothing
+#
+# --check is a LOCAL gate: it catches a developer who edited a synced copy instead of the canonical
+# source. It needs the copies to exist, so it is meaningless on a fresh CI checkout, where they are
+# gitignored and absent -- there, "missing" means "not synced yet", not "drifted".
+#
+# --check-tracked is the CI gate, and it checks the thing that CAN go wrong in a commit: that a
+# synced copy was never committed. One would create a second source of truth that silently diverges
+# from the canonical one, which is precisely what this layout exists to prevent.
 #
 # Env:
 #   ORBITNET_LINK=1   symlink instead of copying. For Unix devs iterating on net.gd itself, where a
@@ -46,9 +55,31 @@ PAYLOAD=(
 )
 
 MODE="${1:-sync}"
-if [ "$MODE" != "sync" ] && [ "$MODE" != "--check" ]; then
-	printf 'usage: %s [--check]\n' "$0" >&2
+if [ "$MODE" != "sync" ] && [ "$MODE" != "--check" ] && [ "$MODE" != "--check-tracked" ]; then
+	printf 'usage: %s [--check | --check-tracked]\n' "$0" >&2
 	exit 2
+fi
+
+if [ "$MODE" = "--check-tracked" ]; then
+	tracked=""
+	for project in "${PROJECTS[@]}"; do
+		for entry in "${PAYLOAD[@]}"; do
+			dest="$project/${entry##*:}"
+			found="$(git ls-files -- "$dest" 2>/dev/null || true)"
+			if [ -n "$found" ]; then
+				tracked="$tracked$found\n"
+			fi
+		done
+	done
+	if [ -n "$tracked" ]; then
+		printf 'sync-addons FAILED: these synced copies are COMMITTED, creating a second source of\n'
+		printf 'truth that will silently diverge from the canonical addon:\n\n'
+		printf "$tracked" | sed 's/^/  /'
+		printf '\nRemove them (`git rm -r --cached <path>`) and check .gitignore still covers them.\n'
+		exit 1
+	fi
+	printf 'sync-addons: no synced copy is committed; the canonical source is the only one.\n'
+	exit 0
 fi
 
 for entry in "${PAYLOAD[@]}"; do

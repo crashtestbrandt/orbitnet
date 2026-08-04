@@ -7,8 +7,8 @@ just sync-addons     # required once after cloning
 just check           # everything a PR must pass
 ```
 
-`check` runs fastest-failing first: `addon-drift` → `net-check` → cargo gates → lint → unit suites → the
-two-peer RTS probe.
+`check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → cargo gates → lint →
+unit suites → the two-peer RTS probe.
 
 ## Layout, and where to edit
 
@@ -24,8 +24,10 @@ demos/rts/                the RTS demo
 ```
 
 **The two `addons/` directories at the root are canonical.** Every project gets a mirror-copy from
-`tools/sync-addons.sh`; those copies are gitignored build artifacts. Editing a copy is the mistake this layout
-invites, so `just addon-drift` fails loudly if you do.
+`tools/sync-addons.sh`; those copies are gitignored build artifacts. Two gates guard that:
+`just addon-drift` fails if you edited a copy instead of the canonical source (local — it needs the copies to
+exist), and `just addon-tracked` fails if a copy was ever *committed*, which is what CI runs because a fresh
+checkout has no copies to drift.
 
 It **copies** rather than symlinks because Git for Windows checks a symlink out as a text file containing the
 path unless `core.symlinks` *and* Developer Mode are both on — a fatal, cryptic first-run failure.
