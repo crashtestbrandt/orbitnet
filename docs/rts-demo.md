@@ -98,10 +98,14 @@ bare `float` hp cannot be narrowed at all, but as a normalized third component i
 - Entities are served **stalest-first**, so exceeding that does not drop anyone — it ages everyone.
 - 2 seats × 48 = **96 units**: a full refresh every ~2 net ticks, i.e. ~100 ms worst-case age at 20 Hz.
 
-A deliberate, comfortable 2× over the single-tick budget — enough that the round-robin is real and visible in
-the HUD's staleness readout, not so much that the demo looks broken. Raise `UNITS_PER_SEAT` and staleness
-climbs linearly. That is the experiment, which is why the number lives in `RtsConfig` with the derivation
-above it.
+A deliberate, comfortable 2× over the single-tick budget — enough that the round-robin is real rather than
+hypothetical, not so much that the demo looks broken. Raise `UNITS_PER_SEAT` and the refresh interval climbs
+linearly. That is the experiment, which is why the number lives in `RtsConfig` with the derivation above it.
+
+Measuring that from the outside takes care: "ticks since this unit last changed" counts a **stationary** unit
+as starving, which it is not. The probe records the gap between *consecutive updates* of a unit known to be
+moving, which is the round-robin interval and nothing else. A per-entity staleness counter belongs in the
+library — it is one of the [filed gaps](../README.md#limits).
 
 ## Determinism is not needed, and that is the point
 
