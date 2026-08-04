@@ -25,12 +25,14 @@ const SLOT_SPACING: float = 2.4
 static func slot_offset(index: int, count: int) -> Vector3:
 	if count <= 1 or index <= 0:
 		return Vector3.ZERO
-	var columns: int = int(ceil(sqrt(float(count))))
+	# ceili, not int(ceil(...)): ceil() takes and returns Variant (it accepts vectors), so int(ceil(x))
+	# passes a Variant to a typed constructor -- banned, and a parse error under this project's settings.
+	var columns: int = ceili(sqrt(float(count)))
 	if columns <= 0:
 		columns = 1
 	var row: int = index / columns
 	var column: int = index % columns
-	var rows: int = int(ceil(float(count) / float(columns)))
+	var rows: int = ceili(float(count) / float(columns))
 	# Centre the block on the target: half a slot of offset per row/column either side of the middle.
 	var x: float = (float(column) - (float(columns) - 1.0) * 0.5) * SLOT_SPACING
 	var z: float = (float(row) - (float(rows) - 1.0) * 0.5) * SLOT_SPACING

@@ -94,9 +94,15 @@ func _compose() -> String:
 
 	lines.push_back("CLOCK   rtt=%.1f ms  jitter=%.1f  offset=%.1f ms  stretch=%.3f  lead=%.1f ticks" % [
 		clock["rtt_ms"], clock["jitter_ms"], clock["offset_ms"], clock["stretch"], clock["lead_ticks"]])
+	# Read through typed locals: Dictionary.get() returns a Variant (the default argument widens it), and
+	# passing a Variant to int() is a parse error here. Assigning it to a typed local is the allowed
+	# conversion -- the same shape net.gd uses when it reads the backend's own metrics.
+	var resim: float = perf.get("resim_ticks", 0.0)
+	var rollback_ms: float = perf.get("rollback_ms", 0.0)
+	var net_ms: float = perf.get("net_ms", 0.0)
+	var rb_nodes: float = perf.get("rb_nodes", 0.0)
 	lines.push_back("ROLLBACK  resim=%d ticks  loop=%.2f ms  net=%.2f ms  rb_nodes=%d" % [
-		int(perf.get("resim_ticks", 0.0)), perf.get("rollback_ms", 0.0), perf.get("net_ms", 0.0),
-		int(perf.get("rb_nodes", 0.0))])
+		int(resim), rollback_ms, net_ms, int(rb_nodes)])
 	lines.push_back("")
 
 	# The lane split, stated as counts, because it is the architectural claim the whole demo exists to make.

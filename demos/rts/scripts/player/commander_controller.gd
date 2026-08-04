@@ -236,7 +236,8 @@ func order_rtt_percentile(fraction: float) -> float:
 		return 0.0
 	var sorted: Array[float] = _rtt_ms.duplicate()
 	sorted.sort()
-	var index: int = clampi(int(round(fraction * float(sorted.size() - 1))), 0, sorted.size() - 1)
+	# roundi, not int(round(...)) -- round() returns Variant. See formation.gd.
+	var index: int = clampi(roundi(fraction * float(sorted.size() - 1)), 0, sorted.size() - 1)
 	return sorted[index]
 
 func order_rtt_samples() -> int:

@@ -84,6 +84,6 @@ func _to_half(value: float) -> float:
 	if value == 0.0:
 		return 0.0
 	var magnitude: float = absf(value)
-	var exponent: int = int(floor(log(magnitude) / log(2.0)))
+	var exponent: int = floori(log(magnitude) / log(2.0))
 	var step: float = pow(2.0, float(exponent - 10))   # binary16 carries 10 explicit mantissa bits
 	return signf(value) * round(magnitude / step) * step
