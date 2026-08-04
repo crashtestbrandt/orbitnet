@@ -389,7 +389,7 @@ pub fn apply_row(bindings: &[PropBinding], row: &[u8], restored_only: bool) {
 /// FNV-1a over a byte string, 64-bit — the stable entity id derived from a node path.
 ///
 /// Both peers derive the same id because the `MultiplayerSpawner` guarantees identical node
-/// names, which is the same invariant the old backend's node-path RPC routing leaned on — made
+/// names — the invariant any node-path-derived identity scheme leans on, made
 /// explicit here instead of implicit in RPC dispatch.
 #[must_use]
 pub fn fnv64(bytes: &[u8]) -> u64 {

@@ -56,7 +56,7 @@ static func _ensure_built() -> void:
 	# latency; this is the profile to default HUMAN playtests to (Gears of War 3 practice) so feel is never tuned
 	# on loopback. Unity's "Home Broadband Congested" is 50/50/1%.
 	_add(_make("congested_wifi", 50.0, 50.0, 0.02))
-	# mobile_4g: LTE -- Unity's Mobile 4G preset (100/20/4%). On Spaceman's roadmap (ENet-over-UDP mobile).
+	# mobile_4g: LTE -- Unity's Mobile 4G preset (100/20/4%). Relevant wherever ENet-over-UDP reaches mobile.
 	_add(_make("mobile_4g", 100.0, 20.0, 0.04))
 	# mobile_3g: degraded cellular -- Unity's 3G preset (360/30/7%), a genuinely hostile link.
 	_add(_make("mobile_3g", 300.0, 30.0, 0.07))

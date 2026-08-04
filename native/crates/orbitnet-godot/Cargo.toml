@@ -17,9 +17,9 @@ crate-type = ["cdylib"]
 orbitnet-core = { workspace = true }
 
 # Built against the 4.4 API rather than 4.7. gdext extensions load in any Godot at or above the API
-# they were built against, so a 4.4 baseline runs on Spaceman's 4.7 while staying usable by public
-# projects on older 4.x. It also avoids the `api-custom` feature, which would drag libclang/bindgen
-# into the Nix dev shell for no benefit here.
+# they were built against, so a 4.4 baseline runs on any newer editor while staying usable by projects
+# on older 4.x. It also avoids the `api-custom` feature, which would drag libclang/bindgen into every
+# dev environment for no benefit here.
 #
 # Pinned exactly, not with a caret: gdext is 0.x and its API moves between releases.
 #

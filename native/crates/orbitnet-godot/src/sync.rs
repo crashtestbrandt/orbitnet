@@ -13,7 +13,7 @@
 //!
 //! Entity identity is the FNV-1a hash of the synchronizer root's node path, salted per lane. Both
 //! peers derive the same id because the `MultiplayerSpawner` guarantees identical node names —
-//! the same invariant the old backend's node-path RPC routing leaned on, made explicit.
+//! the invariant any node-path-derived identity scheme leans on, made explicit.
 
 use godot::classes::Node;
 use godot::prelude::*;
@@ -74,7 +74,7 @@ pub struct OrbitRollbackSynchronizer {
     enable_prediction: bool,
 
     /// Display-only exemption: this peer applies received state and never joins the rollback
-    /// loop. The first-class replacement for the old backend's `rollback_exempt` local patch.
+    /// loop.
     #[export]
     exempt: bool,
 
@@ -267,9 +267,8 @@ impl OrbitRollbackSynchronizer {
 
     /// Record a per-tick memo value, keyed `(tick, key)`.
     ///
-    /// This is the backend-owned replacement for hand-rolled resim logs (weapon_authority's old
-    /// 256-tick held-catalog dictionary): record on the fresh pass, read back on every replayed
-    /// pass, trimmed with history.
+    /// The backend-owned alternative to a hand-rolled resim log: record on the fresh pass, read the
+    /// same value back on every replayed pass, trimmed with history.
     #[func]
     fn memo_set(&mut self, tick: i64, key: i64, value: i64) {
         if tick >= 0 {
@@ -546,7 +545,7 @@ impl OrbitRollbackSynchronizer {
     }
 
     /// This entity's frontier position, decoded from the first Vec3 State-role property of its
-    /// newest state row (Spaceman's bodies lead with `net_pos`). `None` when the entity has no
+    /// newest state row, so register position FIRST. `None` when the entity has no
     /// positional prop or no recorded row yet — the AOI filter then keeps it always-replicated.
     pub(crate) fn position_hint(&self) -> Option<[f32; 3]> {
         let prop = self

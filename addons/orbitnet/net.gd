@@ -263,8 +263,8 @@ func set_display_offset(ticks: int) -> void:
 # (exempt): remote bodies are display-only on non-owning clients -- they apply the latest authoritative
 # server state each tick and render engine-interpolated at that DELAYED tick. TRUE un-exempts them: the
 # client then predicts remote bodies FORWARD from their latest authoritative state with held input
-# (dead-reckoning through the real sim) -- unlike the old backend this needs no O(N^2) input broadcast,
-# because prediction extrapolates the last known state instead of replaying peer input.
+# (dead-reckoning through the real sim). This needs no O(N^2) input broadcast: prediction extrapolates the
+# last known state instead of replaying peer input.
 # Per-client and live (the console cvar net.remote_resim flips it mid-session); peers need not agree.
 var _remote_resim: bool = false
 
@@ -298,8 +298,8 @@ func set_aoi_radius(metres: float) -> void:
 	_orbit.aoi_radius = maxf(0.0, metres)
 
 ## Diagnostic (#214 net.perf): last-loop rollback counters from the backend. resim_ticks is the effective
-## resim window depth (ticks re-simulated in the latest rollback loop). Unlike the old backend these are
-## live in every build, release included -- the counters are a byproduct of the native loop, not monitors.
+## resim window depth (ticks re-simulated in the latest rollback loop). Live in EVERY build, release
+## included -- the counters are a byproduct of the native loop, not debug monitors.
 func perf_summary() -> String:
 	if _mode == Mode.OFFLINE:
 		return "offline (no rollback loop)"
@@ -419,8 +419,8 @@ func make_interpolator(root: Node) -> NetInterpolatorHandle:
 ## non-owning client (apply state only). Splitting state vs input authority requires input to live on its OWN
 ## node -- hence `input_node`, a child whose authority differs from the body's.
 ##
-## Unlike the old backend there is no "one synchronizer type per body on every peer" constraint: replication
-## routes by a server-assigned entity id derived from the root's node path, not by RPC node paths -- but the
+## There is no "one synchronizer type per body on every peer" constraint: replication routes by an entity id
+## DERIVED from the root's node path rather than by RPC node paths -- but the
 ## property SETS must still be identical on every peer (the wire schema is positional; the backend hashes it
 ## and refuses to misapply a mismatch).
 func register_rollback_body(root: Node, input_node: Node, state_properties: Array[String], input_properties: Array[String], predict: bool, cosmetic_properties: Array[String] = []) -> NetRollbackHandle:

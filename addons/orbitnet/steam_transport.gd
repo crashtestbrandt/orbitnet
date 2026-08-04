@@ -41,9 +41,10 @@ signal sessions_updated()
 ## Steam launched us with `+connect_lobby <id>`.
 signal invite_accepted(connect_target: String)
 
-## Steam's public "Spacewar" test app is 480; Moonshot's real app id is the shipped default. Overridable via the
-## `steam/app_id` project setting (project.godot) so a dev/test app id can be swapped in without a code change.
-const DEFAULT_APP_ID: int = 3074080
+## SET `steam/app_id` IN YOUR project.godot. The default is 480 -- Steam's public "Spacewar" test app, which
+## every Steam SDK ships with and which lets the transport be exercised before you have an app id of your own.
+## It is NOT a usable shipping value: two different games both left on 480 would see each other's lobbies.
+const DEFAULT_APP_ID: int = 480
 const _APP_ID_SETTING: String = "steam/app_id"
 
 # GodotSteam / Steamworks enum values inlined as ints (the enums live in the Steam singleton, which may be absent
@@ -70,7 +71,11 @@ const _LOBBY_TYPE_PUBLIC: int = 2
 # getNumLobbyMembers: only the host ever joins the Steam lobby (clients connect straight to the host's relay
 # socket), so the member count is stuck at 1 no matter how many pilots are actually in the session.
 const _LOBBY_KEY_GAME: String = "game"
-const _LOBBY_KEY_GAME_VALUE: String = "moonshot"
+# Tags a lobby as belonging to YOUR game, so the browser's list filter excludes another app's lobbies. Set
+# `steam/lobby_game_tag` in project.godot; the default is only sensible while you are the only OrbitNet game
+# on a given app id.
+const _LOBBY_TAG_SETTING: String = "steam/lobby_game_tag"
+const _DEFAULT_LOBBY_TAG: String = "orbitnet"
 const _LOBBY_KEY_HOST_ID: String = "host_id"
 const _LOBBY_KEY_OWNER_NAME: String = "owner_name"
 const _LOBBY_KEY_PLAYERS: String = "players"
@@ -97,7 +102,8 @@ const _CHAT_ROOM_ENTER_SUCCESS: int = 1
 const _CONNECT_LOBBY_FLAG: String = "+connect_lobby"
 const _RICH_PRESENCE_CONNECT: String = "connect"
 # The rich-presence line the Steam friends list shows next to our name. `steam_display` is a localisation token
-# resolved from the app's Steamworks rich-presence config; `#Status_InSession` is the token Moonshot registers.
+# resolved from your app's Steamworks rich-presence config -- register a `Status_InSession` token there, or
+# change this to a token you do register, or the friends list shows nothing next to your name.
 const _RICH_PRESENCE_DISPLAY: String = "steam_display"
 const _RICH_PRESENCE_DISPLAY_VALUE: String = "#Status_InSession"
 
@@ -524,7 +530,7 @@ func request_session_list() -> void:
 	# hides overseas hosts), and state the result cap. All best-effort across GodotSteam name drift. Filters apply
 	# to the NEXT requestLobbyList only, so they are re-applied on every sweep.
 	_call_first(_steam_obj, [&"addRequestLobbyListStringFilter"],
-		[_LOBBY_KEY_GAME, _LOBBY_KEY_GAME_VALUE, _LOBBY_COMPARISON_EQUAL])
+		[_LOBBY_KEY_GAME, _lobby_tag(), _LOBBY_COMPARISON_EQUAL])
 	_call_first(_steam_obj, [&"addRequestLobbyListDistanceFilter"], [_LOBBY_DISTANCE_WORLDWIDE])
 	_call_first(_steam_obj, [&"addRequestLobbyListResultCountFilter"], [_LOBBY_RESULT_LIMIT])
 	_call_first(_steam_obj, [&"requestLobbyList"], [])
@@ -578,7 +584,7 @@ func _on_lobby_created(result: int, lobby_id: int) -> void:
 	if result != _RESULT_OK or lobby_id == 0:
 		return
 	_hosted_lobby_id = lobby_id
-	_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_GAME, _LOBBY_KEY_GAME_VALUE])
+	_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_GAME, _lobby_tag()])
 	# The connect target, published as metadata because a browsing non-member cannot call getLobbyOwner (see the
 	# _LOBBY_KEY_HOST_ID comment). Without this key every discovered row is unjoinable and gets filtered away.
 	_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_HOST_ID, str(_local_steam_id())])
@@ -854,11 +860,17 @@ func _resolve_singleton(names: Array[StringName]) -> Object:
 			return Engine.get_singleton(n)
 	return null
 
-# The configured Steam app id (project setting override, else Moonshot's shipped id). Read as a plain int.
+# The configured Steam app id (project setting, else the Spacewar test app). Read as a plain int.
 func _app_id() -> int:
 	var raw: Variant = ProjectSettings.get_setting(_APP_ID_SETTING, DEFAULT_APP_ID)
 	var id: int = raw if raw is int else DEFAULT_APP_ID
 	return id
+
+# The lobby tag identifying this game's lobbies, from the project setting.
+func _lobby_tag() -> String:
+	var raw: Variant = ProjectSettings.get_setting(_LOBBY_TAG_SETTING, _DEFAULT_LOBBY_TAG)
+	var tag: String = raw if raw is String else _DEFAULT_LOBBY_TAG
+	return tag if tag != "" else _DEFAULT_LOBBY_TAG
 
 # Call the first method in `methods` that exists on `obj`, with `args`; null if none exist (or obj is null). Lets
 # a single call site tolerate GodotSteam renaming a function across versions without a hard failure.

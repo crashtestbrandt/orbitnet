@@ -1,19 +1,16 @@
 # Third-party code
 
-OrbitNet itself is **MIT OR Apache-2.0** (see `LICENSE`). This file inventories everything else that ends up
-in a build, and — because it is the question people actually have — explains what the MPL-2.0 dependency does
-and does not require of you.
+OrbitNet is **MIT OR Apache-2.0** (see `LICENSE`). This file inventories everything else that ends up in a
+build and answers the question people actually have about the MPL-2.0 dependency.
 
 ## The short version
 
-If you use OrbitNet the way it is meant to be used — install the addon, ship a game — **you inherit no
-copyleft obligation.** MPL-2.0 is a *file-level* licence, and no MPL-licensed file is modified by this
-project or by your game. The obligation MPL-2.0 creates attaches to changes to *its own files*, and there
-are none. Attribution of the binary's contents (this file) is good practice and is what the notice
-requirements amount to in practice.
+Install the addon, ship a game — **you inherit no copyleft obligation.** MPL-2.0 is a *file-level* licence,
+its obligation attaches to changes to *its own files*, and no MPL file is modified by this project or by your
+game. Keeping this notice with your build is what the notice requirements amount to in practice.
 
-If you *fork gdext itself* and modify its files, MPL-2.0 requires you to publish those modified files. That
-is a real obligation and it is on you, not on OrbitNet.
+If you *fork gdext itself* and modify its files, MPL-2.0 requires you to publish those modified files. That is
+a real obligation, and it is on you rather than on OrbitNet.
 
 ## What ships in the compiled extension
 
@@ -34,12 +31,10 @@ Regenerate this list with `cargo tree` in `native/` after any dependency change.
 
 ## Why MPL-2.0 in the dependency tree is fine
 
-This comes up every time, so here is the reasoning in full.
-
-MPL-2.0 is **weak, file-scoped copyleft**. Its central obligation (§3.1) is: if you distribute *Covered
-Software* in Source Code Form, you must make the source of **those files** available under the MPL. §3.2
-explicitly permits distributing the software in **Executable Form** under a licence of your choosing,
-provided the Covered Software's source stays available under the MPL.
+MPL-2.0 is **weak, file-scoped copyleft**. Its central obligation (§3.1): if you distribute *Covered Software*
+in Source Code Form, you must make the source of **those files** available under the MPL. §3.2 explicitly
+permits distributing the software in **Executable Form** under a licence of your choosing, provided the
+Covered Software's source stays available under the MPL.
 
 Three consequences:
 

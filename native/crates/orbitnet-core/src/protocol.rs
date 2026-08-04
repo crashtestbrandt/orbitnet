@@ -122,9 +122,10 @@ pub enum PropRole {
     /// Presentation-only state: replicated, but never restored during rollback and never counted
     /// as a misprediction.
     ///
-    /// Spaceman's thruster actuation and gait blend values are the motivating case — they are
-    /// written by the simulation and read only by visual effects, so replaying them changes
-    /// nothing and comparing them causes needless resimulation.
+    /// The test is "does the simulation ever read it back", not "does it look presentational".
+    /// An actuation value the sim rewrites every tick from `(state, input)` and never reads back is
+    /// genuinely cosmetic. A self-referential integrator — a smoothed heading low-passing over its
+    /// own previous value — is `State`, however presentational it looks.
     Cosmetic = 3,
 }
 

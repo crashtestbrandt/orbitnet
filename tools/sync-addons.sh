@@ -4,9 +4,8 @@
 # The repo root is deliberately NOT a Godot project. OrbitNet is configured through a [orbitnet]
 # block in project.godot (sync_to_physics / tickrate / max_time_stretch / history_limit), and the
 # demos disagree about those values on purpose -- the RTS wants a decoupled 20 Hz net tick with a
-# short history, a Spaceman-shaped demo wants the coupled 60 Hz opposite. Two projects cannot share
-# one settings block, so each consuming project is its own Godot project and gets its own COPY of
-# the addon. `addons/orbitnet/` + `addons/orbitnet_native/` at the repo root are the single source
+# short history, a character-shooter demo wants the coupled 60 Hz opposite. Two projects cannot
+# share one settings block, so each is its own Godot project and gets its own COPY of the addon. `addons/orbitnet/` + `addons/orbitnet_native/` at the repo root are the single source
 # of truth and the AssetLib payload; every copy under a project is a build artifact (gitignored).
 #
 # WHY COPY, NOT SYMLINK: Git for Windows checks a symlink out as a TEXT FILE containing the target
@@ -37,7 +36,7 @@ PROJECTS=(harness demos/rts)
 # What gets mirrored, as `source:destination-inside-each-project` pairs.
 #
 # The two addon directories are the payload proper -- exactly what an AssetLib zip contains and exactly
-# what a consuming project vendors. tools/test-harness is here for the same reason and by the same
+# what a game vendors. tools/test-harness is here for the same reason and by the same
 # mechanism: both projects run the same tiny hand-rolled unit-test runner, and one canonical copy with
 # drift checking beats two copies that quietly diverge.
 PAYLOAD=(

@@ -13,8 +13,8 @@
 #     POLICY   bot behaviour: idle|strafe|orbit|wander|strafe_fire (default strafe)
 #
 # PASS = every client logs BENCH-RESULT PASS and the relay bound. Exits non-zero on any FAIL / bringup failure.
-# Uses the RAW godot binary + a pkill-by-cmdline sweep (killing the godot-quiet.sh wrapper orphans the child, which
-# squats the UDP port and poisons later runs -- learned the hard way; see tools/loadtest.sh).
+# Uses the RAW godot binary + a pkill-by-cmdline sweep: killing the godot-quiet.sh wrapper orphans the child,
+# which squats the UDP port and poisons every later run.
 set -uo pipefail
 
 CLIENTS="${1:-4}"
