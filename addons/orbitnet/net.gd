@@ -68,10 +68,17 @@ func _init() -> void:
 	var tickrate_cfg: int = ProjectSettings.get_setting(&"orbitnet/tickrate", 60)
 	var history_cfg: int = ProjectSettings.get_setting(&"orbitnet/history_limit", 128)
 	var stretch_cfg: float = ProjectSettings.get_setting(&"orbitnet/max_time_stretch", 1.05)
+	# The send path's two INDEPENDENT distance knobs. The fallbacks here are the "no config"
+	# values, not the shipped policy -- the shipped numbers and the reasoning for them are in the
+	# [orbitnet] block, and `aoi_weapon_range_test.gd` is what stops the radius drifting under a weapon.
+	var aoi_cfg: float = ProjectSettings.get_setting(&"orbitnet/aoi_radius", 0.0)
+	var aoi_band_cfg: float = ProjectSettings.get_setting(&"orbitnet/aoi_band_radius", 0.0)
 	_orbit.sync_to_physics = sync_phys
 	_orbit.tickrate = tickrate_cfg
 	_orbit.history_limit = history_cfg
 	_orbit.max_stretch = stretch_cfg
+	_orbit.aoi_radius = maxf(0.0, aoi_cfg)
+	_orbit.aoi_band_radius = maxf(0.0, aoi_band_cfg)
 	add_child(_orbit)
 	# Bridge the backend's per-tick + post-loop signals into the facade signals. The backend signals only
 	# fire while the tick loop runs (networked), so OFFLINE these connections are inert.
@@ -103,6 +110,33 @@ func install_native_crash_handler(dir: String) -> bool:
 		return false
 	return _orbit.install_crash_handler(dir)
 
+# --- backend-version tolerance -------------------------------------------------------------------
+## Read a backend property that may not exist on the loaded binary yet, falling back to `fallback`.
+##
+## The cdylib is rebuilt and COMMITTED BY A BOT (orbitnet-binaries.yml) in a commit SEPARATE from the Rust
+## sources, so a perfectly valid checkout can pair new GDScript with an OLDER binary: a PR branch before the bot
+## lands, a bisect, or any working copy that has not run `just native-install`. install_native_crash_handler
+## already guards for exactly this reason -- and it is not hypothetical: a CI run has failed the
+## Linux gate on `aoi_max_entities` and `rate_tiering` for precisely one commit while the macOS binary (rebuilt
+## locally) was fine. A tuning or diagnostics knob has no business erroring at boot: it degrades to its default
+## and the game runs.
+##
+## `Object.get` answers null for an absent property rather than erroring, and `Object.set` is a silent no-op --
+## which is why the write paths below need no guard of their own.
+func _backend_int(name: StringName, fallback: int) -> int:
+	var raw: Variant = _orbit.get(name)
+	if raw == null:
+		return fallback
+	var value: int = raw
+	return value
+
+func _backend_bool(name: StringName, fallback: bool) -> bool:
+	var raw: Variant = _orbit.get(name)
+	if raw == null:
+		return fallback
+	var value: bool = raw
+	return value
+
 # --- physics/net decouple (#214) -----------------------------------------------------------------
 ## Run the network tick DECOUPLED from (slower than) the physics tick: the net loop paces off the wall clock at
 ## `tick_hz` in _process while physics stays at its project rate, so the per-second sim/collide-and-slide/state-
@@ -131,10 +165,35 @@ func net_tick_factor() -> float:
 	return _orbit.tick_factor()
 
 ## The net tick duration in seconds (the extrapolation/interpolation span). 0 OFFLINE.
+##
+## **Anything that turns a count of NET ticks into seconds must use this**, and the engine's
+## `Engine.physics_ticks_per_second` is never the right number for it. A session that calls
+## [method set_net_tick_decoupled] runs the net tick at its own rate -- typically 60 -- while physics stays at
+## 120. The `orbitnet/sync_to_physics` project setting is only the seed for an offline or sessionless process.
+##
+## The failure is silent in the worst way: a caller that counts ticks at 60/s and multiplies by 1/120 runs at
+## half speed, EVERY PEER COMPUTES THE SAME WRONG NUMBER, so no sync or determinism gate can see it -- it is a
+## uniform, agreed-upon error. The bug this prevents is projectiles flying at half speed and debris drifting at
+## half speed on exactly that arithmetic, each carrying a comment asserting a premise the decouple had already
+## retired. At the 30 Hz tick a 100-player target needs, the same code would be out by four.
+##
+## This is the twin of the rule [method effective_tickrate] states for milliseconds: a tick is not a fixed
+## amount of time.
 func net_tick_dt() -> float:
 	if _mode == Mode.OFFLINE:
 		return 0.0
 	return _orbit.tick_time()
+
+## The tick rate the loop is ACTUALLY running at -- the physics rate when coupled, the configured rate when
+## decoupled. `tickrate()` returns the CONFIGURED value, which is the wrong one under `sync_to_physics`.
+## Anything converting between ticks and milliseconds must use this: a tick is not a fixed
+## amount of time. 0 OFFLINE. A passthrough to the backend method this file already calls in `clock_metrics`;
+## it exists as a facade method so a caller outside this addon can ask the question without naming a backend
+## class.
+func effective_tickrate() -> int:
+	if _mode == Mode.OFFLINE:
+		return 0
+	return _orbit.effective_tickrate()
 
 # --- mode ----------------------------------------------------------------------------------------
 ## The current network mode. OFFLINE at boot; asserted by the #61 acceptance test (Net.current_mode() == OFFLINE).
@@ -286,16 +345,66 @@ func resim_force() -> int:
 func set_resim_force(ticks: int) -> void:
 	_orbit.resim_force = clampi(ticks, 0, 64)
 
-## Interest-management radius in metres (#318/#328, the 100-player lever): with a radius set, the SERVER sends
-## each peer only the rollback bodies within it of that peer's own body (1.25x exit hysteresis so boundary
-## entities don't flicker; state-lane entities always replicate). 0 = off (every peer receives everything --
-## the shipped default, since the demo arena fits inside any sensible radius). Server-side only; ignored on
-## clients. The `net.aoi_radius` console cvar (server-marked) reads/writes this.
+## Interest-management radius in metres, the 100-player lever: with a radius set, the SERVER sends each peer only
+## the entities within it of that peer's own body (1.25x exit hysteresis so boundary entities don't flicker).
+## 0 = off, every peer receives everything. Server-side only; ignored on clients.
+##
+## **Size it by the longest range at which a player can act on a body, never by what makes culling look
+## effective.** A culled entity is not despawned -- it keeps its node on the peer and freezes at the last pose
+## that arrived -- so a radius under a weapon's range leaves a scoped shooter aiming at a stale ghost they cannot
+## hit. Set it to the longest range in your game and let an arena that outgrows that start culling on its own; a
+## radius that culls nothing on today's maps is doing its job, not wasting itself.
 func aoi_radius() -> float:
 	return _orbit.aoi_radius
 
 func set_aoi_radius(metres: float) -> void:
 	_orbit.aoi_radius = maxf(0.0, metres)
+
+## The scale the PRIORITY BANDS are derived from, in metres: edges at `scale/3` and `2*scale/3`.
+##
+## A separate number from [method aoi_radius] because they answer different questions and their answers differ by
+## two orders of magnitude -- one decides whether an entity is sent at all, the other how often relative to
+## everything else. While they are one number, a value that bands usefully culls bodies players are shooting at,
+## and a value safe for the longest shot puts every entity on a small map in one band, where the distance weight
+## is a constant that cancels out of the ordering and the scorer is inert. This one can only reorder what is
+## already being sent; it can never remove anything.
+func aoi_band_radius() -> float:
+	return _orbit.aoi_band_radius
+
+func set_aoi_band_radius(metres: float) -> void:
+	_orbit.aoi_band_radius = maxf(0.0, metres)
+
+## Hard cap on one peer's interest set, 0 = uncapped. The nearest N CULLABLE entities win; a peer's own body and
+## every always-relevant channel are exempt, so this bounds the scenery, never the gameplay. An entity evicted by
+## the cap is a real LEAVE -- it must re-enter through the full radius like any newcomer.
+func aoi_max_entities() -> int:
+	return _backend_int(&"aoi_max_entities", 0)
+
+func set_aoi_max_entities(count: int) -> void:
+	_orbit.set(&"aoi_max_entities", maxi(0, count))
+
+## Rate tiering by distance band: send the MID band every other tick and the FAR band every fourth, phase-offset
+## by entity id so a band's traffic is level rather than spiking once per interval.
+##
+## DEFAULTS OFF, deliberately. The priority scorer already produces a weight-proportional send rate per band
+## without a fixed schedule (a far body settles at ~16x the near band's inter-send gap, because that is the ratio
+## of their weights), so this is a HARD cap for when even that is too expensive. It is also the item most likely
+## to make remote bodies visibly stutter -- a feel change dressed as a bandwidth change -- which is why it should
+## not be turned on before [method bandwidth_metrics]'s `interarrival_far` proves the far band is genuinely far.
+func rate_tiering() -> bool:
+	return _backend_bool(&"rate_tiering", false)
+
+func set_rate_tiering(on: bool) -> void:
+	_orbit.set(&"rate_tiering", on)
+
+## The per-peer snapshot byte budget per tick. Entities the priority rota cannot fit under this are DEFERRED to a
+## later tick, never dropped. Clamped 256..1200: the ceiling is the codec's MAX_FRAME_PAYLOAD, and the floor is a
+## budget that can still carry a full block -- below it every entity defers forever.
+func send_budget() -> int:
+	return _orbit.send_budget
+
+func set_send_budget(bytes: int) -> void:
+	_orbit.send_budget = clampi(bytes, 256, 1200)
 
 ## Diagnostic (#214 net.perf): last-loop rollback counters from the backend. resim_ticks is the effective
 ## resim window depth (ticks re-simulated in the latest rollback loop). Live in EVERY build, release
@@ -316,18 +425,134 @@ func perf_summary() -> String:
 ## frame). Zeros OFFLINE.
 func perf_metrics() -> Dictionary[String, float]:
 	if _mode == Mode.OFFLINE:
-		return {"resim_ticks": 0.0, "rollback_ms": 0.0, "net_ms": 0.0}
+		return {"resim_ticks": 0.0, "rollback_ms": 0.0, "net_ms": 0.0,
+			"restore_ms": 0.0, "sim_ms": 0.0, "record_ms": 0.0}
 	var m: Dictionary = _orbit.metrics()
 	var resim: float = m.get("resim_ticks", 0.0)
 	var rb_ms: float = m.get("rollback_ms", 0.0)
 	var net_ms: float = m.get("net_ms", 0.0)
 	var rb_nodes: float = m.get("rb_nodes", 0.0)
+	# The three phases rollback_ms wrapped in one number. RESTORE writes a tick's recorded state
+	# and input back onto every replaying entity, SIM is the game code, RECORD captures the result -- and the
+	# capture-cost claim the docs lead with is about restore + record. Until these existed nobody could say what
+	# share of a rollback loop they were, so the headline performance gap was an assertion rather than a
+	# measurement. They do not sum to rollback_ms: the remainder is range setup and the display-offset restore,
+	# left visible rather than attributed. Zeros on a binary older than this script, like every other addition.
+	var restore_ms: float = m.get("restore_ms", 0.0)
+	var sim_ms: float = m.get("sim_ms", 0.0)
+	var record_ms: float = m.get("record_ms", 0.0)
 	return {
 		"resim_ticks": resim,
 		"rollback_ms": rb_ms,
 		"net_ms": net_ms,
 		"rb_nodes": rb_nodes,
+		"restore_ms": restore_ms,
+		"sim_ms": sim_ms,
+		"record_ms": record_ms,
 	}
+
+## Diagnostic: the SEND PATH's bandwidth and fairness accounting, windowed to per-second figures once a
+## second by the backend. Zeros OFFLINE. Deliberately a SEPARATE dictionary from perf_metrics(), whose exact
+## shape bench_metrics.gd and the perf probe read -- widening a dictionary two harnesses index into is how a
+## measurement change becomes a gate failure.
+##
+##   tx_bytes_s / rx_bytes_s        -- OrbitNet PAYLOAD, in and out. Not what the link carries.
+##   tx_datagrams_s / rx_datagrams_s -- datagram counts, published so the wire figure can be CHECKED not trusted
+##   tx_wire_bytes_s                -- payload + 41 B/datagram (28 IPv4+UDP, 12 ENet, 1 Godot RAW tag). On a full
+##                                     1200 B frame that is 3%; on a 90 B one it is over 40%.
+##   tx_peak_peer_bytes_s           -- the busiest single peer's payload: the figure an AOI A/B has to move
+##   blocks_admitted_s              -- entity blocks that made it into a frame
+##   blocks_deferred_s              -- blocks that wanted to go out and did not fit. BUDGET PRESSURE.
+##   blocks_culled_s                -- blocks intentionally withheld (out of interest, or rate-tiered). DELIBERATE.
+##                                     Kept apart from deferred because conflating them hides the failure.
+##   want_full_nacks_s              -- WANT_FULL NACKs received. SERVER-SIDE ONLY: it is counted where a
+##                                     client's INPUT frame is decoded, so a client reads a structural 0.00.
+##   blocks_oversize_s              -- blocks admitted even though one of them exceeded the WHOLE byte budget, so
+##                                     that frame went out over the MTU and fragmented. Non-zero means one
+##                                     entity's full state does not fit in a datagram, which is a schema fact.
+##                                     Not a deferral: deferring the FIRST block of a frame sends no frame at
+##                                     all, and a never-sent entity sorts first again next tick, so it would
+##                                     end that peer's snapshot stream for the session.
+##   stale_blocks_s                 -- state blocks discarded because a NEWER row for that entity had already
+##                                     landed: reordering and duplication, which is what a real link does.
+##                                     CLIENT-SIDE ONLY, for the mirror reason -- it is counted where a received
+##                                     SNAPSHOT is integrated, which a server never does.
+##
+##   THE NACK/STALE PAIR SPANS TWO PROCESSES. They are the diagnosis together and either alone is not, and they
+##   live on opposite peers -- so pairing them means pairing a CLIENT's stale_blocks_s with a SERVER's
+##   want_full_nacks_s. Inside one net.perf they can never both be non-zero, and "want_full 0.00" read off a
+##   client is not evidence about a storm; it is evidence that the reader was on a client.
+##   starve_ticks_max               -- worst age in ticks of an in-interest entity that HAS been sent at least once
+##   unsent_backlog_max             -- worst count of in-interest entities never yet sent to a peer (the re-entry
+##                                     storm gauge, which starve_ticks_max cannot see: a never-sent entity has no age)
+##   interest_ms                    -- ms/tick in the interest pass. The number that would justify revisiting the
+##                                     grid-vs-scan decision recorded in orbitnet-core's interest module.
+##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded
+##                                     before rate tiering may be enabled.
+##   peers / interest_entities      -- peers synced, and the mean size of ONE peer's interest set
+## The POOLED mean ticks between admissions across every band -- the one figure from
+## [method bandwidth_metrics] that is read EVERY NET TICK on the authority rather than at human rates.
+##
+## It is the interpolation term in every shot's rewind depth, refreshed once per tick by the server's own
+## per-tick hook instead of once per pellet. Reading it through the dictionary allocated a nineteen-key
+## `Dictionary` in the backend, boxed every value, and rebuilt a typed copy here, per tick, forever -- on the
+## very send path this accounting exists to make cheaper. Everything else in that dictionary stays where it
+## is.
+##
+## FAILS OPEN at 0.0, which [NetLagComp.refresh_observed_interp] reads as "no measurement yet" and answers with
+## the floor. That matters for the same reason [method NetStateHandle.last_known_state]'s guard does: the
+## committed cdylib is a bot's and can be a commit behind these sources, so a peer can be running GDScript that
+## knows this method against a binary that does not.
+func interarrival_all_ticks() -> float:
+	if _mode == Mode.OFFLINE or not _backend_has(&"interarrival_all"):
+		return 0.0
+	return _orbit.interarrival_all()
+
+## Whether the LOADED cdylib carries the scalar above, as a fact separate from what it answers.
+##
+## The scalar fails open at 0.0, and so does every key `bandwidth_metrics()` cannot find, so on a binary that
+## predates this accessor BOTH read 0.0 and a probe comparing them agrees with itself. That is the exact case
+## the comparison was written to catch (`net-damage-probe`), and it could not: the rewind silently reverts to
+## the constant 1.0 the measured term replaced, with nothing red anywhere. Asking whether the method EXISTS is
+## the question that separates a stale binary from an unpublished window.
+func has_interarrival_scalar() -> bool:
+	return _mode != Mode.OFFLINE and _backend_has(&"interarrival_all")
+
+# WHETHER THE LOADED CDYLIB CARRIES A METHOD, ANSWERED ONCE. Several accessors on this facade have to tolerate a
+# binary older than these sources (the committed one is a bot's and lands in its own commit), and they did it with
+# `has_method` -- a ClassDB lookup with a StringName argument, on paths this epic identifies as per-tick and
+# per-shot. The answer cannot change while a process holds one `_orbit`, so it is resolved on the first ask and
+# kept. Keyed by name so a new tolerant accessor costs one dictionary hit rather than a new member.
+var _backend_methods: Dictionary[StringName, bool] = {}
+
+func _backend_has(method: StringName) -> bool:
+	var known: bool = _backend_methods.get(method, false)
+	if known:
+		return true
+	if _backend_methods.has(method):
+		return false
+	var present: bool = _orbit != null and _orbit.has_method(method)
+	_backend_methods[method] = present
+	return present
+
+func bandwidth_metrics() -> Dictionary[String, float]:
+	var out: Dictionary[String, float] = {
+		"tx_bytes_s": 0.0, "tx_datagrams_s": 0.0, "tx_wire_bytes_s": 0.0, "tx_peak_peer_bytes_s": 0.0,
+		"rx_bytes_s": 0.0, "rx_datagrams_s": 0.0,
+		"blocks_admitted_s": 0.0, "blocks_deferred_s": 0.0, "blocks_culled_s": 0.0,
+		"want_full_nacks_s": 0.0, "stale_blocks_s": 0.0, "blocks_oversize_s": 0.0,
+		"starve_ticks_max": 0.0, "unsent_backlog_max": 0.0,
+		"interest_ms": 0.0,
+		"interarrival_near": 0.0, "interarrival_mid": 0.0, "interarrival_far": 0.0,
+		"interarrival_all": 0.0,
+		"peers": 0.0, "interest_entities": 0.0,
+	}
+	if _mode == Mode.OFFLINE or not _backend_has(&"bandwidth_metrics"):
+		return out
+	var m: Dictionary = _orbit.bandwidth_metrics()
+	for key: String in out.keys():
+		out[key] = m.get(key, 0.0)
+	return out
 
 ## Diagnostic (loopback-stutter triage): the backend CLOCK state driving the tick cadence.
 ##   stretch  -- current sim-clock speed multiplier (1.0 = locked; pinned to exactly 1.0 in coupled mode,
@@ -352,6 +577,30 @@ func clock_metrics() -> Dictionary[String, float]:
 		"jitter_ms": jitter_ms,
 		"lead_ticks": lead_ticks,
 	}
+
+## What THIS SERVER measured about `peer`'s round trip, in milliseconds, or a NEGATIVE value when there is no
+## estimate: an unknown peer, a peer that has not acknowledged a snapshot frame since it joined, a client (which
+## measures nobody), or offline. The input to the per-shooter lag-compensation rewind ([NetLagComp]).
+##
+## NOT the same figure as `clock_metrics()["rtt_ms"]`, which is the LOCAL peer's own ping sampler and reads 0.0 on
+## a server -- the pong path only ever runs client-side. Ask this one about somebody else, that one about yourself.
+##
+## The backend derives it from the snapshot acknowledgements it already receives, so nothing was added to the wire.
+## A caller must handle the negative: "we do not know yet" is a real answer for the first moments of every join,
+## and treating it as zero would hand a fresh joiner the shallowest possible rewind at exactly the moment their
+## link is least settled. It is also what a backend binary older than this script answers -- see the `has_method`
+## probe, and `_backend_int` below for why a valid checkout can be in that state -- and it degrades to the flat
+## flat fallback window rather than erroring, because a mispaired binary must not stop the game resolving hits.
+## A LISTEN HOST asking about ITSELF is answered 0.0 rather than "no estimate", and that case is real rather than
+## defensive: the backend's peer table holds REMOTE peers only, so a host's own shots would otherwise fall back to
+## the flat window and be rewound further than a LAN client's in the same session -- the exact inversion this
+## exists to remove. The host's round trip to itself is zero by construction; nothing is measured or believed.
+func peer_rtt_ms(peer: int) -> float:
+	if _mode == Mode.OFFLINE or not _backend_has(&"peer_rtt_ms"):
+		return -1.0
+	if is_server() and peer == multiplayer.get_unique_id():
+		return 0.0
+	return _orbit.peer_rtt_ms(peer)
 
 # --- rollback / state / interpolation handles (created here so the backend is named only here) ----
 ## Create a rollback handle for a predicted body (#63 owner prediction + reconciliation). OFFLINE returns an
