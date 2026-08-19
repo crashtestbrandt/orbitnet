@@ -174,6 +174,17 @@ impl Writer {
         self.buf
     }
 
+    /// Roll the buffer back to a length recorded earlier, discarding everything written since.
+    ///
+    /// The send path needs this because an entity block's encoded size is not known until it has been
+    /// written: the budget can only be enforced by writing the block and un-writing it when it does not
+    /// fit. Longer than the current length is a no-op, so a caller can never grow the buffer with it.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.buf.len() {
+            self.buf.truncate(len);
+        }
+    }
+
     /// Drop everything written, keeping the allocation for reuse.
     pub fn clear(&mut self) {
         self.buf.clear();

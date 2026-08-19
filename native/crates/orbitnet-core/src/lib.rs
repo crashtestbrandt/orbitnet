@@ -5,7 +5,7 @@
 //! instead of standing up a scene tree, a physics world and two peers.
 //!
 //! The split mirrors the four costs that motivated moving off the GDScript backend (see
-//! `docs/orbitnet-native.md`, issue #318):
+//! docs/architecture.md):
 //!
 //! * [`tick`] — the tick clock: fixed-rate stepping, catch-up bounding, sub-tick factor.
 //! * [`clock`] — remote clock discipline: RTT/jitter estimation and bounded time stretch.
@@ -18,6 +18,7 @@
 //! * [`freshness`] — the #67 fix: per-(entity, tick) input confidence, so `is_fresh` keys on
 //!   input *novelty* rather than tick visitation, plus the tick-indexed memo ring.
 //! * [`interest`] — AOI: the uniform grid and per-peer interest sets with hysteresis.
+//! * [`priority`] — the send rota: distance bands, weights, and `staleness × weight` ordering.
 //! * [`pacing`] — coupled-mode tick slewing and the input-lead margin tracker.
 
 #![forbid(unsafe_code)]
@@ -30,6 +31,7 @@ pub mod freshness;
 pub mod history;
 pub mod interest;
 pub mod pacing;
+pub mod priority;
 pub mod protocol;
 pub mod quant;
 pub mod tick;
@@ -39,7 +41,8 @@ pub use codec::{CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
 pub use columnar::ColumnarHistory;
 pub use freshness::{Confidence, FreshnessLedger, MemoRing};
 pub use history::{plan_cost, BodyId, BodyResim, DirtyWindow, ResimPlanner, ResimRange, TickRing};
-pub use interest::{AoiConfig, InterestGrid, PeerInterest};
+pub use interest::{AoiConfig, InterestCandidate, InterestGrid, PeerInterest};
 pub use pacing::{CoupledSlew, LeadTracker, SlewDecision};
+pub use priority::{Band, Candidate, WEIGHT_ONE, WEIGHT_OWNED};
 pub use protocol::{PropKind, PropRole, PropSchema, QuantKind, SchemaBuilder, PROTOCOL_VERSION};
 pub use tick::{TickAccumulator, TickRate, TickStep};

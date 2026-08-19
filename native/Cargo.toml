@@ -21,3 +21,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Local native-profiler exports use the same optimizer/LTO settings as shipping, but retain enough
+# DWARF for perf/Hotspot to attribute OrbitNet frames to Rust functions and source lines. This
+# profile is staged under an ignored profile-only addon directory by `just profile-native`; shipping uses
+# `[profile.release]` above and its stripped, LFS-managed binaries.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"

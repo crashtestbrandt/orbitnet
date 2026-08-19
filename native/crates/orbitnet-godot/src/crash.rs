@@ -242,6 +242,14 @@ mod platform {
         context_record: *mut core::ffi::c_void,
     }
 
+    /// The callback `SetUnhandledExceptionFilter` takes, spelled as a FUNCTION POINTER rather than as the
+    /// `usize` the raw Win32 signature is often transcribed to. Rust 1.94 warns on casting a function item
+    /// straight to an integer (`function_casts_as_integer`), and the cast was never buying anything: naming
+    /// the real type lets the compiler check that `filter` still matches what the OS will call, which an
+    /// integer parameter cannot. `Option<fn>` is the nullable form -- passing `None` clears the filter, and
+    /// the previous one comes back the same way.
+    type TopLevelExceptionFilter = extern "system" fn(*mut ExceptionPointers) -> i32;
+
     #[repr(C)]
     struct ExceptionRecord {
         exception_code: u32,
@@ -277,7 +285,9 @@ mod platform {
             frames: *mut *mut core::ffi::c_void,
             hash: *mut u32,
         ) -> u16;
-        fn SetUnhandledExceptionFilter(filter: usize) -> usize;
+        fn SetUnhandledExceptionFilter(
+            filter: Option<TopLevelExceptionFilter>,
+        ) -> Option<TopLevelExceptionFilter>;
     }
 
     unsafe fn write_all(file: Handle, bytes: &[u8]) {
@@ -362,7 +372,7 @@ mod platform {
 
     pub(super) fn install() {
         // SAFETY: called once from the boot path.
-        unsafe { SetUnhandledExceptionFilter(filter as usize) };
+        unsafe { SetUnhandledExceptionFilter(Some(filter)) };
     }
 }
 
