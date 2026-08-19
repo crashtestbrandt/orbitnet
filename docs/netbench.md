@@ -25,7 +25,7 @@ netcode bench lies.
 
 ## Pointing it at your game
 
-netbench needs four things from a game, and `BenchSubject` is those four things:
+netbench needs four things from a game, and `BenchSubject` is those four things (plus one optional fifth):
 
 ```gdscript
 extends BenchSubject
@@ -35,7 +35,16 @@ func is_ready() -> bool                     # session live and simulating
 func local_body() -> Node                   # the locally-owned body, or null
 func apply_input(frame: Dictionary) -> void # feed one tick-pure frame
 func sample(body: Node) -> Dictionary       # optional per-tick game metrics
+func remote_bodies() -> Array[Node]         # optional; enables the remote-cadence reading
 ```
+
+`remote_bodies()` is the one addition that is not part of the four. Leave it alone and every gate still runs;
+implement it and `RemoteCadence` reports how often a remote body's authoritative pose actually reaches this
+client, split near from far. That is the measurement for "the other players move choppily", which no
+local-player metric can see: a client renders a remote body by interpolating between the last two poses it
+captured at a net tick, so a tick that brought no fresh row renders a held frame. Return a list the game
+already has to hand — it is called once per net tick, so walking the whole scene tree is the wrong
+implementation.
 
 Then attach the probe during session bring-up:
 

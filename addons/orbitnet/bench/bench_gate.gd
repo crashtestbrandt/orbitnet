@@ -115,3 +115,44 @@ static func evaluate(profile: NetProfile, rtt_ms: Array[float], stretch: Array[f
 			percentile(resim_ticks, 0.50), percentile(resim_ticks, 0.95)])
 
 	return r
+
+## Report the send path's bandwidth and fairness accounting. INFORMATIONAL rather than asserted, because the
+## honest bar differs per game and per arena: what is universal is which three figures to look at.
+##
+## `rx_bytes` is PAYLOAD only -- the link additionally carries roughly 41 bytes of UDP+ENet header per datagram,
+## so a run that looks comfortable here can still saturate a thin link.
+static func evaluate_bandwidth(r: Result, rx_bytes: Array[float], want_full: Array[float],
+		starve_ticks: Array[float]) -> Result:
+	if rx_bytes.is_empty():
+		return r
+	r._info("rx p50=%.0fB/s p95=%.0fB/s (PAYLOAD -- the link additionally carries ~41 B per datagram)" % [
+		percentile(rx_bytes, 0.50), percentile(rx_bytes, 0.95)])
+	# THE ACCEPTANCE BAR FOR INTEREST MANAGEMENT BEING ON. An entity re-entering interest must get its full block
+	# without a want_full storm: WANT_FULL is a per-peer, ALL-ENTITY flag, so one bad re-entry costs a round trip
+	# plus a full-state burst for everything that peer holds, arriving exactly when a fight starts. Clearing
+	# last_sent and acked_base at the LEAVE is what keeps this near zero; watch it whenever the radius changes.
+	r._info("want_full nacks p50=%.2f/s p95=%.2f/s (near zero is the interest-management acceptance bar)" % [
+		percentile(want_full, 0.50), percentile(want_full, 0.95)])
+	# Starvation is what the priority rota exists to delete, and it is NOT bandwidth overage: the bytes are never
+	# sent. It reads zero on a client (the server owns the rota), so an all-zero column here means "not measured",
+	# not "healthy" -- which is why the figure is printed rather than asserted against.
+	r._info("worst in-interest staleness p95=%.0f ticks (server-side; 0 in a client-only run)" % [
+		percentile(starve_ticks, 0.95)])
+	return r
+
+## Report how often remote bodies' poses actually reached this client. INFORMATIONAL, and read the NEAR figure:
+## the far band is what interest management is supposed to make sparser, so pooling the two reports a working
+## cull as a regression. See [RemoteCadence] for why the reading is biased LONG and never short.
+static func evaluate_remote_cadence(r: Result, cadence: RemoteCadence) -> Result:
+	var near: Array[int] = cadence.near_gaps()
+	if near.is_empty() and cadence.far_gaps().is_empty():
+		return r
+	var far: Array[int] = cadence.far_gaps()
+	r._info("remote cadence near mean=%.2f p95=%.0f ticks | far mean=%.2f p95=%.0f ticks" % [
+		RemoteCadence.mean_of(near), RemoteCadence.percentile_of(near, 0.95),
+		RemoteCadence.mean_of(far), RemoteCadence.percentile_of(far, 0.95)])
+	# bodies_moving beside bodies_seen is how far the figure can be trusted: a window in which most watched bodies
+	# never moved is measuring stillness, not the rota.
+	r._info("remote cadence over %d bodies seen / %d moving, %d absences (despawn, death or cull)" % [
+		cadence.bodies_seen(), cadence.bodies_moving(), cadence.absences()])
+	return r
