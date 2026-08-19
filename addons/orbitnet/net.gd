@@ -78,7 +78,7 @@ func _init() -> void:
 	_orbit.history_limit = history_cfg
 	_orbit.max_stretch = stretch_cfg
 	_orbit.aoi_radius = maxf(0.0, aoi_cfg)
-	_orbit.aoi_band_radius = maxf(0.0, aoi_band_cfg)
+	_orbit.set(&"aoi_band_radius", maxf(0.0, aoi_band_cfg))
 	add_child(_orbit)
 	# Bridge the backend's per-tick + post-loop signals into the facade signals. The backend signals only
 	# fire while the tick loop runs (networked), so OFFLINE these connections are inert.
@@ -113,13 +113,17 @@ func install_native_crash_handler(dir: String) -> bool:
 # --- backend-version tolerance -------------------------------------------------------------------
 ## Read a backend property that may not exist on the loaded binary yet, falling back to `fallback`.
 ##
-## The cdylib is rebuilt and COMMITTED BY A BOT (orbitnet-binaries.yml) in a commit SEPARATE from the Rust
-## sources, so a perfectly valid checkout can pair new GDScript with an OLDER binary: a PR branch before the bot
-## lands, a bisect, or any working copy that has not run `just native-install`. install_native_crash_handler
-## already guards for exactly this reason -- and it is not hypothetical: a CI run has failed the
-## Linux gate on `aoi_max_entities` and `rate_tiering` for precisely one commit while the macOS binary (rebuilt
-## locally) was fine. A tuning or diagnostics knob has no business erroring at boot: it degrades to its default
-## and the game runs.
+## The committed cdylib is refreshed only when a release tag is cut (release.yml), while the Rust sources change
+## on every merge to main. Every checkout between two releases therefore pairs new GDScript with an OLDER binary
+## -- as does a bisect, or any working copy that has not run `just native-install`. install_native_crash_handler
+## already guards for exactly this reason, and it is not hypothetical: the headless lint gate has failed on
+## `aoi_max_entities`, `rate_tiering` and `aoi_band_radius`, each of them a property the Rust side had and the
+## committed binary did not. A tuning or diagnostics knob has no business erroring at boot: it degrades to its
+## default and the game runs.
+##
+## So a new backend property reaches GDScript through the helpers below and `Object.set`, never through
+## `_orbit.<name>` directly. A direct read or write of a property the loaded binary lacks is a script error, and
+## in _init that error lands on every project load, which is what the lint gate reports.
 ##
 ## `Object.get` answers null for an absent property rather than erroring, and `Object.set` is a silent no-op --
 ## which is why the write paths below need no guard of their own.
@@ -135,6 +139,13 @@ func _backend_bool(name: StringName, fallback: bool) -> bool:
 	if raw == null:
 		return fallback
 	var value: bool = raw
+	return value
+
+func _backend_float(name: StringName, fallback: float) -> float:
+	var raw: Variant = _orbit.get(name)
+	if raw == null:
+		return fallback
+	var value: float = raw
 	return value
 
 # --- physics/net decouple (#214) -----------------------------------------------------------------
@@ -369,10 +380,10 @@ func set_aoi_radius(metres: float) -> void:
 ## is a constant that cancels out of the ordering and the scorer is inert. This one can only reorder what is
 ## already being sent; it can never remove anything.
 func aoi_band_radius() -> float:
-	return _orbit.aoi_band_radius
+	return _backend_float(&"aoi_band_radius", 0.0)
 
 func set_aoi_band_radius(metres: float) -> void:
-	_orbit.aoi_band_radius = maxf(0.0, metres)
+	_orbit.set(&"aoi_band_radius", maxf(0.0, metres))
 
 ## Hard cap on one peer's interest set, 0 = uncapped. The nearest N CULLABLE entities win; a peer's own body and
 ## every always-relevant channel are exempt, so this bounds the scenery, never the gameplay. An entity evicted by
