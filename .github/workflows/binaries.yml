@@ -54,8 +54,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          # `cd native` FIRST. native/rust-toolchain.toml pins the toolchain cargo uses in that directory,
+          # while the repository root has no override and resolves to whatever rustup's default is. Running
+          # `rustup target add` from the root installs the std libraries onto the DEFAULT toolchain, which the
+          # pinned one cannot see, and the cross build then fails with "can't find crate for `std`" for
+          # x86_64-apple-darwin on an arm64 runner.
           cd native
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
           cargo build --release -p orbitnet-godot --target x86_64-apple-darwin
           cargo build --release -p orbitnet-godot --target aarch64-apple-darwin
           mkdir -p target/release
