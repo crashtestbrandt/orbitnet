@@ -6,9 +6,14 @@ class_name NetLagComp
 ##   * the PRESENT tick -- a live-space ray cast (NetRay), which is what S7 ships and is correct on a localhost
 ##     listen-server where RTT is ~0, OR
 ##   * a PAST tick reconstructed from the ring, so a high-ping shooter's shot is judged against where the targets
-##     were on THEIR screen (the classic "favour the shooter" rewind). The ring and the rewind method SIGNATURE
-##     are in place now but the reconstruct-and-cast body is RESERVED (it falls back to the present cast) -- wiring
-##     it is a follow-up once interpolation delay + per-target colliders are replicated.
+##     were on THEIR screen (the classic "favour the shooter" rewind). LIVE since 89c -- [method _resolve_rewound]
+##     reconstructs the recorded per-region capsules and tests them analytically; only an un-recorded tick (or
+##     the derived rewind depth is 0) still falls through to the present-tick cast.
+##
+## COST LIVES ON THE RESOLVE SIDE, and it is charged per SHOT, not per player: [method record] runs once a tick
+## whatever is happening, while [method resolve_hit] runs once per LIVE PELLET TRACK per tick for the whole time
+## of flight of every round in the world. Both halves are counted (perf_take_static / perf_take_resolve) and
+## reported by `net.perf` -- read the resolve line during a firefight, since it is flat zero at rest.
 ##
 ## Pure Godot physics through [NetRay] -- no rollback-backend symbols (the `just net-check` gate). Owned by the
 ## SERVER's weapon authority; a client never instances one (it never resolves an authoritative hit). The hittable
@@ -16,13 +21,201 @@ class_name NetLagComp
 
 const _RING_SIZE: int = 128   # matches the backend history_limit default; the tick window a rewind could span
 
-## Lag-comp rewind delay in ticks (#100 / 89c) -- how far into the past a shot is resolved: the server tests a
-## traveling round against targets rewound by THIS many ticks (the shooter's view / interpolation delay), not all
-## the way to fire-tick. Small ⇒ targets stay near-live, so leading + dodging + tracer-coherence survive while the
-## shooter's view lag is modestly compensated. 0 ⇒ present-tick (no comp). Tunable live via the `net.lagcomp_ticks`
-## cvar; default ~3 ≈ interp/render lag at 120 Hz. GLOBAL for M1; the per-shooter (interp + measured RTT/2) form is
-## the documented follow-up and needs no change here -- the ring + _resolve_rewound are identical.
-static var delay_ticks: int = 3
+## Lag-comp rewind delay in MILLISECONDS -- how far into the past a shot is resolved: the server tests a
+## traveling round against targets rewound by this much (the shooter's view / interpolation delay), not all the
+## way to fire-tick. Small ⇒ targets stay near-live, so leading + dodging + tracer-coherence survive while the
+## shooter's view lag is modestly compensated. 0 ⇒ present-tick (no comp).
+##
+## THIS IS THE FALLBACK, not the window every shot gets. A shot fired by a peer the server has an RTT estimate
+## for is rewound by [method rewind_ticks_for_shooter] instead; this value is what a shot gets when there is no
+## estimate to use -- offline, an AI's round, a peer in the first moments of its join, or [member per_shooter]
+## off.
+##
+## **Milliseconds, not ticks, because a tick is not a fixed amount of time.** The obvious spelling of this knob
+## is a tick count, documented against the rate the author happened to be running. Then the loop runs at another
+## rate and the same line means something else: a window written as "3 ticks ≈ interpolation lag at 120 Hz" is
+## worth 25 ms there, 50 ms at 60, and 100 ms at the 30 Hz decoupled tick a 100-player target wants -- doubling
+## twice with nobody seeing a line change. A window denominated in time survives the rate change; one denominated
+## in ticks is a different policy at every rate it is run at.
+static var delay_ms: float = 50.0
+
+## The ceiling on any rewind window, per-shooter or fallback. Read the number as **the deepest rewind this game
+## will ever grant**. It defaults to 250 ms because that is the one-way delay of `worst_case` in netbench's
+## profile catalog -- so a shooter sitting exactly on that design ceiling (500 ms round trip) asks for 250 ms of
+## round trip plus a tick of interpolation and gets 250. The clamp binds AT the ceiling and nowhere below it,
+## which is what makes it a bound on the hostile case rather than a cap on the honest one.
+##
+## Published figures for other engines are usually a ROUND TRIP and this is a rewind DEPTH; confusing them is how
+## a ceiling ends up worth twice what its author meant.
+##
+## IT IS THE WHOLE CONTAINMENT, so read what it is containing rather than assuming the backend has already
+## handled it. The estimate is derived from acknowledgements the client chooses when to send, and nothing ties
+## that report to what the peer actually received. The backend refuses to measure an ack that did not ADVANCE and
+## keeps the MINIMUM of a recent window, which together stop a peer inflating for free -- but a steady
+## under-report still reads as a slow link, is believed, and is indistinguishable from a player who put a traffic
+## shaper in front of their connection and is honestly that far away. Neither case can be told apart, and neither
+## needs to be: both get at most this many milliseconds of rewind, which is what the worst supported legitimate
+## link already receives. Lowering this number is the only lever that narrows either. See `note_ack` in
+## `orbit_net.rs` for the two backend rules and what they do not cover.
+static var max_delay_ms: float = 250.0
+
+## Whether a shot is rewound by its own shooter's measured round trip, or by the flat [member delay_ms] every
+## shooter shares. An AUTHORITY knob: it changes how the server adjudicates, so a client setting it changes
+## nothing. Off restores the flat-window behaviour exactly, which is what makes a feel regression an A/B rather
+## than a bisect.
+static var per_shooter: bool = true
+
+## The shooter's VIEW LAG of what they are shooting at, in NET TICKS: how far behind the server's present the
+## remote bodies on their screen are drawn.
+##
+## **IT IS MEASURED, NOT ASSUMED.** The tempting constant is 1.0, on the argument that every remote body renders
+## by interpolating between the last two RECEIVED poses and is therefore drawn exactly one net tick behind. The
+## first half is true; the second does not follow, because a row does not arrive every tick. A peer's snapshot
+## frame is one datagram of at most `MAX_FRAME_PAYLOAD`, and the send path admits entities into it by priority
+## until the bytes run out -- so a body renders at the last row it RECEIVED, which is `interarrival` ticks old,
+## not one. Measured against a real dedicated server on a two-dozen-entity arena from a LAN client: a mean of 3.4
+## net ticks between rows for the near band, p95 of 8. At 7.5 m/s that is 0.42 m of travel the rewind did not
+## account for, against a 0.40 m hit capsule -- a dead-centre shot resolving cleanly past the body it was aimed
+## at. That is arithmetic rather than a feel judgement.
+##
+## The send path publishes the figure, and **what is read is the POOLED value across every band**, not the near
+## band's. It is refreshed once per server tick from the scalar accessor [method Net.interarrival_all_ticks] (see
+## [method refresh_observed_interp]) rather than read per shot, because a nineteen-key dictionary per pellet per
+## tick is the kind of cost this file's header exists to warn about.
+##
+## **THE POOLED FIGURE IS THE HONEST ONE FOR THIS CONSUMER.** This term is applied to EVERY shot at EVERY range,
+## and the code that applies it does not know which band its target sits in. Feeding it the near figure would
+## rewind a shot at a mid-band target short by exactly the error this exists to remove. Pooled is the figure a
+## consumer that cannot see its subject's band should use, and if it is wrong it is wrong LONG -- a contested
+## target carries more staleness x weight than the pool mean, so its real gap is a little shorter than the
+## estimate -- while an over-deep rewind is bounded twice over, by [constant MAX_INTERP_TICKS] and again by
+## [member max_delay_ms]. Per-TARGET rewind depth is the better answer and is a follow-up.
+##
+## The FLOOR is 1.0: a body cannot render fresher than the tick it arrived on, and a measurement that has not
+## started yet must not shrink the window below what a flat one-tick assumption would have given.
+static var observed_interp_ticks: float = 1.0
+
+## The floor the measurement is clamped to, and the value used before any measurement exists.
+const INTERP_TICKS: float = 1.0
+
+## The ceiling on the MEASURED interpolation term, in ticks.
+##
+## A send path so starved that a body arrives every twentieth tick is broken in a way a deeper rewind does not
+## fix -- it would only trade missed shots for shots that land on targets who had already taken cover. The clamp
+## keeps a pathological measurement from turning the rewind into a time machine, and [member max_delay_ms] bounds
+## the total independently.
+const MAX_INTERP_TICKS: float = 8.0
+
+## Re-read the send path's measured inter-arrival. SERVER ONLY, once per net tick.
+##
+## A zero or absent figure means the window has not published yet (the accounting is per second) or nothing was
+## admitted at all; both leave the floor in place rather than inventing a number.
+static func refresh_observed_interp(interarrival: float) -> void:
+	if is_nan(interarrival) or interarrival <= 0.0:
+		observed_interp_ticks = INTERP_TICKS
+		return
+	observed_interp_ticks = clampf(interarrival, INTERP_TICKS, MAX_INTERP_TICKS)
+
+## Put the measurement back to the floor. Called when a session ends: this is a `static var`, so it outlives the
+## session whose send path it describes, and the next session must start from the floor rather than inherit it.
+static func reset_observed_interp() -> void:
+	observed_interp_ticks = INTERP_TICKS
+
+## How many ticks of rewind `ms` is worth at `tick_hz`, clamped in MS first and then bounded by what the ring can
+## actually hold. Pure -- the whole policy, unit-testable without a session.
+static func rewind_ticks_for(ms: float, tick_hz: float, ring_size: int = _RING_SIZE) -> int:
+	# NaN is rejected outright (it would survive clampf and poison the conversion); an INFINITE ask is not, because
+	# clamping it is the whole job -- "as much rewind as you can give me" resolves to the ceiling, not to none.
+	if is_nan(ms) or not is_finite(tick_hz) or tick_hz <= 0.0:
+		return 0
+	var clamped_ms: float = clampf(ms, 0.0, max_delay_ms)
+	return clampi(roundi(clamped_ms * 0.001 * tick_hz), 0, maxi(ring_size - 1, 0))
+
+## The rewind window ONE SHOOTER has earned, in milliseconds, given what the server measured about their round
+## trip (`rtt_ms`, from [method Net.peer_rtt_ms]) at `tick_hz`. Pure, so the whole per-shooter policy is a unit
+## test rather than a session.
+##
+## **interpolation + THE WHOLE ROUND TRIP.** The intuitive formula uses `rtt/2`, and half is the wrong half. The
+## rewind is measured from the server's PRESENT tick back to the world as the shooter saw it, and that span is
+## the sum of three legs, not two: the state left this server and took the downstream leg to reach the client;
+## the client drew it `interp` ticks behind whatever it held; and the shot command then took the upstream leg to
+## get back here. Down plus up is the whole round trip. Halving it answers "when did the client send this", which
+## is a different question and not the one a rewind asks.
+##
+## A flat 50 ms window is, by this formula, correct for a shooter at roughly 33 ms RTT -- which is what a LAN
+## playtest measures, and why the error hides there. `rtt/2` is BELOW the flat window it replaces for every
+## shooter under about 67 ms, so adopting it ships as a regression for exactly the population it was meant to
+## help.
+##
+## A NEGATIVE `rtt_ms` means "no estimate", which is not the same as zero and must not be treated as it: the
+## caller falls back to [member delay_ms] rather than handing a fresh joiner the shallowest window in the session
+## at the moment their link is least settled. Returns a negative here to say so, rather than silently
+## substituting.
+static func rewind_ms_for_shooter(rtt_ms: float, tick_hz: float, interp_ticks: float = -1.0) -> float:
+	if rtt_ms < 0.0 or is_nan(rtt_ms) or not is_finite(tick_hz) or tick_hz <= 0.0:
+		return -1.0
+	var ticks: float = observed_interp_ticks if interp_ticks < 0.0 else interp_ticks
+	if is_nan(ticks):
+		ticks = INTERP_TICKS
+	var interp_ms: float = clampf(ticks, INTERP_TICKS, MAX_INTERP_TICKS) * 1000.0 / tick_hz
+	# An infinite measurement is not rejected, for the same reason an infinite `ms` is not rejected above: the
+	# clamp in rewind_ticks_for is what answers it, and answering "the ceiling" is correct.
+	return interp_ms + maxf(0.0, rtt_ms)
+
+## The rewind depth in ticks for one shot, in the units [method resolve_hit] wants. `rtt_ms` negative (no
+## estimate) or [member per_shooter] off both fall back to the flat [member delay_ms] window.
+static func rewind_ticks_for_shooter(rtt_ms: float, tick_hz: float, interp_ticks: float = -1.0) -> int:
+	if not per_shooter:
+		return rewind_ticks_for(delay_ms, tick_hz)
+	var ms: float = rewind_ms_for_shooter(rtt_ms, tick_hz, interp_ticks)
+	if ms < 0.0:
+		return rewind_ticks_for(delay_ms, tick_hz)
+	return rewind_ticks_for(ms, tick_hz)
+
+## The rewind depth in ticks for ONE SHOT, including the rule for a round the AUTHORITY itself fired.
+##
+## **THE AUTHORITY'S OWN SHOTS TAKE NO REWIND**, and that rule lives HERE rather than at the shot site, for two
+## reasons that each go wrong when it does not:
+##
+##   * It is part of the per-shooter policy, so it has to answer to [member per_shooter] like the rest of it.
+##     Written at the shot site it is unconditional, so turning per-shooter off restores the flat window for
+##     every peer EXCEPT the host -- and a listen host is exactly where a developer runs the A/B this switch
+##     exists for.
+##   * Any diagnostic that re-derives the depth from [method rewind_ticks_for_shooter] does not know about the
+##     authority, so it reports a window for the host's own body that no shot of that body would ever take. One
+##     definition, two callers.
+##
+## A listen host does not render remote bodies from a replicated pose -- it renders the bodies it is simulating,
+## live -- so its view lag is zero on both terms: no round trip to itself, and no interpolation delay to what it
+## is drawing. Feeding it through the formula gives it a tick of interpolation it does not have, and a flat
+## window gives it the fallback: the host would otherwise be the worst-compensated shooter in its own session.
+static func rewind_ticks_for_shot(is_authority_shooter: bool, rtt_ms: float, tick_hz: float,
+		interp_ticks: float = -1.0) -> int:
+	if per_shooter and is_authority_shooter:
+		return 0
+	return rewind_ticks_for_shooter(rtt_ms, tick_hz, interp_ticks)
+
+## The rewind depth in ticks for the CURRENT session's FALLBACK window, derived from [member delay_ms] at the
+## tick rate the loop is actually running at. [method Net.effective_tickrate] and not [method Net.tickrate]: the
+## latter is the CONFIGURED rate and reads 60 while a physics-coupled loop runs at 120.
+static func rewind_ticks(tick_hz: int) -> int:
+	return rewind_ticks_for(delay_ms, float(tick_hz))
+
+## How long the ring RETAINS a recorded tick, in slots.
+##
+## The ring is 128 slots, which is a duration only once a rate is fixed: 1.07 s at 120 Hz, 2.13 s at 60, and
+## **4.27 s at 30**. That last one matters more than it looks. Game code that frees a body some seconds after its
+## death typically argues the delay is safe because it exceeds the ring span, so a corpse has aged out of every
+## slot before the node is freed. Halving the net rate re-arms that window: the ring would still hold a freed
+## body's region capsules, and only `is_instance_valid` would stand between that and a use-after-free.
+##
+## Bounding RESIDENCY instead of trusting the slot count makes the guarantee rate-independent. Nothing older than
+## the maximum window plus a margin can ever be rewound to, so nothing older needs keeping: at 60 Hz that is
+## 15 + 8 = 23 slots (383 ms), at 30 Hz 8 + 8 = 16 (533 ms). Both are an order of magnitude inside any plausible
+## linger, at every rate, without anyone having to check.
+const _RETAIN_MARGIN_TICKS: int = 8
+static func retain_ticks(tick_hz: int) -> int:
+	return mini(_RING_SIZE - 1, rewind_ticks_for(max_delay_ms, float(tick_hz)) + _RETAIN_MARGIN_TICKS)
 
 ## One hittable collider's pose at a recorded tick (the unit the rewind reconstructs before resolving). For the 89c
 ## per-region model these are the individual region capsules: `collider` is the struck node (read back by the
@@ -49,6 +242,24 @@ static var _perf_samples: int = 0
 static var _perf_record_usec: int = 0
 static var _perf_tick_lo: int = -1
 static var _perf_tick_hi: int = -1
+# The RESOLVE side of the same instrumentation, and the one that actually rides a FIREFIGHT. record() is paid once
+# per tick whatever is happening; _resolve_rewound is paid once per LIVE PELLET TRACK per tick, and each call used
+# to walk the entire ring slot -- so the server-side cost of shooting is O(rounds in flight x bodies x regions) and
+# is invisible in the record-side numbers above. `calls` is rewound casts (~= live tracks), `tests` the ray-vs-
+# capsule NARROW-phase tests that survived the broad-phase cull (the term that used to be calls x samples), `usec`
+# the wall-clock both cost. Static for the same reason: one whole-server figure, read by net.perf.
+static var _perf_resolve_calls: int = 0
+static var _perf_resolve_tests: int = 0
+static var _perf_resolve_usec: int = 0
+
+## Read-and-reset the resolve-side counters (net.perf): rewound casts run, narrow-phase capsule tests they
+## performed, and the usec they cost. All zero on a client / offline (only the server resolves authoritative hits).
+static func perf_take_resolve() -> Dictionary[String, int]:
+	var out: Dictionary[String, int] = {"calls": _perf_resolve_calls, "tests": _perf_resolve_tests, "usec": _perf_resolve_usec}
+	_perf_resolve_calls = 0
+	_perf_resolve_tests = 0
+	_perf_resolve_usec = 0
+	return out
 
 ## Read-and-reset the server-wide lag-comp perf counters (net.perf, #214): total Samples recorded, total usec
 ## spent in record(), and the span of distinct server ticks those covered (0 if nothing recorded since the last
@@ -74,7 +285,12 @@ func _init() -> void:
 		_ring_snaps[i] = []
 
 ## Record the hittable snapshot for `tick` into the ring (server, once per fresh tick). No-op without a provider.
-func record(tick: int) -> void:
+##
+## `retain` bounds how many ticks of history the ring KEEPS (see [retain_ticks]); 0 leaves the full 128 slots
+## resident, which is what an unbounded ring does. It is a parameter rather than a lookup because this runs once per
+## body per server tick and the caller already knows the session's tick rate -- and because it lets the ring be
+## exercised without a session at all.
+func record(tick: int, retain: int = 0) -> void:
 	if not hittable_provider.is_valid():
 		return
 	var t0: int = Time.get_ticks_usec()
@@ -82,6 +298,14 @@ func record(tick: int) -> void:
 	var slot: int = tick % _RING_SIZE
 	_ring_ticks[slot] = tick
 	_ring_snaps[slot] = samples
+	# Evict the slot that has just aged past the retention window (see [retain_ticks]). Without this the ring's
+	# residency is 128 ticks, which is a different DURATION at every tick rate -- and at 30 Hz it outlives the
+	# corpse linger that keeps a freed body's region capsules from being rewound to.
+	if retain > 0 and tick >= retain:
+		var stale_slot: int = (tick - retain) % _RING_SIZE
+		if stale_slot != slot and _ring_ticks[stale_slot] >= 0:
+			_ring_ticks[stale_slot] = -1
+			_ring_snaps[stale_slot] = []
 	# #214 perf: accumulate the server-side lag-comp cost. Static -- sums across every body's ring so net.perf
 	# reads the whole-server figure; the wall-clock captures the Sample allocation cost the pooling step will cut.
 	_perf_samples += samples.size()
@@ -122,6 +346,8 @@ func resolve_hit(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3
 # does not move) is cast live at the present tick. The nearer of the two is the resolved hit; a struck region's
 # Sample.collider is returned so the caller resolves region + health uniformly with the present-tick path.
 func _resolve_rewound(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3, dist: float, exclude: Array[RID], mask: int, at_tick: int, dynamic_mask: int) -> NetRay.Hit:
+	var t0: int = Time.get_ticks_usec()
+	_perf_resolve_calls += 1
 	var static_mask: int = mask & ~dynamic_mask
 	var best: NetRay.Hit = NetRay.cast(space, origin, dir, dist, exclude, static_mask)
 	var best_dist: float = best.distance if best.valid else dist + 1.0
@@ -131,8 +357,27 @@ func _resolve_rewound(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Ve
 	for sample: Sample in _ring_snaps[at_tick % _RING_SIZE]:
 		if sample == null or sample.radius <= 0.0:
 			continue
+		# BROAD PHASE, first because it is the cheapest test and the one that rejects nearly everything. The narrow
+		# ray-vs-capsule below runs for EVERY recorded capsule in the WHOLE ZONE, for every live pellet track, every
+		# tick -- so a firefight costs O(rounds in flight x bodies x regions) and a round crossing the midfield was
+		# ray-testing every limb of every player and every AI in the arena. This rejects a capsule the segment
+		# provably cannot reach: an intersection point lies within the capsule's bounding-sphere radius of its centre
+		# AND on the segment, so if the segment's CLOSEST APPROACH to the centre already exceeds that radius there is
+		# no intersection. Exact and conservative -- it can only skip capsules _ray_capsule would have missed anyway,
+		# so no shot resolves differently.
+		#
+		# Ordered ahead of the liveness + exclude checks deliberately: both of those DEREFERENCE the collider (an
+		# `as`-cast, a get_rid(), and a linear scan of the exclude set), while this reads only the Sample's own value
+		# fields -- which stay valid whatever happened to the collider.
+		var to_centre: Vector3 = sample.transform.origin - origin
+		var along: float = clampf(to_centre.dot(dir), 0.0, dist)
+		# Bounding-sphere radius of a capsule of total `height` and `radius` (axis through the centre): the caps
+		# reach height/2 from the centre, and a degenerate height shorter than the caps leaves the radius itself.
+		var bound: float = maxf(sample.height * 0.5, sample.radius)
+		if to_centre.distance_squared_to(dir * along) > bound * bound:
+			continue
 		# A sample holds a RAW reference to the recorded collider, and a Node reference keeps nothing alive: a
-		# death/respawn frees the body and its region hitboxes while the ring still carries the `delay_ticks`
+		# death/respawn frees the body and its region hitboxes while the ring still carries the rewind window's
 		# snapshots that named them. record() checks liveness at CAPTURE time; this is the only read of the ring,
 		# so it must check again -- an EXPORTED build performs no liveness validation on a freed Object reference
 		# (Variant's raw-pointer accessor; the "object was freed" guard is DEBUG_ENABLED-only), so `as`-casting a
@@ -146,6 +391,15 @@ func _resolve_rewound(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Ve
 		var co: CollisionObject3D = sample.collider as CollisionObject3D
 		if co != null and exclude.has(co.get_rid()):
 			continue
+		# A collider that has LEFT the queried layers since this sample was recorded is transparent to the
+		# rewound cast too, exactly as it already is to the live cast above -- the ring must not resurrect a
+		# target the present world says is not castable. The concrete case is a corpse: its hit capsules go to
+		# layer 0 at death, and without this a shot rewound a few ticks could still spend itself on a body the
+		# un-rewound shot beside it passes through. Read off the layer bits rather than any game-side notion of
+		# "dead", so the ring stays as ignorant of gameplay as the physics query it stands in for.
+		if co != null and (co.collision_layer & mask) == 0:
+			continue
+		_perf_resolve_tests += 1
 		var t: float = _ray_capsule(origin, dir, dist, sample.transform, sample.radius, sample.height)
 		if t >= 0.0 and t < best_dist:
 			best_dist = t
@@ -156,6 +410,7 @@ func _resolve_rewound(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Ve
 			hit.normal = _capsule_normal(hit.position, sample.transform, sample.radius, sample.height)
 			hit.distance = t
 			best = hit
+	_perf_resolve_usec += Time.get_ticks_usec() - t0
 	return best
 
 # The outward surface normal of a capsule (axis = local Y) at world point `pos`: radial from the NEAREST point on

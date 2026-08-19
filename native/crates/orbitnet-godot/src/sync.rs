@@ -1,7 +1,7 @@
 //! The per-entity synchronizers.
 //!
 //! [`OrbitRollbackSynchronizer`] owns one entity's replication state: the resolved property
-//! bindings, the packed state/input history rings, the input-confidence ledger (#67), and the
+//! bindings, the packed state/input history rings, the input-confidence ledger, and the
 //! tick-memo ring. It does **not** drive anything — the `OrbitNet` singleton iterates entities in
 //! ascending id order and calls the `pub(crate)` phase methods below, which keeps the whole
 //! rollback loop a flat native iteration instead of the old five-signals-per-tick fan-out.
@@ -27,6 +27,31 @@ use orbitnet_core::{
 
 use crate::binding::{self, PropBinding};
 
+/// `relevancy`: this channel is replicated to every peer, whatever the interest radius says.
+pub(crate) const RELEVANCY_ALWAYS: i32 = 0;
+/// `relevancy`: this channel is culled by distance from the anchor `anchor_property` names.
+pub(crate) const RELEVANCY_ANCHORED: i32 = 1;
+
+/// Rows the **state lane** retains per entity.
+///
+/// This was `8`, chosen for "slack for reordering" — a comment that predates `acked_base` and is no
+/// longer the constraint. A masked delta may only reference a tick the peer has ACKED, and an ack
+/// costs a full round trip: at 60 Hz an 8-row ring spans 133 ms, so above roughly 130 ms RTT the
+/// base has *always* fallen out of the ring by the time it becomes usable, and
+/// [`OrbitStateSynchronizer::encode_block`] resolves `reference = None` on every block forever. The
+/// fattest non-player lane on the wire therefore sent full rows on exactly the links least able to
+/// carry them, and no amount of interest culling would have touched it.
+///
+/// 64 rows spans 1.07 s at 60 Hz and 2.13 s at 30 — past the 250 ms design ceiling netbench's
+/// `worst_case` profile is calibrated against, and past the 32-frame ack window the frame header
+/// carries. An entity the send rota visits *less* often than that still degrades to a full block,
+/// which is correct: a body seen once a second is one whose delta base is worthless anyway.
+///
+/// The cost is `64 × row_stride` bytes per entity, which for a fat channel — 41 `i64` props at
+/// 328 B/row, say an inventory or equipment block — is 21 kB, or 2.6 MB across a full 100-player
+/// session, on the server alone.
+const STATE_HISTORY_DEPTH: usize = 64;
+
 /// What integrating a received authoritative state concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateIntegration {
@@ -36,8 +61,23 @@ pub enum StateIntegration {
     Mispredict(u64),
     /// Applied/buffered for a display-only or future tick — no rollback interaction.
     Buffered,
-    /// The row could not be integrated (stale beyond history, or no delta base).
-    Rejected,
+    /// The block was a masked delta and the base row it references is not resident, so nothing
+    /// could be decoded. **The only rejection a `WANT_FULL` NACK can fix**, because the same tick
+    /// re-sent as a full block carries every prop and needs no base.
+    NoBase,
+    /// The row was decoded and then discarded because this receiver is already past it — an
+    /// out-of-order or duplicate datagram, or a tick older than the history window can hold.
+    ///
+    /// **Separate from [`Self::NoBase`], and the separation is the fix.** Both
+    /// were once `Rejected`, and the receiver answered any non-full rejection with `want_full`,
+    /// which is a per-peer **all-entity** flag: one reordered datagram made the server's next frame
+    /// full blocks for every entity that peer holds, at a byte budget that carries a fraction of
+    /// them, so the rest deferred, arrived as deltas against a base that had moved, and re-raised
+    /// it. Reordering is routine on a relayed or congested link, so the storm ran continuously
+    /// there and never once on loopback — which is exactly the asymmetry a relayed-link playtest reported
+    /// (remote bodies frozen then jumping, the client's own rows arriving every several ticks).
+    /// A newer row for the same entity already applied, so there is nothing to ask for.
+    Stale,
 }
 
 /// Rollback state + input replication for one entity.
@@ -78,6 +118,14 @@ pub struct OrbitRollbackSynchronizer {
     #[export]
     exempt: bool,
 
+    /// Send-rota priority, `1..=16`, multiplying the distance-band weight.
+    ///
+    /// The backend must not guess game semantics: a scene that considers this body worth four
+    /// ordinary ones when the byte budget is tight says so here. The ownership floor is applied
+    /// separately and needs no declaration — a peer's own body is recognised by its input authority.
+    #[export]
+    priority: i32,
+
     // --- resolved at process_settings ---
     entity_id: u64,
     state_schema: SchemaBuilder,
@@ -88,6 +136,13 @@ pub struct OrbitRollbackSynchronizer {
     rollback_nodes: Vec<Gd<Node>>,
     /// Whether the local peer authors this entity's input (its own player).
     input_local: bool,
+    /// The peer id that owns this entity's input, cached at [`Self::process_authority`].
+    ///
+    /// Refreshed on exactly the same contract as `input_local`, which is the point: if this can go stale, so can
+    /// that, and the whole ownership model with it. Read by the once-per-tick send-path gather, so the send path
+    /// costs ZERO `get_multiplayer_authority()` calls. The anti-forgery check on received input deliberately does
+    /// NOT read this -- see [`Self::input_owner_peer`].
+    input_owner: i32,
     /// Whether the local peer owns this entity's state (the server).
     state_local: bool,
 
@@ -130,6 +185,7 @@ impl INode for OrbitRollbackSynchronizer {
             cosmetic_properties: PackedStringArray::new(),
             enable_prediction: true,
             exempt: false,
+            priority: 1,
             entity_id: 0,
             state_schema: SchemaBuilder::new(),
             state_bindings: Vec::new(),
@@ -138,6 +194,7 @@ impl INode for OrbitRollbackSynchronizer {
             unresolved: PackedStringArray::new(),
             rollback_nodes: Vec::new(),
             input_local: false,
+            input_owner: 0,
             state_local: false,
             state_history: ColumnarHistory::new(0, 1),
             input_history: ColumnarHistory::new(0, 1),
@@ -237,10 +294,12 @@ impl OrbitRollbackSynchronizer {
             .resolved_root()
             .map(|n| n.get_multiplayer_authority() == local_peer)
             .unwrap_or(false);
-        self.input_local = self
+        let owner = self
             .resolved_input_root()
-            .map(|n| n.get_multiplayer_authority() == local_peer)
-            .unwrap_or(false);
+            .map(|n| n.get_multiplayer_authority())
+            .unwrap_or(0);
+        self.input_owner = owner;
+        self.input_local = owner == local_peer;
     }
 
     /// Whether the most recent simulated tick ran on non-authoritative (predicted or
@@ -523,15 +582,36 @@ impl OrbitRollbackSynchronizer {
 
     /// The peer id that owns this entity's input node — the anti-forgery check for received
     /// input frames.
+    ///
+    /// Read LIVE, every time, and not from the cache below it. This one answers "may this sender write this
+    /// body's input", which is a security question; a cache is a window in which the answer can be wrong, and the
+    /// saving is one engine call per received input block rather than per entity per peer per tick.
     pub(crate) fn input_owner_peer(&self) -> i32 {
         self.resolved_input_root()
             .map(|n| n.get_multiplayer_authority())
             .unwrap_or(0)
     }
 
+    /// The input owner as last resolved by `process_authority` — the SEND path's copy.
+    ///
+    /// The send path uses it for two things, both about send ORDER: which body anchors a peer's interest radius,
+    /// and which body gets the ownership weight floor. A stale value there costs a slightly wrong priority for a
+    /// tick, never a wrong authority decision — which is why this is cached and [`Self::input_owner_peer`] is
+    /// not. The first implementation asked the LIVE question once per entity per peer per tick; at 100 peers
+    /// that is a hundredfold multiplier on an answer no peer's identity changes.
+    pub(crate) fn input_owner_hint(&self) -> i32 {
+        self.input_owner
+    }
+
     /// Whether the local peer owns this entity's state (is the simulating server).
     pub(crate) fn owns_state(&self) -> bool {
         self.state_local
+    }
+
+    /// The declared send-rota priority, clamped into the range the scorer accepts.
+    pub(crate) fn send_priority(&self) -> u32 {
+        self.priority
+            .clamp(1, orbitnet_core::priority::PRIORITY_MAX as i32) as u32
     }
 
     /// Whether this peer simulates the entity in the rollback loop.
@@ -760,7 +840,7 @@ impl OrbitRollbackSynchronizer {
             &mut out,
         )?;
         let result = if !applied {
-            StateIntegration::Rejected
+            StateIntegration::NoBase
         } else {
             self.integrate_authoritative_row(meta.tick, &out, current_tick)
         };
@@ -777,7 +857,7 @@ impl OrbitRollbackSynchronizer {
         let tick_i = i64::try_from(tick).unwrap_or(i64::MAX);
         if tick_i <= self.latest_state_tick && self.latest_state_tick >= 0 {
             // Out-of-order or duplicate snapshot; the newer one already integrated.
-            return StateIntegration::Rejected;
+            return StateIntegration::Stale;
         }
         self.latest_state_tick = tick_i;
 
@@ -792,7 +872,9 @@ impl OrbitRollbackSynchronizer {
 
         // Predicting path (owner reconcile, or the un-exempted remote-resim mode).
         if self.state_history.is_stale(tick) {
-            return StateIntegration::Rejected;
+            // Older than the rollback ring can hold. A full block for the same tick would be just
+            // as unusable, so this must not raise a NACK either.
+            return StateIntegration::Stale;
         }
         let mispredicted = match self.state_history.row(tick) {
             Some(recorded) => {
@@ -925,11 +1007,38 @@ pub struct OrbitStateSynchronizer {
     #[export]
     properties: PackedStringArray,
 
+    /// Interest relevancy: [`RELEVANCY_ALWAYS`] or [`RELEVANCY_ANCHORED`].
+    ///
+    /// Defaults to ALWAYS, which is the behaviour every state channel had before interest applied here — the lane
+    /// was not culled at all. A channel only becomes cullable when it *also* names a resolvable
+    /// `anchor_property`, so declaring relevancy without an anchor is inert rather than a way to
+    /// accidentally delete a body from somebody's world.
+    #[export]
+    relevancy: i32,
+
+    /// The world-space interest anchor, as a `"NodePath:property"` entry resolved against `root`.
+    ///
+    /// **Explicitly named, never inferred.** The obvious heuristic — "the first Vec3 the channel
+    /// replicates" — is actively wrong on this lane: a health channel's first Vec3 is as likely to be
+    /// a local-space impact offset, and an environment channel's an acceleration vector.
+    /// Binning either of those would park every one of those channels at the world origin and cull
+    /// it for everybody. The entry need **not** be one of `properties` — it costs no wire bytes and
+    /// is read live on the authority, which is the only peer that computes relevancy — so a channel
+    /// whose root is a plain `Node` can point at an ancestor's `global_position`.
+    #[export]
+    anchor_property: GString,
+
+    /// Send-rota priority, `1..=16`. See `OrbitRollbackSynchronizer::priority`.
+    #[export]
+    priority: i32,
+
     entity_id: u64,
     schema: SchemaBuilder,
     bindings: Vec<PropBinding>,
     unresolved: PackedStringArray,
     state_local: bool,
+    /// The resolved `anchor_property`, or `None` when unset, unresolvable or not a `Vector3`.
+    anchor: Option<(Gd<Node>, StringName)>,
     /// The authority's captured frontier row, and each receiver's newest applied tick/row.
     history: ColumnarHistory,
     latest_tick: i64,
@@ -944,11 +1053,15 @@ impl INode for OrbitStateSynchronizer {
             base,
             root: None,
             properties: PackedStringArray::new(),
+            relevancy: RELEVANCY_ALWAYS,
+            anchor_property: GString::new(),
+            priority: 1,
             entity_id: 0,
             schema: SchemaBuilder::new(),
             bindings: Vec::new(),
             unresolved: PackedStringArray::new(),
             state_local: false,
+            anchor: None,
             history: ColumnarHistory::new(0, 1),
             latest_tick: -1,
             pending: None,
@@ -1012,6 +1125,7 @@ impl OrbitStateSynchronizer {
                 self.entity_id = binding::fnv64(format!("S|{path}").as_bytes());
             }
         }
+        self.resolve_anchor(root.as_ref());
         let local_peer = self
             .base()
             .get_multiplayer()
@@ -1020,9 +1134,7 @@ impl OrbitStateSynchronizer {
         self.state_local = root
             .map(|n| n.get_multiplayer_authority() == local_peer)
             .unwrap_or(false);
-        // A short ring: receivers only need the newest applied row as a delta base, plus slack
-        // for reordering.
-        self.history = ColumnarHistory::new(self.schema.row_stride(), 8);
+        self.history = ColumnarHistory::new(self.schema.row_stride(), STATE_HISTORY_DEPTH);
         self.latest_tick = -1;
         self.pending = None;
 
@@ -1043,8 +1155,60 @@ impl OrbitStateSynchronizer {
         self.unresolved.clone()
     }
 
+    /// The tick of the newest authoritative row this channel has (-1 before any).
+    ///
+    /// The twin of `OrbitRollbackSynchronizer::get_last_known_state`, and the client half of the
+    /// S7: interest culling stops the updates but never removes the node, so a client that wants to
+    /// stop drawing a frozen body has to notice for itself that the rows stopped. This is how it
+    /// notices, and it covers packet loss and server stalls at no extra cost — which a leave
+    /// message on the wire, itself droppable, would not.
+    #[func]
+    fn get_last_known_state(&self) -> i64 {
+        self.latest_tick
+    }
+
+    /// Whether this channel declares a resolvable interest anchor (diagnostics and tests).
+    #[func]
+    fn is_anchored(&self) -> bool {
+        self.relevancy == RELEVANCY_ANCHORED && self.anchor.is_some()
+    }
+
     fn resolved_root(&self) -> Option<Gd<Node>> {
         self.root.clone().or_else(|| self.base().get_parent())
+    }
+
+    /// Resolve `anchor_property` into a live `(node, property)` pair, or report why it could not be.
+    ///
+    /// Every failure path leaves `anchor` as `None`, which means ALWAYS relevant — the fail-open
+    /// direction. A misconfigured anchor costs bandwidth; a silently-wrong one deletes a body from
+    /// somebody's world, which is the failure that must never be quiet.
+    fn resolve_anchor(&mut self, root: Option<&Gd<Node>>) {
+        self.anchor = None;
+        let entry = self.anchor_property.to_string();
+        if entry.is_empty() {
+            if self.relevancy == RELEVANCY_ANCHORED {
+                godot_warn!(
+                    "OrbitStateSynchronizer {}: relevancy is ANCHORED but anchor_property is empty \
+                     — this channel stays always-relevant.",
+                    self.base().get_path()
+                );
+            }
+            return;
+        }
+        match root.and_then(|r| binding::resolve_entry(r, &entry)) {
+            Some((target, name, PropKind::Vec3)) => self.anchor = Some((target, name)),
+            Some((_, _, kind)) => godot_error!(
+                "OrbitStateSynchronizer {}: anchor_property {entry:?} resolved to {kind:?}, not a \
+                 Vector3. An interest anchor must be a world-space position; this channel stays \
+                 always-relevant rather than being culled against something that is not one.",
+                self.base().get_path()
+            ),
+            None => godot_error!(
+                "OrbitStateSynchronizer {}: anchor_property {entry:?} did not resolve against the \
+                 root — this channel stays always-relevant.",
+                self.base().get_path()
+            ),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1054,6 +1218,28 @@ impl OrbitStateSynchronizer {
     /// Whether the local peer owns (and therefore broadcasts) this entity.
     pub(crate) fn owns_state(&self) -> bool {
         self.state_local
+    }
+
+    /// The declared send-rota priority, clamped into the range the scorer accepts.
+    pub(crate) fn send_priority(&self) -> u32 {
+        self.priority
+            .clamp(1, orbitnet_core::priority::PRIORITY_MAX as i32) as u32
+    }
+
+    /// This channel's world-space interest anchor, read live from `anchor_property`.
+    ///
+    /// `None` — meaning always-relevant — when the channel declares ALWAYS, when the anchor did not
+    /// resolve, or when the node behind it has been freed. Only the authority calls this, and the
+    /// authority owns the value, so reading it live is both correct and cheaper than replicating a
+    /// position the wire does not otherwise need.
+    pub(crate) fn position_hint(&self) -> Option<[f32; 3]> {
+        if self.relevancy != RELEVANCY_ANCHORED {
+            return None;
+        }
+        let (node, name) = self.anchor.as_ref()?;
+        let node = crate::orbit_net::live_handle(node)?;
+        let value = node.get(name).try_to::<Vector3>().ok()?;
+        Some([value.x, value.y, value.z])
     }
 
     /// Capture the live values as the authority's frontier row for `tick`.
@@ -1128,11 +1314,11 @@ impl OrbitStateSynchronizer {
             &mut out,
         )?;
         let result = if !applied {
-            StateIntegration::Rejected
+            StateIntegration::NoBase
         } else {
             let tick_i = i64::try_from(meta.tick).unwrap_or(i64::MAX);
             if tick_i <= self.latest_tick {
-                StateIntegration::Rejected
+                StateIntegration::Stale
             } else {
                 self.latest_tick = tick_i;
                 self.history.write_row(meta.tick, &out);

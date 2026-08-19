@@ -45,6 +45,12 @@ func is_predicting() -> bool:
 func get_last_known_state() -> int:
 	return _sync.get_last_known_state() if _sync != null else -1
 
+## The tick of the newest input row in this body's ring (-1 when inert, or before any row arrives).
+## On the authority for a wire-driven body this is the input lane's frontier: `tick - last_known_input()`
+## is how long that lane has been silent, which is what the stale-input coast rule keys on.
+func get_last_known_input() -> int:
+	return _sync.get_last_known_input() if _sync != null else -1
+
 ## Record a per-tick memo value keyed (tick, key) -- the backend-owned resim log (#103/#67). Record on the
 ## is_fresh pass; every replayed pass reads the same value back, so a resim resolves against what the fresh
 ## pass saw (e.g. the weapon category held at the fire tick) even if live state changed since. Trimmed with

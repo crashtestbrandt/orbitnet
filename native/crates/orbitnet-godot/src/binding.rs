@@ -8,8 +8,8 @@
 //!
 //! The role split matters during rollback: `State` and `Input` are restored before a replayed
 //! tick; `Cosmetic` is captured and replicated but never restored and never counted as a
-//! misprediction (see `docs/orbitnet-native.md` §5.3 — the test is "does the simulation read it
-//! back", and `eva_state.gd` is the authority on which props qualify).
+//! misprediction (see docs/api.md — the test is "does the simulation read it
+//! back", and the game's own state script is the authority on which props qualify).
 
 use godot::classes::Node;
 use godot::prelude::*;

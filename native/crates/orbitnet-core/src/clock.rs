@@ -155,11 +155,43 @@ impl ClockEstimator {
     }
 
     /// Whether the offset is too large to walk off with a stretch and needs a hard reseek.
+    ///
+    /// **Prefer [`Self::needs_hard_resync_with_lead`].** This form compares the RAW offset, which is only
+    /// the control error for a peer that wants zero offset. A client does not: it must run AHEAD of the
+    /// server so its input arrives before the tick that consumes it, so its offset settles at minus the
+    /// lead it has dialled in, and testing the raw value fires the panic path on a perfectly healthy client.
     #[must_use]
     pub fn needs_hard_resync(&self, panic_threshold: f64) -> bool {
-        panic_threshold.is_finite()
-            && panic_threshold > 0.0
-            && self.offset().abs() > panic_threshold
+        self.needs_hard_resync_with_lead(panic_threshold, 0.0)
+    }
+
+    /// Whether the RESIDUAL — the error the caller's controller is actually driving to zero — is too large
+    /// to walk off with a stretch.
+    ///
+    /// `lead_seconds` is how far ahead of the server the caller intends to run, so the residual is
+    /// `offset + lead_seconds` and a client holding exactly its intended lead reports zero however large
+    /// that lead is. Comparing the raw offset instead made the panic path self-sustaining: it fired on a
+    /// correctly-leading client, the reseek that followed targeted zero offset and discarded the lead, the
+    /// controller drove straight back to it, and it fired again — measured at about thirty hard resyncs per
+    /// minute on a rendered client over a LAN, each one reseeking the tick and forcing a full snapshot.
+    /// **A PANIC PATH MAY NOT FIRE ON THE ABSENCE OF A MEASUREMENT.** With no samples `offset()` reports
+    /// `0.0` — which is not "the clocks agree", it is "nobody has looked" — and the residual then reads as
+    /// the whole intended lead. That is not hypothetical: the reseek this test guards calls
+    /// [`Self::clear`] itself, so the very next tick evaluates a residual derived from nothing. At 60 Hz the
+    /// clamped 8-tick lead is 133 ms and stays under the 250 ms threshold by luck; at the 30 Hz decoupled
+    /// tick the 100-player target runs on it is 267 ms, and the reseek re-armed itself every tick, restoring
+    /// exactly the storm the lead term was added to stop — at the one rate nothing measures.
+    #[must_use]
+    pub fn needs_hard_resync_with_lead(&self, panic_threshold: f64, lead_seconds: f64) -> bool {
+        if !panic_threshold.is_finite() || panic_threshold <= 0.0 || self.samples.is_empty() {
+            return false;
+        }
+        let lead = if lead_seconds.is_finite() {
+            lead_seconds
+        } else {
+            0.0
+        };
+        (self.offset() + lead).abs() > panic_threshold
     }
 }
 
@@ -172,6 +204,94 @@ impl Default for ClockEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client holding exactly the lead it intends is NOT in trouble, however big the lead is.
+    #[test]
+    fn a_client_holding_its_intended_lead_does_not_panic() {
+        let mut clock = ClockEstimator::default();
+        // 8 ticks of lead at 60 Hz is 133 ms, which is what `lead_bias_ticks` clamps to.
+        let lead = 8.0 / 60.0;
+        for _ in 0..4 {
+            clock.push_sample(0.02, -lead);
+        }
+        assert!(
+            !clock.needs_hard_resync_with_lead(0.25, lead),
+            "offset == -lead is zero residual: the controller is exactly where it wants to be"
+        );
+    }
+
+    /// ...and the loop this replaced: a lead large enough to trip the raw threshold on its own.
+    #[test]
+    fn the_raw_form_fires_on_a_healthy_client_and_the_lead_aware_form_does_not() {
+        let mut clock = ClockEstimator::default();
+        let lead = 0.30; // deliberately past the 0.25 panic threshold
+        for _ in 0..4 {
+            clock.push_sample(0.02, -lead);
+        }
+        assert!(
+            clock.needs_hard_resync(0.25),
+            "the raw offset alone trips the threshold -- this is the bug"
+        );
+        assert!(
+            !clock.needs_hard_resync_with_lead(0.25, lead),
+            "but the residual is zero, so nothing is wrong and nothing should reseek"
+        );
+    }
+
+    /// Genuine trouble must still be caught, or the panic path stops doing its job.
+    #[test]
+    fn a_real_excursion_still_reseeks() {
+        let mut clock = ClockEstimator::default();
+        let lead = 8.0 / 60.0;
+        for _ in 0..4 {
+            clock.push_sample(0.02, -lead - 0.5);
+        }
+        assert!(
+            clock.needs_hard_resync_with_lead(0.25, lead),
+            "half a second of residual is exactly what the reseek exists for"
+        );
+        let mut ahead = ClockEstimator::default();
+        for _ in 0..4 {
+            ahead.push_sample(0.02, 0.9);
+        }
+        assert!(
+            ahead.needs_hard_resync_with_lead(0.25, lead),
+            "and it is symmetric -- a client far BEHIND is in trouble too"
+        );
+    }
+
+    /// THE RESEEK MUST NOT RE-ARM ITSELF, and the rate where it did is the one nothing measures.
+    ///
+    /// `maybe_hard_resync` clears the estimator as part of reseeking, so the tick immediately after a reseek
+    /// asks this question with an EMPTY window. `offset()` answers `0.0` there -- meaning "nobody has looked",
+    /// not "the clocks agree" -- and the residual then reads as the whole intended lead. At 60 Hz the clamped
+    /// 8-tick lead is 133 ms and squeaks under the 250 ms threshold; at the 30 Hz decoupled tick the 100-player
+    /// target runs on it is 267 ms, so the reseek fired again, and again, every tick.
+    #[test]
+    fn a_reseek_that_cleared_the_window_does_not_immediately_re_arm() {
+        let mut clock = ClockEstimator::default();
+        for _ in 0..4 {
+            clock.push_sample(0.02, -1.0);
+        }
+        let lead_30hz = 8.0 / 30.0; // 267 ms -- past the panic threshold on its own
+        assert!(
+            clock.needs_hard_resync_with_lead(0.25, lead_30hz),
+            "a one-second offset is genuine trouble and must reseek"
+        );
+        clock.clear(); // ...which is what the reseek itself does
+        assert!(
+            !clock.needs_hard_resync_with_lead(0.25, lead_30hz),
+            "with no samples there is no measurement to panic about -- the lead alone is not a residual"
+        );
+        // ...and once real samples arrive at the post-reseek steady state, it stays quiet.
+        for _ in 0..4 {
+            clock.push_sample(0.02, -lead_30hz);
+        }
+        assert!(
+            !clock.needs_hard_resync_with_lead(0.25, lead_30hz),
+            "a client holding its 30 Hz lead is exactly where the controller wants it"
+        );
+    }
 
     #[test]
     fn empty_estimator_is_neutral() {

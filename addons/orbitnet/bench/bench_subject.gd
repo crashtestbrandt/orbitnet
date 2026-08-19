@@ -8,6 +8,9 @@ class_name BenchSubject
 ## tick-domain gates -- is already pure. This class is those four things, and implementing it is the entire
 ## cost of pointing netbench at a new game.
 ##
+## [method remote_bodies] is a fifth, and it is OPTIONAL rather than one of the four: leave it alone and every
+## gate still runs, minus the remote-cadence reading.
+##
 ## Subclass it, and hand an instance to [BenchProbe.subject] before the probe enters the tree:
 ##
 ##     var probe := BenchProbe.new()
@@ -94,6 +97,18 @@ func capture_input() -> Dictionary:
 ## cannot.
 func sample(_body: Node) -> Dictionary:
 	return {}
+
+## The REMOTE bodies this peer is watching -- every replicated body that is not the local one. OPTIONAL: the
+## default publishes nothing, and a game that leaves it alone simply gets no cadence reading.
+##
+## [BenchMetrics] feeds these to [RemoteCadence], which answers "how often does a remote body's authoritative
+## pose actually reach this client" -- the one thing a player complains about that no local-player metric can
+## see. Only [Node3D]s are measured, since the reading is a pose change and a distance.
+##
+## Return whatever the game already has to hand (a group query, a spawner's registry); this is called once per
+## net tick, so a walk of the whole scene tree is the wrong implementation.
+func remote_bodies() -> Array[Node]:
+	return []
 
 ## Called once when the bench run finishes, so a subject can drop signal connections and hand the body back
 ## to live input. The default releases input, which is right for almost every implementation.
