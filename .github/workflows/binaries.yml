@@ -28,16 +28,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
+            # Pushes to main and workflow_dispatch both require write access to this repository, unlike
+            # check.yml's pull_request gate -- see that file's header for why THAT one must stay
+            # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
+            # here.
+            runner: [self-hosted, Linux, X64, legion]
             artifact: liborbitnet.linux.x86_64.so
             built: native/target/release/liborbitnet.so
-          - os: windows-latest
+          - os: windows
+            runner: [self-hosted, Windows, X64, legion-win]
             artifact: orbitnet.windows.x86_64.dll
             built: native/target/release/orbitnet.dll
-          - os: macos-latest
+          - os: macos
+            runner: [self-hosted, macOS, ARM64, legion-mac]
             artifact: liborbitnet.macos.universal.dylib
             built: native/target/release/liborbitnet.dylib
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,9 +55,10 @@ jobs:
 
       # macOS builds BOTH architectures and lipos them together. A single-arch dylib works on the machine
       # that built it and fails on the other half of the Mac install base, which is the kind of bug that
-      # only shows up in a bug report from a user you cannot reproduce.
+      # only shows up in a bug report from a user you cannot reproduce. legion-mac is ARM64, but that is
+      # only the HOST -- both targets are cross-built and combined regardless of which arch the runner is.
       - name: Build (macOS universal)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +78,7 @@ jobs:
           lipo -info target/release/liborbitnet.dylib
 
       - name: Build
-        if: matrix.os != 'macos-latest'
+        if: matrix.os != 'macos'
         shell: bash
         run: cd native && cargo build --release -p orbitnet-godot
 
