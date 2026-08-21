@@ -15,7 +15,7 @@ class_name BenchGate
 ##     thrashing) and hard stretch excursions rare.
 ##   * reconciliation converges -- the smoother resolves corrections without an unreasonable run of hard SNAPs
 ##     (a snap storm means prediction never catches up). This is the real "prediction still works" signal.
-## Rollback resim DEPTH is REPORTED, not gated: under latency the resim window legitimately deepens (the #214
+## Rollback resim DEPTH is REPORTED, not gated: under latency the resim window legitimately deepens (the
 ## cost), bounded by the backend's history_limit -- broken prediction shows up as snaps, not depth. Thresholds SCALE
 ## with the profile: a 250ms worst_case link legitimately shows more RTT/jitter/stretch than broadband, so the
 ## bounds are derived from the profile rather than fixed, and `clean` is held to the tightest bar.

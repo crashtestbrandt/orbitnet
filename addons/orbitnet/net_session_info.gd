@@ -1,6 +1,6 @@
 extends RefCounted
 class_name NetSessionInfo
-## One joinable session as the join browser sees it (#280). A PURE, Steam-blind value object: the transport
+## One joinable session as the join browser sees it. A PURE, Steam-blind value object: the transport
 ## factory ([NetTransport]) hands these out and the [SessionMenu] browser renders them, so neither the UI nor
 ## the session layer ever names Steam. On a Steam build [SteamTransport] fills each field from a discovered lobby's
 ## metadata (owner persona name, live member count, the advertised cap, the friends-only flag); on a non-Steam

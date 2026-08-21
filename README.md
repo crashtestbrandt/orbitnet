@@ -86,13 +86,18 @@ feels and what ping does not measure. Six keybound levers change it live.
 
 Known and filed, not hidden:
 
-- **AOI culls the rollback lane only.** State-lane entities always replicate.
-- **No per-peer visibility veto**, so any game needing fog of war can be maphacked.
-- **No send-budget knob or per-entity priority.** The budget is a constant; entities are served stalest-first.
-- **No state-lane health metrics** (`entities_deferred`, `worst_staleness_ticks`, `snapshot_bytes`).
-- **`@half` silently no-ops on invalid pairings** instead of warning.
+- **No per-peer visibility veto.** Interest culling stops an entity's rows; it never withholds the entity, so a
+  game needing fog of war can be maphacked.
+- **Interest is spatial only, and the anchor is inferred.** A peer's radius is centred on the lowest-id rollback
+  entity that peer drives, so a peer driving more than one gets its world centred on whichever that is. There is
+  no membership key, so two worlds sharing a coordinate space cannot be told apart.
+- **Nothing despawns.** A culled entity freezes at its last received pose rather than leaving the scene.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
-- **Interest anchors are not configurable** — always the peer's own rollback body.
+- **`@half` silently no-ops on invalid pairings** instead of warning.
+- **The retained interest grid is unused.** It reports no leave list, and a leave has to clear the peer's delta
+  bookkeeping, so the linear scan is what ships.
+- **No reconnection and no packet authentication.** A dropped client loses its entity, and the wire carries
+  nothing beyond a per-entity authority check.
 
 ## Licence
 

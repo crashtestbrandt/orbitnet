@@ -1,7 +1,7 @@
 extends RefCounted
 class_name NetRollbackHandle
 ## Opaque handle around the vendored rollback synchronizer, created by orbitnet/net.gd. Game code drives owner
-## prediction + reconciliation (#63) THROUGH this handle so it never names the backend (the net-check gate). The
+## prediction + reconciliation THROUGH this handle so it never names the backend (the net-check gate). The
 ## wrapped synchronizer is held as a plain Node; method calls onto it are method NAMES (not backend symbols), so
 ## this file stays clear of the facade boundary.
 ##
@@ -17,12 +17,12 @@ func _init(sync: Node) -> void:
 func is_active() -> bool:
 	return _sync != null
 
-## Register a synchronized STATE property (e.g. the fields of the body's serialized simulation state) -- #63.
+## Register a synchronized STATE property (e.g. the fields of the body's serialized simulation state).
 func add_state(node: Object, property: String) -> void:
 	if _sync != null:
 		_sync.add_state(node, property)
 
-## Register a synchronized INPUT property (the per-tick input frame the owning client authored) -- #63.
+## Register a synchronized INPUT property (the per-tick input frame the owning client authored).
 func add_input(node: Object, property: String) -> void:
 	if _sync != null:
 		_sync.add_input(node, property)
@@ -51,7 +51,7 @@ func get_last_known_state() -> int:
 func get_last_known_input() -> int:
 	return _sync.get_last_known_input() if _sync != null else -1
 
-## Record a per-tick memo value keyed (tick, key) -- the backend-owned resim log (#103/#67). Record on the
+## Record a per-tick memo value keyed (tick, key) -- the backend-owned resim log. Record on the
 ## is_fresh pass; every replayed pass reads the same value back, so a resim resolves against what the fresh
 ## pass saw (e.g. the weapon category held at the fire tick) even if live state changed since. Trimmed with
 ## rollback history. No-op when inert (offline reads fall through to the caller's live value).
