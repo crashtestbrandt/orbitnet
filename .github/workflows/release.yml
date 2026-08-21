@@ -120,6 +120,21 @@ jobs:
         shell: bash
         run: tools/build-native.sh build ${{ matrix.platform }} staged-profiling profiling
 
+      # macOS debug information is a .dSYM BUNDLE -- a directory. A release asset is a single file, so it
+      # is tarred here rather than at publish time, on the machine that produced it.
+      - name: Pack the macOS debug bundle
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged-profiling
+          for d in *.dSYM; do
+            [ -d "$d" ] || continue
+            tar -czf "$d.tar.gz" "$d"
+            rm -rf "$d"
+          done
+          ls -l
+
       - uses: actions/upload-artifact@v4
         with:
           name: orbitnet-${{ matrix.platform }}
