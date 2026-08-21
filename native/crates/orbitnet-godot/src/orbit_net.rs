@@ -33,7 +33,7 @@ use orbitnet_core::codec::{
     input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
     Handshake, ManifestEntry, Ping, Pong, Reader, Welcome, Writer, MAGIC, MAX_FRAME_PAYLOAD,
 };
-use orbitnet_core::interest::InterestCandidate;
+use orbitnet_core::interest::{InterestCandidate, MembershipId, MEMBERSHIP_GLOBAL};
 use orbitnet_core::priority::{self, Band};
 use orbitnet_core::{
     AoiConfig, ClockEstimator, CoupledSlew, LeadTracker, PeerInterest, ResimPlanner,
@@ -108,10 +108,35 @@ struct EntityRow {
     /// The peer whose input drives this entity, or 0 when nobody's does.
     owner: i32,
     /// World-space interest anchor, or `None` when the entity declares none — which means it is
-    /// unconditionally relevant, the direction that fails open.
+    /// unconditionally relevant *within its membership*, the direction that fails open.
     anchor: Option<[f32; 3]>,
+    /// The world this entity is in, or [`MEMBERSHIP_GLOBAL`] for every world.
+    ///
+    /// A separate axis from `anchor`, and the two fail independently: an entity whose anchor did not
+    /// resolve is still bounded to the world it declares, because a declaration is not a
+    /// measurement and did not fail. See the `interest` module header in `orbitnet-core`.
+    membership: MembershipId,
     /// Declared send priority, already clamped.
     priority: u32,
+}
+
+/// What one peer's interest is measured against: where it observes from, and which world it is in.
+///
+/// Both facts come from the **same row** — the lowest-id entity whose input authority is that peer
+/// and which resolved an anchor. A peer's membership has no home of its own on the wire or in the
+/// registry, and taking it from the body that already anchors the peer's radius keeps the two
+/// answers about one entity rather than about two that could disagree.
+///
+/// A peer with no such row has no entry here at all: it is not distance-culled, and its membership
+/// reads as [`MEMBERSHIP_GLOBAL`], so it sees every world. Both halves fail open together, which is
+/// the only defensible direction — blanking a peer's world because its avatar has not spawned yet
+/// is not.
+#[derive(Clone, Copy)]
+struct PeerObserver {
+    /// The centre the peer's interest radius is measured from.
+    center: [f32; 3],
+    /// The world the peer is in.
+    membership: MembershipId,
 }
 
 /// The windowed send-path accounting `Net.bandwidth_metrics()` republishes.
@@ -568,7 +593,7 @@ pub struct OrbitNet {
 
     // --- send-path allocation pools, reused every tick so a warm frame allocates nothing ---
     aoi_rows: Vec<EntityRow>,
-    aoi_anchors: HashMap<i32, [f32; 3]>,
+    aoi_observers: HashMap<i32, PeerObserver>,
     aoi_candidates: Vec<InterestCandidate>,
     aoi_dist_scratch: Vec<(u64, f32)>,
     /// This peer's candidate set for the order build: `(id, distance²)`. Filled from the peer's
@@ -670,7 +695,7 @@ impl INode for OrbitNet {
             win_starve_ticks_max: 0,
             win_unsent_backlog_max: 0,
             aoi_rows: Vec::new(),
-            aoi_anchors: HashMap::new(),
+            aoi_observers: HashMap::new(),
             aoi_candidates: Vec::new(),
             aoi_dist_scratch: Vec::new(),
             aoi_members: Vec::new(),
@@ -1978,15 +2003,22 @@ impl OrbitNet {
 
         let interest_started = Instant::now();
         let mut rows = std::mem::take(&mut self.aoi_rows);
-        let mut anchors = std::mem::take(&mut self.aoi_anchors);
-        self.collect_entity_rows(&mut rows, &mut anchors);
+        let mut observers = std::mem::take(&mut self.aoi_observers);
+        self.collect_entity_rows(&mut rows, &mut observers);
         // Ascending by id, so the per-peer walk over an (ascending) interest set can binary-search
         // back to the row rather than carrying a per-tick map — and so the anchor pick below is a
         // fact about the scene rather than about `HashMap` iteration order.
         rows.sort_unstable_by_key(|row| row.id);
-        if culling {
-            Self::collect_anchors(&rows, &mut anchors);
-            self.update_interest(&peer_ids, &rows, &anchors);
+        // WHETHER THE FILTER CAN REFUSE ANYTHING AT ALL — the gate the comment above is about, now
+        // that there are two levers rather than one. Membership is not a radius: a game that
+        // separates worlds and sets no `aoi_radius` still needs the pass to run, because refusing an
+        // overlapping world is the only culling it asked for. Answered from the gathered rows rather
+        // than from a config value, since a membership is a per-entity declaration and no setting
+        // announces that any entity made one.
+        let filtering = culling || rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL);
+        if filtering {
+            Self::collect_observers(&rows, &mut observers);
+            self.update_interest(&peer_ids, &rows, &observers);
         }
         self.acc_interest_us += interest_started.elapsed().as_micros() as u64;
         self.acc_interest_ticks += 1;
@@ -2014,11 +2046,17 @@ impl OrbitNet {
 
             // --- order, over the surviving set only ---
             //
-            // With culling off there IS no surviving set — every row is a candidate, at a distance
-            // no radius will be compared against, which `band_of` reports as `Near` for all of them.
-            // Reading `peer.interest` there would read a structure nothing has maintained.
+            // With the filter off there IS no surviving set — every row is a candidate, at a
+            // distance no radius will be compared against, which `band_of` reports as `Near` for all
+            // of them. Reading `peer.interest` there would read a structure nothing has maintained.
+            //
+            // The gate is `filtering`, not `culling`: with memberships declared and no radius, the
+            // pass DID run and `peer.interest` is exactly the set that survived it. `band_for_row`
+            // below still takes `culling`, because a membership refusal produces no distance and so
+            // no band — every surviving row takes the one constant weight, as it does with the
+            // radius off.
             members.clear();
-            if culling {
+            if filtering {
                 let Some(peer) = self.peers.get(&peer_id) else {
                     continue;
                 };
@@ -2258,7 +2296,7 @@ impl OrbitNet {
         }
 
         self.aoi_rows = rows;
-        self.aoi_anchors = anchors;
+        self.aoi_observers = observers;
         self.order_scratch = order;
         self.aoi_members = members;
     }
@@ -2289,15 +2327,19 @@ impl OrbitNet {
         }
     }
 
-    /// Gather every replicated entity's owner, anchor and priority — **once per tick**.
+    /// Gather every replicated entity's owner, anchor, membership and priority — **once per tick**.
     ///
-    /// `input_owner_peer()` is a Godot `get_multiplayer_authority()` call and `position_hint()` on
-    /// the state lane is a live property read; doing either once per peer is the O(peers × entities)
-    /// cost this pass exists to delete. `anchors` maps a peer to the position of the body it drives,
-    /// which is the centre its interest radius is measured from.
-    fn collect_entity_rows(&self, rows: &mut Vec<EntityRow>, anchors: &mut HashMap<i32, [f32; 3]>) {
+    /// `input_owner_peer()` is a Godot `get_multiplayer_authority()` call, and `position_hint()` and
+    /// `membership_hint()` are live property reads; doing any of them once per peer is the
+    /// O(peers × entities) cost this pass exists to delete. `observers` is cleared here and filled
+    /// by [`Self::collect_observers`] once the rows are sorted.
+    fn collect_entity_rows(
+        &self,
+        rows: &mut Vec<EntityRow>,
+        observers: &mut HashMap<i32, PeerObserver>,
+    ) {
         rows.clear();
-        anchors.clear();
+        observers.clear();
         for (&id, sync) in &self.rollback_entities {
             let Some(sync) = live_handle(sync) else {
                 continue;
@@ -2305,12 +2347,14 @@ impl OrbitNet {
             let bound = sync.bind();
             let owner = bound.input_owner_hint();
             let anchor = bound.position_hint();
+            let membership = bound.membership_hint();
             let priority = bound.send_priority();
             drop(bound);
             rows.push(EntityRow {
                 id,
                 owner,
                 anchor,
+                membership,
                 priority,
             });
         }
@@ -2319,21 +2363,26 @@ impl OrbitNet {
                 continue;
             };
             let bound = sync.bind();
-            // `None` here is the ALWAYS declaration, not a missing value: a state channel is culled
-            // only when it names an anchor that resolved to a Vector3.
+            // `None` here is the "no distance to cull by" declaration, not a missing value: a state
+            // channel is distance-culled only when it names an anchor that resolved to a Vector3.
+            // It says nothing about the channel's world, which is the next line and is what lets a
+            // positionless channel — health, inventory, a door — be bounded at all.
             let anchor = bound.position_hint();
+            let membership = bound.membership_hint();
             let priority = bound.send_priority();
             drop(bound);
             rows.push(EntityRow {
                 id,
                 owner: 0,
                 anchor,
+                membership,
                 priority,
             });
         }
     }
 
-    /// The world position each peer's interest radius is measured from: the entity that peer drives.
+    /// Where each peer observes from and which world it is in: both read off the entity that peer
+    /// drives.
     ///
     /// **Called on rows already sorted by id, and it keeps the LOWEST id per owner.** `rows` is
     /// gathered by walking a `HashMap`, so a last-writer-wins insert would pick a different entity
@@ -2341,14 +2390,22 @@ impl OrbitNet {
     /// interest centred somewhere iteration order chose. In a game where each peer drives exactly
     /// one rollback body the rule is unobservable; it is written down because the failure it
     /// prevents is a whole peer's world quietly centring on the wrong thing.
-    fn collect_anchors(rows: &[EntityRow], anchors: &mut HashMap<i32, [f32; 3]>) {
-        anchors.clear();
+    ///
+    /// **One row supplies both facts.** A row with no resolved anchor is skipped entirely rather
+    /// than contributing its membership, so a peer's centre and its world always describe the same
+    /// body. Splitting the picks would let a peer be centred on one entity and filtered against
+    /// another's world, which is the same class of failure the lowest-id rule exists to prevent.
+    fn collect_observers(rows: &[EntityRow], observers: &mut HashMap<i32, PeerObserver>) {
+        observers.clear();
         for row in rows {
             if row.owner <= 0 {
                 continue;
             }
-            if let Some(pos) = row.anchor {
-                anchors.entry(row.owner).or_insert(pos);
+            if let Some(center) = row.anchor {
+                observers.entry(row.owner).or_insert(PeerObserver {
+                    center,
+                    membership: row.membership,
+                });
             }
         }
     }
@@ -2366,7 +2423,7 @@ impl OrbitNet {
         &mut self,
         peer_ids: &[i32],
         rows: &[EntityRow],
-        anchors: &HashMap<i32, [f32; 3]>,
+        observers: &HashMap<i32, PeerObserver>,
     ) {
         let cfg = self.aoi_config();
         let mut candidates = std::mem::take(&mut self.aoi_candidates);
@@ -2375,24 +2432,26 @@ impl OrbitNet {
         let mut culled = 0u64;
 
         for &peer_id in peer_ids {
-            let center = anchors.get(&peer_id).copied();
-            // No radius, or no body to measure from: everything stays relevant. Blanking a peer's
-            // world because its avatar has not spawned yet is not a defensible failure mode.
-            let culling = cfg.enter_radius > 0.0 && center.is_some();
+            let observer = observers.get(&peer_id).copied();
+            // No radius, or no body to measure from: everything stays relevant *on distance*.
+            // Blanking a peer's world because its avatar has not spawned yet is not a defensible
+            // failure mode. Membership is a separate axis and is not switched off here — an
+            // observer with no body reads as MEMBERSHIP_GLOBAL below, which matches every world, so
+            // that case fails open too.
+            let culling = cfg.enter_radius > 0.0 && observer.is_some();
+            let observer_membership = observer.map_or(MEMBERSHIP_GLOBAL, |o| o.membership);
             candidates.clear();
-            for row in rows {
-                let cullable = culling && row.owner != peer_id;
-                match (cullable, row.anchor) {
-                    (true, Some(pos)) => candidates.push(InterestCandidate::anchored(row.id, pos)),
-                    _ => candidates.push(InterestCandidate::always(row.id)),
-                }
-            }
+            candidates.extend(
+                rows.iter()
+                    .map(|row| candidate_for_row(row, peer_id, culling)),
+            );
             let Some(peer) = self.peers.get_mut(&peer_id) else {
                 continue;
             };
             peer.interest.update_linear_into(
                 &cfg,
-                center.unwrap_or([0.0; 3]),
+                observer.map_or([0.0; 3], |o| o.center),
+                observer_membership,
                 &candidates,
                 &mut scratch,
                 &mut leaves,
@@ -2815,6 +2874,36 @@ fn band_for_row(culling: bool, has_anchor: bool, dist_sq: f32, band_scale: f32) 
     }
 }
 
+/// How one gathered row is offered to one peer's interest filter. A free function so the rule the
+/// send loop runs is the rule a test can call.
+///
+/// Three cases, in the order they are decided:
+///
+/// 1. **The peer's own body** — `always` in every world. Never culled by anything, and deliberately
+///    not membership-tested: the peer's membership was read off this very row, so the test could
+///    only restate a tautology, or, for a peer that drives bodies in two worlds, cull that peer's
+///    own avatar out of its own view.
+/// 2. **A row with a resolved anchor, with culling on** — distance-culled from that anchor, within
+///    the world the row declares.
+/// 3. **Everything else** — a row that declares no anchor, one whose anchor did not resolve, and
+///    every row when culling is off: `always` **within the world the row declares**. The distance
+///    half fails open because a missing anchor is a measurement that failed; the membership half
+///    does not, because a membership is a declaration and did not.
+///
+/// Case 3 is the one the feature exists for. It is where a positionless state channel — health,
+/// inventory, a door's state — lands, and before a membership existed it had exactly one setting:
+/// every peer in every world.
+#[must_use]
+fn candidate_for_row(row: &EntityRow, peer_id: i32, culling: bool) -> InterestCandidate {
+    if row.owner == peer_id {
+        return InterestCandidate::always(row.id);
+    }
+    match (culling, row.anchor) {
+        (true, Some(pos)) => InterestCandidate::anchored_in(row.id, pos, row.membership),
+        _ => InterestCandidate::always_in(row.id, row.membership),
+    }
+}
+
 /// Whether this entity's next block for this peer must be a full row. A free function so the rule
 /// the send loop runs is the rule a test can call.
 ///
@@ -2842,10 +2931,140 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 #[cfg(test)]
 mod tests {
     use super::{
-        band_for_row, classify_rx, full_block_due, PeerState, RxOutcome, StateIntegration,
-        FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
+        band_for_row, candidate_for_row, classify_rx, full_block_due, EntityRow, OrbitNet,
+        PeerObserver, PeerState, RxOutcome, StateIntegration, FULL_STATE_INTERVAL,
+        RTT_SAMPLE_MAX_MS, RTT_WINDOW,
     };
+    use orbitnet_core::interest::{InterestCandidate, MembershipId, MEMBERSHIP_GLOBAL};
     use orbitnet_core::priority::Band;
+    use std::collections::HashMap;
+
+    // ------------------------------------------------------------------
+    // Membership: how a gathered row reaches the filter, and where a peer's own world comes from.
+    // ------------------------------------------------------------------
+
+    fn row(id: u64, owner: i32, anchor: Option<[f32; 3]>, membership: MembershipId) -> EntityRow {
+        EntityRow {
+            id,
+            owner,
+            anchor,
+            membership,
+            priority: 1,
+        }
+    }
+
+    /// The case the feature exists for. A channel with no anchor has no distance to be culled by, so
+    /// it goes in as `always` — but `always` must now carry the row's world, or the channel keeps its
+    /// one pre-membership setting of "every peer in every world".
+    #[test]
+    fn a_row_with_no_anchor_is_always_relevant_within_its_own_world() {
+        let candidate = candidate_for_row(&row(7, 0, None, 3), 42, true);
+        assert_eq!(candidate, InterestCandidate::always_in(7, 3));
+        assert!(candidate.always, "no anchor still means no distance test");
+        assert_eq!(
+            candidate.membership, 3,
+            "and it is still bounded to world 3"
+        );
+    }
+
+    /// An anchor that did not resolve fails open on DISTANCE. Its membership is a declaration rather
+    /// than a measurement and did not fail, so it must not fail open too.
+    #[test]
+    fn an_unresolved_anchor_fails_open_on_distance_only() {
+        for culling in [true, false] {
+            let candidate = candidate_for_row(&row(7, 0, None, 9), 42, culling);
+            assert!(candidate.always);
+            assert_eq!(candidate.membership, 9);
+        }
+        // ...and with culling off, a row that DOES have an anchor takes the same treatment: no
+        // distance to test against, world still enforced.
+        let candidate = candidate_for_row(&row(7, 0, Some([1.0, 2.0, 3.0]), 9), 42, false);
+        assert_eq!(candidate, InterestCandidate::always_in(7, 9));
+    }
+
+    /// A peer's own body is never culled by anything, membership included — the peer's world was read
+    /// off this very row, and a peer driving bodies in two worlds must not lose its own avatar.
+    #[test]
+    fn a_peers_own_body_is_always_relevant_in_every_world() {
+        for membership in [MEMBERSHIP_GLOBAL, 1, MembershipId::MAX] {
+            let candidate =
+                candidate_for_row(&row(7, 42, Some([500.0, 0.0, 0.0]), membership), 42, true);
+            assert_eq!(
+                candidate,
+                InterestCandidate::always(7),
+                "the peer's own body goes in global, whatever world the row declares"
+            );
+        }
+    }
+
+    /// An anchored row under culling carries both axes: the position for the radius, the declared
+    /// world for the membership test.
+    #[test]
+    fn an_anchored_row_carries_its_position_and_its_world() {
+        let candidate = candidate_for_row(&row(7, 5, Some([1.0, 2.0, 3.0]), 4), 42, true);
+        assert_eq!(
+            candidate,
+            InterestCandidate::anchored_in(7, [1.0, 2.0, 3.0], 4)
+        );
+        assert!(!candidate.always);
+    }
+
+    /// A game that declares no worlds produces exactly the candidates it did before memberships
+    /// existed.
+    #[test]
+    fn declaring_no_membership_reproduces_the_pre_membership_candidates() {
+        assert_eq!(
+            candidate_for_row(
+                &row(7, 5, Some([1.0, 2.0, 3.0]), MEMBERSHIP_GLOBAL),
+                42,
+                true
+            ),
+            InterestCandidate::anchored(7, [1.0, 2.0, 3.0])
+        );
+        assert_eq!(
+            candidate_for_row(&row(7, 5, None, MEMBERSHIP_GLOBAL), 42, true),
+            InterestCandidate::always(7)
+        );
+    }
+
+    /// The peer's own world comes from the same row its interest centre does: the LOWEST-id owned row
+    /// that resolved an anchor. Rows arrive sorted by id, and a peer driving more than one body must
+    /// not have either answer decided by `HashMap` iteration order.
+    #[test]
+    fn a_peers_centre_and_world_both_come_from_its_lowest_id_anchored_body() {
+        let rows = [
+            // Owned but unanchored, and the lowest id: skipped, so it supplies NEITHER fact.
+            row(1, 42, None, 77),
+            row(2, 42, Some([10.0, 0.0, 0.0]), 5),
+            row(3, 42, Some([20.0, 0.0, 0.0]), 6),
+            // Another peer's body, and an unowned state-lane row.
+            row(4, 43, Some([30.0, 0.0, 0.0]), 8),
+            row(5, 0, Some([40.0, 0.0, 0.0]), 9),
+        ];
+        let mut observers = HashMap::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+
+        let peer = observers[&42];
+        assert_eq!(peer.center, [10.0, 0.0, 0.0]);
+        assert_eq!(
+            peer.membership, 5,
+            "the world comes from the row that supplied the centre, not from a lower unanchored one"
+        );
+        assert_eq!(observers[&43].membership, 8);
+        assert!(!observers.contains_key(&0), "an unowned row anchors nobody");
+        assert_eq!(observers.len(), 2);
+    }
+
+    /// A peer with no anchored body gets no entry, so it is neither distance-culled nor
+    /// membership-filtered: `update_interest` reads the absence as MEMBERSHIP_GLOBAL and it sees
+    /// every world. Both halves fail open together.
+    #[test]
+    fn a_peer_with_no_anchored_body_has_no_observer_at_all() {
+        let rows = [row(1, 42, None, 77), row(2, 0, Some([1.0, 0.0, 0.0]), 5)];
+        let mut observers: HashMap<i32, PeerObserver> = HashMap::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+        assert!(observers.is_empty());
+    }
 
     // ------------------------------------------------------------------
     // Which band a candidate row scores in.

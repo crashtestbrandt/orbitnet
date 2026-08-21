@@ -106,19 +106,46 @@ Net.perf_summary()   -> String
 - **`rb_nodes`** — how many nodes the loop called `_rollback_tick` on. A quick check that your rollback
   entity count is what you think it is.
 
-### ⚠️ AOI culls the rollback lane only
+### Interest: two axes, distance and membership
 
-`set_aoi_radius()` iterates **rollback entities**, anchors on the entity whose *input* authority is that peer,
-takes its first `Vector3` **State** property as the centre, and filters the other rollback entities against it.
+A peer replicates an entity when **both** filters admit it. They are independent and are declared separately.
+
+| axis | rollback lane | state lane |
+|---|---|---|
+| **Distance** — within `aoi_radius` of the peer's centre | always on; the anchor is the body's first `Vector3` **State** property, so register position first | opt in with `NetStateHandle.set_anchor(entry)`, naming a `Vector3` explicitly |
+| **Membership** — in the same world as the peer | opt in with `NetRollbackHandle.set_membership(entry)`, naming an `int` | opt in with `NetStateHandle.set_membership(entry)`, naming an `int` |
+
+**The peer's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
+authority is that peer, and which resolved an anchor.
 
 Three consequences people find the hard way:
 
-1. **State-lane entities always replicate.** If your bandwidth is a thousand server-driven objects, AOI does
-   nothing for you today.
-2. **A peer with no rollback body has no anchor**, and the backend falls back to "everything is in interest".
-   Interest management therefore requires at least one rollback entity per peer — which is why the RTS demo
-   puts the command cursor on that lane.
-3. **The anchor is the first `Vector3` State property**, so register position first.
+1. **A state channel is culled only if it declares how.** A channel with no `set_anchor()` has no distance to
+   be culled by, and one with no `set_membership()` is in every world. Declaring neither means it replicates
+   to every peer, which is the default and is the fail-open direction.
+2. **A peer with no rollback body has no anchor**, so the backend falls back to "everything is in interest" —
+   every world, at every distance. Interest management therefore requires at least one rollback entity per
+   peer, which is why the RTS demo puts the command cursor on that lane.
+3. **Membership is what a positionless channel has instead of a radius.** Health, inventory, a door's state:
+   none of them replicate a position, so no radius reaches them. `set_membership()` bounds them to one world
+   while leaving them uncullable inside it.
+
+Membership matters when one session hosts **several independent worlds**, each rebased near its own coordinate
+origin. Two entities at the same coordinates in different worlds are zero metres apart, so no radius can
+separate them. `0` is the default id on both sides and matches every world.
+
+```gdscript
+# A player body: its world is also the OWNING PEER's world.
+var body := Net.register_rollback_body(unit, input, state_props, input_props, predict)
+body.set_membership("world_id")      # an int property on `unit`
+body.process_settings()              # register_rollback_body already processed settings once
+
+# A positionless channel bounded to the same world.
+var hp := Net.make_state(unit)
+hp.add_state(unit, "health")
+hp.set_membership("world_id")
+hp.process_settings()
+```
 
 ---
 
@@ -128,6 +155,7 @@ Three consequences people find the hard way:
 |---|---|
 | `is_active() -> bool` | False when inert (OFFLINE). |
 | `add_state(node, property)` / `add_input(node, property)` | For handles built with `make_rollback()`. |
+| `set_membership(entry) -> void` | Declare which **world** this body is in, as a `"NodePath:property"` naming an `int`. Also sets the owning peer's own world. Call before `process_settings()`. |
 | `process_settings() -> void` | Re-resolve after the property set changes. |
 | `process_authority() -> void` | Re-evaluate prediction after an authority change. Call on **every** peer when ownership moves. |
 | `is_predicting() -> bool` | Whether the owner is currently mispredicting — the reconciliation gate. |
@@ -140,6 +168,11 @@ Three consequences people find the hard way:
 |---|---|
 | `is_active() -> bool` | |
 | `add_state(node, property)` | Register a replicated property. **Supports wire quantization** — see below. |
+| `set_anchor(entry) -> void` | Declare the `Vector3` this channel is culled by distance from. Without it the channel has no distance and is never radius-culled. |
+| `set_membership(entry) -> void` | Declare which **world** this channel is in, as a `"NodePath:property"` naming an `int`. Composes with `set_anchor()`; called alone it bounds the channel to one world without a distance test. |
+| `membership() -> int` | The world the filter reads this tick, `0` meaning every world. A property that did not resolve reports `0`. |
+| `set_priority(weight)` | Send-rota priority, 1..16. |
+| `last_known_state() -> int` | Tick of the newest authoritative row received. |
 | `process_settings()` | |
 
 Server-authoritative, no prediction, and — critically — **no rollback restore**, so a value set outside the

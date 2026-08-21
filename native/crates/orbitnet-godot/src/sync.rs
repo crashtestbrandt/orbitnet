@@ -22,15 +22,86 @@ use orbitnet_core::codec::{
     decode_state_block_into, encode_state_block, Reader, StateBlockMeta, Writer,
 };
 use orbitnet_core::{
-    ColumnarHistory, Confidence, FreshnessLedger, MemoRing, PropKind, PropRole, SchemaBuilder,
+    ColumnarHistory, Confidence, FreshnessLedger, MembershipId, MemoRing, PropKind, PropRole,
+    SchemaBuilder, MEMBERSHIP_GLOBAL,
 };
 
 use crate::binding::{self, PropBinding};
 
-/// `relevancy`: this channel is replicated to every peer, whatever the interest radius says.
+/// `relevancy`: this channel is replicated to every peer in every world, whatever the interest
+/// radius says and whatever `membership_property` names.
 pub(crate) const RELEVANCY_ALWAYS: i32 = 0;
-/// `relevancy`: this channel is culled by distance from the anchor `anchor_property` names.
+/// `relevancy`: this channel is culled by distance from the anchor `anchor_property` names, and by
+/// the membership `membership_property` names.
 pub(crate) const RELEVANCY_ANCHORED: i32 = 1;
+/// `relevancy`: this channel is never culled by distance, and is replicated only to peers in the
+/// membership `membership_property` names.
+///
+/// The setting for a channel with **no position to be culled by** — health, inventory, a door's
+/// state. Before this existed such a channel had one lever, all-or-nothing, so it reached every
+/// peer in every world. See the `interest` module header in `orbitnet-core`.
+pub(crate) const RELEVANCY_MEMBERSHIP: i32 = 2;
+
+/// Resolve a `membership_property` entry into a live `(node, property)` pair.
+///
+/// `label` names the synchronizer in any diagnostic. Every failure path returns `None`, which reads
+/// as [`MEMBERSHIP_GLOBAL`] — the same fail-open direction the anchor takes, and for the same
+/// reason: a misconfigured membership costs bandwidth, a silently-wrong one deletes a body from
+/// somebody's world.
+///
+/// The property must be a Godot **int**. A membership id is compared for equality and never
+/// measured, so a float would introduce a rounding question the filter has no answer to.
+fn resolve_membership(
+    root: Option<&Gd<Node>>,
+    entry: &GString,
+    label: &str,
+) -> Option<(Gd<Node>, StringName)> {
+    let entry = entry.to_string();
+    if entry.is_empty() {
+        return None;
+    }
+    match root.and_then(|r| binding::resolve_entry(r, &entry)) {
+        Some((target, name, PropKind::I64 | PropKind::I32)) => Some((target, name)),
+        Some((_, _, kind)) => {
+            godot_error!(
+                "{label}: membership_property {entry:?} resolved to {kind:?}, not an int. A \
+                 membership id is compared for equality; this channel stays in every world."
+            );
+            None
+        }
+        None => {
+            godot_error!(
+                "{label}: membership_property {entry:?} did not resolve against the root — this \
+                 channel stays in every world."
+            );
+            None
+        }
+    }
+}
+
+/// Read a resolved membership pair live, or [`MEMBERSHIP_GLOBAL`] when it is unset, unresolved, or
+/// the node behind it has been freed.
+///
+/// Only the authority calls this, and the authority owns the value, so reading it live is both
+/// correct and cheaper than replicating an id the wire does not otherwise need — the same argument
+/// `position_hint` makes for the anchor.
+///
+/// A Godot int is an `i64` and a [`MembershipId`] is a `u64`, so the `as` is a **reinterpretation
+/// of the same 64 bits**, not a conversion: every distinct declared value stays distinct, `0` stays
+/// [`MEMBERSHIP_GLOBAL`], and there is no value a game can write that the filter has to reject.
+/// Note that a game using `-1` as its own "unset" gets `u64::MAX`, which is a world like any other.
+fn read_membership(pair: Option<&(Gd<Node>, StringName)>) -> MembershipId {
+    let Some((node, name)) = pair else {
+        return MEMBERSHIP_GLOBAL;
+    };
+    let Some(node) = crate::orbit_net::live_handle(node) else {
+        return MEMBERSHIP_GLOBAL;
+    };
+    node.get(name)
+        .try_to::<i64>()
+        .map(|value| value as MembershipId)
+        .unwrap_or(MEMBERSHIP_GLOBAL)
+}
 
 /// Rows the **state lane** retains per entity.
 ///
@@ -126,6 +197,25 @@ pub struct OrbitRollbackSynchronizer {
     #[export]
     priority: i32,
 
+    /// The world this body belongs to, as a `"NodePath:property"` entry naming an **int**, resolved
+    /// against `root`.
+    ///
+    /// Interest is a distance test, and distance cannot separate several independent worlds inside
+    /// one session when each is rebased near its own coordinate origin: two bodies at the same
+    /// coordinates in different worlds are zero metres apart. A peer only ever replicates bodies
+    /// whose membership matches its own, whatever the radius says.
+    ///
+    /// **This lane has no `relevancy` export and needs none.** A rollback body always carries a
+    /// position, so it is always distance-cullable; membership narrows that, it does not replace it.
+    ///
+    /// Unset, unresolvable, or not an int leaves the body in `MEMBERSHIP_GLOBAL` — every world, the
+    /// behaviour every rollback body had before this existed, and the fail-open direction.
+    ///
+    /// The entry need **not** be one of `state_properties`: it costs no wire bytes and is read live
+    /// on the authority, the only peer that computes relevancy.
+    #[export]
+    membership_property: GString,
+
     // --- resolved at process_settings ---
     entity_id: u64,
     state_schema: SchemaBuilder,
@@ -134,6 +224,8 @@ pub struct OrbitRollbackSynchronizer {
     input_bindings: Vec<PropBinding>,
     unresolved: PackedStringArray,
     rollback_nodes: Vec<Gd<Node>>,
+    /// The resolved `membership_property`, or `None` when unset or unresolvable.
+    membership: Option<(Gd<Node>, StringName)>,
     /// Whether the local peer authors this entity's input (its own player).
     input_local: bool,
     /// The peer id that owns this entity's input, cached at [`Self::process_authority`].
@@ -193,6 +285,7 @@ impl INode for OrbitRollbackSynchronizer {
             enable_prediction: true,
             exempt: false,
             priority: 1,
+            membership_property: GString::new(),
             entity_id: 0,
             state_schema: SchemaBuilder::new(),
             state_bindings: Vec::new(),
@@ -200,6 +293,7 @@ impl INode for OrbitRollbackSynchronizer {
             input_bindings: Vec::new(),
             unresolved: PackedStringArray::new(),
             rollback_nodes: Vec::new(),
+            membership: None,
             input_local: false,
             input_owner: 0,
             state_local: false,
@@ -453,6 +547,7 @@ impl OrbitRollbackSynchronizer {
         self.input_bindings.clear();
         self.unresolved = PackedStringArray::new();
         self.rollback_nodes.clear();
+        self.membership = None;
 
         let state_root = self.resolved_root();
 
@@ -485,6 +580,10 @@ impl OrbitRollbackSynchronizer {
             &mut self.input_bindings,
             &mut self.unresolved,
         );
+
+        let label = format!("OrbitRollbackSynchronizer {}", self.base().get_path());
+        self.membership =
+            resolve_membership(state_root.as_ref(), &self.membership_property, &label);
 
         // Gather the rollback-aware nodes to simulate: the root plus every descendant that
         // implements _rollback_tick. `owned=false` so runtime-added children (the input carrier)
@@ -648,6 +747,15 @@ impl OrbitRollbackSynchronizer {
         }
         let f = |i: usize| f32::from_le_bytes([row[i], row[i + 1], row[i + 2], row[i + 3]]);
         Some([f(o), f(o + 4), f(o + 8)])
+    }
+
+    /// The world this body is in, read live from `membership_property`.
+    ///
+    /// [`MEMBERSHIP_GLOBAL`] when the export is unset, did not resolve, or its node has been freed —
+    /// which is every rollback body in a game that declares no worlds, and is filtered on distance
+    /// alone.
+    pub(crate) fn membership_hint(&self) -> MembershipId {
+        read_membership(self.membership.as_ref())
     }
 
     /// Capture the locally-authored input for `tick` into history.
@@ -1028,12 +1136,23 @@ pub struct OrbitStateSynchronizer {
     #[export]
     properties: PackedStringArray,
 
-    /// Interest relevancy: [`RELEVANCY_ALWAYS`] or [`RELEVANCY_ANCHORED`].
+    /// Interest relevancy — the policy, one of three:
+    ///
+    /// | value | distance | membership |
+    /// |---|---|---|
+    /// | [`RELEVANCY_ALWAYS`] (0, default) | never culled | every world |
+    /// | [`RELEVANCY_ANCHORED`] (1) | culled from `anchor_property` | `membership_property`'s world |
+    /// | [`RELEVANCY_MEMBERSHIP`] (2) | never culled | `membership_property`'s world |
     ///
     /// Defaults to ALWAYS, which is the behaviour every state channel had before interest applied here — the lane
     /// was not culled at all. A channel only becomes cullable when it *also* names a resolvable
-    /// `anchor_property`, so declaring relevancy without an anchor is inert rather than a way to
-    /// accidentally delete a body from somebody's world.
+    /// `anchor_property` (or, for MEMBERSHIP, a resolvable `membership_property`), so declaring
+    /// relevancy without one is inert rather than a way to accidentally delete a body from
+    /// somebody's world.
+    ///
+    /// MEMBERSHIP is the setting for a channel that replicates **no position** — health, inventory,
+    /// a door's state. It has no distance to be culled by, so before this value existed its only
+    /// lever was all-or-nothing and it reached every peer in every world.
     #[export]
     relevancy: i32,
 
@@ -1049,6 +1168,15 @@ pub struct OrbitStateSynchronizer {
     #[export]
     anchor_property: GString,
 
+    /// The world this channel belongs to, as a `"NodePath:property"` entry naming an **int**,
+    /// resolved against `root`. See `OrbitRollbackSynchronizer::membership_property`.
+    ///
+    /// Read only under [`RELEVANCY_ANCHORED`] and [`RELEVANCY_MEMBERSHIP`]. Under
+    /// [`RELEVANCY_ALWAYS`] the channel is session-global by declaration and this export is inert
+    /// (a warning says so at resolve time rather than leaving it to be discovered).
+    #[export]
+    membership_property: GString,
+
     /// Send-rota priority, `1..=16`. See `OrbitRollbackSynchronizer::priority`.
     #[export]
     priority: i32,
@@ -1060,6 +1188,8 @@ pub struct OrbitStateSynchronizer {
     state_local: bool,
     /// The resolved `anchor_property`, or `None` when unset, unresolvable or not a `Vector3`.
     anchor: Option<(Gd<Node>, StringName)>,
+    /// The resolved `membership_property`, or `None` when unset, unresolvable or not an int.
+    membership: Option<(Gd<Node>, StringName)>,
     /// The authority's captured frontier row, and each receiver's newest applied tick/row.
     history: ColumnarHistory,
     latest_tick: i64,
@@ -1076,6 +1206,7 @@ impl INode for OrbitStateSynchronizer {
             properties: PackedStringArray::new(),
             relevancy: RELEVANCY_ALWAYS,
             anchor_property: GString::new(),
+            membership_property: GString::new(),
             priority: 1,
             entity_id: 0,
             schema: SchemaBuilder::new(),
@@ -1083,6 +1214,7 @@ impl INode for OrbitStateSynchronizer {
             unresolved: PackedStringArray::new(),
             state_local: false,
             anchor: None,
+            membership: None,
             history: ColumnarHistory::new(0, 1),
             latest_tick: -1,
             pending: None,
@@ -1147,6 +1279,7 @@ impl OrbitStateSynchronizer {
             }
         }
         self.resolve_anchor(root.as_ref());
+        self.resolve_membership_declaration(root.as_ref());
         let local_peer = self
             .base()
             .get_multiplayer()
@@ -1194,6 +1327,16 @@ impl OrbitStateSynchronizer {
         self.relevancy == RELEVANCY_ANCHORED && self.anchor.is_some()
     }
 
+    /// The world this channel is currently in, `0` meaning every world (diagnostics and tests).
+    ///
+    /// Reports what the filter would read this tick, so a channel whose `membership_property` did
+    /// not resolve, or whose relevancy leaves the declaration inert, reports `0` rather than the
+    /// value the game wrote.
+    #[func]
+    fn get_membership(&self) -> i64 {
+        self.membership_hint() as i64
+    }
+
     fn resolved_root(&self) -> Option<Gd<Node>> {
         self.root.clone().or_else(|| self.base().get_parent())
     }
@@ -1232,6 +1375,36 @@ impl OrbitStateSynchronizer {
         }
     }
 
+    /// Resolve `membership_property` into a live `(node, property)` pair, or report why it could not
+    /// be.
+    ///
+    /// Skipped entirely under [`RELEVANCY_ALWAYS`], where the channel is session-global by
+    /// declaration. Setting both is a contradiction, so it warns instead of silently picking one.
+    fn resolve_membership_declaration(&mut self, root: Option<&Gd<Node>>) {
+        self.membership = None;
+        if self.relevancy == RELEVANCY_ALWAYS {
+            if !self.membership_property.is_empty() {
+                godot_warn!(
+                    "OrbitStateSynchronizer {}: relevancy is ALWAYS, so membership_property is \
+                     inert — this channel reaches every peer in every world. Set relevancy to \
+                     MEMBERSHIP (2) or ANCHORED (1) to bound it to one.",
+                    self.base().get_path()
+                );
+            }
+            return;
+        }
+        if self.relevancy == RELEVANCY_MEMBERSHIP && self.membership_property.is_empty() {
+            godot_warn!(
+                "OrbitStateSynchronizer {}: relevancy is MEMBERSHIP but membership_property is \
+                 empty — this channel stays in every world.",
+                self.base().get_path()
+            );
+            return;
+        }
+        let label = format!("OrbitStateSynchronizer {}", self.base().get_path());
+        self.membership = resolve_membership(root, &self.membership_property, &label);
+    }
+
     // ------------------------------------------------------------------
     // pub(crate) phase API, driven by OrbitNet
     // ------------------------------------------------------------------
@@ -1261,6 +1434,21 @@ impl OrbitStateSynchronizer {
         let node = crate::orbit_net::live_handle(node)?;
         let value = node.get(name).try_to::<Vector3>().ok()?;
         Some([value.x, value.y, value.z])
+    }
+
+    /// The world this channel is in, read live from `membership_property`.
+    ///
+    /// [`MEMBERSHIP_GLOBAL`] under [`RELEVANCY_ALWAYS`] — the declaration that this channel
+    /// describes the session rather than a place in it — and whenever the property is unset, did not
+    /// resolve, or its node has been freed.
+    ///
+    /// Independent of [`Self::position_hint`]: a channel with no anchor still has a world, which is
+    /// the whole of [`RELEVANCY_MEMBERSHIP`].
+    pub(crate) fn membership_hint(&self) -> MembershipId {
+        if self.relevancy == RELEVANCY_ALWAYS {
+            return MEMBERSHIP_GLOBAL;
+        }
+        read_membership(self.membership.as_ref())
     }
 
     /// Capture the live values as the authority's frontier row for `tick`.
