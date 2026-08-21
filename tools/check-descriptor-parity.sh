@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 DESCRIPTOR="addons/orbitnet_native/orbitnet.gdextension"
-WORKFLOW=".github/workflows/binaries.yml"
+WORKFLOWS=".github/workflows/binaries.yml .github/workflows/release.yml"
 PLATFORMS=(linux windows macos)
 
 # Filenames the descriptor points at, deduplicated: several entries may name one file.
@@ -52,14 +52,20 @@ fi
 
 # A platform tools/build-native.sh can name but no workflow leg ever runs produces nothing, which is the
 # same defect one step further back. `platform:` is the matrix key each leg passes to the script.
-legs="$(grep -oE '^[[:space:]]*-?[[:space:]]*platform:[[:space:]]*[a-z0-9_]+' "$WORKFLOW" \
-	| sed 's/.*platform:[[:space:]]*//' | sort -u || true)"
-for p in "${PLATFORMS[@]}"; do
-	if ! printf '%s\n' "$legs" | grep -qx "$p"; then
-		printf '::error::%s is a platform tools/build-native.sh builds, but %s has no leg for it.\n' \
-			"$p" "$WORKFLOW"
-		status=1
-	fi
+#
+# BOTH WORKFLOWS, not just binaries.yml. release.yml carries its own copy of the three-leg matrix, and it
+# is the one that actually ships -- a platform missing there is caught at tag time, after three builds,
+# or not at all.
+for wf in $WORKFLOWS; do
+	legs="$(grep -oE '^[[:space:]]*-?[[:space:]]*platform:[[:space:]]*[a-z0-9_]+' "$wf" \
+		| sed 's/.*platform:[[:space:]]*//' | sort -u || true)"
+	for p in "${PLATFORMS[@]}"; do
+		if ! printf '%s\n' "$legs" | grep -qx "$p"; then
+			printf '::error::%s is a platform tools/build-native.sh builds, but %s has no leg for it.\n' \
+				"$p" "$wf"
+			status=1
+		fi
+	done
 done
 
 if [ "$status" -eq 0 ]; then

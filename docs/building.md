@@ -64,11 +64,14 @@ about how many bytes it wrote, and disagreement there corrupts a delta chain.
 frames to Rust functions and source lines. It is published as a release asset and is deliberately not a
 descriptor entry — shipping it would put 11 MB of debug information nobody loads into every export.
 
-Two settings on `[profile.release]` are load-bearing, and every profile inherits them:
+Two settings on `[profile.release]` are load-bearing:
 
-- **`strip = "debuginfo"`.** An unstripped gdext cdylib is 30–80 MB; stripped it is 2–5 MB.
-- **`panic = "abort"` is deliberately NOT set.** gdext converts a panic at the `#[func]` boundary into a
-  Godot error. Aborting would turn a recoverable bug into a hard process kill that takes the editor with it.
+- **`panic = "abort"` is deliberately NOT set**, and no profile overrides that. gdext converts a panic at
+  the `#[func]` boundary into a Godot error. Aborting would turn a recoverable bug into a hard process
+  kill that takes the editor with it.
+- **`strip = "debuginfo"`** is inherited by both descriptor profiles. `profiling` deliberately overrides
+  it to `"none"`, which is the whole reason that build is 15.0 MB against 4 MB. An unstripped gdext
+  cdylib is 30–80 MB; stripped it is 2–5 MB.
 
 **`tools/build-native.sh` is the only place that maps a platform and a profile onto a filename.** Both build
 workflows, the load smoke, the PR gate and `just native-install` ask it rather than spelling names out, and

@@ -194,14 +194,21 @@ jobs:
           fi
           echo "publishing exactly the $(printf '%s\n' "$named" | grep -c .) libraries the descriptor names"
 
+      # INPUT_VERSION THROUGH THE ENVIRONMENT, NOT `${{ }}` INTERPOLATION. Expression interpolation
+      # splices the value into the script SOURCE before bash parses it, so a crafted dispatch input
+      # would run as code on a persistent self-hosted runner. Read as an env var it is data.
       - name: Stamp the plugin version from the tag
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
-            version="${{ github.event.inputs.version }}"
-            version="${version#v}"
+            version="${INPUT_VERSION#v}"
           fi
+          case "$version" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::refusing version '$version'"; exit 1 ;;
+          esac
           sed -i "s/^version=\".*\"$/version=\"${version}\"/" addons/orbitnet/plugin.cfg
           grep '^version=' addons/orbitnet/plugin.cfg
 
@@ -211,12 +218,13 @@ jobs:
       # install, and counts the libraries it packaged rather than trusting the walk -- bin/ is
       # gitignored, so a clean checkout would otherwise ship an addon with no backend and say nothing.
       - name: Build the Asset Library zip
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
-            version="${{ github.event.inputs.version }}"
-            version="${version#v}"
+            version="${INPUT_VERSION#v}"
           fi
           # The licences ride INSIDE the payload: an addon installed from a zip carries no repository
           # with it, and a user who cannot find the terms will assume the worst.
@@ -292,9 +300,9 @@ jobs:
       # plugin.cfg has been stamped and binaries.json freshly written. `git checkout -B ... origin/main`
       # in THIS tree aborts whenever either file differs between the tag and main -- a re-run after the
       # manifest has landed, a patch tag cut below main's last manifest commit, a re-tag of an older
-      # commit -- and because the publish step below carries an implicit `success()`, that abort used to
-      # skip the publish entirely. Three cross-platform builds, no release, and a tag that cannot be
-      # re-run without editing this file.
+      # commit. A step carries an implicit `success()` unless told otherwise, so while this ran BEFORE
+      # the publish, that abort skipped the publish entirely: three cross-platform builds, no release,
+      # and a tag that could not be re-run without editing this file. Hence the order above.
       #
       # `cp` rather than a `$(cat ...)` / `printf '%s'` round trip: command substitution strips trailing
       # newlines, which silently rewrote plugin.cfg from 424 bytes to 423 on every release.
@@ -316,6 +324,18 @@ jobs:
             echo "manifest unchanged; nothing to commit"
           else
             git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
-            git -C "$wt" push origin HEAD:main
+            # main can move between the fetch and the push. Rebase and retry rather than failing the
+            # run: the release is already published by this point, so a lost race would leave the tag
+            # shipped and its digest unrecorded, which is the one state a consumer cannot verify against.
+            pushed=0
+            for attempt in 1 2 3; do
+              if git -C "$wt" push origin HEAD:main; then pushed=1; break; fi
+              echo "push rejected (attempt ${attempt}); rebasing onto origin/main"
+              git -C "$wt" fetch origin main
+              git -C "$wt" rebase origin/main || { git -C "$wt" rebase --abort || true; break; }
+            done
+            [ "$pushed" -eq 1 ] || {
+              echo "::error::could not push the manifest to main after 3 attempts. The release IS published; re-run only this step, or commit addons/orbitnet_native/binaries.json by hand."
+              exit 1; }
           fi
           git worktree remove --force "$wt"
