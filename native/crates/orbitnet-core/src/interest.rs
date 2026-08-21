@@ -51,57 +51,59 @@
 //! Each row times three variants over one session (`tests/interest_bench.rs`, 240 ticks, radius
 //! 256 m, release, one unowned row in eight positionless):
 //!
-//! * **scan/peer** — what `orbit_net.rs` runs. A peer's own body is `always` to that peer alone, so
-//!   the candidate list is rebuilt inside the per-peer loop: O(P·N) per tick on top of the filter.
-//! * **scan/shared** — the same filter over one list per tick, that single row patched in and out
-//!   around each call. Needs no grid.
+//! * **scan/shared** — what `orbit_net.rs` runs. One candidate list per tick, the rows a peer drives
+//!   patched in and out around that peer's call.
+//! * **scan/peer** — the shape it ran before: a fresh list per peer, O(P·N) per tick on top of the
+//!   filter. Kept because the gap between the two columns is what deleting it bought.
 //! * **grid** — one [`InterestGrid::rebuild`] per tick, the own body passed as the `also` override.
 //!
-//! **Arena extent** (64 peers, 800 entities). A uniform grid can only win when the query radius
-//! covers a small fraction of the occupied space; otherwise [`InterestGrid::query_within`]'s own
-//! guard finds the scan rectangle larger than the occupancy and iterates every bucket — which
-//! **is** the linear scan, plus a rebuild.
+//! Only `scan/shared` against `grid` decides anything. Both build one list per tick, so that ratio
+//! is the spatial index against the flat pass and nothing else.
 //!
-//! | arena extent | mean set | scan/peer | scan/shared | grid  |
-//! |--------------|----------|-----------|-------------|-------|
-//! | ±300 m       | 391      | 935       | 899         | 1129  |
-//! | ±600 m       | 182      | 524       | 473         | 454   |
-//! | ±1200 m      | 115      | 412       | 367         | 219   |
-//! | ±2500 m      | 96       | 364       | 315         | 174   |
-//! | ±5000 m      | 93       | 362       | 313         | 165   |
-//! | ±25000 m     | 93       | 375       | 326         | 162   |
+//! **Arena extent** (64 peers, 800 entities, µs/tick). A uniform grid can only win when the query
+//! radius covers a small fraction of the occupied space; otherwise
+//! [`InterestGrid::query_within`]'s own guard finds the scan rectangle larger than the occupancy and
+//! iterates every bucket — which **is** the linear scan, plus a rebuild.
 //!
-//! The crossover is between ±300 m and ±600 m, and past ±1200 m the grid is about twice as fast as
-//! either scan. No shipped arena is out there: 2fort's forts sit at ±74 m and the container cube is
-//! 60 m on a side, which is the ±300 m row, and that row is the one the grid loses.
+//! | arena extent | mean set | scan/peer | scan/shared | grid | grid vs shipped |
+//! |--------------|----------|-----------|-------------|------|-----------------|
+//! | ±300 m       | 391      | 987       | 921         | 1146 | 0.80×           |
+//! | ±600 m       | 182      | 532       | 475         | 452  | 1.05×           |
+//! | ±1200 m      | 115      | 407       | 378         | 217  | 1.74×           |
+//! | ±2500 m      | 96       | 376       | 317         | 171  | 1.85×           |
+//! | ±5000 m      | 93       | 381       | 318         | 164  | 1.94×           |
+//! | ±25000 m     | 93       | 374       | 316         | 162  | 1.95×           |
+//!
+//! The crossover is between ±300 m and ±600 m, and past ±1200 m the grid is close to twice as fast.
+//! No shipped arena is out there: 2fort's forts sit at ±74 m and the container cube is 60 m on a
+//! side, which is the ±300 m row, and that row is the one the grid loses.
 //!
 //! **World count** (64 peers, 1200 entities total, each world rebased on its own origin at ±300 m).
 //! Several worlds in one session was the case the grid was expected to win — a peer is entitled to
 //! a shrinking share of a session that keeps its size.
 //!
-//! | worlds | mean set | scan/peer | scan/shared | grid |
-//! |--------|----------|-----------|-------------|------|
-//! | 1      | 587      | 1926      | 1739        | 1831 |
-//! | 2      | 295      | 718       | 632         | 854  |
-//! | 4      | 146      | 353       | 277         | 434  |
-//! | 8      | 72       | 210       | 134         | 238  |
-//! | 16     | 36       | 151       | 76          | 135  |
-//! | 32     | 18       | 125       | 52          | 87   |
+//! | worlds | mean set | scan/peer | scan/shared | grid | grid vs shipped |
+//! |--------|----------|-----------|-------------|------|-----------------|
+//! | 1      | 587      | 1973      | 1790        | 1855 | 0.97×           |
+//! | 2      | 295      | 734       | 637         | 882  | 0.72×           |
+//! | 4      | 146      | 365       | 274         | 434  | 0.63×           |
+//! | 8      | 72       | 211       | 132         | 236  | 0.56×           |
+//! | 16     | 36       | 153       | 80          | 139  | 0.57×           |
+//! | 32     | 18       | 130       | 55          | 92   | 0.60×           |
 //!
-//! **The two scan columns disagree, and the disagreement is the finding.** From 16 worlds up the
-//! grid beats what ships — but it beats it by deleting the per-peer candidate rebuild, not by
-//! indexing space, and `scan/shared` deletes the same rebuild without a grid and is then 1.7× ahead
-//! of the grid. What the grid saves at a high world count is the rebuild, not the distance pass.
-//! Refusing another world costs a scan one integer comparison per candidate, which is already less
-//! than binning that candidate costs the grid.
+//! **It does not win it, and the `scan/peer` column is why the answer looked otherwise.** Measured
+//! against the per-peer rebuild the grid appeared to overtake the scan from 16 worlds up. What it
+//! was deleting there was the rebuild, not the distance pass: sharing the list deletes the same
+//! O(P·N) — 2.35× at 32 worlds — and the grid then loses at every world count. Refusing another
+//! world costs a scan one integer comparison per candidate, which is already less than binning that
+//! candidate costs the grid.
 //!
 //! So [`PeerInterest::update_linear_into`] is what `orbit_net.rs` calls, and the grid is retained
 //! and tested rather than adopted. What changed is that it is now *adoptable*: it reports the leaves
 //! the send path clears its delta bookkeeping from, it carries the always-set and the worlds, and
 //! the only thing an adopting caller adds is one [`InterestGrid::rebuild`] per tick before the
 //! per-peer loop. **An arena past about ±600 m of occupancy is what would justify making that
-//! switch**, and `net.perf`'s `interest_ms` is the live number to watch. A high world count is not:
-//! the cheaper answer there is to stop rebuilding the candidate list per peer.
+//! switch**, and `net.perf`'s `interest_ms` is the live number to watch. A high world count is not.
 
 use std::collections::{BTreeMap, HashMap};
 

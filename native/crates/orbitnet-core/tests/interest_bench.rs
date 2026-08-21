@@ -8,19 +8,19 @@
 //!
 //! Five variants are timed over the same synthetic session. The three the decision rests on:
 //!
-//! * `scan/peer` — **what ships**. Per peer, a fresh candidate list, then
-//!   [`PeerInterest::update_linear_into`]. The rebuild is inside the loop because a peer's own body
-//!   is `always` to that peer alone, so the list cannot be shared as it stands: O(P·N) per tick on
-//!   top of the filter.
-//! * `scan/shared` — the same filter over **one** candidate list per tick, with that one row
-//!   patched in and out around each call. Needs no grid, so whatever it recovers is not evidence
-//!   for one.
+//! * `scan/shared` — **what ships**. One candidate list per tick, with the rows a peer drives
+//!   patched in and out around that peer's [`PeerInterest::update_linear_into`] call.
+//! * `scan/peer` — the shape that shipped before: a fresh list per peer, because a peer's own body
+//!   is `always` to that peer alone and the list was rebuilt around it. O(P·N) per tick on top of
+//!   the filter. Kept because the gap between the two columns is what deleting it bought.
 //! * `grid` — [`InterestGrid`] rebuilt once per tick plus [`PeerInterest::update_grid_into`] per
 //!   peer, the own body handed over as the `also` override. Cell size derived from the radius.
 //!
-//! Reading the three together is the point: `scan/peer` against `grid` says whether adopting the
-//! grid would lower `interest_ms` today, and `scan/shared` against `grid` says how much of that is
-//! the grid rather than the rebuild it happens to delete.
+//! Reading the three together is the point. `scan/shared` against `grid` is the adoption question —
+//! both share one list per tick, so the ratio is the index against the flat pass and nothing else.
+//! `scan/peer` against `scan/shared` is there because that gap once read as a grid win: measured
+//! against the old shape the grid appeared to win a multi-world session, and what it was actually
+//! deleting was the rebuild.
 //!
 //! Two more are kept because they are what the earlier restructure was measured against:
 //!
@@ -289,13 +289,13 @@ struct Buffers {
     leaves: Vec<BodyId>,
 }
 
-/// **The shipped shape**: the prepass, then per peer a fresh candidate list and one
-/// `update_linear_into` (`orbit_net.rs`'s `update_interest`).
+/// The shape the backend ran before the list was shared: the prepass, then per peer a fresh
+/// candidate list and one `update_linear_into`.
 ///
-/// The per-peer rebuild is not incidental. `candidate_for_row` takes the peer id, because that
-/// peer's own body is `always` to it and to nobody else, so the list cannot be shared as it
-/// stands — which makes this pass O(P·N) per tick, on top of the filter it feeds. Measuring the
-/// filter without it charges the scan for less work than the backend does.
+/// The rebuild was there because a peer's own body is `always` to it and to nobody else, and a peer
+/// with no resolved anchor reshaped every row — so the list looked peer-specific. Both facts moved
+/// (to a patch and to a non-finite centre) and the pass went with them. Retained here because a
+/// measurement that charges the scan for it reads a rebuild win as a grid win.
 fn tick_scan_per_peer(
     scene: &Scene,
     sets: &mut HashMap<i32, PeerInterest>,
@@ -330,12 +330,13 @@ fn tick_scan_per_peer(
     total
 }
 
-/// The same scan over **one** candidate list per tick, with the peer's own body patched in and out
-/// around each call.
+/// **The shipped shape**: one candidate list per tick, with the peer's own body patched in and out
+/// around each call (`orbit_net.rs`'s `update_interest`).
 ///
-/// This isolates the two savings a grid adoption would collect at once. Dropping the per-peer
-/// rebuild needs no grid — the one row that varies per peer can be swapped in place — so whatever
-/// this variant recovers is not evidence for the grid, and whatever the grid beats *this* by is.
+/// Sharing the list is what separates the two savings a grid adoption would otherwise collect at
+/// once. Dropping the per-peer rebuild needs no grid — the rows that vary per peer can be swapped
+/// in place — so whatever `scan/peer` recovers is not evidence for the grid, and whatever the grid
+/// beats *this* by is.
 fn tick_scan_shared(
     scene: &Scene,
     sets: &mut HashMap<i32, PeerInterest>,
@@ -430,10 +431,12 @@ impl CoreRow {
         let shared = micros_per_tick(ticks, self.shared_ns);
         let grid = micros_per_tick(ticks, self.grid_ns);
         let mean_set = self.set_sum as f64 / f64::from(ticks) / peers as f64;
+        // `rebuild` is what sharing one list bought; `vs shipped` is what adopting the grid
+        // would buy on top of it, and only the second decides anything.
         println!(
             "{label} {mean_set:>7.0} | {per_peer:>13.1} {shared:>13.1} {grid:>11.1} | \
              {:>8.2}x {:>10.2}x",
-            per_peer / grid,
+            per_peer / shared,
             shared / grid,
         );
     }
@@ -442,7 +445,7 @@ impl CoreRow {
 fn print_core_header(first: &str) {
     println!(
         "{first:>8} {:>7} | {:>13} {:>13} {:>11} | {:>9} {:>11}",
-        "in-set", "scan/peer us/t", "scan/shared", "grid us/t", "vs shipped", "vs shared"
+        "in-set", "scan/peer us/t", "scan/shared", "grid us/t", "rebuild", "vs shipped"
     );
 }
 
