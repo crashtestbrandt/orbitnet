@@ -133,8 +133,8 @@ Known and filed, not hidden:
   worlds — but it measures slower at the arena sizes a session runs at today, so the linear scan is what ships.
   It overtakes the scan past about ±600 m of occupancy. The measured tables are in `interest.rs`'s header.
 - **The candidate list is rebuilt per peer.** One row varies by peer — that peer's own body — and the whole
-  list is rebuilt for it, which is O(peers × entities) per tick before the filter runs. Measured at 2.4× the
-  filter's own cost in a 32-world session.
+  list is rebuilt for it, which is O(peers × entities) per tick before the filter runs. In a 32-world session
+  that rebuild is 58% of the interest pass; patching the one row instead would need no other change.
 - **No reconnection and no packet authentication.** A dropped client loses its entity, and the wire carries
   nothing beyond a per-entity authority check.
 
