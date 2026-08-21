@@ -107,6 +107,14 @@ peer and which resolved an anchor. A peer with no such body has neither, and the
 to "everything is in interest" — every world, at every distance. This is the limitation most likely to surprise
 you — see [api.md](api.md#interest-two-axes-distance-and-membership).
 
+**That inference is a fallback, and `Net.set_peer_anchor()` replaces it.** What a peer observes is a different
+question from what its input drives — a spectator drives nothing, and a peer with a body in each of two worlds
+observes one of them — and the inferred world is read off whichever body sorts lowest by FNV hash, which makes
+a peer driving two bodies in different worlds undefined. The declaration states the centre and the world
+together and is authoritative for both. Its two axes fail separately: a tracked entity that has not spawned
+gives no centre, so nothing is distance-culled, while the peer stays in the world it was declared into, because
+a membership is a declaration and did not fail.
+
 Tick tiers are assigned statically per synchronizer and dynamically by distance band, phase-offset by entity id
 so sends spread across ticks instead of spiking.
 

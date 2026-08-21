@@ -116,16 +116,16 @@ A peer replicates an entity when **both** filters admit it. They are independent
 | **Membership** — in the same world as the peer | opt in with `NetRollbackHandle.set_membership(entry)`, naming an `int` | opt in with `NetStateHandle.set_membership(entry)`, naming an `int` |
 
 **The peer's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
-authority is that peer, and which resolved an anchor.
+authority is that peer, and which resolved an anchor — unless the peer declares them, below.
 
 Three consequences people find the hard way:
 
 1. **A state channel is culled only if it declares how.** A channel with no `set_anchor()` has no distance to
    be culled by, and one with no `set_membership()` is in every world. Declaring neither means it replicates
    to every peer, which is the default and is the fail-open direction.
-2. **A peer with no rollback body has no anchor**, so the backend falls back to "everything is in interest" —
-   every world, at every distance. Interest management therefore requires at least one rollback entity per
-   peer, which is why the RTS demo puts the command cursor on that lane.
+2. **A peer with no rollback body and no declaration has no anchor**, so the backend falls back to "everything
+   is in interest" — every world, at every distance. Either give every peer a rollback entity, which is why the
+   RTS demo puts the command cursor on that lane, or declare the pair with `Net.set_peer_anchor()`.
 3. **Membership is what a positionless channel has instead of a radius.** Health, inventory, a door's state:
    none of them replicate a position, so no radius reaches them. `set_membership()` bounds them to one world
    while leaving them uncullable inside it.
@@ -147,6 +147,37 @@ hp.set_membership("world_id")
 hp.process_settings()
 ```
 
+#### Declaring where a peer observes from
+
+Server-side only, and no-ops OFFLINE. What a peer **observes** is not what its input **controls**: a spectator
+drives nothing, a commander watches ground its body is not standing on, and a peer with a body in each of two
+worlds observes exactly one of them.
+
+| | |
+|---|---|
+| `set_peer_anchor(peer, position, membership = 0)` | Observe from a fixed world position, in this world. |
+| `set_peer_anchor_entity(peer, entity_id, membership = 0)` | Observe from an entity, wherever it is, in this world. `entity_id` comes from `entity_id()` on a rollback or state handle; `0` retracts. |
+| `clear_peer_anchor(peer)` | Retract the centre **and** the world, back to the inferred body. |
+| `peer_membership(peer)` | The **declared** world, 0 when nothing was declared. Not what an undeclared peer is filtered in — that is `NetRollbackHandle.membership()`. |
+
+- **A declaration replaces inference on both axes at once.** The driven body is consulted for neither until
+  `clear_peer_anchor()`.
+- **It makes a peer's world a fact rather than a pick.** The inferred path reads it off whichever of the peer's
+  bodies sorts lowest by hash, so a peer driving two bodies in different worlds has no defined world without
+  this call.
+- **A tracked entity that despawns leaves the peer where it last was, in the world it was declared into.** A
+  membership is a declaration and did not fail; a centre is a measurement and did.
+- **A declaration may precede the peer's handshake**, and a tracked entity with no state row yet starts
+  resolving on the tick it gets one.
+
+```gdscript
+# A spectator with no body of its own, watching world 2 from above its centre.
+Net.set_peer_anchor(peer_id, Vector3(0.0, 120.0, 0.0), 2)
+
+# ...or following one unit around, wherever it goes.
+Net.set_peer_anchor_entity(peer_id, body.entity_id(), 2)
+```
+
 ---
 
 ## `NetRollbackHandle`
@@ -155,7 +186,8 @@ hp.process_settings()
 |---|---|
 | `is_active() -> bool` | False when inert (OFFLINE). |
 | `add_state(node, property)` / `add_input(node, property)` | For handles built with `make_rollback()`. |
-| `set_membership(entry) -> void` | Declare which **world** this body is in, as a `"NodePath:property"` naming an `int`. Also sets the owning peer's own world. Call before `process_settings()`. |
+| `set_membership(entry) -> void` | Declare which **world** this body is in, as a `"NodePath:property"` naming an `int`. Also sets the owning peer's own world, unless that peer declared its own with `Net.set_peer_anchor()`. Call before `process_settings()`. |
+| `entity_id() -> int` | This body's stable replication id, for `Net.set_peer_anchor_entity()`. An opaque token — routinely negative, never compared or ordered. 0 when inert or unresolved. |
 | `process_settings() -> void` | Re-resolve after the property set changes. |
 | `process_authority() -> void` | Re-evaluate prediction after an authority change. Call on **every** peer when ownership moves. |
 | `is_predicting() -> bool` | Whether the owner is currently mispredicting — the reconciliation gate. |
@@ -171,6 +203,7 @@ hp.process_settings()
 | `set_anchor(entry) -> void` | Declare the `Vector3` this channel is culled by distance from. Without it the channel has no distance and is never radius-culled. |
 | `set_membership(entry) -> void` | Declare which **world** this channel is in, as a `"NodePath:property"` naming an `int`. Composes with `set_anchor()`; called alone it bounds the channel to one world without a distance test. |
 | `membership() -> int` | The world the filter reads this tick, `0` meaning every world. A property that did not resolve reports `0`. |
+| `entity_id() -> int` | This channel's stable replication id, for `Net.set_peer_anchor_entity()`. 0 when inert or unresolved. |
 | `set_priority(weight)` | Send-rota priority, 1..16. |
 | `last_known_state() -> int` | Tick of the newest authoritative row received. |
 | `process_settings()` | |

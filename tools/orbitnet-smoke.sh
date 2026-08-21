@@ -131,6 +131,27 @@ func _initialize() -> void:
 		return
 	print("ORBIT-SMOKE schema %s" % str(sync.call("describe")))
 
+	# The per-peer observer declaration binds and round-trips. It is a `#[func]` quartet plus the entity-id
+	# token it consumes, and nothing else in the tree would notice one of them failing to register: a peer
+	# declared into a world would silently fall back to inferring both its centre and its world from the body
+	# it drives, which is the inference this declaration exists to replace.
+	if not sync.has_method("get_entity_id"):
+		printerr("ORBIT-SMOKE FAIL: the entity id the anchor declaration names is not published")
+		quit(1)
+		return
+	_net.call("set_peer_anchor", 7, Vector3(10.0, 0.0, -4.0), 3)
+	var declared: int = int(_net.call("peer_membership", 7))
+	_net.call("set_peer_anchor_entity", 7, 123456789, 5)
+	var retracked: int = int(_net.call("peer_membership", 7))
+	_net.call("clear_peer_anchor", 7)
+	var cleared: int = int(_net.call("peer_membership", 7))
+	if declared != 3 or retracked != 5 or cleared != 0:
+		printerr("ORBIT-SMOKE FAIL: the peer anchor declaration did not round-trip (%d/%d/%d)"
+			% [declared, retracked, cleared])
+		quit(1)
+		return
+	print("ORBIT-SMOKE peer anchor declaration round-trips")
+
 func _on_before_tick(_delta: float, tick: int) -> void:
 	_ticks += 1
 	# current_tick() inside a handler must equal the tick being run. Consuming code stamps captured
