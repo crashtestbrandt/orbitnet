@@ -31,9 +31,13 @@ class StateSyncStub extends Node:
 class RollbackSyncStub extends Node:
 	var membership_property: String = ""
 	var membership_value: int = 0
+	var id: int = 0
 
 	func get_membership() -> int:
 		return membership_value
+
+	func get_entity_id() -> int:
+		return id
 
 func test_membership_promotes_an_always_channel_to_membership() -> void:
 	var stub: StateSyncStub = StateSyncStub.new()
@@ -125,3 +129,25 @@ func test_membership_is_zero_on_a_backend_that_cannot_answer() -> void:
 	assert_eq(NetStateHandle.new(bare).membership(), 0, "no get_membership on the state lane reports every world")
 	assert_eq(NetRollbackHandle.new(bare).membership(), 0, "and the same on the rollback lane")
 	bare.free()
+
+func test_entity_id_forwards_the_token_unmodified() -> void:
+	# The id is an FNV hash read as a signed int, so it is routinely NEGATIVE and must survive the handle
+	# untouched -- `Net.set_peer_anchor_entity()` casts it straight back to the unsigned id the registry keys on.
+	var stub: RollbackSyncStub = RollbackSyncStub.new()
+	stub.id = -6917529027641081856
+	var handle: NetRollbackHandle = NetRollbackHandle.new(stub)
+	assert_eq(handle.entity_id(), -6917529027641081856, "a negative token is not clamped or re-signed")
+	stub.free()
+
+func test_entity_id_is_zero_on_a_backend_that_cannot_answer() -> void:
+	# Same binary-mismatch rule as membership(), and the failure it prevents is worse: 0 is what
+	# `Net.set_peer_anchor_entity()` reads as a RETRACTION, so an unanswerable id declares nothing rather than
+	# anchoring a peer on entity zero.
+	var bare: Node = Node.new()
+	assert_eq(NetRollbackHandle.new(bare).entity_id(), 0, "no get_entity_id on the rollback lane reports 0")
+	assert_eq(NetStateHandle.new(bare).entity_id(), 0, "and the same on the state lane")
+	bare.free()
+
+func test_inert_handles_report_no_entity_id() -> void:
+	assert_eq(NetRollbackHandle.new(null).entity_id(), 0, "an inert rollback handle names no entity")
+	assert_eq(NetStateHandle.new(null).entity_id(), 0, "an inert state handle names no entity")

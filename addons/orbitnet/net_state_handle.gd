@@ -150,3 +150,11 @@ func last_known_state() -> int:
 func process_settings() -> void:
 	if _sync != null:
 		_sync.process_settings()
+
+## This channel's stable replication id (0 when inert, or before process_settings() resolves a root inside the
+## tree). See [method NetRollbackHandle.entity_id] -- same token, same caveat that it is a hash and not a
+## quantity, and the same single consumer in [method Net.set_peer_anchor_entity].
+func entity_id() -> int:
+	if _sync == null or not _sync.has_method(&"get_entity_id"):
+		return 0
+	return _sync.get_entity_id()

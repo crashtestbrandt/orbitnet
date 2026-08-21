@@ -404,6 +404,61 @@ func aoi_max_entities() -> int:
 func set_aoi_max_entities(count: int) -> void:
 	_orbit.set(&"aoi_max_entities", maxi(0, count))
 
+## Declare where one peer OBSERVES from, and which world it observes in. SERVER-SIDE ONLY; no-op OFFLINE or
+## against a backend that predates the call.
+##
+## Undeclared, a peer is centred on -- and put in the world of -- the lowest-id rollback body its input drives.
+## That answers what a peer CONTROLS, and interest management asks what it OBSERVES. The two agree in a game with
+## one world and one avatar per player, and disagree in every other one: a spectator drives nothing, a commander
+## watches ground its body is not standing on, and a peer with a body in each of two worlds observes exactly one.
+##
+## `membership` is the same id [method NetRollbackHandle.set_membership] declares on an entity, and 0 is every
+## world. Declaring it here makes a peer's world a FACT RATHER THAN A PICK: the inferred path reads it off
+## whichever of the peer's bodies sorts lowest by hash, so a peer driving two bodies in different worlds has no
+## defined world without this call.
+##
+## A DECLARATION REPLACES INFERENCE OUTRIGHT, on both axes at once -- the driven body is consulted for neither
+## until [method clear_peer_anchor]. May be called before the peer finishes its handshake.
+func set_peer_anchor(peer: int, position: Vector3, membership: int = 0) -> void:
+	if _mode == Mode.OFFLINE or not _backend_has(&"set_peer_anchor"):
+		return
+	_orbit.set_peer_anchor(peer, position, membership)
+
+## Declare that one peer observes from an ENTITY, and which world it observes in. SERVER-SIDE ONLY; no-op OFFLINE
+## or against a backend that predates the call.
+##
+## `entity_id` comes from `entity_id()` on the rollback or state handle for the body being watched -- an opaque
+## token, routinely negative, only ever passed back unmodified. The entity need NOT be one the peer drives, which
+## is the point. `0` retracts, exactly as [method clear_peer_anchor] does.
+##
+## The same statement as [method set_peer_anchor], differing in what it costs the caller: a tracked centre follows
+## the entity with no per-tick call. **When the tracked entity despawns the peer keeps the last position it
+## resolved to, and stays in the world it was declared into** -- a membership is a declaration and did not fail,
+## while a centre is a measurement and did. A declaration made before the entity has any replicated state simply
+## starts resolving on the tick it does.
+func set_peer_anchor_entity(peer: int, entity_id: int, membership: int = 0) -> void:
+	if _mode == Mode.OFFLINE or not _backend_has(&"set_peer_anchor_entity"):
+		return
+	_orbit.set_peer_anchor_entity(peer, entity_id, membership)
+
+## Retract a peer's anchor declaration AND its world, together. The peer returns to the inferred pair: centred on
+## the lowest-id body its input drives, in that body's world. Retracting one axis without the other would leave a
+## peer declared into a world it has no declared position in, or positioned in a world it is no longer in.
+func clear_peer_anchor(peer: int) -> void:
+	if _mode == Mode.OFFLINE or not _backend_has(&"clear_peer_anchor"):
+		return
+	_orbit.clear_peer_anchor(peer)
+
+## The world DECLARED for one peer; 0 when nothing was declared for it, and 0 OFFLINE.
+##
+## NOT the world an undeclared peer is filtered in -- that one is read off the body it drives and is reported by
+## [method NetRollbackHandle.membership], which is where a misconfigured membership shows. 0 here means "no
+## declaration", which has the same consequence as declaring every world, so the two are not distinguished.
+func peer_membership(peer: int) -> int:
+	if _mode == Mode.OFFLINE or not _backend_has(&"peer_membership"):
+		return 0
+	return _orbit.peer_membership(peer)
+
 ## Rate tiering by distance band: send the MID band every other tick and the FAR band every fourth, phase-offset
 ## by entity id so a band's traffic is level rather than spiking once per interval.
 ##
