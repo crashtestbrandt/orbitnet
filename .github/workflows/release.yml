@@ -46,44 +46,70 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      # SELF-HOSTED WINDOWS: rustup is on PATH but its SHIM DIRECTORY is not, so `rustup toolchain
-      # install` and `rustup default` both succeed while `rustc` is not found. dtolnay/rust-toolchain
-      # only repairs PATH when it installs rustup itself, so on a box where rustup is already present
-      # the failure surfaces inside the action's own cachekey step as "rustc: command not found" --
-      # which reads like a missing toolchain rather than a missing PATH entry.
+      # NO dtolnay/rust-toolchain AND NO Swatinem/rust-cache ON THE SELF-HOSTED LEGS. Both exist to
+      # provision a fresh hosted runner. These boxes already carry rustup and a persistent `target/`
+      # directory, and both actions run `rustc` directly to build a cache key -- which is how a box whose
+      # rustup SHIMS had gone missing failed here with "rustc: command not found" while `rustup toolchain
+      # install` and `rustup default` both reported success. check.yml keeps the actions: it runs on
+      # GitHub-hosted runners that genuinely start empty.
       #
-      # The SHIM directory, not the toolchain's own bin: the shims are what honour
-      # native/rust-toolchain.toml. Putting the toolchain bin on PATH instead would silently ignore the
-      # pin.
-      - name: Put the rustup shims on PATH
-        if: matrix.platform == 'windows'
+      # `cargo` is what the build invokes, and the rustup cargo shim points rustc at the toolchain itself,
+      # so cargo resolving is the condition that matters. native/rust-toolchain.toml pins the version;
+      # rustup honours it from inside that directory with no help from CI.
+      - name: Check the Rust toolchain on this runner
         shell: bash
         run: |
           set -euo pipefail
-          if command -v rustc >/dev/null 2>&1; then
-            echo "rustc already resolves: $(command -v rustc)"
-            exit 0
-          fi
           for dir in \
             "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
             "${CARGO_HOME:-}/bin" \
-            "${USERPROFILE:-}/.cargo/bin"
+            "${USERPROFILE:-}/.cargo/bin" \
+            "$HOME/.cargo/bin"
           do
-            [ -n "$dir" ] || continue
-            if [ -x "$dir/rustc.exe" ] || [ -x "$dir/rustc" ]; then
-              echo "found the rustc shim in $dir"
-              echo "$dir" >> "$GITHUB_PATH"
-              exit 0
-            fi
+            [ -n "$dir" ] && [ -d "$dir" ] || continue
+            echo "-- $dir"
+            ls -l "$dir" || true
+            case ":$PATH:" in *":$dir:"*) ;; *) echo "$dir" >> "$GITHUB_PATH" ;; esac
+            break
           done
-          echo "::error::no rustc shim on this runner. rustup=$(command -v rustup || echo none), CARGO_HOME=${CARGO_HOME:-unset}. Reinstall rustup for the account the runner service runs as."
-          exit 1
+          if ! command -v cargo >/dev/null 2>&1; then
+            # THE RUSTUP PROXIES ARE MISSING, NOT THE TOOLCHAIN. rustup installs `cargo`, `rustc` and the
+            # rest as copies of rustup.exe in the same directory; when those are deleted, `rustup` still
+            # answers and reports its toolchains while nothing else on PATH exists. Observed on a runner
+            # whose .cargo/bin held rustup.exe and nothing else.
+            #
+            # `rustup self update` reinstalls the proxies, which is the sanctioned repair. If it cannot
+            # (offline, or a rustup installed by a package manager), the proxies are recreated directly --
+            # copying rustup.exe under each name is exactly what rustup does internally.
+            rustup_bin="$(command -v rustup || true)"
+            if [ -z "$rustup_bin" ]; then
+              echo "::error::neither cargo nor rustup is on this runner. Install rustup for the account the runner service runs as."
+              exit 1
+            fi
+            bindir="$(dirname "$rustup_bin")"
+            echo "::warning::cargo is missing from ${bindir}; repairing the rustup proxies"
+            rustup self update || echo "rustup self update did not run; recreating the proxies directly"
+            if ! command -v cargo >/dev/null 2>&1; then
+              ext=""
+              case "$rustup_bin" in *.exe) ext=".exe" ;; esac
+              for tool in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+                [ -e "${bindir}/${tool}${ext}" ] || cp "$rustup_bin" "${bindir}/${tool}${ext}"
+              done
+              chmod 0755 "${bindir}"/* 2>/dev/null || true
+              hash -r 2>/dev/null || true
+            fi
+          fi
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::cargo still does not resolve after repair. rustup=$(command -v rustup || echo none). Reinstall rustup for the account the runner service runs as."
+            exit 1
+          fi
+          echo "cargo: $(command -v cargo)"
+          # From inside native/, so the versions printed are the ones rust-toolchain.toml pins. `rustc`
+          # is reported and not required: the rustup cargo shim resolves rustc for its own children, so a
+          # missing rustc shim does not stop a build -- it only stops a step that runs rustc directly.
+          ( cd native && cargo --version )
+          ( cd native && rustc --version ) || echo "rustc does not resolve directly; cargo will resolve it"
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: native
-          key: release-${{ matrix.platform }}
 
       - name: Build both descriptor profiles
         shell: bash
