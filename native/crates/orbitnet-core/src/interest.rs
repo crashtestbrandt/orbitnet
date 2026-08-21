@@ -42,24 +42,57 @@
 //!
 //! ## Grid or scan
 //!
-//! [`PeerInterest`] has two update paths and the backend ships the *linear* one. A uniform grid can
-//! only beat a flat scan when the query radius covers a small fraction of the occupied space;
-//! otherwise [`InterestGrid::query_within`]'s own guard finds the scan rectangle larger than the
-//! occupancy and iterates every bucket — which **is** the linear scan, plus a rebuild. Measured
-//! (`tests/interest_bench.rs`, 240 ticks, radius 256 m, release):
+//! [`PeerInterest`] has two update paths and the backend ships the *linear* one.
+//! [`PeerInterest::update_grid_into`] and [`PeerInterest::update_linear_into`] apply the same
+//! rules to the same [`InterestCandidate`]s and report the same leaves — the suite asserts both
+//! over a randomised walk — so the choice between them is a cost decision, and it is the two
+//! measurements below rather than an argument.
+//!
+//! **Arena extent.** A uniform grid can only beat a flat scan when the query radius covers a small
+//! fraction of the occupied space; otherwise [`InterestGrid::query_within`]'s own guard finds the
+//! scan rectangle larger than the occupancy and iterates every bucket — which **is** the linear
+//! scan, plus a rebuild. Measured (`tests/interest_bench.rs`, 64 peers, 800 entities, 240 ticks,
+//! radius 256 m, release):
 //!
 //! | arena extent | mean set | scan µs/tick | grid µs/tick |
 //! |--------------|----------|--------------|--------------|
-//! | ±300 m       | 335      | 519          | 1628         |
-//! | ±600 m       | 101      | 311          | 483          |
-//! | ±1200 m      | 26       | 190          | 113          |
-//! | ±5000 m      | 1        | 85           | 85           |
+//! | ±300 m       | 335      | 884          | 1312         |
+//! | ±600 m       | 101      | 432          | 430          |
+//! | ±1200 m      | 26       | 237          | 131          |
+//! | ±2500 m      | 4        | 130          | 99           |
+//! | ±5000 m      | 1        | 101          | 98           |
+//! | ±10000 m     | 1        | 99           | 112          |
+//! | ±25000 m     | 1        | 98           | 104          |
 //!
-//! The grid wins only in a band no shipped arena occupies (2fort's forts sit at ±74 m, the
-//! container cube is 60 m on a side), and by ~80 µs/tick when it does. So [`PeerInterest::update`]
-//! and the grid are retained, tested and unchanged — they are the right answer if arenas ever grow
-//! an order of magnitude — while [`PeerInterest::update_linear_into`] is what `orbit_net.rs` calls.
-//! `net.perf`'s `interest_ms` is the live number that would justify revisiting.
+//! The grid wins in a band no shipped arena occupies — 2fort's forts sit at ±74 m and the
+//! container cube is 60 m on a side — and it loses again past ±10 km, where the occupancy is so
+//! sparse that nearly every entity holds a cell of its own and the rebuild buys no locality.
+//!
+//! **World count.** Several independent worlds in one session was the case the grid was expected
+//! to win: each world adds entities while every peer's radius still covers only its own, so the
+//! mean set per peer falls as `N` rises. It does not win it. Measured (64 peers, 1200 entities
+//! total, each world rebased on its own origin at ±300 m, radius 256 m):
+//!
+//! | worlds | mean set | scan µs/tick | grid µs/tick |
+//! |--------|----------|--------------|--------------|
+//! | 1      | 500      | 1735         | 2095         |
+//! | 2      | 254      | 640          | 1004         |
+//! | 4      | 127      | 304          | 519          |
+//! | 8      | 63       | 146          | 287          |
+//! | 16     | 32       | 85           | 169          |
+//! | 32     | 16       | 58           | 102          |
+//!
+//! Both paths get cheaper as the worlds multiply, and the scan stays about twice as fast at every
+//! count. Refusing another world costs the scan one integer comparison per candidate, which is
+//! already less than binning that candidate costs the grid — so the work a grid saves here is work
+//! the scan was never doing.
+//!
+//! So [`PeerInterest::update_linear_into`] is what `orbit_net.rs` calls, and the grid is retained
+//! and tested rather than adopted. What changed is that it is now *adoptable*: it reports the
+//! leaves the send path clears its delta bookkeeping from, it carries the always-set and the
+//! worlds, and the only thing an adopting caller adds is one [`InterestGrid::rebuild`] per tick
+//! before the per-peer loop. `net.perf`'s `interest_ms` is the live number that would justify it,
+//! and the ±1200 m row is the arena shape that would.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -67,6 +100,9 @@ use crate::history::BodyId;
 
 /// One grid cell's occupants: `(id, position)` pairs, position retained for the distance check.
 type CellBucket = Vec<(BodyId, [f32; 3])>;
+
+/// One world's XZ cells. Each [`MembershipId`] gets its own map — see [`InterestGrid`].
+type WorldCells = HashMap<(i32, i32), CellBucket>;
 
 /// Tuning for the AOI grid and the per-peer hysteresis band.
 ///
@@ -79,7 +115,8 @@ pub struct AoiConfig {
     /// Edge length of one grid cell in metres. Values that are non-finite or `<= 0` behave as the
     /// default `32.0`.
     pub cell_size: f32,
-    /// Radius in metres at which an entity enters a peer's interest set.
+    /// Radius in metres at which an entity enters a peer's interest set. A negative radius
+    /// behaves as `0.0`.
     ///
     /// The default of `256.0` covers the demo arena with margin: the 2fort CTF forts sit at
     /// ±74 m, so a peer in one fort holds interest over the bridged midfield *and* the far fort.
@@ -112,6 +149,20 @@ impl AoiConfig {
         }
     }
 
+    /// The enter radius actually used, with a negative one floored at `0.0`.
+    ///
+    /// A negative radius reads as "cull everything", and it is the only reading available: the
+    /// squared distance a filter compares against cannot carry the sign, so the raw value would
+    /// admit everything within its magnitude instead. `NaN` and infinity pass through — both are
+    /// meaningful to the comparisons downstream (nothing enters, and everything does).
+    fn effective_enter_radius(&self) -> f32 {
+        if self.enter_radius < 0.0 {
+            0.0
+        } else {
+            self.enter_radius
+        }
+    }
+
     /// The exit factor actually used, floored at `1.0` (a band narrower than the enter radius
     /// would make entities leave the set while still eligible to re-enter it — flicker by
     /// construction).
@@ -132,7 +183,7 @@ fn cell_coord(value: f32, cell_size: f32) -> i32 {
     (value / cell_size).floor() as i32
 }
 
-/// A uniform spatial grid over the XZ plane, rebuilt from entity positions each net tick.
+/// A uniform spatial grid over the XZ plane, rebuilt from the tick's candidates.
 ///
 /// Y is deliberately **not** part of the cell key (see the module header); it still participates
 /// in every distance computed by [`InterestGrid::query_within`]. Bucket `Vec`s are pooled across
@@ -140,10 +191,26 @@ fn cell_coord(value: f32, cell_size: f32) -> i32 {
 ///
 /// Rebuild and query must use the same [`AoiConfig`] (or at least the same effective cell size) —
 /// the query derives its cell scan from the size the entities were binned under.
+///
+/// **Each world is binned separately.** [`MembershipId`] keys the outer map rather than forming a
+/// third component of the cell key, because [`InterestGrid::query_within`]'s occupancy guard
+/// compares a scan rectangle against a cell count. Folding the worlds together would compare it
+/// against every world's cells at once, and a query that reads one world would take the
+/// scan-everything branch on the strength of occupancy it can never see.
+///
+/// **The candidates that bypass the distance test are held beside the cells**, not in them:
+/// [`InterestCandidate::always`] entities, and any whose position has a non-finite component. They
+/// have no cell to be found in — an `always` candidate carries no position at all, and a `NaN`
+/// cannot be binned — and a query must return them whatever its radius, so they are a flat list
+/// read through [`InterestGrid::uncullable_for`]. Failing open on an unbinnable position rather
+/// than dropping it is the rule the linear path applies, and the reason is recorded on
+/// [`PeerInterest::update_linear_into`].
 #[derive(Debug, Clone, Default)]
 pub struct InterestGrid {
-    cells: HashMap<(i32, i32), CellBucket>,
-    pool: Vec<CellBucket>,
+    worlds: HashMap<MembershipId, WorldCells>,
+    uncullable: Vec<(BodyId, MembershipId)>,
+    cell_pool: Vec<CellBucket>,
+    world_pool: Vec<WorldCells>,
 }
 
 impl InterestGrid {
@@ -153,43 +220,59 @@ impl InterestGrid {
         Self::default()
     }
 
-    /// Replace the grid's contents with `entities`, binning by XZ cell.
+    /// Replace the grid's contents with `candidates`, binning each by world and XZ cell.
     ///
-    /// Entities with any non-finite position component are **skipped**, not clamped: a `NaN`
-    /// cannot be meaningfully binned, and clamping would teleport the body into some arbitrary
-    /// boundary cell where it would match queries it should not. A skipped entity simply falls
-    /// out of every peer's set, which is the same thing that happens when it despawns.
-    pub fn rebuild(&mut self, cfg: &AoiConfig, entities: &[(BodyId, [f32; 3])]) {
+    /// A candidate that is [`InterestCandidate::always`], or whose position has any non-finite
+    /// component, is **not binned**: it joins the uncullable list and reaches every observer its
+    /// membership admits, at any distance. Clamping a non-finite position instead would teleport
+    /// the body into some arbitrary boundary cell where it would match queries it should not.
+    pub fn rebuild(&mut self, cfg: &AoiConfig, candidates: &[InterestCandidate]) {
         let cell_size = cfg.effective_cell_size();
-        let pool = &mut self.pool;
-        let cells = &mut self.cells;
-        for (_, mut bucket) in cells.drain() {
-            bucket.clear();
-            pool.push(bucket);
+        let cell_pool = &mut self.cell_pool;
+        let world_pool = &mut self.world_pool;
+        let worlds = &mut self.worlds;
+        for (_, mut world) in worlds.drain() {
+            for (_, mut bucket) in world.drain() {
+                bucket.clear();
+                cell_pool.push(bucket);
+            }
+            world_pool.push(world);
         }
-        for &(id, pos) in entities {
-            if !(pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite()) {
+        self.uncullable.clear();
+        for candidate in candidates {
+            let pos = candidate.pos;
+            if candidate.always || !(pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite())
+            {
+                self.uncullable.push((candidate.id, candidate.membership));
                 continue;
             }
             let key = (cell_coord(pos[0], cell_size), cell_coord(pos[2], cell_size));
-            cells
+            worlds
+                .entry(candidate.membership)
+                .or_insert_with(|| world_pool.pop().unwrap_or_default())
                 .entry(key)
-                .or_insert_with(|| pool.pop().unwrap_or_default())
-                .push((id, pos));
+                .or_insert_with(|| cell_pool.pop().unwrap_or_default())
+                .push((candidate.id, pos));
         }
     }
 
-    /// Append every entity within true 3D euclidean distance `<= radius` of `center` to `out` as
-    /// `(id, distance_squared)`, scanning only the grid cells the radius overlaps.
+    /// Append every entity `observer` may see within true 3D euclidean distance `<= radius` of
+    /// `center` to `out` as `(id, distance_squared)`, scanning only the cells the radius overlaps
+    /// in the worlds [`membership_matches`] admits.
     ///
     /// `out` is cleared first. A non-finite `radius` or `center`, or a negative `radius`, yields
-    /// an empty result. When the scan rectangle would cover more cells than are actually occupied
-    /// (an enormous radius), the occupied cells are scanned instead, so the cost is bounded by the
-    /// entity count either way. Append **order is unspecified** — sort by id if a deterministic
-    /// order matters downstream ([`PeerInterest`] does not depend on it).
+    /// an empty result. When the scan rectangle would cover more cells than a world actually
+    /// occupies (an enormous radius), that world's occupied cells are scanned instead, so the cost
+    /// is bounded by the entity count either way. Append **order is unspecified** — sort by id if a
+    /// deterministic order matters downstream ([`PeerInterest`] does not depend on it).
+    ///
+    /// This is the **distance** half alone. The uncullable candidates are never returned here at
+    /// any radius, because they have no distance to be inside;
+    /// [`PeerInterest::update_grid_into`] merges them in from [`Self::uncullable_for`].
     pub fn query_within(
         &self,
         cfg: &AoiConfig,
+        observer: MembershipId,
         center: [f32; 3],
         radius: f32,
         out: &mut Vec<(BodyId, f32)>,
@@ -211,19 +294,47 @@ impl InterestGrid {
         // overflows u64 exactly at the corner case.
         let span_x = (i64::from(max_x) - i64::from(min_x) + 1) as u128;
         let span_z = (i64::from(max_z) - i64::from(min_z) + 1) as u128;
-        if span_x * span_z > self.cells.len() as u128 {
-            for bucket in self.cells.values() {
-                Self::append_within(bucket, center, radius_sq, out);
+        for (&membership, world) in &self.worlds {
+            if !membership_matches(observer, membership) {
+                continue;
             }
-        } else {
-            for cx in min_x..=max_x {
-                for cz in min_z..=max_z {
-                    if let Some(bucket) = self.cells.get(&(cx, cz)) {
-                        Self::append_within(bucket, center, radius_sq, out);
+            if span_x * span_z > world.len() as u128 {
+                for bucket in world.values() {
+                    Self::append_within(bucket, center, radius_sq, out);
+                }
+            } else {
+                for cx in min_x..=max_x {
+                    for cz in min_z..=max_z {
+                        if let Some(bucket) = world.get(&(cx, cz)) {
+                            Self::append_within(bucket, center, radius_sq, out);
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Every entity `observer` may see that bypasses the distance test: the
+    /// [`InterestCandidate::always`] candidates and the ones whose position could not be binned.
+    /// Order is unspecified.
+    pub fn uncullable_for(&self, observer: MembershipId) -> impl Iterator<Item = BodyId> + '_ {
+        self.uncullable
+            .iter()
+            .filter(move |&&(_, membership)| membership_matches(observer, membership))
+            .map(|&(id, _)| id)
+    }
+
+    /// Every entity `observer` may see at **any** distance: the binned ones plus
+    /// [`Self::uncullable_for`]. Order is unspecified.
+    ///
+    /// This is what an observer with no usable centre sees. A non-finite centre is a measurement
+    /// that failed, and the filter fails open on it rather than blanking that peer's world.
+    pub fn visible_to(&self, observer: MembershipId) -> impl Iterator<Item = BodyId> + '_ {
+        self.worlds
+            .iter()
+            .filter(move |(&membership, _)| membership_matches(observer, membership))
+            .flat_map(|(_, world)| world.values().flat_map(|b| b.iter().map(|&(id, _)| id)))
+            .chain(self.uncullable_for(observer))
     }
 
     /// Distance-check one bucket's occupants against `center`, appending the hits.
@@ -357,70 +468,117 @@ impl PeerInterest {
         Self::default()
     }
 
-    /// Recompute the set from the grid for a peer observing from `center`.
+    /// Recompute the set from `grid` for a peer observing from `center`, reporting every id that
+    /// **left**.
     ///
-    /// Entities within `enter_radius` join; current members are retained until they exceed
-    /// `enter_radius * exit_factor`; members not found within the exit radius (moved away,
-    /// despawned, or position went non-finite) are removed — nothing leaks. When
-    /// `cfg.max_entities > 0`, only the nearest N survive, ordered by distance, then **current
-    /// members before newcomers** on a distance tie (so the set stays stable when a newcomer
-    /// merely matches a member's range), then ascending id (so the result is deterministic
-    /// regardless of grid iteration order). An entity evicted by the cap is a real leave: it must
-    /// re-enter through `enter_radius` like any newcomer.
+    /// These are [`Self::update_linear_into`]'s rules applied to the same candidates through a
+    /// spatial index instead of a flat scan. The two paths are asserted to agree — members and
+    /// leaves alike — over a randomised walk in this module's suite, so choosing between them is a
+    /// cost decision and not a behaviour change. Part by part:
     ///
-    /// `scratch` is caller-provided working storage so a per-peer, per-tick update allocates
-    /// nothing once warm; its contents on return are unspecified. A non-finite `enter_radius` or
-    /// `center` empties the set (the query it depends on returns nothing).
+    /// * Entities within `enter_radius` join; current members are retained until they exceed
+    ///   `enter_radius * exit_factor`; members the query no longer returns (moved away, despawned,
+    ///   or position went non-finite) are removed — nothing leaks.
+    /// * `observer` is the world the peer is in. [`InterestGrid::rebuild`] bins each world
+    ///   separately and the query reads only the ones [`membership_matches`] admits, so an
+    ///   overlapping world's entities never enter the set at any distance.
+    /// * [`InterestCandidate::always`] entities, and any whose position could not be binned, arrive
+    ///   from [`InterestGrid::uncullable_for`] and bypass both the radius and the cap.
+    /// * When `cfg.max_entities > 0`, only the nearest N **cullable** entities survive, ordered by
+    ///   distance, then current members before newcomers on a distance tie (so the set stays stable
+    ///   when a newcomer merely matches a member's range), then ascending id (so the result is
+    ///   deterministic regardless of grid iteration order). An entity evicted by the cap is a real
+    ///   leave: it must re-enter through `enter_radius` like any newcomer.
+    /// * `leaves` receives every id that was a member and is not one now — radius exits, membership
+    ///   refusals and cap evictions alike. The caller clears its per-peer delta bookkeeping from
+    ///   that list, so a re-entrant entity gets a full block rather than a delta against a base the
+    ///   peer stopped tracking. Without it the peer NACKs, and a NACK is per-peer and all-entity:
+    ///   one re-entering body costs a full-state burst for everything that peer holds.
     ///
-    /// **NOT THE SHIPPED PATH, AND IT CANNOT BE ADOPTED AS IT STANDS.** The binding calls
-    /// [`Self::update_linear_into`], which reports the entities that LEFT the set — and the send path needs
-    /// that list, not as a nicety but for correctness: a leave has to clear `last_sent` and `acked_base` for
-    /// that entity, or a re-entering body is answered with a delta against a base its peer dropped, which
-    /// raises the per-peer all-entity `WANT_FULL` flag. This grid form returns nothing. Whoever adopts it for
-    /// the entity counts a grid finally pays for has to give it the same leave diff first; swapping the call
-    /// site alone would trade a linear scan for a full-state storm.
+    /// `also` holds candidates offered to **this peer alone**, filtered exactly as
+    /// [`Self::update_linear_into`] filters its slice and merged in before the cap runs. It carries
+    /// the facts a grid shared by every peer cannot, of which the send path has one: a peer's own
+    /// body is always-relevant to that peer and to no other. An id named in `also` is answered by
+    /// `also` alone and its binned entry is ignored, so the two can never both admit it. That check
+    /// is a scan of `also` per grid hit, which is why `also` holds a peer's handful of overrides
+    /// rather than a second candidate list.
     ///
-    /// It also carries no [`MembershipId`]. The grid keys its cells on XZ cell coordinates alone, so
-    /// overlapping worlds share buckets; an adoption has to key on `(membership, cell_x, cell_z)` or
-    /// filter the query results, on top of the leave diff.
-    pub fn update(
+    /// A non-finite `center` admits every entity `observer` may see, uncapped. An observer that
+    /// cannot be located measures nothing, and failing open costs bandwidth where failing closed
+    /// would blank that peer's world; [`Self::update_linear_into`] fails open the same way.
+    ///
+    /// `leaves` and `scratch` are both cleared on entry; `scratch` is caller-owned working storage
+    /// so a warm per-peer update allocates nothing.
+    // The grid, the config, the observer's centre and world, that peer's overrides and the two
+    // caller-owned buffers. Bundling any pair of them into a struct would either allocate per peer
+    // per tick or move the same arguments to a constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_grid_into(
         &mut self,
         grid: &InterestGrid,
         cfg: &AoiConfig,
         center: [f32; 3],
+        observer: MembershipId,
+        also: &[InterestCandidate],
         scratch: &mut Vec<(BodyId, f32)>,
+        leaves: &mut Vec<BodyId>,
     ) {
-        let enter_radius = cfg.enter_radius;
+        scratch.clear();
+        leaves.clear();
+        let center_ok = center[0].is_finite() && center[1].is_finite() && center[2].is_finite();
+        let enter_radius = cfg.effective_enter_radius();
+        let enter_sq = enter_radius * enter_radius;
         // `.min(f32::MAX)` keeps an overflowing product finite so the query still runs.
         let exit_radius = (enter_radius * cfg.effective_exit_factor()).min(f32::MAX);
-        grid.query_within(cfg, center, exit_radius, scratch);
+        let exit_sq = exit_radius * exit_radius;
+        // Cheap because `also` holds a peer's overrides, and free when it is empty — which it is
+        // for every caller that has no per-peer fact to add.
+        let overridden = |id: BodyId| !also.is_empty() && also.iter().any(|c| c.id == id);
 
-        // One query at the exit radius serves both bands: everything returned is inside the exit
-        // radius (members retained), and the enter check below filters the newcomers.
-        let enter_sq = enter_radius * enter_radius;
-        let members = &self.members;
-        scratch.retain(|&(id, dist_sq)| members.contains_key(&id) || dist_sq <= enter_sq);
-
-        if cfg.max_entities > 0 && scratch.len() > cfg.max_entities {
-            scratch.sort_by(|a, b| {
-                a.1.total_cmp(&b.1)
-                    .then_with(|| members.contains_key(&b.0).cmp(&members.contains_key(&a.0)))
-                    .then_with(|| a.0.cmp(&b.0))
+        let mut cullable = 0usize;
+        if center_ok {
+            // One query at the exit radius serves both bands: everything returned is inside the
+            // exit radius (members retained), and the enter check below filters the newcomers.
+            grid.query_within(cfg, observer, center, exit_radius, scratch);
+            let members = &self.members;
+            scratch.retain(|&(id, dist_sq)| {
+                !overridden(id) && (members.contains_key(&id) || dist_sq <= enter_sq)
             });
-            scratch.truncate(cfg.max_entities);
+            cullable = scratch.len();
+            for id in grid.uncullable_for(observer) {
+                if !overridden(id) {
+                    // Sorting below `0.0` is impossible, so an uncullable entity can never be
+                    // reordered ahead of a genuinely closer one by the cap sort — it is excluded
+                    // from that sort's population instead.
+                    scratch.push((id, f32::NEG_INFINITY));
+                }
+            }
+        } else {
+            for id in grid.visible_to(observer) {
+                if !overridden(id) {
+                    scratch.push((id, f32::NEG_INFINITY));
+                }
+            }
+        }
+        for candidate in also {
+            if let Some((dist_sq, is_cullable)) =
+                self.classify(candidate, observer, center, center_ok, enter_sq, exit_sq)
+            {
+                scratch.push((candidate.id, dist_sq));
+                cullable += usize::from(is_cullable);
+            }
         }
 
-        self.members.clear();
-        for &(id, dist_sq) in scratch.iter() {
-            self.members.insert(id, dist_sq);
-        }
+        Self::apply_cap(cfg, &self.members, cullable, scratch);
+        self.commit(scratch, leaves);
     }
 
     /// Recompute the set from a flat candidate slice, reporting every id that **left**.
     ///
     /// This is the path `orbit_net.rs` runs (see the module header for why the grid is not). The
-    /// hysteresis, cap and tie-breaking rules are identical to [`Self::update`]; what differs is
-    /// only how candidates are found, plus three things [`Self::update`] cannot express:
+    /// hysteresis, cap, tie-breaking and leave rules are [`Self::update_grid_into`]'s; what differs
+    /// is only how candidates are found. Three of them are worth restating where the shipped caller
+    /// will read them:
     ///
     /// * [`InterestCandidate::always`] entities bypass both the radius and the cap. The cap bounds
     ///   the *cullable* set; an unconditionally-relevant entity is never evicted by it.
@@ -456,60 +614,94 @@ impl PeerInterest {
         scratch.clear();
         leaves.clear();
         let center_ok = center[0].is_finite() && center[1].is_finite() && center[2].is_finite();
-        let enter_radius = cfg.enter_radius;
+        let enter_radius = cfg.effective_enter_radius();
         let enter_sq = enter_radius * enter_radius;
+        // `.min(f32::MAX)` keeps an overflowing product finite so the comparison still means
+        // something.
         let exit_radius = (enter_radius * cfg.effective_exit_factor()).min(f32::MAX);
         let exit_sq = exit_radius * exit_radius;
 
         let mut cullable = 0usize;
         for candidate in candidates {
-            // Membership first. A candidate in a world the observer is not in is refused whatever
-            // its distance and whatever `always` says, so nothing below this line can readmit it.
-            if !membership_matches(observer, candidate.membership) {
-                continue;
-            }
-            let pos = candidate.pos;
-            let binnable =
-                center_ok && pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite();
-            if candidate.always || !binnable {
-                // Sorted below `0.0` is impossible, so an always-entity can never be reordered
-                // ahead of a genuinely closer one by the cap sort — it is excluded from it.
-                scratch.push((candidate.id, f32::NEG_INFINITY));
-                continue;
-            }
-            let dx = pos[0] - center[0];
-            let dy = pos[1] - center[1];
-            let dz = pos[2] - center[2];
-            let dist_sq = dx * dx + dy * dy + dz * dz;
-            let member = self.members.contains_key(&candidate.id);
-            let keep = if member {
-                dist_sq <= exit_sq
-            } else {
-                dist_sq <= enter_sq
-            };
-            if keep {
+            if let Some((dist_sq, is_cullable)) =
+                self.classify(candidate, observer, center, center_ok, enter_sq, exit_sq)
+            {
                 scratch.push((candidate.id, dist_sq));
-                cullable += 1;
+                cullable += usize::from(is_cullable);
             }
         }
 
-        if cfg.max_entities > 0 && cullable > cfg.max_entities {
-            let members = &self.members;
-            // `NEG_INFINITY` sorts the always-entities to the front, so truncating to
-            // `max_entities + always_count` keeps every one of them plus the nearest N cullable.
-            scratch.sort_by(|a, b| {
-                a.1.total_cmp(&b.1)
-                    .then_with(|| members.contains_key(&b.0).cmp(&members.contains_key(&a.0)))
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            let always_count = scratch.len() - cullable;
-            scratch.truncate(always_count + cfg.max_entities);
-        }
+        Self::apply_cap(cfg, &self.members, cullable, scratch);
+        self.commit(scratch, leaves);
+    }
 
-        // Diff before overwrite: everything the old set held that the new one does not is a leave.
-        // `self.members` is already ascending by id, so sorting `scratch` the same way turns the
-        // diff into one linear merge — a nested scan here would be O(K^2) per peer per tick, which
-        // at the interest-set sizes this exists to serve is worse than the filter it replaced.
+    /// One candidate's verdict, shared by both update paths so their rules cannot drift apart.
+    ///
+    /// `None` refuses it. `Some((dist_sq, cullable))` keeps it, and `cullable` is `false` for an
+    /// entity that bypassed the distance test — those carry [`f32::NEG_INFINITY`] and are excluded
+    /// from the cap's population rather than merely sorted to the front of it.
+    ///
+    /// Membership is decided first. A candidate in a world the observer is not in is refused
+    /// whatever its distance and whatever `always` says, so nothing below that line can readmit it.
+    fn classify(
+        &self,
+        candidate: &InterestCandidate,
+        observer: MembershipId,
+        center: [f32; 3],
+        center_ok: bool,
+        enter_sq: f32,
+        exit_sq: f32,
+    ) -> Option<(f32, bool)> {
+        if !membership_matches(observer, candidate.membership) {
+            return None;
+        }
+        let pos = candidate.pos;
+        let binnable = center_ok && pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite();
+        if candidate.always || !binnable {
+            return Some((f32::NEG_INFINITY, false));
+        }
+        let dx = pos[0] - center[0];
+        let dy = pos[1] - center[1];
+        let dz = pos[2] - center[2];
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+        let keep = if self.members.contains_key(&candidate.id) {
+            dist_sq <= exit_sq
+        } else {
+            dist_sq <= enter_sq
+        };
+        keep.then_some((dist_sq, true))
+    }
+
+    /// Keep only the nearest `cfg.max_entities` cullable entries, plus every uncullable one.
+    ///
+    /// `cullable` is how many of `scratch`'s entries were admitted on distance; the rest carry
+    /// [`f32::NEG_INFINITY`] and sort to the front, so truncating to `uncullable + max_entities`
+    /// keeps all of them and the nearest N of the others.
+    fn apply_cap(
+        cfg: &AoiConfig,
+        members: &BTreeMap<BodyId, f32>,
+        cullable: usize,
+        scratch: &mut Vec<(BodyId, f32)>,
+    ) {
+        if cfg.max_entities == 0 || cullable <= cfg.max_entities {
+            return;
+        }
+        scratch.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| members.contains_key(&b.0).cmp(&members.contains_key(&a.0)))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let uncullable = scratch.len() - cullable;
+        scratch.truncate(uncullable + cfg.max_entities);
+    }
+
+    /// Diff `scratch` against the current members, push what left to `leaves`, then overwrite.
+    ///
+    /// Diff **before** overwrite: everything the old set held that the new one does not is a leave.
+    /// `self.members` is already ascending by id, so sorting `scratch` the same way turns the diff
+    /// into one linear merge — a nested scan here would be O(K^2) per peer per tick, which at the
+    /// interest-set sizes this exists to serve is worse than the filter it replaced.
+    fn commit(&mut self, scratch: &mut [(BodyId, f32)], leaves: &mut Vec<BodyId>) {
         scratch.sort_unstable_by_key(|&(id, _)| id);
         let mut fresh = scratch.iter().peekable();
         for &id in self.members.keys() {
@@ -647,6 +839,35 @@ mod tests {
         assert!(cfg.enter_radius > 2.0 * 74.0);
     }
 
+    /// Every entity as a plain anchored candidate in every world — the shape most of the grid
+    /// suite feeds [`InterestGrid::rebuild`].
+    fn anchored(entities: &[(BodyId, [f32; 3])]) -> Vec<InterestCandidate> {
+        entities
+            .iter()
+            .map(|&(id, pos)| InterestCandidate::anchored(id, pos))
+            .collect()
+    }
+
+    /// A grid update for a global observer with no per-peer overrides, discarding the leaves —
+    /// for the tests about the distance rules rather than about the diff.
+    fn update_grid(
+        peer: &mut PeerInterest,
+        grid: &InterestGrid,
+        cfg: &AoiConfig,
+        center: [f32; 3],
+    ) {
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_grid_into(
+            grid,
+            cfg,
+            center,
+            MEMBERSHIP_GLOBAL,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+    }
+
     #[test]
     fn grid_query_matches_brute_force_on_a_pseudo_random_layout() {
         let mut state = 0x1234_5678u32;
@@ -661,7 +882,7 @@ mod tests {
         }
         let cfg = AoiConfig::default();
         let mut grid = InterestGrid::new();
-        grid.rebuild(&cfg, &entities);
+        grid.rebuild(&cfg, &anchored(&entities));
 
         let centers = [
             [0.0, 0.0, 0.0],
@@ -672,7 +893,7 @@ mod tests {
         let mut out: Vec<(BodyId, f32)> = Vec::new();
         for center in centers {
             for radius in radii {
-                grid.query_within(&cfg, center, radius, &mut out);
+                grid.query_within(&cfg, MEMBERSHIP_GLOBAL, center, radius, &mut out);
                 assert_eq!(
                     sorted_by_id(out.clone()),
                     brute_force(&entities, center, radius),
@@ -687,12 +908,13 @@ mod tests {
         let cfg = AoiConfig::default();
         let grid = InterestGrid::new();
         let mut out = vec![(1, 0.0)]; // must be cleared even when nothing matches
-        grid.query_within(&cfg, [0.0; 3], 100.0, &mut out);
+        grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], 100.0, &mut out);
         assert!(out.is_empty());
+        assert_eq!(grid.uncullable_for(MEMBERSHIP_GLOBAL).count(), 0);
+        assert_eq!(grid.visible_to(MEMBERSHIP_GLOBAL).count(), 0);
 
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(peer.is_empty());
         assert_eq!(peer.len(), 0);
         assert_eq!(peer.iter().count(), 0);
@@ -703,33 +925,52 @@ mod tests {
         let cfg = AoiConfig::default();
         let mut grid = InterestGrid::new();
         // Both share the origin's XZ cell; one hangs 300 m overhead.
-        grid.rebuild(&cfg, &[(1, [0.0, 300.0, 0.0]), (2, [0.0, 10.0, 0.0])]);
+        grid.rebuild(
+            &cfg,
+            &anchored(&[(1, [0.0, 300.0, 0.0]), (2, [0.0, 10.0, 0.0])]),
+        );
         let mut out = Vec::new();
-        grid.query_within(&cfg, [0.0; 3], 50.0, &mut out);
+        grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], 50.0, &mut out);
         assert_eq!(sorted_by_id(out.clone()), vec![(2, 100.0)]);
         // A radius covering the true 3D distance finds the overhead body too, which also proves
         // it was binned by XZ alone — the scan rectangle only covers cells around the origin.
-        grid.query_within(&cfg, [0.0; 3], 301.0, &mut out);
+        grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], 301.0, &mut out);
         assert_eq!(sorted_by_id(out.clone()).len(), 2);
     }
 
     #[test]
-    fn non_finite_positions_are_skipped_on_rebuild() {
-        let cfg = AoiConfig::default();
+    fn non_finite_positions_are_held_beside_the_cells_and_fail_open() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
         let mut grid = InterestGrid::new();
         grid.rebuild(
             &cfg,
-            &[
+            &anchored(&[
                 (1, [f32::NAN, 0.0, 0.0]),
                 (2, [0.0, f32::INFINITY, 0.0]),
                 (3, [0.0, 0.0, f32::NEG_INFINITY]),
                 (4, [1.0, 2.0, 3.0]),
-            ],
+                (5, [10_000.0, 0.0, 0.0]),
+            ]),
         );
+        // None of the three unbinnable bodies is in a cell, so the distance query never sees them
+        // whatever its radius.
         let mut out = Vec::new();
-        grid.query_within(&cfg, [0.0; 3], f32::MAX.sqrt(), &mut out);
+        grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], f32::MAX.sqrt(), &mut out);
         let ids: Vec<BodyId> = sorted_by_id(out).iter().map(|&(id, _)| id).collect();
-        assert_eq!(ids, vec![4]);
+        assert_eq!(ids, vec![4, 5]);
+
+        // They are uncullable instead — a body the filter cannot reason about is replicated
+        // rather than silently deleted from the peer's world. Body 5 is genuinely out of range.
+        let mut uncullable: Vec<BodyId> = grid.uncullable_for(MEMBERSHIP_GLOBAL).collect();
+        uncullable.sort_unstable();
+        assert_eq!(uncullable, vec![1, 2, 3]);
+
+        let mut peer = PeerInterest::new();
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        // An uncullable member has no meaningful distance, and stores `0.0` rather than the
+        // `NEG_INFINITY` it sorted under.
+        assert_eq!(peer.dist_sq(1), Some(0.0));
     }
 
     #[test]
@@ -743,8 +984,8 @@ mod tests {
         for bad in [0.0, -3.0, f32::NAN, f32::INFINITY] {
             let cfg = cfg(bad, 256.0, 1.25, 0);
             let mut grid = InterestGrid::new();
-            grid.rebuild(&cfg, &entities);
-            grid.query_within(&cfg, [0.0; 3], 200.0, &mut out);
+            grid.rebuild(&cfg, &anchored(&entities));
+            grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], 200.0, &mut out);
             assert_eq!(
                 sorted_by_id(out.clone()),
                 brute_force(&entities, [0.0; 3], 200.0),
@@ -757,7 +998,7 @@ mod tests {
     fn query_rejects_non_finite_centers_and_radii() {
         let cfg = AoiConfig::default();
         let mut grid = InterestGrid::new();
-        grid.rebuild(&cfg, &[(1, [0.0, 0.0, 0.0])]);
+        grid.rebuild(&cfg, &anchored(&[(1, [0.0, 0.0, 0.0])]));
         let mut out = Vec::new();
         for (center, radius) in [
             ([f32::NAN, 0.0, 0.0], 100.0),
@@ -766,7 +1007,7 @@ mod tests {
             ([0.0; 3], f32::INFINITY),
             ([0.0; 3], -1.0),
         ] {
-            grid.query_within(&cfg, center, radius, &mut out);
+            grid.query_within(&cfg, MEMBERSHIP_GLOBAL, center, radius, &mut out);
             assert!(out.is_empty(), "center {center:?} radius {radius} matched");
         }
     }
@@ -775,22 +1016,35 @@ mod tests {
     fn rebuild_replaces_previous_contents() {
         let cfg = AoiConfig::default();
         let mut grid = InterestGrid::new();
-        grid.rebuild(&cfg, &[(1, [0.0; 3]), (2, [10.0, 0.0, 0.0])]);
-        grid.rebuild(&cfg, &[(3, [0.0; 3])]);
+        grid.rebuild(
+            &cfg,
+            &[
+                InterestCandidate::anchored(1, [0.0; 3]),
+                InterestCandidate::anchored_in(2, [10.0, 0.0, 0.0], 7),
+                InterestCandidate::always(9),
+            ],
+        );
+        grid.rebuild(&cfg, &anchored(&[(3, [0.0; 3])]));
         let mut out = Vec::new();
-        grid.query_within(&cfg, [0.0; 3], 500.0, &mut out);
+        grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], 500.0, &mut out);
         assert_eq!(sorted_by_id(out), vec![(3, 0.0)]);
+        // The emptied world and the uncullable list are replaced too, not merely shadowed.
+        assert_eq!(grid.uncullable_for(MEMBERSHIP_GLOBAL).count(), 0);
+        assert_eq!(grid.visible_to(7).collect::<Vec<_>>(), vec![3]);
     }
 
     #[test]
     fn enormous_radius_scans_occupied_cells_not_the_rectangle() {
         let cfg = AoiConfig::default();
         let mut grid = InterestGrid::new();
-        grid.rebuild(&cfg, &[(1, [0.0; 3]), (2, [5000.0, 0.0, -5000.0])]);
+        grid.rebuild(
+            &cfg,
+            &anchored(&[(1, [0.0; 3]), (2, [5000.0, 0.0, -5000.0])]),
+        );
         let mut out = Vec::new();
         // Finite but so large the XZ scan rectangle would span the whole i32 cell range; the
         // occupied-cell fallback must return everything without iterating billions of cells.
-        grid.query_within(&cfg, [0.0; 3], 1.0e30, &mut out);
+        grid.query_within(&cfg, MEMBERSHIP_GLOBAL, [0.0; 3], 1.0e30, &mut out);
         let ids: Vec<BodyId> = sorted_by_id(out).iter().map(|&(id, _)| id).collect();
         assert_eq!(ids, vec![1, 2]);
     }
@@ -800,20 +1054,19 @@ mod tests {
         let cfg = cfg(32.0, 100.0, 1.25, 0); // exit at 125
         let mut grid = InterestGrid::new();
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
 
-        grid.rebuild(&cfg, &[(1, [90.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(&cfg, &anchored(&[(1, [90.0, 0.0, 0.0])]));
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(peer.contains(1), "90 m is inside the enter radius");
 
         for held in [110.0f32, 124.0] {
-            grid.rebuild(&cfg, &[(1, [held, 0.0, 0.0])]);
-            peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+            grid.rebuild(&cfg, &anchored(&[(1, [held, 0.0, 0.0])]));
+            update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
             assert!(peer.contains(1), "{held} m is inside the hysteresis band");
         }
 
-        grid.rebuild(&cfg, &[(1, [126.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(&cfg, &anchored(&[(1, [126.0, 0.0, 0.0])]));
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(!peer.contains(1), "126 m is past the exit radius");
     }
 
@@ -831,11 +1084,10 @@ mod tests {
         let cfg = cfg(32.0, sniper_range, 1.25, 0);
         let mut grid = InterestGrid::new();
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
 
         for shot in [1.0f32, 600.0, 700.0, 1999.0, sniper_range] {
-            grid.rebuild(&cfg, &[(1, [shot, 0.0, 0.0])]);
-            peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+            grid.rebuild(&cfg, &anchored(&[(1, [shot, 0.0, 0.0])]));
+            update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
             assert!(
                 peer.contains(1),
                 "a target {shot} m away is within the sniper's reach and must still be replicated"
@@ -844,8 +1096,11 @@ mod tests {
 
         // And the radius is what bounds it: past the hysteresis band the body does leave, which is
         // the behaviour an arena larger than the sniper's reach is meant to get.
-        grid.rebuild(&cfg, &[(1, [sniper_range * 1.25 + 1.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(
+            &cfg,
+            &anchored(&[(1, [sniper_range * 1.25 + 1.0, 0.0, 0.0])]),
+        );
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(!peer.contains(1), "past the exit radius it leaves");
     }
 
@@ -853,10 +1108,9 @@ mod tests {
     fn hysteresis_band_does_not_admit_newcomers() {
         let cfg = cfg(32.0, 100.0, 1.25, 0);
         let mut grid = InterestGrid::new();
-        grid.rebuild(&cfg, &[(1, [110.0, 0.0, 0.0])]);
+        grid.rebuild(&cfg, &anchored(&[(1, [110.0, 0.0, 0.0])]));
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(
             !peer.contains(1),
             "110 m is in the band, and the band only retains — it never admits"
@@ -869,14 +1123,16 @@ mod tests {
         let cfg = cfg(32.0, 100.0, 1.25, 0);
         let mut grid = InterestGrid::new();
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
-        grid.rebuild(&cfg, &[(1, [50.0, 0.0, 0.0]), (2, [60.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(
+            &cfg,
+            &anchored(&[(1, [50.0, 0.0, 0.0]), (2, [60.0, 0.0, 0.0])]),
+        );
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(peer.len(), 2);
 
         // Body 1 teleports far away, body 2 despawns from the grid entirely.
-        grid.rebuild(&cfg, &[(1, [10_000.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(&cfg, &anchored(&[(1, [10_000.0, 0.0, 0.0])]));
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(!peer.contains(1));
         assert!(!peer.contains(2));
         assert!(peer.is_empty(), "stale members must not accumulate");
@@ -887,13 +1143,39 @@ mod tests {
         let cfg = cfg(32.0, 100.0, 0.5, 0); // effective factor 1.0: no band
         let mut grid = InterestGrid::new();
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
-        grid.rebuild(&cfg, &[(1, [50.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(&cfg, &anchored(&[(1, [50.0, 0.0, 0.0])]));
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(peer.contains(1));
-        grid.rebuild(&cfg, &[(1, [101.0, 0.0, 0.0])]);
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        grid.rebuild(&cfg, &anchored(&[(1, [101.0, 0.0, 0.0])]));
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert!(!peer.contains(1), "with no band, past enter means out");
+    }
+
+    #[test]
+    fn a_negative_enter_radius_culls_everything_on_both_paths() {
+        // The squared distance the filter compares against cannot carry the sign, so a raw
+        // negative radius would admit everything within its magnitude on the linear path while the
+        // grid query rejected it outright — the one input on which the two could disagree.
+        let cfg = cfg(32.0, -100.0, 1.25, 0);
+        let entities = [(1, [10.0, 0.0, 0.0]), (2, [0.0; 3])];
+        let mut grid = InterestGrid::new();
+        grid.rebuild(&cfg, &anchored(&entities));
+        let mut via_grid = PeerInterest::new();
+        update_grid(&mut via_grid, &grid, &cfg, [0.0; 3]);
+
+        let mut via_linear = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        via_linear.update_linear_into(
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &anchored(&entities),
+            &mut scratch,
+            &mut leaves,
+        );
+        // A radius of zero still admits a body at exactly the centre, which body 2 is.
+        assert_eq!(via_grid.iter().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(via_linear.iter().collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
@@ -901,42 +1183,41 @@ mod tests {
         let cfg = cfg(32.0, 100.0, 1.25, 2);
         let mut grid = InterestGrid::new();
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
 
         grid.rebuild(
             &cfg,
-            &[
+            &anchored(&[
                 (1, [10.0, 0.0, 0.0]),
                 (2, [20.0, 0.0, 0.0]),
                 (3, [30.0, 0.0, 0.0]),
-            ],
+            ]),
         );
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2]);
 
         // Body 3 closes to an exact distance tie with member 2: the member wins, so the set does
         // not churn on a mere tie.
         grid.rebuild(
             &cfg,
-            &[
+            &anchored(&[
                 (1, [10.0, 0.0, 0.0]),
                 (2, [20.0, 0.0, 0.0]),
                 (3, [0.0, 0.0, 20.0]),
-            ],
+            ]),
         );
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2]);
 
         // Strictly closer beats membership: 3 displaces 2, even though 2 is still in range.
         grid.rebuild(
             &cfg,
-            &[
+            &anchored(&[
                 (1, [10.0, 0.0, 0.0]),
                 (2, [20.0, 0.0, 0.0]),
                 (3, [15.0, 0.0, 0.0]),
-            ],
+            ]),
         );
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 3]);
     }
 
@@ -947,15 +1228,14 @@ mod tests {
         // Fresh peer, so everyone is a newcomer; 2 and 3 tie at 20 m.
         grid.rebuild(
             &cfg,
-            &[
+            &anchored(&[
                 (3, [0.0, 0.0, 20.0]),
                 (2, [20.0, 0.0, 0.0]),
                 (1, [10.0, 0.0, 0.0]),
-            ],
+            ]),
         );
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(
             peer.iter().collect::<Vec<_>>(),
             vec![1, 2],
@@ -972,10 +1252,9 @@ mod tests {
             (7, [2.0, 0.0, 0.0]),
             (99, [3.0, 0.0, 0.0]),
         ];
-        grid.rebuild(&cfg, &entities);
+        grid.rebuild(&cfg, &anchored(&entities));
         let mut peer = PeerInterest::new();
-        let mut scratch = Vec::new();
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(peer.iter().collect::<Vec<_>>(), vec![7, 42, 99]);
 
         peer.remove(42);
@@ -984,74 +1263,344 @@ mod tests {
         assert_eq!(peer.iter().collect::<Vec<_>>(), vec![7, 99]);
 
         // Still present in the grid and inside the enter radius, so it re-enters next update.
-        peer.update(&grid, &cfg, [0.0; 3], &mut scratch);
+        update_grid(&mut peer, &grid, &cfg, [0.0; 3]);
         assert_eq!(peer.iter().collect::<Vec<_>>(), vec![7, 42, 99]);
+    }
+
+    // ------------------------------------------------------------------
+    // What the grid path gained: worlds, an uncullable set, and a leave diff.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn grid_bins_each_world_separately_at_identical_coordinates() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let mut grid = InterestGrid::new();
+        grid.rebuild(
+            &cfg,
+            &[
+                InterestCandidate::anchored_in(1, [5.0, 0.0, 5.0], 1),
+                InterestCandidate::anchored_in(2, [5.0, 0.0, 5.0], 2),
+                InterestCandidate::anchored(3, [5.0, 0.0, 5.0]),
+            ],
+        );
+        let mut out = Vec::new();
+        for (observer, expected) in [
+            (1u64, vec![1u64, 3]),
+            (2, vec![2, 3]),
+            (MEMBERSHIP_GLOBAL, vec![1, 2, 3]),
+            (99, vec![3]),
+        ] {
+            grid.query_within(&cfg, observer, [0.0; 3], 100.0, &mut out);
+            let ids: Vec<BodyId> = sorted_by_id(out.clone())
+                .iter()
+                .map(|&(id, _)| id)
+                .collect();
+            assert_eq!(ids, expected, "observer {observer} saw the wrong world");
+        }
+    }
+
+    #[test]
+    fn grid_uncullable_candidates_bypass_both_the_radius_and_the_cap() {
+        let cfg = cfg(32.0, 100.0, 1.25, 1);
+        let mut grid = InterestGrid::new();
+        grid.rebuild(
+            &cfg,
+            &[
+                InterestCandidate::always(1),
+                InterestCandidate::always_in(2, 5),
+                InterestCandidate::always_in(3, 6),
+                InterestCandidate::anchored(4, [10.0, 0.0, 0.0]),
+                InterestCandidate::anchored(5, [20.0, 0.0, 0.0]),
+            ],
+        );
+        let mut peer = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 5, &[], &mut scratch, &mut leaves);
+        // 1 is global and 2 shares the observer's world; 3 belongs to another one. The cap of 1
+        // bounds only the cullable pair, keeping the nearer of 4 and 5.
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2, 4]);
+        assert!(leaves.is_empty());
+
+        // 500 m from anything, and the two always-entities are still there.
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [500.0, 0.0, 0.0],
+            5,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(leaves, vec![4]);
+    }
+
+    #[test]
+    fn grid_reports_a_radius_exit_as_a_leave() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0); // exit at 125
+        let mut grid = InterestGrid::new();
+        let mut peer = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+
+        grid.rebuild(&cfg, &anchored(&[(1, [90.0, 0.0, 0.0])]));
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert!(peer.contains(1));
+        assert!(leaves.is_empty(), "entering is not leaving");
+
+        grid.rebuild(&cfg, &anchored(&[(1, [110.0, 0.0, 0.0])]));
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert!(peer.contains(1), "still inside the band");
+        assert!(leaves.is_empty());
+
+        grid.rebuild(&cfg, &anchored(&[(1, [126.0, 0.0, 0.0])]));
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert!(!peer.contains(1));
+        assert_eq!(
+            leaves,
+            vec![1],
+            "the exit must be reported, not just applied"
+        );
+    }
+
+    #[test]
+    fn grid_counts_a_cap_eviction_and_a_membership_refusal_as_leaves() {
+        let cfg = cfg(32.0, 100.0, 1.25, 2);
+        let mut grid = InterestGrid::new();
+        let mut peer = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+
+        grid.rebuild(
+            &cfg,
+            &anchored(&[(1, [10.0, 0.0, 0.0]), (2, [20.0, 0.0, 0.0])]),
+        );
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 1, &[], &mut scratch, &mut leaves);
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2]);
+
+        // A third body arrives closer than member 2 and the cap evicts it. An eviction is a real
+        // leave: body 2 has to re-enter through the enter radius like any newcomer.
+        grid.rebuild(
+            &cfg,
+            &anchored(&[
+                (1, [10.0, 0.0, 0.0]),
+                (2, [20.0, 0.0, 0.0]),
+                (3, [15.0, 0.0, 0.0]),
+            ]),
+        );
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 1, &[], &mut scratch, &mut leaves);
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(leaves, vec![2]);
+
+        // The peer's own body moves to another world: everything it held is refused at once, and
+        // every refusal is a leave, whatever the distance says.
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 1, &[], &mut scratch, &mut leaves);
+        assert_eq!(leaves, Vec::<BodyId>::new());
+        grid.rebuild(
+            &cfg,
+            &[
+                InterestCandidate::anchored_in(1, [10.0, 0.0, 0.0], 4),
+                InterestCandidate::anchored_in(3, [15.0, 0.0, 0.0], 4),
+            ],
+        );
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 1, &[], &mut scratch, &mut leaves);
+        assert!(peer.is_empty());
+        assert_eq!(leaves, vec![1, 3]);
+    }
+
+    #[test]
+    fn grid_fails_open_on_a_non_finite_centre() {
+        let cfg = cfg(32.0, 100.0, 1.25, 1);
+        let mut grid = InterestGrid::new();
+        grid.rebuild(
+            &cfg,
+            &[
+                InterestCandidate::anchored(1, [10.0, 0.0, 0.0]),
+                InterestCandidate::anchored(2, [100_000.0, 0.0, 0.0]),
+                InterestCandidate::always_in(3, 8),
+                InterestCandidate::anchored_in(4, [10.0, 0.0, 0.0], 9),
+            ],
+        );
+        let mut peer = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [f32::NAN, 0.0, 0.0],
+            8,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+        // An observer that cannot be located measures nothing, so nothing is culled by distance
+        // and the cap of 1 evicts nothing either. The other world is still refused: a membership
+        // is a declaration, and it did not fail.
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn grid_per_peer_overrides_shadow_the_binned_entry() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let mut grid = InterestGrid::new();
+        grid.rebuild(
+            &cfg,
+            &[
+                // The peer's own body, 3 km out in a world the peer is not in — the two facts a
+                // grid shared by every peer cannot carry.
+                InterestCandidate::anchored_in(1, [3000.0, 0.0, 0.0], 7),
+                InterestCandidate::anchored(2, [10.0, 0.0, 0.0]),
+            ],
+        );
+        let mut peer = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 3, &[], &mut scratch, &mut leaves);
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![2], "no override yet");
+
+        let own = [InterestCandidate::always(1)];
+        peer.update_grid_into(&grid, &cfg, [0.0; 3], 3, &own, &mut scratch, &mut leaves);
+        assert_eq!(peer.iter().collect::<Vec<_>>(), vec![1, 2]);
+
+        // The override answers for that id alone. A refusing one removes the body the grid would
+        // otherwise have admitted, rather than the two both admitting it.
+        let refused = [InterestCandidate::anchored_in(2, [10.0, 0.0, 0.0], 12)];
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [0.0; 3],
+            3,
+            &refused,
+            &mut scratch,
+            &mut leaves,
+        );
+        assert!(peer.is_empty());
+        assert_eq!(leaves, vec![1, 2]);
     }
 
     // ------------------------------------------------------------------
     // The linear path — the one the backend actually runs.
     // ------------------------------------------------------------------
 
-    fn anchored(entities: &[(BodyId, [f32; 3])]) -> Vec<InterestCandidate> {
-        entities
-            .iter()
-            .map(|&(id, pos)| InterestCandidate::anchored(id, pos))
-            .collect()
-    }
-
     #[test]
     fn linear_agrees_with_the_grid_over_a_pseudo_random_walk() {
         // The two paths are separate implementations of one rule; if they ever disagree, the
-        // measurement that chose between them was comparing different work.
-        let cfg = cfg(64.0, 100.0, 1.25, 0);
+        // measurement that chose between them was comparing different work. Everything that can
+        // differ between them is varied here at once: three worlds at overlapping coordinates,
+        // always-relevant channels, positions that go non-finite mid-walk, a cap that bites, an
+        // observer whose centre cannot be resolved, and a per-peer override that shadows a binned
+        // body. Members *and* leaves are compared every step, because the send path's correctness
+        // rests on the leaves rather than on the set.
+        let cfg = cfg(64.0, 100.0, 1.25, 12);
         let mut state = 0x0bad_f00du32;
-        let mut entities: Vec<(BodyId, [f32; 3])> = (0..64u64)
+        let mut candidates: Vec<InterestCandidate> = (0..64u64)
             .map(|id| {
-                (
-                    id + 1,
-                    [
-                        lcg_coord(&mut state),
-                        lcg_coord(&mut state),
-                        lcg_coord(&mut state),
-                    ],
-                )
+                let pos = [
+                    lcg_coord(&mut state),
+                    lcg_coord(&mut state),
+                    lcg_coord(&mut state),
+                ];
+                match id % 8 {
+                    0 => InterestCandidate::always_in(id + 1, id % 3),
+                    _ => InterestCandidate::anchored_in(id + 1, pos, id % 3),
+                }
             })
             .collect();
+        // One override per observer world, shadowing a body the grid holds anchored elsewhere.
+        let overrides = [
+            InterestCandidate::always(4),
+            InterestCandidate::anchored_in(5, [0.0; 3], 2),
+        ];
 
         let mut grid = InterestGrid::new();
         let mut via_grid = PeerInterest::new();
         let mut via_linear = PeerInterest::new();
         let mut scratch = Vec::new();
-        let mut leaves = Vec::new();
+        let (mut grid_leaves, mut linear_leaves) = (Vec::new(), Vec::new());
 
-        for step in 0..40 {
-            for entry in entities.iter_mut() {
-                entry.1[0] += lcg_coord(&mut state) * 0.05;
-                entry.1[2] += lcg_coord(&mut state) * 0.05;
+        for step in 0..120u32 {
+            for candidate in candidates.iter_mut() {
+                candidate.pos[0] += lcg_coord(&mut state) * 0.05;
+                candidate.pos[2] += lcg_coord(&mut state) * 0.05;
             }
-            let center = [
-                lcg_coord(&mut state) * 0.2,
-                0.0,
-                lcg_coord(&mut state) * 0.2,
-            ];
-            grid.rebuild(&cfg, &entities);
-            via_grid.update(&grid, &cfg, center, &mut scratch);
+            // A body's anchor goes non-finite for one step in eight — the fail-open the two paths
+            // reach by opposite routes: the linear one classifies it, the grid holds it out of the
+            // cells entirely.
+            let sick = (step as usize * 7) % candidates.len();
+            let restore = candidates[sick].pos;
+            if step % 8 == 3 {
+                candidates[sick].pos[1] = f32::NAN;
+            }
+            let observer = u64::from(step % 4);
+            let center = if step % 16 == 9 {
+                [f32::INFINITY, 0.0, 0.0]
+            } else {
+                [
+                    lcg_coord(&mut state) * 0.2,
+                    0.0,
+                    lcg_coord(&mut state) * 0.2,
+                ]
+            };
+            let also: &[InterestCandidate] = if step % 3 == 0 { &overrides } else { &[] };
+            // The linear path sees one flat list, so an override replaces the row it names.
+            let flat: Vec<InterestCandidate> = candidates
+                .iter()
+                .map(|c| *also.iter().find(|o| o.id == c.id).unwrap_or(c))
+                .collect();
+
+            grid.rebuild(&cfg, &candidates);
+            via_grid.update_grid_into(
+                &grid,
+                &cfg,
+                center,
+                observer,
+                also,
+                &mut scratch,
+                &mut grid_leaves,
+            );
             via_linear.update_linear_into(
                 &cfg,
                 center,
-                MEMBERSHIP_GLOBAL,
-                &anchored(&entities),
+                observer,
+                &flat,
                 &mut scratch,
-                &mut leaves,
+                &mut linear_leaves,
             );
             assert_eq!(
-                via_grid.iter().collect::<Vec<_>>(),
-                via_linear.iter().collect::<Vec<_>>(),
-                "grid and linear diverged at step {step}"
+                via_grid.iter_with_distance().collect::<Vec<_>>(),
+                via_linear.iter_with_distance().collect::<Vec<_>>(),
+                "grid and linear diverged on members at step {step}"
             );
+            assert_eq!(
+                grid_leaves, linear_leaves,
+                "grid and linear diverged on leaves at step {step}"
+            );
+            candidates[sick].pos = restore;
         }
+        // The walk has to actually exercise the rules it varies, or it proves the two paths agree
+        // about nothing.
+        assert!(!via_grid.is_empty());
     }
-
     #[test]
     fn linear_holds_through_the_band_and_reports_the_exit_as_a_leave() {
         let cfg = cfg(32.0, 100.0, 1.25, 0); // exit at 125
