@@ -17,11 +17,17 @@ name: Claude PR review
 #
 # GITHUB-HOSTED RUNNER. A public repository must never point PR CI at a self-hosted runner.
 #
+# A CHANGE TO THIS FILE DOES NOT TAKE EFFECT UNTIL IT IS ON `main`, AND THE JOB STILL REPORTS SUCCESS.
+# `claude-code-action` compares this file against the copy on the repository's default branch and skips itself
+# when the two differ -- an anti-tampering guard, since a pull request can otherwise rewrite the workflow that
+# reviews it. The skip exits 0, so a GREEN `claude-review` check does NOT mean a review happened; read the job
+# log, or look for the sticky comment. The pull request that adds or edits this file therefore always reviews
+# nothing, and the next one gets the new behaviour.
+#
 # REQUIRES a repository secret named CLAUDE_CODE_OAUTH_TOKEN (Settings -> Secrets and variables -> Actions ->
 # New repository secret). Generate it with `claude setup-token` locally; it bills against a Claude
 # subscription. For Anthropic API-credit billing instead, store a Console API key as ANTHROPIC_API_KEY and
 # swap the `claude_code_oauth_token:` line below for `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
-# With neither secret set, the job fails; it does not silently pass.
 
 on:
   pull_request:
