@@ -173,13 +173,34 @@ build)
 				|| { printf 'build-native: %s has no ELF build ID\n' "$ship" >&2; exit 1; }
 		fi
 
-		# The Windows profiling build's symbols live in a separate PDB rather than inside the image.
-		# It keeps the name the DLL records, because that name is what dbghelp searches a symbol path
-		# for; renaming it to match the platform-tagged library would hide it from every analyzer.
+		# WHERE WINDOWS DEBUG INFORMATION LIVES DEPENDS ON THE ABI, and which ABI a runner has is a
+		# property of that box rather than of this repository:
+		#   *-pc-windows-msvc  the linker writes a separate PDB and stamps the image with the CodeView
+		#                      key naming it. The PDB must ride along, under the name the DLL records --
+		#                      that name is what dbghelp searches a symbol path for, so renaming it to
+		#                      match the platform-tagged library would hide it from every analyzer.
+		#   *-pc-windows-gnu   no PDB is ever produced; DWARF goes INTO the DLL, as on Linux.
+		# Requiring a PDB failed the build outright on a gnu-ABI runner even though the artifact it had
+		# just produced was perfectly symbolizable.
 		if [ "$PLATFORM" = windows ] && [ "$p" = profiling ]; then
 			pdb="$NATIVE/target/$CARGO_DIR/orbitnet.pdb"
-			[ -s "$pdb" ] || { printf 'build-native: no PDB beside the profiling DLL at %s\n' "$pdb" >&2; exit 1; }
-			cp -p "$pdb" "$OUTDIR/orbitnet.pdb"
+			host="$( cd "$NATIVE" && rustc -vV 2>/dev/null | sed -n 's/^host: //p' )"
+			if [ -s "$pdb" ]; then
+				printf 'build-native: msvc ABI (%s); shipping orbitnet.pdb beside the DLL\n' "${host:-unknown}"
+				cp -p "$pdb" "$OUTDIR/orbitnet.pdb"
+			else
+				printf 'build-native: no PDB; %s keeps DWARF inside the DLL\n' "${host:-this toolchain}"
+				# Prove the claim rather than assuming it: a DLL with neither a PDB nor debug sections
+				# is an unsymbolizable artifact that would publish looking fine.
+				if command -v objdump >/dev/null 2>&1; then
+					objdump -h "$OUTDIR/$ship" | grep -q 'debug_info' || {
+						printf 'build-native: %s has no PDB and no .debug_info -- not symbolizable\n' "$ship" >&2
+						exit 1; }
+					printf 'build-native: confirmed .debug_info inside %s\n' "$ship"
+				else
+					printf 'build-native: objdump absent; could not confirm debug sections in %s\n' "$ship" >&2
+				fi
+			fi
 		fi
 
 		[ -s "$OUTDIR/$ship" ] || { printf 'build-native: staged %s is empty\n' "$ship" >&2; exit 1; }
