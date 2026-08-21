@@ -562,6 +562,15 @@ const STATE_BLOCK_LANE: u8 = 1 << 1;
 /// `reference` is the previously-sent row this block may delta against; `None` (or a reference
 /// tick the encoder no longer holds) forces a full block. The mask/payload are computed here so
 /// every call site shares one definition of "changed".
+/// Returns whether the block written was a full row rather than a masked delta.
+///
+/// The encoder has the last word on fullness; a caller may not infer it from having supplied a
+/// `reference`. A reference is a request, not a guarantee: the delta branch is taken only when the
+/// base names an **earlier** tick than the row being sent, and an entity whose tick has not
+/// advanced since the last send hands over a reference equal to it. That block goes out full and
+/// repairs a broken delta chain as well as a requested one, so the keyframe clock has to see it.
+/// Inferring fullness at the call site makes the clock miss those, and the miss is invisible: the
+/// block is correct either way, only the bookkeeping is wrong.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_state_block(
     writer: &mut Writer,
@@ -573,7 +582,7 @@ pub fn encode_state_block(
     reference: Option<(u64, &[u8])>,
     row: &[u8],
     state_lane: bool,
-) {
+) -> bool {
     writer.varint(id);
 
     let mut body = Writer::new();
@@ -581,7 +590,7 @@ pub fn encode_state_block(
     if state_lane {
         flags |= STATE_BLOCK_LANE;
     }
-    match reference {
+    let full = match reference {
         Some((reference_tick, base)) if reference_tick < entity_tick => {
             changed_mask(props, base, row, scratch);
             body.u8(flags);
@@ -593,16 +602,19 @@ pub fn encode_state_block(
                 body.len() - before,
                 crate::quant::masked_wire_size(props, scratch)
             );
+            false
         }
         _ => {
             body.u8(flags | STATE_BLOCK_FULL);
             crate::quant::encode_row(props, row, &mut body.buf);
+            true
         }
-    }
+    };
 
     writer.varint(frame_tick.saturating_sub(entity_tick));
     writer.varint(body.len() as u64);
     writer.bytes(body.as_slice());
+    full
 }
 
 /// Read a state block's metadata, leaving the reader at its mask/payload.

@@ -152,10 +152,17 @@ pub struct OrbitRollbackSynchronizer {
     ledger: FreshnessLedger,
     memo: MemoRing,
     history_limit: usize,
-    /// Ring of ticks whose `state_history` row is a bit-exact wire row (`u64::MAX` = none). A
-    /// masked delta may only decode against such a base: any locally simulated row is a
-    /// prediction the server did not delta against, and decoding over it corrupts silently.
-    auth_ticks: Vec<u64>,
+    /// Wire rows this receiver has decoded, keyed by tick. These are the **delta bases**, stored
+    /// apart from `state_history`. `None` until the first block arrives, so a sender-only peer
+    /// pays no memory for it.
+    ///
+    /// - A masked delta may decode only against the row the sender deltaed against. Decoding over
+    ///   a locally simulated row corrupts silently and raises no error.
+    /// - `state_history` rows are rewritten by the owner's own replay, so they cannot serve as
+    ///   bases. Keeping the two apart is what makes a base survive a resim.
+    /// - A row too old for the simulation to apply is still a valid base, because the receiver
+    ///   acknowledged the frame it rode in and the sender may name its tick.
+    auth_rows: Option<ColumnarHistory>,
     /// Newest authoritative state tick known (received on clients, broadcast tick on the server).
     latest_state_tick: i64,
     /// Newest received-and-not-yet-integrated authoritative row (owner reconcile path).
@@ -201,7 +208,7 @@ impl INode for OrbitRollbackSynchronizer {
             ledger: FreshnessLedger::with_capacity(1),
             memo: MemoRing::with_capacity(1),
             history_limit: 128,
-            auth_ticks: Vec::new(),
+            auth_rows: None,
             latest_state_tick: -1,
             pending_state: None,
             pending_display: None,
@@ -529,7 +536,7 @@ impl OrbitRollbackSynchronizer {
         self.input_history = ColumnarHistory::new(self.input_schema.row_stride(), capacity);
         self.ledger = FreshnessLedger::with_capacity(capacity);
         self.memo = MemoRing::with_capacity(capacity * 2);
-        self.auth_ticks = vec![u64::MAX; capacity];
+        self.auth_rows = None;
         self.latest_state_tick = -1;
         self.latest_auth_sim_tick = 0;
         self.latest_remote_input_tick = -1;
@@ -562,7 +569,7 @@ impl OrbitRollbackSynchronizer {
         self.input_history = ColumnarHistory::new(self.input_schema.row_stride(), limit);
         self.ledger = FreshnessLedger::with_capacity(limit);
         self.memo = MemoRing::with_capacity(limit * 2);
-        self.auth_ticks = vec![u64::MAX; limit];
+        self.auth_rows = None;
         self.latest_state_tick = -1;
         self.latest_auth_sim_tick = 0;
         self.latest_remote_input_tick = -1;
@@ -745,14 +752,15 @@ impl OrbitRollbackSynchronizer {
     /// Encode this entity's state block for one peer.
     ///
     /// `reference_tick` is the last tick this peer applied (delta base) — `None` forces full.
-    /// Returns the entity tick the block describes.
+    /// Returns the entity tick the block describes and whether it went out as a full row, which is
+    /// what the keyframe clock is measured against.
     pub(crate) fn encode_block(
         &mut self,
         writer: &mut Writer,
         scratch: &mut Vec<bool>,
         frame_tick: u64,
         reference_tick: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<(u64, bool)> {
         let tick = if self.latest_auth_sim_tick > 0 {
             self.latest_auth_sim_tick
         } else {
@@ -764,7 +772,7 @@ impl OrbitRollbackSynchronizer {
                 .row(ref_tick)
                 .map(|base| (ref_tick, base.to_vec()))
         });
-        match reference {
+        let full = match reference {
             Some((ref_tick, base)) => encode_state_block(
                 writer,
                 scratch,
@@ -787,30 +795,27 @@ impl OrbitRollbackSynchronizer {
                 &row,
                 false,
             ),
-        }
-        Some(tick)
+        };
+        Some((tick, full))
     }
 
-    fn mark_auth(&mut self, tick: u64) {
-        if let Some(len) = std::num::NonZeroUsize::new(self.auth_ticks.len()) {
-            self.auth_ticks[(tick % len.get() as u64) as usize] = tick;
-        }
+    /// Keep a decoded wire row as a future delta base.
+    ///
+    /// Called for every row that decodes, including one the simulation discards as superseded: the
+    /// receiver acknowledged the frame it rode in, so the sender may name its tick. The ring
+    /// refuses a tick already outside its window.
+    fn keep_auth_row(&mut self, tick: u64, row: &[u8]) {
+        let stride = self.state_schema.row_stride();
+        let capacity = self.history_limit.max(2);
+        let rows = self
+            .auth_rows
+            .get_or_insert_with(|| ColumnarHistory::new(stride, capacity));
+        rows.write_row(tick, row);
     }
 
-    fn unmark_auth(&mut self, tick: u64) {
-        if let Some(len) = std::num::NonZeroUsize::new(self.auth_ticks.len()) {
-            let slot = &mut self.auth_ticks[(tick % len.get() as u64) as usize];
-            if *slot == tick {
-                *slot = u64::MAX;
-            }
-        }
-    }
-
-    fn is_auth(&self, tick: u64) -> bool {
-        match std::num::NonZeroUsize::new(self.auth_ticks.len()) {
-            Some(len) => self.auth_ticks[(tick % len.get() as u64) as usize] == tick,
-            None => false,
-        }
+    /// The wire row this receiver decoded for `tick`, if it still holds one.
+    fn auth_row(&self, tick: u64) -> Option<&[u8]> {
+        self.auth_rows.as_ref().and_then(|rows| rows.row(tick))
     }
 
     /// Decode a received state block into this entity, returning what to do about it.
@@ -823,14 +828,11 @@ impl OrbitRollbackSynchronizer {
     ) -> Result<StateIntegration, orbitnet_core::CodecError> {
         self.scratch_state.resize(self.state_schema.row_stride(), 0);
         let mut out = std::mem::take(&mut self.scratch_state);
-        // A masked delta must decode against the row the SERVER deltaed against — a wire row. If
-        // the snapshot carrying the base was lost, the resident row at that tick is our own
-        // prediction and decoding over it corrupts silently; treating it as base-less turns it
-        // into a clean Rejected → WANT_FULL NACK → the server sends a full.
+        // The base comes from `auth_rows`, never from `state_history`: the owner's prediction
+        // rewrites the latter. A missing base resolves to `NoBase`, which NACKs for a full row.
         let base = meta
             .reference_tick
-            .filter(|&t| self.is_auth(t))
-            .and_then(|t| self.state_history.row(t).map(<[u8]>::to_vec));
+            .and_then(|t| self.auth_row(t).map(<[u8]>::to_vec));
         let applied = decode_state_block_into(
             reader,
             meta,
@@ -842,6 +844,9 @@ impl OrbitRollbackSynchronizer {
         let result = if !applied {
             StateIntegration::NoBase
         } else {
+            // Recorded BEFORE the integration decides what to do with it, because that decision is
+            // about the simulation and this record is not.
+            self.keep_auth_row(meta.tick, &out);
             self.integrate_authoritative_row(meta.tick, &out, current_tick)
         };
         self.scratch_state = out;
@@ -862,10 +867,10 @@ impl OrbitRollbackSynchronizer {
         self.latest_state_tick = tick_i;
 
         if !self.simulates() {
-            // Display path: hold the newest row for the next tick boundary, and keep it in
-            // history so a later masked block can delta against it.
+            // Display path: hold the newest row for the next tick boundary and keep it in history
+            // so `restore_tick` has a pose to draw from. The delta base is the `auth_rows` copy
+            // written above, so nothing here needs to survive a replay.
             self.state_history.write_row(tick, row);
-            self.mark_auth(tick);
             self.pending_display = Some((tick, row.to_vec()));
             return StateIntegration::Buffered;
         }
@@ -896,7 +901,6 @@ impl OrbitRollbackSynchronizer {
             None => true,
         };
         self.state_history.write_row(tick, row);
-        self.mark_auth(tick);
         if !mispredicted {
             return StateIntegration::Confirmed;
         }
@@ -952,9 +956,6 @@ impl OrbitRollbackSynchronizer {
         let mut row = std::mem::take(&mut self.scratch_state);
         binding::capture_row(&self.state_bindings, &mut row);
         self.state_history.write_row(next, &row);
-        // The row is now locally simulated, not a wire row — a resim replay may have just
-        // overwritten a tick that previously held one.
-        self.unmark_auth(next);
         // Quantized-state write-back: forward simulation must continue from the canonical
         // (wire-representable) value the row holds, or replay-from-row would diverge from the
         // forward pass on every peer.
@@ -983,7 +984,9 @@ impl OrbitRollbackSynchronizer {
         self.input_history.clear();
         self.ledger.clear();
         self.memo.clear();
-        self.auth_ticks.fill(u64::MAX);
+        if let Some(rows) = self.auth_rows.as_mut() {
+            rows.clear();
+        }
         self.latest_state_tick = -1;
         self.latest_auth_sim_tick = 0;
         self.latest_remote_input_tick = -1;
@@ -1261,12 +1264,12 @@ impl OrbitStateSynchronizer {
         scratch: &mut Vec<bool>,
         frame_tick: u64,
         reference_tick: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<(u64, bool)> {
         let tick = u64::try_from(self.latest_tick).ok()?;
         let row = self.history.row(tick)?.to_vec();
         let reference =
             reference_tick.and_then(|t| self.history.row(t).map(|base| (t, base.to_vec())));
-        match reference {
+        let full = match reference {
             Some((ref_tick, base)) => encode_state_block(
                 writer,
                 scratch,
@@ -1289,8 +1292,8 @@ impl OrbitStateSynchronizer {
                 &row,
                 true,
             ),
-        }
-        Some(tick)
+        };
+        Some((tick, full))
     }
 
     /// Decode a received block; the row is buffered and applied at the next tick boundary.
@@ -1318,6 +1321,12 @@ impl OrbitStateSynchronizer {
         } else {
             let tick_i = i64::try_from(meta.tick).unwrap_or(i64::MAX);
             if tick_i <= self.latest_tick {
+                // A row too old to apply is still kept, because the sender promotes `acked_base`
+                // off the frame ack and the next masked delta may name this tick as its base.
+                // Dropping it breaks the chain: that delta and every later one names a base the
+                // receiver no longer holds. `write_row` refuses a tick outside the ring, so this
+                // cannot clobber a newer slot, and `latest_tick` still names the newest row.
+                self.history.write_row(meta.tick, &out);
                 StateIntegration::Stale
             } else {
                 self.latest_tick = tick_i;
