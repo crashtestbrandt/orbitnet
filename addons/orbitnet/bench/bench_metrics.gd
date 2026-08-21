@@ -17,7 +17,7 @@ class_name BenchMetrics
 ##
 ## Attached by [BenchProbe] from `--bench-metrics=<path>`; never present in shipped play.
 
-const _CSV_HEADER: String = "tick,time,rtt_ms,jitter_ms,stretch,offset_ms,resim_ticks,rollback_ms,net_ms,reconcile_error,reconcile_smooth,reconcile_snap,rx_bytes_s,rx_datagrams_s,tx_bytes_s,tx_wire_bytes_s,tx_peak_peer_bytes_s,blocks_admitted_s,blocks_deferred_s,blocks_culled_s,want_full_nacks_s,starve_ticks_max,unsent_backlog_max,interest_ms,interest_entities,interarrival_near,interarrival_mid,interarrival_far"
+const _CSV_HEADER: String = "tick,time,rtt_ms,jitter_ms,stretch,offset_ms,resim_ticks,rollback_ms,net_ms,reconcile_error,reconcile_smooth,reconcile_snap,rx_bytes_s,rx_datagrams_s,tx_bytes_s,tx_wire_bytes_s,tx_peak_peer_bytes_s,blocks_admitted_s,blocks_full_s,blocks_deferred_s,blocks_culled_s,want_full_nacks_s,starve_ticks_max,unsent_backlog_max,interest_ms,interest_entities,interarrival_near,interarrival_mid,interarrival_far,shots_fired,hits_confirmed"
 const _PRINT_EVERY: int = 240      # emit a periodic BENCH line every N samples
 const _FLUSH_EVERY: int = 60       # flush the CSV every N rows (bound data loss if the process is killed)
 
@@ -49,6 +49,35 @@ var _starve: Array[float] = []
 # a game that does not implement [method BenchSubject.remote_bodies] simply reports no cadence.
 var _cadence: RemoteCadence = RemoteCadence.new()
 
+# --- combat, measured as a DIFFERENCE across the window -------------------------------------------
+# The game publishes monotonic run totals, so a bench window that starts mid-session subtracts its own
+# first reading rather than assuming the counters began at zero.
+var _shots_first: int = -1
+var _shots_last: int = 0
+var _confirms_first: int = -1
+var _confirms_last: int = 0
+
+# --- orientation reconciliation -------------------------------------------------------------------
+var _orient_smooth_first: int = -1
+var _orient_smooth_last: int = 0
+var _orient_miss_first: int = -1
+var _orient_miss_last: int = 0
+## Running maximum over the whole run. Monotonic in the LENGTH of the run, so it cannot distinguish one
+## absorbed correction from a tilt that never bled away. Reported beside the standing figure below, which
+## can.
+var _orient_err_max: float = 0.0
+## The worst trailing-window MINIMUM seen. A residual that bleeds to zero puts a zero in every window and
+## leaves this at 0; one that persists holds the window's minimum above zero. This is the figure that has
+## to reach zero before an orientation arm may ship.
+var _orient_err_floor: float = 0.0
+var _orient_err_window: Array[float] = []
+var _orient_err_window_at: int = 0
+const _STANDING_WINDOW: int = 60
+var _resim_max: float = 0.0
+## Latched from the game's samples, so `finish()` still knows after the body is gone.
+var _orient_armed: bool = false
+var _target_kind: String = BenchSubject.TARGET_NONE
+
 func _ready() -> void:
 	process_mode = Node.PROCESS_MODE_ALWAYS
 	_profile = NetProfiles.get_profile(profile_name)
@@ -76,10 +105,18 @@ func _on_post_tick() -> void:
 	var reconcile_err: float = BenchSubject.float_field(game, BenchSubject.KEY_RECONCILE_ERROR)
 	var smooth: int = int(BenchSubject.float_field(game, BenchSubject.KEY_RECONCILE_SMOOTH))
 	var snap: int = int(BenchSubject.float_field(game, BenchSubject.KEY_RECONCILE_SNAP))
+	# Read through a typed local: `Dictionary.get` with a default widens the return to Variant.
+	var resim_ticks: float = perf.get("resim_ticks", 0.0)
+	if not game.is_empty():
+		_sample_combat(game)
+		_sample_orientation(game, resim_ticks)
+		# Latched rather than read at `finish()`: by then a dead or despawned body reports nothing.
+		if subject != null:
+			_target_kind = subject.target_kind()
 
 	_rtt.push_back(clock["rtt_ms"])
 	_stretch.push_back(clock["stretch"])
-	_resim.push_back(perf.get("resim_ticks", 0.0))
+	_resim.push_back(resim_ticks)
 	_rx_bytes.push_back(bw["rx_bytes_s"])
 	_want_full.push_back(bw["want_full_nacks_s"])
 	_starve.push_back(bw["starve_ticks_max"])
@@ -88,25 +125,29 @@ func _on_post_tick() -> void:
 	_sample_cadence()
 
 	if _file != null:
-		_file.store_line("%d,%.4f,%.3f,%.3f,%.5f,%.3f,%.1f,%.3f,%.3f,%.5f,%d,%d,%.0f,%.1f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.2f,%.0f,%.0f,%.3f,%.1f,%.2f,%.2f,%.2f" % [
+		_file.store_line("%d,%.4f,%.3f,%.3f,%.5f,%.3f,%.1f,%.3f,%.3f,%.5f,%d,%d,%.0f,%.1f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.2f,%.0f,%.0f,%.3f,%.1f,%.2f,%.2f,%.2f,%d,%d" % [
 			Net.current_tick(), Net.current_time(),
 			clock["rtt_ms"], clock["jitter_ms"], clock["stretch"], clock["offset_ms"],
-			perf.get("resim_ticks", 0.0), perf.get("rollback_ms", 0.0), perf.get("net_ms", 0.0),
+			resim_ticks, perf.get("rollback_ms", 0.0), perf.get("net_ms", 0.0),
 			reconcile_err, smooth, snap,
 			bw["rx_bytes_s"], bw["rx_datagrams_s"], bw["tx_bytes_s"], bw["tx_wire_bytes_s"],
-			bw["tx_peak_peer_bytes_s"], bw["blocks_admitted_s"], bw["blocks_deferred_s"],
+			bw["tx_peak_peer_bytes_s"], bw["blocks_admitted_s"], bw["blocks_full_s"],
+			bw["blocks_deferred_s"],
 			bw["blocks_culled_s"], bw["want_full_nacks_s"], bw["starve_ticks_max"],
 			bw["unsent_backlog_max"], bw["interest_ms"], bw["interest_entities"],
-			bw["interarrival_near"], bw["interarrival_mid"], bw["interarrival_far"]])
+			bw["interarrival_near"], bw["interarrival_mid"], bw["interarrival_far"],
+			shots_fired(), hits_confirmed()])
 		_rows_since_flush += 1
 		if _rows_since_flush >= _FLUSH_EVERY:
 			_rows_since_flush = 0
 			_file.flush()
 
 	if _sample_count % _PRINT_EVERY == 0:
-		print("BENCH: n=%d rtt_p50=%.1f rtt_p95=%.1f stretch_mean=%.4f snaps=%d" % [
+		print("BENCH: n=%d rtt_p50=%.1f rtt_p95=%.1f stretch_mean=%.4f snaps=%d rx=%.0fB/s nacks=%.2f/s shots=%d hits=%d" % [
 			_sample_count, BenchGate.percentile(_rtt, 0.50), BenchGate.percentile(_rtt, 0.95),
-			BenchGate.mean(_stretch), _last_snap])
+			BenchGate.mean(_stretch), _last_snap,
+			BenchGate.mean(_rx_bytes), BenchGate.mean(_want_full),
+			shots_fired(), hits_confirmed()])
 
 ## Evaluate the gate over everything sampled so far, print the BENCH-RESULT marker + per-gate reasons, flush
 ## and close the CSV. Idempotent (the probe may call it on duration-end and again on teardown). Returns the
@@ -115,6 +156,9 @@ func finish() -> BenchGate.Result:
 	var result: BenchGate.Result = BenchGate.evaluate(_profile, _rtt, _stretch, _resim, _last_snap)
 	result = BenchGate.evaluate_bandwidth(result, _rx_bytes, _want_full, _starve)
 	result = BenchGate.evaluate_remote_cadence(result, _cadence)
+	result = BenchGate.evaluate_hit_registration(result, shots_fired(), hits_confirmed(), _target_kind)
+	result = BenchGate.evaluate_orientation_arm(result, _orient_armed, orient_smoothed(), orient_misses(),
+		peak_orient_residual(), standing_orient_residual(), _sample_count, _resim_max)
 	if not _finished:
 		_finished = true
 		var verdict: String = "PASS" if result.passed else "FAIL"
@@ -128,6 +172,78 @@ func finish() -> BenchGate.Result:
 			_file = null
 			print("BENCH: metrics csv -> %s" % out_path)
 	return result
+
+# Two monotonic run totals from the game, held as first-and-last so the window reports a DIFFERENCE.
+func _sample_combat(game: Dictionary) -> void:
+	_shots_last = int(BenchSubject.float_field(game, BenchSubject.KEY_SHOTS_FIRED))
+	if _shots_first < 0:
+		_shots_first = _shots_last
+	_confirms_last = int(BenchSubject.float_field(game, BenchSubject.KEY_HITS_CONFIRMED))
+	if _confirms_first < 0:
+		_confirms_first = _confirms_last
+
+func _sample_orientation(game: Dictionary, resim_ticks: float) -> void:
+	_orient_smooth_last = int(BenchSubject.float_field(game, BenchSubject.KEY_ORIENT_SMOOTH))
+	if _orient_smooth_first < 0:
+		_orient_smooth_first = _orient_smooth_last
+	_orient_miss_last = int(BenchSubject.float_field(game, BenchSubject.KEY_ORIENT_MISS))
+	if _orient_miss_first < 0:
+		_orient_miss_first = _orient_miss_last
+	if BenchSubject.float_field(game, BenchSubject.KEY_ORIENT_ARMED) > 0.0:
+		_orient_armed = true
+	var orient_err: float = BenchSubject.float_field(game, BenchSubject.KEY_ORIENT_ERROR)
+	_orient_err_max = maxf(_orient_err_max, orient_err)
+	_push_orient_residual(orient_err)
+	_resim_max = maxf(_resim_max, resim_ticks)
+
+# Feed one residual into the trailing window and update the standing floor. Ring-buffered, so this is two
+# float writes plus, once a window is full, one pass over `_STANDING_WINDOW` floats -- and the pass exits
+# early on a zero sample, because a window containing a zero cannot raise the floor.
+func _push_orient_residual(err: float) -> void:
+	if _orient_err_window.size() < _STANDING_WINDOW:
+		_orient_err_window.push_back(err)
+		if _orient_err_window.size() < _STANDING_WINDOW:
+			return   # a partial window would report a floor the run has not earned
+	else:
+		_orient_err_window[_orient_err_window_at] = err
+		_orient_err_window_at = (_orient_err_window_at + 1) % _STANDING_WINDOW
+	if err <= 0.0:
+		return
+	var lo: float = INF
+	for v: float in _orient_err_window:
+		lo = minf(lo, v)
+		if lo <= 0.0:
+			return
+	_orient_err_floor = maxf(_orient_err_floor, lo)
+
+## Rounds this peer fired inside the measurement window.
+func shots_fired() -> int:
+	return maxi(0, _shots_last - maxi(_shots_first, 0))
+
+## How many of those the server confirmed landing on something damageable.
+func hits_confirmed() -> int:
+	return maxi(0, _confirms_last - maxi(_confirms_first, 0))
+
+## Orientation corrections absorbed by smoothing inside the window.
+func orient_smoothed() -> int:
+	return maxi(0, _orient_smooth_last - maxi(_orient_smooth_first, 0))
+
+## Orientation corrections that found no history row to correct against, inside the window.
+func orient_misses() -> int:
+	return maxi(0, _orient_miss_last - maxi(_orient_miss_first, 0))
+
+## The worst orientation residual seen at any instant. Monotonic in run length.
+func peak_orient_residual() -> float:
+	return _orient_err_max
+
+## The worst trailing-window minimum: a residual that never bled away. Reaches 0 when every correction
+## is eventually absorbed, whatever the peak was.
+func standing_orient_residual() -> float:
+	return _orient_err_floor
+
+## The per-tick pose cadence of the remote bodies this peer is watching.
+func cadence() -> RemoteCadence:
+	return _cadence
 
 ## Observe every remote body the subject publishes, once per net tick.
 ##

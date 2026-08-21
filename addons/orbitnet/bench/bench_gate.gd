@@ -143,6 +143,61 @@ static func evaluate_bandwidth(r: Result, rx_bytes: Array[float], want_full: Arr
 ## Report how often remote bodies' poses actually reached this client. INFORMATIONAL, and read the NEAR figure:
 ## the far band is what interest management is supposed to make sparser, so pooling the two reports a working
 ## cull as a regression. See [RemoteCadence] for why the reading is biased LONG and never short.
+## Rounds a run must fire before "the server confirmed nothing" is evidence rather than luck.
+const MIN_SHOTS_TO_CONCLUDE: int = 120
+
+## Report on hit registration: the one property lag compensation exists to serve.
+##
+## `target_kind` is one of [BenchSubject]'s `TARGET_*` constants and decides what the run can conclude.
+## The shot floor gates the NEGATIVE conclusion only: a run that landed even one confirmed hit has
+## demonstrated the mechanism -- the shooter aimed, the server adjudicated, the confirmation came back --
+## and no number of rounds makes that less true. Only "the server confirmed nothing" needs enough rounds
+## behind it to mean something.
+##
+## The hit RATE is reported and not bounded. It moves with the scenario, the seed and the profile, so a
+## threshold on it needs a week of runs first.
+static func evaluate_hit_registration(r: Result, shots: int, confirms: int, target_kind: String,
+		min_shots: int = MIN_SHOTS_TO_CONCLUDE) -> Result:
+	if target_kind == BenchSubject.TARGET_NONE:
+		r._info("hit registration NOT EXERCISED: the shooter resolved no target, so its %d round(s) say nothing about hit registration (a blind-firing policy, or nobody lined up)" % shots)
+		return r
+	if confirms <= 0 and shots < min_shots:
+		r._info("hit registration NOT EXERCISED: %d shot(s) fired at a %s target and none confirmed, under the %d rounds needed before that means anything" % [
+			shots, target_kind, min_shots])
+		return r
+	r._record(confirms > 0,
+		"hit registration: %d of %d shot(s) confirmed by the server (target=%s). Zero confirms from a firing peer is a broken mechanism, not a bad rate" % [
+			confirms, shots, target_kind])
+	r._info("hit rate %.1f%% (%d/%d, target=%s) -- reported, not bounded" % [
+		100.0 * float(confirms) / float(shots), confirms, shots, target_kind])
+	if target_kind == BenchSubject.TARGET_STATIONARY:
+		r._info("target was STATIONARY: this proves adjudication and confirmation under latency, but a still target resolves the same at the present tick, so it does not exercise the rewind")
+	elif target_kind == BenchSubject.TARGET_MOVING:
+		r._info("target was MOVING: a confirmed hit on one is a statement about the rewind and not only about adjudication")
+	return r
+
+## Report on the orientation reconciliation arm.
+##
+## `armed` is the game's answer to "is the arm actually on". A disabled arm must not report like a healthy
+## one: with it off every counter below is zero by construction, which is the exact signature of a perfectly
+## behaved arm, and a reader would conclude the defect was fixed.
+##
+## Two residuals, and the decision turns on the second. `peak_rad` is a running maximum over the run, so it
+## grows with the run's LENGTH and one cleanly absorbed correction reads the same as a tilt that never left.
+## `standing_rad` is the worst trailing-window minimum: a residual that bleeds out touches zero inside every
+## window and scores 0 however many corrections were folded, so a non-zero figure is a residual being
+## refreshed faster than it decays.
+static func evaluate_orientation_arm(r: Result, armed: bool, smooths: int, misses: int, peak_rad: float,
+		standing_rad: float, samples: int, resim_max: float) -> Result:
+	if samples <= 0:
+		return r
+	if not armed:
+		r._info("orientation reconcile arm NOT EXERCISED: the game reports the arm off, so its counters are zero by construction rather than by behaving -- arm it to measure it")
+		return r
+	r._info("orientation reconcile arm: %d correction(s) over %d ticks, STANDING residual %.4f deg (peak %.4f deg), %d ring miss(es), deepest resim %.0f ticks. The standing figure is the gauge; a peak only says one correction was big" % [
+		smooths, samples, rad_to_deg(standing_rad), rad_to_deg(peak_rad), misses, resim_max])
+	return r
+
 static func evaluate_remote_cadence(r: Result, cadence: RemoteCadence) -> Result:
 	var near: Array[int] = cadence.near_gaps()
 	if near.is_empty() and cadence.far_gaps().is_empty():

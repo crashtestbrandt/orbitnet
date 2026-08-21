@@ -478,6 +478,12 @@ func perf_metrics() -> Dictionary[String, float]:
 ##                                     Kept apart from deferred because conflating them hides the failure.
 ##   want_full_nacks_s              -- WANT_FULL NACKs received. SERVER-SIDE ONLY: it is counted where a
 ##                                     client's INPUT frame is decoded, so a client reads a structural 0.00.
+##   blocks_full_s                  -- blocks sent as full rows rather than masked deltas: the send lane's
+##                                     composition, and what the keyframe interval costs. Floor is about
+##                                     blocks_admitted_s / 16, since every entity owes one keyframe per
+##                                     interval. Near blocks_admitted_s means almost nothing is being deltaed,
+##                                     which on a server indicates a want_full storm -- read it beside
+##                                     want_full_nacks_s.
 ##   blocks_oversize_s              -- blocks admitted even though one of them exceeded the WHOLE byte budget, so
 ##                                     that frame went out over the MTU and fragmented. Non-zero means one
 ##                                     entity's full state does not fit in a datagram, which is a schema fact.
@@ -552,6 +558,7 @@ func bandwidth_metrics() -> Dictionary[String, float]:
 		"rx_bytes_s": 0.0, "rx_datagrams_s": 0.0,
 		"blocks_admitted_s": 0.0, "blocks_deferred_s": 0.0, "blocks_culled_s": 0.0,
 		"want_full_nacks_s": 0.0, "stale_blocks_s": 0.0, "blocks_oversize_s": 0.0,
+		"blocks_full_s": 0.0,
 		"starve_ticks_max": 0.0, "unsent_backlog_max": 0.0,
 		"interest_ms": 0.0,
 		"interarrival_near": 0.0, "interarrival_mid": 0.0, "interarrival_far": 0.0,

@@ -144,6 +144,14 @@ struct BandwidthMetrics {
     /// Non-zero means one entity's full state does not fit in a datagram, so that frame went out
     /// over the MTU and fragmented. **Not** a deferral: deferring it is what wedges the stream.
     blocks_oversize_s: f64,
+    /// Blocks sent as full rows rather than masked deltas: the send lane's composition, and what
+    /// the keyframe interval costs.
+    ///
+    /// - Floor: about `blocks_admitted_s / FULL_STATE_INTERVAL`. Every entity owes one keyframe
+    ///   per interval, so nothing lower is reachable.
+    /// - Near `blocks_admitted_s`: almost nothing is being deltaed. On a server that indicates a
+    ///   `want_full` storm; read it beside `want_full_nacks_s`.
+    blocks_full_s: f64,
     /// `WANT_FULL` NACKs received. **SERVER-SIDE ONLY** — it is incremented where a client's input
     /// frame is decoded, so a client reads a structural 0.00 here whatever its link is doing.
     want_full_nacks_s: f64,
@@ -248,8 +256,14 @@ pub(crate) fn unregister_entity(id: u64, who: InstanceId) {
 struct PeerState {
     /// Whether the handshake completed (server side: Hello received and answered).
     synced: bool,
-    /// Per-entity newest tick sent — drives send priority and the periodic-full phase.
+    /// Per-entity newest tick sent — drives send priority.
     last_sent: HashMap<u64, u64>,
+    /// Per-entity newest tick sent as a full block. Drives the keyframe interval.
+    ///
+    /// Separate from `last_sent`: an entity whose chain this peer cannot decode keeps being sent
+    /// as deltas, so `last_sent` never ages past [`FULL_STATE_INTERVAL`] and the keyframe that
+    /// would repair the chain never comes due.
+    last_full: HashMap<u64, u64>,
     /// The peer asked for full masks (its delta base broke).
     want_full: bool,
     /// Newest input tick received from this peer (server side).
@@ -539,6 +553,7 @@ pub struct OrbitNet {
     acc_blocks_deferred: u64,
     acc_blocks_culled: u64,
     acc_blocks_oversize: u64,
+    acc_blocks_full: u64,
     acc_want_full_nacks: u64,
     acc_stale_blocks: u64,
     acc_interest_us: u64,
@@ -642,6 +657,7 @@ impl INode for OrbitNet {
             acc_blocks_deferred: 0,
             acc_blocks_culled: 0,
             acc_blocks_oversize: 0,
+            acc_blocks_full: 0,
             acc_want_full_nacks: 0,
             acc_stale_blocks: 0,
             acc_interest_us: 0,
@@ -991,6 +1007,7 @@ impl OrbitNet {
             "blocks_deferred_s" => bw.blocks_deferred_s,
             "blocks_culled_s" => bw.blocks_culled_s,
             "blocks_oversize_s" => bw.blocks_oversize_s,
+            "blocks_full_s" => bw.blocks_full_s,
             "want_full_nacks_s" => bw.want_full_nacks_s,
             "stale_blocks_s" => bw.stale_blocks_s,
             "starve_ticks_max" => bw.starve_ticks_max,
@@ -1242,6 +1259,7 @@ impl OrbitNet {
                     self.planner.remove(id);
                     for peer in self.peers.values_mut() {
                         peer.last_sent.remove(&id);
+                        peer.last_full.remove(&id);
                         peer.acked_base.remove(&id);
                         peer.interest.remove(id);
                     }
@@ -1768,6 +1786,7 @@ impl OrbitNet {
             blocks_deferred_s: self.acc_blocks_deferred as f64 * per_second,
             blocks_culled_s: self.acc_blocks_culled as f64 * per_second,
             blocks_oversize_s: self.acc_blocks_oversize as f64 * per_second,
+            blocks_full_s: self.acc_blocks_full as f64 * per_second,
             want_full_nacks_s: self.acc_want_full_nacks as f64 * per_second,
             stale_blocks_s: self.acc_stale_blocks as f64 * per_second,
             starve_ticks_max: self.win_starve_ticks_max as f64,
@@ -1798,6 +1817,7 @@ impl OrbitNet {
         self.acc_blocks_deferred = 0;
         self.acc_blocks_culled = 0;
         self.acc_blocks_oversize = 0;
+        self.acc_blocks_full = 0;
         self.acc_want_full_nacks = 0;
         self.acc_stale_blocks = 0;
         self.acc_interest_us = 0;
@@ -2086,6 +2106,10 @@ impl OrbitNet {
             let mut writer = Writer::with_capacity(budget + 128);
             let mut body = Writer::with_capacity(budget);
             let mut sent: Vec<(u64, u64)> = Vec::new();
+            // The subset of `sent` that went out full, so the keyframe clock is measured against
+            // what repairs a chain. Kept beside `sent` rather than widening it, because `sent` is
+            // moved into the ack log verbatim.
+            let mut sent_full: Vec<(u64, u64)> = Vec::new();
 
             for index in 0..order.len() {
                 let (candidate, band) = order[index];
@@ -2103,16 +2127,14 @@ impl OrbitNet {
                     self.acc_blocks_culled += 1;
                     continue;
                 }
-                let last_sent = self
+                let last_full = self
                     .peers
                     .get(&peer_id)
-                    .and_then(|p| p.last_sent.get(&id))
+                    .and_then(|p| p.last_full.get(&id))
                     .copied()
                     .unwrap_or(0);
-                let full_due = want_full
-                    || last_sent == 0
-                    || orbitnet_core::interest::send_phase(id, current, FULL_STATE_INTERVAL)
-                        && current.saturating_sub(last_sent) >= FULL_STATE_INTERVAL;
+                let full_due =
+                    full_block_due(want_full, id, current, last_full, FULL_STATE_INTERVAL);
                 // Masked deltas reference only CLIENT-ACKED ticks: the peer provably applied
                 // that base, so loss can no longer leave it reconstructing against its own
                 // prediction. No acked base yet (or an evicted row) degrades to a full block.
@@ -2170,9 +2192,12 @@ impl OrbitNet {
                     // rather than swallowed, because "one entity's full state does not fit in a datagram"
                     // is a fact about the schema that somebody has to be told.
                     if sent.is_empty() {
-                        if let Some(tick) = tick_sent {
+                        if let Some((tick, was_full)) = tick_sent {
                             self.acc_blocks_oversize += 1;
                             sent.push((id, tick));
+                            if was_full {
+                                sent_full.push((id, tick));
+                            }
                             self.acc_band_sends[band.index()] += 1;
                             self.acc_blocks_deferred += (order.len() - index - 1) as u64;
                             break;
@@ -2188,8 +2213,11 @@ impl OrbitNet {
                     self.acc_blocks_deferred += (order.len() - index) as u64;
                     break;
                 }
-                if let Some(tick) = tick_sent {
+                if let Some((tick, was_full)) = tick_sent {
                     sent.push((id, tick));
+                    if was_full {
+                        sent_full.push((id, tick));
+                    }
                     self.acc_band_sends[band.index()] += 1;
                 }
             }
@@ -2209,6 +2237,7 @@ impl OrbitNet {
             header.encode(&mut writer);
             writer.bytes(body.as_slice());
             self.acc_blocks_admitted += sent.len() as u64;
+            self.acc_blocks_full += sent_full.len() as u64;
             self.dbg_sent += sent.len() as u64;
             self.dbg_sent_bytes += writer.len() as u64;
             self.send_to(peer_id, writer.as_slice(), TransferMode::UNRELIABLE);
@@ -2217,6 +2246,9 @@ impl OrbitNet {
                 peer.want_full = false;
                 for &(id, tick) in &sent {
                     peer.last_sent.insert(id, tick);
+                }
+                for &(id, tick) in &sent_full {
+                    peer.last_full.insert(id, tick);
                 }
                 peer.sent_log.push_back((current, sent));
                 while peer.sent_log.len() > SENT_LOG_DEPTH {
@@ -2367,6 +2399,7 @@ impl OrbitNet {
             );
             for &id in &leaves {
                 peer.last_sent.remove(&id);
+                peer.last_full.remove(&id);
                 peer.acked_base.remove(&id);
             }
             culled += (rows.len() as u64).saturating_sub(peer.interest.len() as u64);
@@ -2782,11 +2815,35 @@ fn band_for_row(culling: bool, has_anchor: bool, dist_sq: f32, band_scale: f32) 
     }
 }
 
+/// Whether this entity's next block for this peer must be a full row. A free function so the rule
+/// the send loop runs is the rule a test can call.
+///
+/// Two reasons:
+/// - The peer NACKed. `want_full` is per-peer and all-entity, so it names no particular entity and
+///   cannot be the only repair.
+/// - The keyframe is due (see [`FULL_STATE_INTERVAL`]), phase-spread across the interval by entity
+///   id. `last_full == 0` covers an entity nothing full has ever gone out for: a fresh one, or one
+///   whose bookkeeping was cleared when it left this peer's interest. The arithmetic reaches that
+///   case on its own, since `current - 0 >= interval`; it is written out to say so.
+///
+/// The clock is `last_full`, and `last_sent` cannot stand in for it. A keyframe exists to clear a
+/// delta chain the receiver cannot decode, and such a chain keeps being **sent** — once per rota
+/// visit, as another delta the receiver discards. Measured from `last_sent` the interval never
+/// elapses for the entities that need it, and fires only for entities the rota already skipped for
+/// a whole interval, which have nothing to repair.
+#[must_use]
+fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interval: u64) -> bool {
+    want_full
+        || last_full == 0
+        || (orbitnet_core::interest::send_phase(id, current, interval)
+            && current.saturating_sub(last_full) >= interval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        band_for_row, classify_rx, PeerState, RxOutcome, StateIntegration, RTT_SAMPLE_MAX_MS,
-        RTT_WINDOW,
+        band_for_row, classify_rx, full_block_due, PeerState, RxOutcome, StateIntegration,
+        FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
     };
     use orbitnet_core::priority::Band;
 
@@ -2821,6 +2878,101 @@ mod tests {
             for dist_sq in [0.0f32, 9_000_000.0] {
                 assert_eq!(band_for_row(false, has_anchor, dist_sq, 256.0), Band::Near);
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // When a block must go out full: the keyframe interval.
+    // ------------------------------------------------------------------
+
+    /// The rule this replaces, written out so the regression reads as a disagreement between two
+    /// arithmetics rather than as prose. It is `full_block_due` with the keyframe measured from
+    /// the last send.
+    fn superseded_rule(
+        want_full: bool,
+        id: u64,
+        current: u64,
+        last_sent: u64,
+        interval: u64,
+    ) -> bool {
+        want_full
+            || last_sent == 0
+            || (orbitnet_core::interest::send_phase(id, current, interval)
+                && current.saturating_sub(last_sent) >= interval)
+    }
+
+    /// The tick inside `[from, from + interval)` at which `id`'s keyframe phase comes up.
+    fn phase_tick(id: u64, from: u64, interval: u64) -> u64 {
+        (from..from + interval)
+            .find(|&t| orbitnet_core::interest::send_phase(id, t, interval))
+            .expect("send_phase fires exactly once per interval")
+    }
+
+    /// Both rules evaluated on the same tick. An entity sent every tick as a delta the receiver
+    /// cannot decode has `last_sent == current`, so an interval measured from the last send never
+    /// elapses and the only unconditional repair never comes due. Measured from the last full
+    /// block it comes due on schedule, whatever the delta traffic in between is doing.
+    #[test]
+    fn a_keyframe_comes_due_even_while_deltas_keep_going_out() {
+        let id: u64 = 7;
+        let interval = FULL_STATE_INTERVAL;
+        let last_full: u64 = 100;
+        let due = phase_tick(id, last_full + interval, interval);
+        // Deltas have gone out every tick since, so the last send is this very tick.
+        let last_sent = due;
+        assert!(
+            full_block_due(false, id, due, last_full, interval),
+            "a keyframe {} ticks past the last full block is due however recently a delta went out",
+            due - last_full
+        );
+        assert!(
+            !superseded_rule(false, id, due, last_sent, interval),
+            "the superseded rule must disagree here; that disagreement is the defect, and a gate \
+             both rules pass would not catch it"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_is_not_due_before_its_interval_elapses() {
+        let id: u64 = 7;
+        let interval = FULL_STATE_INTERVAL;
+        let last_full: u64 = 100;
+        for tick in last_full..last_full + interval {
+            assert!(
+                !full_block_due(false, id, tick, last_full, interval),
+                "tick {tick} is inside the interval and must stay a delta"
+            );
+        }
+    }
+
+    /// The two unconditional reasons, each on its own: a NACK, and an entity nothing full has ever
+    /// gone out for (fresh, or bookkeeping cleared at an interest leave).
+    #[test]
+    fn a_nack_or_an_absent_base_forces_a_full_block() {
+        let interval = FULL_STATE_INTERVAL;
+        assert!(full_block_due(true, 7, 500, 499, interval), "NACK");
+        assert!(
+            full_block_due(false, 7, 500, 0, interval),
+            "never sent full"
+        );
+    }
+
+    /// Phase-spread by id, so a session's keyframes are level traffic rather than one spike per
+    /// interval. `send_phase` provides that property and this rule must not lose it.
+    #[test]
+    fn keyframes_spread_across_the_interval_by_entity_id() {
+        let interval = FULL_STATE_INTERVAL;
+        // Not 0: that is "never had a full block", which is unconditionally due for every id.
+        let last_full: u64 = 1;
+        for tick in interval * 2..interval * 3 {
+            let due: Vec<u64> = (0..interval)
+                .filter(|&id| full_block_due(false, id, tick, last_full, interval))
+                .collect();
+            assert_eq!(
+                due.len(),
+                1,
+                "tick {tick} must owe exactly one id a keyframe"
+            );
         }
     }
 
