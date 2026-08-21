@@ -15,11 +15,11 @@ Net.register_rollback_body(
 
 ```sh
 git clone https://github.com/crashtestbrandt/orbitnet && cd orbitnet
-just sync-addons && just rts     # 96-unit RTS, single player, no networking
+just native-install && just rts  # 96-unit RTS, single player, no networking
 just rts-host                    # then `just rts-join` in another terminal
 ```
 
-No Rust toolchain needed — the extension binaries are committed as plain files.
+`native-install` builds the extension for this host; a `git clone` carries no binaries.
 
 > **0.x.** `Net` is the surface intended to be stable. The wire format and the Rust internals may change
 > between minor versions. Pin a tag.

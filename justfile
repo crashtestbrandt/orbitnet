@@ -42,6 +42,12 @@ addon-tracked:
 net-check:
     tools/net-check.sh
 
+# Every filename the .gdextension names is one tools/build-native.sh produces, and every platform that
+# script knows has a leg in binaries.yml. A bad entry fails at dlopen on one platform and nowhere else,
+# so no other gate can see it.
+descriptor-parity:
+    tools/check-descriptor-parity.sh
+
 # Headless project load for each Godot project -- catches every GDScript compile and parse error, with the
 # project's warnings-as-errors promotion applied.
 lint: (lint-project "harness") (lint-project "demos/rts")
@@ -71,7 +77,7 @@ rts-probe:
     GODOT="{{godot}}" tools/rts-probe.sh
 
 # Everything a PR must pass, in the order that fails fastest first.
-check: addon-tracked addon-drift net-check native-test lint test rts-probe
+check: addon-tracked addon-drift net-check descriptor-parity native-test lint test rts-probe
 
 # =====================================================================================================
 # the native backend (Rust)
