@@ -24,8 +24,8 @@ strip = "debuginfo"
 
 # Local native-profiler exports use the same optimizer/LTO settings as shipping, but retain enough
 # DWARF for perf/Hotspot to attribute OrbitNet frames to Rust functions and source lines. This
-# profile is staged under an ignored profile-only addon directory by `just profile-native`; shipping uses
-# `[profile.release]` above and its stripped, LFS-managed binaries.
+# profile is published as a release asset and swapped in by a developer under a profile-only directory;
+# shipping uses `[profile.release]` above. Nothing here is committed or LFS-managed.
 [profile.profiling]
 inherits = "release"
 debug = 1
@@ -45,8 +45,8 @@ strip = "none"
 # is FNV-1a, which already uses `wrapping_mul` explicitly.
 #
 # NOT symbolized, deliberately. `debug = 1` / `strip = "none"` here measured 16.6 MB against release's
-# 4.0 MB, and these binaries are plain git blobs rather than LFS (see the .gdextension header), so the
-# debuginfo would land in history on every tag. Stripped, the whole cost of the checks is ~0.4 MB.
+# 4.0 MB, and this is a build every project run from source loads. Stripped, the whole cost of the
+# checks is ~0.4 MB.
 # Symbolized builds are what `[profile.profiling]` below is for.
 [profile.template-debug]
 inherits = "release"
