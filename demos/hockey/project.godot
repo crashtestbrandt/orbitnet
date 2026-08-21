@@ -1,0 +1,87 @@
+; OrbitNet air-hockey demo — a Godot project of its own, NOT a scene folder inside a shared one.
+;
+; The [orbitnet] block below is why, and it is the exact configuration demos/rts/project.godot names as the
+; one that cannot coexist with its own: a net tick COUPLED to the physics tick at 60 Hz with a deep history
+; ring. The RTS wants the opposite (decoupled, 20 Hz, 64 ticks) because it predicts one cursor per player;
+; this demo predicts a shared puck on every peer, every tick, and reconciles it. Two projects cannot share one
+; settings block, so each is its own Godot project. The addon is mirror-copied in by tools/sync-addons.sh;
+; addons/ here is a build artifact and is gitignored.
+
+config_version=5
+
+[application]
+
+config/name="OrbitNet Air Hockey Demo"
+config/description="Air hockey demonstrating OrbitNet's rollback lane on a SHARED object: every peer predicts the puck through the real simulation and reconciles it against the server, and the correction is reported in millimetres."
+run/main_scene="res://scenes/hockey_main.tscn"
+; Declared as 4.4 to match the extension's compatibility_minimum. A newer editor opens it fine (and offers to
+; bump this line); the point is that a 4.4 user is not locked out.
+config/features=PackedStringArray("4.4", "GL Compatibility")
+
+[autoload]
+
+; Written here rather than left to the EditorPlugin because this entry is what makes `Net` exist in an
+; EXPORTED build and under `--headless --script` (the unit-test runner). The plugin adds the same line when
+; enabled in the editor; both must agree.
+Net="*res://addons/orbitnet/net.gd"
+
+[debug]
+
+; The typed-GDScript rules this repo is written to, promoted from warnings to ERRORS. Identical to the RTS
+; demo's block on purpose: a demo that needed an @warning_ignore to compile would be a demo proving the facade
+; has a hole.
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/unsafe_method_access=2
+gdscript/warnings/unsafe_cast=2
+gdscript/warnings/unsafe_call_argument=2
+; The addon's own unavoidable opaque-Node backend calls live under addons/; exclude that tree from the
+; promotion above so the facade lints. Demo code under scripts/ stays strict. Default is true; pinned explicit.
+gdscript/warnings/exclude_addons=true
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=800
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/orbitnet/plugin.cfg")
+
+[orbitnet]
+
+; Read once by addons/orbitnet/net.gd when it creates the backend node.
+;
+; sync_to_physics=true + tickrate=60: the COUPLED configuration. The net tick runs inside _physics_process
+; ahead of the physics step, one net tick per physics frame, and the clock never stretches -- error is absorbed
+; by whole-tick lead adjustments instead. HockeyNet therefore calls no set_net_tick_decoupled(): the one
+; session-layer ordering rule the RTS demo has that this one does not.
+;
+; A puck is struck and answered inside a few tens of milliseconds, so a 20 Hz tick would quantize the strike
+; itself. 60 Hz is the rate at which the correction this demo measures is smaller than the puck.
+sync_to_physics=true
+tickrate=60
+; 128 rather than the RTS's 64: history is per ROLLBACK entity and it bounds how far back a correction may
+; reach. At 60 Hz, 128 ticks is 2.1 s of rewind depth -- comfortably past any round trip a session survives.
+; It is also the ring ReconcileMeter sizes itself against, so a correction can never outrun the record it is
+; measured from.
+history_limit=128
+max_time_stretch=1.05
+
+[physics]
+
+; Nothing in this demo is a PhysicsBody. The puck, the mallets, the rails and the goal mouths are pure math
+; over a plane (PuckPhysics, MalletControl, TableGeometry) and pointer picking is Plane.intersects_ray, so the
+; whole simulation step is unit-testable with no PhysicsServer at all.
+;
+; That is not a stylistic choice here, it is a requirement: the rollback loop REPLAYS a tick, and Godot's
+; physics server cannot be rewound and re-stepped. A rollback body whose motion came out of the physics server
+; would resimulate to a different answer than the one it recorded.
+common/physics_ticks_per_second=60
+3d/default_gravity=0.0
+
+[rendering]
+
+; GL Compatibility, not Forward+: this demo must run on a software GL CI runner and on old hardware, and it
+; renders a table, some rails and a handful of primitives.
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

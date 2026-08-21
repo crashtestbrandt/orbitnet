@@ -1,0 +1,225 @@
+# The air hockey demo
+
+`demos/hockey/` — a table, a puck, and up to 32 mallets on alternating ends. No menu, no match end.
+
+It makes an argument the RTS demo cannot: **the rollback lane is not only for the body you author**. The puck
+is authored by nobody, and every peer predicts it through the real simulation and reconciles it against the
+server. How far wrong that prediction was, in millimetres, is the number on screen.
+
+```sh
+just hockey        # single player, no networking at all
+just hockey-host   # terminal 1
+just hockey-join   # terminal 2, and 3, and 4 …
+```
+
+## The configuration, and why it is a separate project
+
+`demos/rts/project.godot` names this demo before it existed: *"a second demo shaped like a shooter would want
+`sync_to_physics=true` at 60 Hz with a 128-tick history. Those cannot coexist in one `project.godot`."*
+
+| `[orbitnet]` | air hockey | RTS |
+|---|---|---|
+| `sync_to_physics` | `true` — **coupled** | `false` |
+| `tickrate` | `60` | `20` |
+| `history_limit` | `128` | `64` |
+
+Coupled means one net tick per physics frame, run before the physics step, with the clock pinned to a stretch
+of exactly 1.0. `HockeyNet` therefore calls **no** `set_net_tick_decoupled()` — the one session-layer ordering
+rule the RTS demo has that this one does not.
+
+## The lane split
+
+| Lane | What is on it | Count |
+|---|---|---|
+| **Rollback** | every mallet — state on the body, input on a client-authority child | 32 |
+| **Rollback** | **the puck** — state only, no input, predicted on every peer | 1 |
+| **State** | the scoreboard | 1 |
+| **Command** | `serve`, one channel for the whole rink | 1 |
+
+### The puck is registered with an empty input list
+
+```gdscript
+# PuckBody.bind_net() — the puck is its own input node; there is no input to carry.
+Net.register_rollback_body(self, self,
+    ["net_pos@half", "net_vel@half", "net_flags"],   # STATE
+    [],                                              # NO INPUT — nobody authors the puck
+    true)                                            # predicted on EVERY peer
+```
+
+The backend's roles fall out of that:
+
+- **Server** — owns the state, and an entity with no input props is stamped authoritative every tick, so its
+  simulation is the truth by construction.
+- **Client** — owns neither the state nor the input, but prediction is enabled and it is not exempt, so it
+  simulates the puck locally and reconciles when the server's row lands.
+
+### The state set has to be the whole simulation state
+
+`net_vel` is on the wire because a restore that returned position without velocity would resume the resim from
+the wrong basis and diverge on the very next tick. The same goes for `net_flags`, which carries liveness, the
+face-off countdown and the serve sequence: the simulation reads all of it, so all of it has to ride the lane
+that gets restored.
+
+**The failure mode looks like a physics bug and is a schema one.** The RTS demo never had to make this point —
+its units are display-only and its cursor has no momentum.
+
+### What a client cannot predict
+
+Two things, both correct rather than gaps:
+
+- **An opponent's strike.** Rollback input travels client → server and is never rebroadcast, because that
+  would be an O(N²) input fan-out. Nothing in a client's possession implies where somebody else's mallet went.
+  `Net.set_remote_resim(true)` at least lets the other mallets coast forward through the resim instead of
+  standing still; `HockeyNet` turns it on at session start and **F2** toggles it.
+- **A serve.** A `NetCommand` handler runs outside the tick and writes a server-only field, so a client sees
+  its own serve one round trip after asking for it.
+
+## The score, and `is_fresh`
+
+A goal is discovered inside the puck's `_rollback_tick`, and two rules keep it from being counted twice:
+
+1. **It is awarded on the `is_fresh` pass.** The backend consumes freshness exactly once per tick, so a resim
+   over the same tick does not award it again.
+2. **The score lives on the state lane.** The rollback lane restores recorded history onto its properties
+   every tick, so an increment stored on the puck would be overwritten by the next restore — silently, on the
+   server, with the score sitting at nil-nil and nothing erroring.
+
+Point 2 is the README's headline warning applied in the direction people do not expect: the usual case is a
+value written *outside* the tick landing on the rollback lane, and this is the same rule from the other side.
+
+**Documented cost:** a goal committed on the fresh pass is **not** un-awarded if a later correction invalidates
+the tick. `NetRollbackHandle.memo_set`/`memo_get` is the primitive for that case; the demo uses it for the
+serve and not for the score, and at a 60 Hz coupled tick the window is a few milliseconds wide.
+
+## The correction, measured
+
+`ReconcileMeter` records the puck's position the **first** time a tick is simulated and compares on every later
+pass over that same tick. A later pass only happens because an authoritative row arrived and the backend
+rewound to replay from it, so the difference between the two answers for one tick *is* the correction.
+
+**It is keyed on visitation, deliberately not on `is_fresh`.** `is_fresh` is keyed on *input* novelty, and an
+inputless puck on a client is never fresh at all — it would report nothing, forever. What this needs is "has
+this tick been simulated before", which is the plain high-water mark that [protocol.md](protocol.md#is_fresh)
+correctly calls the *wrong* definition of `is_fresh`. Both are right about their own question.
+
+The HUD prints the measurement's floor beside it:
+
+```
+PUCK CORRECTION  p50=4.8 mm  p99=41.2 mm  peak=96.0 mm  n=240
+        replayed 61 of 1440 ticks   view: 58 blended, 3 snapped   wire floor ~0.98 mm (@half)
+```
+
+`net_pos` rides as three IEEE-754 binary16s, whose spacing near a table coordinate of 1 m is about a
+millimetre, and the backend writes the quantized value back after every record so every peer replays from the
+same canonical basis. A correction cannot be measured below that. The table is sized in metres partly for this
+reason: ten times the table and the floor would be the number.
+
+### The view absorbs the correction, and knows when not to
+
+A predicted puck travels up to 100 mm per tick, so smoothing its *position* toward the simulation would render
+it lagging behind itself. `PuckView` smooths the **discontinuity** instead: it extrapolates the previous pose
+forward, takes the difference from the authoritative one as an offset, and bleeds the offset away over
+`CORRECTION_HALF_LIFE`.
+
+Two discontinuities are the simulation's own and must not be absorbed, or the puck renders passing through a
+rail and sliding back into it — a **rail or mallet contact**, and a **face-off**. `PuckPhysics.State` carries a
+contact count for exactly that reason. Anything past `CORRECTION_SNAP_M` snaps instead of blending, and the
+blended and snapped counts are what `BenchSubject.KEY_RECONCILE_SMOOTH` and `KEY_RECONCILE_SNAP` were defined
+for. This demo is the first to fill them.
+
+## Teams and seating
+
+- **Seat parity fixes the end.** Even seats defend `-z`, odd seats defend `+z`, and a player's team is derived
+  from the seat index rather than replicated.
+- **A joiner takes the lowest free seat on the thinner end**, ties to team 0. On an empty table that is strict
+  alternation — 0, 1, 2, 3 — and after a drop-out it refills the side that lost a player rather than deepening
+  a 3-v-1.
+- **Drop-in and drop-out are the same mechanism.** A peer connecting takes a seat, a peer leaving releases it,
+  and the whole seat table is rebroadcast either way over a reliable RPC — which is what re-points each
+  `MalletInput`'s multiplayer authority on every peer.
+- **Mallets do not collide with each other.** Team-mates may overlap, and the renderer fades the nearer one
+  instead of pushing it away. Pushing would put a rule in the simulation to solve a drawing problem, and every
+  peer would then have to predict it.
+
+### 32 seats is a wire fact, not a gameplay one
+
+Every peer builds all 32 mallets at world build with identical names, and the node set never changes. OrbitNet
+derives an entity id from a node **path**, so a mallet created after world build would have to be created at
+the identical path on every peer, in the same order — which needs spawn replication, a real problem and the
+wrong one for this demo to also be about. The ENet peer cap is set to the same number, so the peer after the
+last seat is refused by the transport.
+
+A vacant seat's mallet is parked, undrawn, skipped by the puck's collision pass, and stops changing — so the
+delta tracking stops sending it. An empty table is free.
+
+## The table
+
+**Table space is 2D and axis-aligned**: `x` across (±0.5 m), `z` along toward the goals (±1.0 m), `y` always 0.
+The incline lives entirely in the view node's transform, so no simulation code knows the table is tilted and a
+body's `position` is already its table-space coordinate.
+
+The camera is **fixed** — no pan, no zoom, no edge scroll. Its distance is *solved* from the table corners
+rather than tuned: `TableFraming.min_distance()` returns the distance at which the tightest corner still sits
+inside the frustum with a margin, and `table_framing_test.gd` asserts it holds at seven aspect ratios. Godot's
+`Camera3D` defaults to `KEEP_HEIGHT`, so a narrow window has *less* horizontal room; `TableView` re-solves on
+resize.
+
+**The one thing that is not fixed is which end faces you**, chosen once when your seat is assigned. Playing
+from the top of the screen is not a camera control, it is a defect.
+
+## Within-tick entity ordering
+
+The puck reads every mallet's pose; nothing writes the puck's. Whether a given mallet has already advanced when
+the puck's tick runs depends on the backend's replay order, which is **ascending entity id** — its planner
+keeps bodies in a `BTreeMap` precisely so replay order cannot vary. An entity id is FNV-1a of the node path, so
+the order is identical on every peer and is already covered by the world signature. At 60 Hz the difference
+between reading a mallet at the start or the end of a tick is under a centimetre.
+
+## The levers
+
+| Key | What it moves |
+|---|---|
+| `F1` | net tick 60 ↔ 30 Hz. Each correction covers twice the travel at 30. |
+| `F2` | `remote_resim`. **Off is "stop predicting, draw what arrives"** — it exempts every body this peer owns neither the state nor the input of, the other mallets *and* the puck. |
+| `F3` | `input_delay` — shrinks the unconfirmed window by stamping input into the future. |
+| `F4` | `display_offset` — presents an older, more-confirmed tick. |
+| `F5` | correction smoothing. Off leaves the puck exactly where the wire put it. |
+| `F6` | team-mate fade. |
+| `Space` | serve. Refused while the puck is live. |
+
+There is no AOI lever. `Net.set_aoi_radius()` culls the rollback lane against a peer's own body, and a 2 m
+table has nothing to cull; [rts-demo.md](rts-demo.md#aoi-reported-honestly) is where interest management is
+explained.
+
+## No token bucket on the command channel
+
+A serve is legal **only while the puck is dead**, and serving makes it live — so the state precondition rate
+limits the channel by itself and the validator's work is O(1) either way. `CommandThrottle` lives in the RTS
+demo, where an order is legal whenever the player likes.
+
+One channel rather than one per seat, for the mirror reason: an order names unit ids, so a request on somebody
+else's channel is unambiguous forgery. A serve names nothing, and the sender id is the entire authorization.
+
+## Nothing is a PhysicsBody
+
+The puck, the mallets, the rails and the goal mouths are pure functions over a plane (`PuckPhysics`,
+`MalletControl`, `TableGeometry`), and pointer picking is `Plane.intersects_ray`.
+
+That is a requirement rather than a preference: **the rollback loop replays a tick, and Godot's physics server
+cannot be rewound and re-stepped**. A body whose motion came out of the physics server would resimulate to a
+different answer than the one it recorded, on every correction.
+
+The puck substeps four times per tick because at its speed cap a single 60 Hz step moves it further than its
+own diameter, and a one-shot overlap test would let it pass straight through a mallet — a *simulation* bug that
+looks exactly like a netcode bug. `puck_physics_test.gd` asserts the derivation rather than the number.
+
+## Deliberately omitted
+
+- **No win condition.** The score climbs and the demo can be left running.
+- **No version handshake.** Two incompatible peers connect and misbehave rather than being refused.
+- **No rejected-command reply.** A refused serve is visible on the host only, which is a
+  [filed gap](../README.md#limits); the HUD says so rather than leaving the line suspiciously empty.
+- **No InputMap** — raw key constants and the raw pointer, so there is no project-settings dependency to break
+  across Godot versions. A real game should use one.
+- **No PR-gating probe.** `tools/rts-probe.sh` is the only scene-bound gate and CONTRIBUTING.md says to keep it
+  that way; this demo's coverage is twelve unit suites over its pure functions.

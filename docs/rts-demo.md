@@ -11,6 +11,9 @@ just rts-host     # terminal 1
 just rts-join     # terminal 2
 ```
 
+The counterpart is [hockey-demo.md](hockey-demo.md): a coupled 60 Hz tick where everything is on the rollback
+lane, including a puck nobody authors. Between them the two demos cover both halves of the lane decision.
+
 ## The lane split
 
 | Lane | What is on it | Count |

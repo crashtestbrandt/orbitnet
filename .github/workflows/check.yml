@@ -150,11 +150,13 @@ jobs:
         run: |
           tools/lint-gdscript.sh harness
           tools/lint-gdscript.sh demos/rts
+          tools/lint-gdscript.sh demos/hockey
 
       - name: Unit suites
         run: |
           godot --headless --path harness --script tests/support/run_unit_tests.gd
           godot --headless --path demos/rts --script tests/support/run_unit_tests.gd
+          godot --headless --path demos/hockey --script tests/support/run_unit_tests.gd
 
       # --skip-build because the build already happened above; the smoke loads what that step installed
       # rather than compiling a second copy.

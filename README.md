@@ -15,7 +15,9 @@ Net.register_rollback_body(
 
 ```sh
 git clone https://github.com/crashtestbrandt/orbitnet && cd orbitnet
-just native-install && just rts  # 96-unit RTS, single player, no networking
+just native-install
+just rts                         # 96-unit RTS, single player, no networking
+just hockey                      # air hockey, a puck every peer predicts
 just rts-host                    # then `just rts-join` in another terminal
 ```
 
@@ -67,6 +69,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 | [getting-started.md](docs/getting-started.md) | Your first replicated body. **Start here.** |
 | [api.md](docs/api.md) | The full surface, wire quantization, and the f64/i64 scalar reality. |
 | [rts-demo.md](docs/rts-demo.md) | A worked example that is not a character shooter, with the byte budget spelled out. |
+| [hockey-demo.md](docs/hockey-demo.md) | The rollback lane on an object nobody authors, and the correction measured in millimetres. |
 | [architecture.md](docs/architecture.md) | Crate layout, batching, history, prop roles, threading. |
 | [protocol.md](docs/protocol.md) | Wire format, clock, `is_fresh`, entity lifecycle. |
 | [netbench.md](docs/netbench.md) | Impairment relay, bot fleet, tick-domain gates. |
@@ -86,6 +89,22 @@ an entity belongs on is decided by the game**:
 
 Its signature number is **order RTT** — click → validate → adjudicate → *observed* — which is what a player
 feels and what ping does not measure. Six keybound levers change it live.
+
+## The air hockey demo
+
+`demos/hockey/` is the coupled 60 Hz counterpart — the configuration the RTS demo's `project.godot` names as
+unable to coexist with its own — and it exists to show that **the rollback lane is not only for the body you
+author**:
+
+- **Rollback: the puck**, registered with an *empty input list* and `predict = true` on every peer. Nobody
+  authors it, so every peer simulates it locally and reconciles against the server.
+- **Rollback: every mallet**, server-owned state and client-owned input, on a 32-seat static pool with players
+  seated on alternating ends as they arrive.
+- **State: the scoreboard**, because a goal found inside the tick would be erased by the next rollback restore.
+- **Command: `serve`**, one channel, refused while the puck is live.
+
+Its signature number is the **puck correction in millimetres** — the distance between what this peer predicted
+for a tick and what the server said about it, reported beside the wire quantization floor that bounds it.
 
 ## Limits
 
