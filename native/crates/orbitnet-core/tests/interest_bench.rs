@@ -619,14 +619,11 @@ fn interest_grid_crossover_by_arena_extent() {
     print_core_header("extent");
 
     for &extent in EXTENTS {
-        let run = |worlds: usize| {
-            core_row(
-                || Scene::session(PEERS, ENTITIES, extent, worlds, UNANCHORED, 0x1234_5678),
-                TICKS,
-                &grid_cfg(RADIUS, 0),
-            )
-        };
-        let row = run(1);
+        let row = core_row(
+            || Scene::session(PEERS, ENTITIES, extent, 1, UNANCHORED, 0x1234_5678),
+            TICKS,
+            &grid_cfg(RADIUS, 0),
+        );
         row.print(&format!("{extent:>8.0}"), TICKS, PEERS);
     }
     println!();
