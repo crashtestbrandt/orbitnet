@@ -149,7 +149,8 @@ jobs:
     needs: build
     runs-on: [self-hosted, Linux, X64, legion]
     permissions:
-      contents: write   # the only place in this repo that needs it: commit the manifest + create a release
+      contents: write        # create the release, and push the manifest branch
+      pull-requests: write   # main is protected, so the manifest arrives as a PR
     steps:
       # THE TAG, not main. This job assembles the zip from the working tree, and the binaries it downloads
       # were built from the tag's sources -- so checking out main shipped a zip pairing the tag's backend
@@ -296,46 +297,48 @@ jobs:
 
             OrbitNet is 0.x. The `Net` facade is the stable surface; everything behind it may change.
 
-      # AFTER the release exists, and in a SEPARATE WORKTREE. This checkout is the TAG and it is dirty:
-      # plugin.cfg has been stamped and binaries.json freshly written. `git checkout -B ... origin/main`
-      # in THIS tree aborts whenever either file differs between the tag and main -- a re-run after the
-      # manifest has landed, a patch tag cut below main's last manifest commit, a re-tag of an older
-      # commit. A step carries an implicit `success()` unless told otherwise, so while this ran BEFORE
-      # the publish, that abort skipped the publish entirely: three cross-platform builds, no release,
-      # and a tag that could not be re-run without editing this file. Hence the order above.
+      # AFTER the release exists, and as a PULL REQUEST. `main` is protected -- "Changes must be made
+      # through a pull request" -- so a bot push is rejected with GH006 by construction, on every run
+      # whose builds all succeeded. A step that can only pass by having nothing to push is not a guard.
       #
-      # `cp` rather than a `$(cat ...)` / `printf '%s'` round trip: command substitution strips trailing
-      # newlines, which silently rewrote plugin.cfg from 424 bytes to 423 on every release.
-      - name: Commit the manifest to main
+      # A SEPARATE WORKTREE, because this checkout is the TAG and it is dirty by now: plugin.cfg has been
+      # stamped and binaries.json freshly written. `git checkout -B` in this tree aborts whenever either
+      # differs between the tag and main.
+      #
+      # AFTER the publish, because the release is the artifact that matters. This step failing must never
+      # cost three cross-platform builds and a tag that cannot be re-run.
+      - name: Propose the manifest to main
         if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
+          branch="release-manifest/${GITHUB_REF_NAME}"
           wt="$RUNNER_TEMP/main-worktree"
           rm -rf "$wt"
           git worktree prune
           git fetch origin main
           git worktree add --detach "$wt" origin/main
+          # `cp`, not a shell round trip: command substitution strips trailing newlines.
           cp addons/orbitnet_native/binaries.json "$wt/addons/orbitnet_native/binaries.json"
           cp addons/orbitnet/plugin.cfg           "$wt/addons/orbitnet/plugin.cfg"
           git -C "$wt" add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
           if git -C "$wt" diff --cached --quiet; then
-            echo "manifest unchanged; nothing to commit"
-          else
-            git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
-            # main can move between the fetch and the push. Rebase and retry rather than failing the
-            # run: the release is already published by this point, so a lost race would leave the tag
-            # shipped and its digest unrecorded, which is the one state a consumer cannot verify against.
-            pushed=0
-            for attempt in 1 2 3; do
-              if git -C "$wt" push origin HEAD:main; then pushed=1; break; fi
-              echo "push rejected (attempt ${attempt}); rebasing onto origin/main"
-              git -C "$wt" fetch origin main
-              git -C "$wt" rebase origin/main || { git -C "$wt" rebase --abort || true; break; }
-            done
-            [ "$pushed" -eq 1 ] || {
-              echo "::error::could not push the manifest to main after 3 attempts. The release IS published; re-run only this step, or commit addons/orbitnet_native/binaries.json by hand."
-              exit 1; }
+            echo "manifest unchanged; nothing to propose"
+            git worktree remove --force "$wt"
+            exit 0
           fi
+          git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
+          git -C "$wt" push --force origin "HEAD:refs/heads/${branch}"
           git worktree remove --force "$wt"
+          # A PR may already exist if this tag was re-run; creating a duplicate is an error, not a
+          # failure worth stopping the run for.
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "{\"title\":\"release: binaries manifest for ${GITHUB_REF_NAME}\",\"head\":\"${branch}\",\"base\":\"main\",\"body\":\"Digest of every asset published on \`${GITHUB_REF_NAME}\`, so a consumer can verify a download against the commit graph rather than against a checksum published beside the file it describes.\\n\\nOpened by \`release.yml\`; \`main\` is protected, so this cannot be a direct push.\"}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print('PR:', d.get('html_url') or d.get('message'))"
