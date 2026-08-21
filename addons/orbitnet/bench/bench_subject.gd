@@ -56,6 +56,42 @@ const KEY_RECONCILE_SMOOTH: String = "reconcile_smooth"
 ## snap is a visible teleport, so a profile bounds how many a run may produce.
 const KEY_RECONCILE_SNAP: String = "reconcile_snap"
 
+## float -- rounds this peer has fired so far (monotonic). Left at 0 by a game with no shooting.
+const KEY_SHOTS_FIRED: String = "shots_fired"
+## float -- how many of those the server confirmed landing on something damageable (monotonic).
+##
+## Hit registration is the one property lag compensation exists to serve, and it is only measurable
+## against a target the shooter actually resolved -- see [method target_kind].
+const KEY_HITS_CONFIRMED: String = "hits_confirmed"
+## float -- current owner-prediction error in ORIENTATION, in the game's own angular units.
+##
+## Separate from [constant KEY_RECONCILE_ERROR] because the two fail differently: a position
+## correction moves the body, while an orientation correction rolls the horizon on the local
+## player's own screen, which is the nauseating one.
+const KEY_ORIENT_ERROR: String = "orient_error"
+## float -- count of orientation corrections absorbed by smoothing so far (monotonic).
+const KEY_ORIENT_SMOOTH: String = "orient_smooth"
+## float -- count of orientation corrections that found no history row to correct against (monotonic).
+const KEY_ORIENT_MISS: String = "orient_miss"
+## float -- 1.0 while the game's orientation reconciliation arm is actually on, 0.0 otherwise.
+##
+## Reported because a disabled arm leaves every counter above at zero by construction, which is the
+## exact signature of a perfectly behaved one. The gate needs to tell those apart.
+const KEY_ORIENT_ARMED: String = "orient_armed"
+
+# --- what a shooter was aiming at -----------------------------------------------------------------
+# Read by [method BenchGate.evaluate_hit_registration], which draws a different conclusion from each.
+
+## No target resolved. The rounds fired prove nothing about hit registration.
+const TARGET_NONE: String = "none"
+## A stationary target. Proves adjudication and confirmation under latency, but a still target
+## resolves the same at the present tick, so it does not exercise the rewind itself.
+const TARGET_STATIONARY: String = "stationary"
+## A moving, server-simulated target. A confirmed hit is a statement about the rewind.
+const TARGET_MOVING: String = "moving"
+## Another player. The full path: a remote body this peer interpolates, rewound by its own lag.
+const TARGET_PLAYER: String = "player"
+
 ## Emitted when the locally-owned body becomes available (or becomes available AGAIN after a respawn).
 ## [BenchProbe] and [BenchBot] bind to it rather than polling.
 signal subject_ready(body: Node)
@@ -109,6 +145,15 @@ func sample(_body: Node) -> Dictionary:
 ## net tick, so a walk of the whole scene tree is the wrong implementation.
 func remote_bodies() -> Array[Node]:
 	return []
+
+## What this peer's shots were aimed at, as one of the `TARGET_*` constants. OPTIONAL: the default is
+## [constant TARGET_NONE], which tells the gate that the rounds fired prove nothing about hit registration.
+##
+## Answered by the game because only the game knows what its shooter resolved. A policy that fires blind
+## and a pilot who never lined anybody up both report [constant TARGET_NONE], and the gate then reports
+## hit registration as not exercised rather than as failed.
+func target_kind() -> String:
+	return TARGET_NONE
 
 ## Called once when the bench run finishes, so a subject can drop signal connections and hand the body back
 ## to live input. The default releases input, which is right for almost every implementation.
