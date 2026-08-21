@@ -205,31 +205,25 @@ jobs:
           sed -i "s/^version=\".*\"$/version=\"${version}\"/" addons/orbitnet/plugin.cfg
           grep '^version=' addons/orbitnet/plugin.cfg
 
+      # tools/make-assetlib-zip.py RATHER THAN THE `zip` BINARY. The publish runner has neither `zip`
+      # nor `unzip`: a dry run failed here with "zip: command not found" after all three cross-platform
+      # builds had already succeeded. The script uses python3's standard library, needs no package
+      # install, and counts the libraries it packaged rather than trusting the walk -- bin/ is
+      # gitignored, so a clean checkout would otherwise ship an addon with no backend and say nothing.
       - name: Build the Asset Library zip
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          mkdir -p build
-          # The payload is exactly the two addon directories -- what a user installs and nothing else.
-          # The licences ride along inside it, because an addon installed from a zip carries no repository
-          # with it and a user who cannot find the terms will assume the worst.
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
+            version="${{ github.event.inputs.version }}"
+            version="${version#v}"
+          fi
+          # The licences ride INSIDE the payload: an addon installed from a zip carries no repository
+          # with it, and a user who cannot find the terms will assume the worst.
           cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
-          # -x the manifest: it is written AFTER this zip, because it hashes the zip. The copy sitting in
-          # the tree is therefore the PREVIOUS tag's, and shipping it inside the payload would hand a user
-          # digests matching none of the six libraries beside it.
-          zip -qr "build/orbitnet-${version}.zip" addons/orbitnet addons/orbitnet_native \
-            -x 'addons/orbitnet_native/binaries.json'
+          tools/make-assetlib-zip.py "$version"
           rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT \
                 addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
-          # bin/ is gitignored, so `zip -r` on a clean checkout would silently ship an addon with no
-          # backend at all. Prove the libraries are in there rather than trusting the glob.
-          zipped="$(unzip -l "build/orbitnet-${version}.zip" | grep -c 'addons/orbitnet_native/bin/.' || true)"
-          expected="$(ls addons/orbitnet_native/bin | grep -c .)"
-          if [ "$zipped" -ne "$expected" ]; then
-            echo "::error::the zip carries ${zipped} libraries; the descriptor needs ${expected}"
-            exit 1
-          fi
-          unzip -l "build/orbitnet-${version}.zip" | tail -3
 
       # EVERY published asset, including the AssetLib zip. A consumer that pins this tag can fetch the
       # single zip -- which carries both addon directories and all six libraries -- and verify one digest,
