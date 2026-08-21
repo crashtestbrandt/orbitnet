@@ -112,3 +112,39 @@ static func cast_sphere(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: 
 	hit.position = best_pos
 	hit.distance = best_d
 	return hit
+
+## EVERY body the swept sphere overlaps at its FIRST contact, unranked -- for a picker that has to resolve a
+## small target pressed against large geometry. [method cast_sphere] crowns one winner by node-origin
+## distance, and a large body's node origin can sit closer than the small one the player is actually
+## touching whenever the player stands inside the large body. A picker that wants a specific type must
+## therefore be handed the whole overlap set and walk it.
+##
+## Occlusion is preserved: the sweep still stops at the first contact, so a target behind a wall is not in
+## the set. Empty when the whole swept tube is clear. Same space-lock rule as [method cast].
+static func cast_sphere_overlaps(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3,
+		dist: float, radius: float, exclude: Array[RID] = [], mask: int = 0xFFFFFFFF) -> Array[Object]:
+	var out: Array[Object] = []
+	if space == null or dist <= 0.0 or radius <= 0.0 or dir.length_squared() < 0.000001:
+		return out
+	var d: Vector3 = dir.normalized()
+	var shape: SphereShape3D = SphereShape3D.new()
+	shape.radius = radius
+	var params: PhysicsShapeQueryParameters3D = PhysicsShapeQueryParameters3D.new()
+	params.shape = shape
+	params.transform = Transform3D(Basis(), origin)
+	params.motion = d * dist
+	params.collision_mask = mask
+	params.exclude = exclude
+	params.collide_with_areas = false
+	params.collide_with_bodies = true
+	var motion: PackedFloat32Array = space.cast_motion(params)
+	if motion.size() < 2:
+		return out
+	if motion[0] >= 1.0 and motion[1] >= 1.0:
+		return out
+	params.transform = Transform3D(Basis(), origin + d * dist * motion[1])
+	for r: Dictionary in space.intersect_shape(params, 16):
+		var collider: Object = r["collider"]
+		if collider != null:
+			out.push_back(collider)
+	return out
