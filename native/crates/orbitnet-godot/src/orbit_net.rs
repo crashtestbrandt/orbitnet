@@ -139,6 +139,41 @@ struct PeerObserver {
     membership: MembershipId,
 }
 
+/// What one peer's filter actually runs against this tick: where it observes from, and its world.
+///
+/// The whole precedence rule, in one testable place. A declaration ([`PeerAnchor`]) wins on both
+/// axes; only [`PeerAnchor::Inferred`] consults the pair read off the body the peer drives:
+///
+/// | Declaration | Centre | World |
+/// | --- | --- | --- |
+/// | [`PeerAnchor::Fixed`] | the declared position, always | the declared one |
+/// | [`PeerAnchor::Entity`] | where that entity is this tick, else where it last was | the declared one |
+/// | [`PeerAnchor::Inferred`] | the inferred body's, if it has one | the inferred body's, else [`MEMBERSHIP_GLOBAL`] |
+///
+/// **THE TWO AXES FAIL SEPARATELY, AND ONLY FOR A DECLARED PEER.** A tracked entity that has never
+/// resolved gives no centre — so nothing is distance-culled, the same open direction an entity with
+/// no anchor already takes — but the peer stays in the world it was DECLARED into. A membership is a
+/// declaration and did not fail; a centre is a measurement and did. Collapsing them would drop a
+/// peer whose avatar has not spawned into every world at once, which is the failure the declaration
+/// exists to remove.
+#[must_use]
+fn resolve_observer(
+    anchor: PeerAnchor,
+    declared: MembershipId,
+    tracked: Option<[f32; 3]>,
+    last: Option<[f32; 3]>,
+    inferred: Option<PeerObserver>,
+) -> (Option<[f32; 3]>, MembershipId) {
+    match anchor {
+        PeerAnchor::Fixed(pos) => (Some(pos), declared),
+        PeerAnchor::Entity(_) => (tracked.or(last), declared),
+        PeerAnchor::Inferred => (
+            inferred.map(|o| o.center),
+            inferred.map_or(MEMBERSHIP_GLOBAL, |o| o.membership),
+        ),
+    }
+}
+
 /// The windowed send-path accounting `Net.bandwidth_metrics()` republishes.
 ///
 /// Nothing downstream of this epic is tunable or gateable without it — a byte budget nobody can
@@ -277,10 +312,53 @@ pub(crate) fn unregister_entity(id: u64, who: InstanceId) {
     }
 }
 
+/// Where a peer observes from, as the GAME declared it — the alternative to inferring it.
+///
+/// **A declaration replaces inference outright**, on both axes at once. The inferred pair
+/// ([`PeerObserver`]) reads a peer's centre and its world off the lowest-id body that peer's input
+/// drives, which answers "what does this peer control" when the question interest management asks is
+/// "what does this peer observe". Those are the same answer in a game with one world and one avatar
+/// per player, and different answers in every other one: a spectator drives nothing, a commander
+/// watches ground its body is not standing on, and a peer with a body in each of two worlds observes
+/// exactly one of them.
+///
+/// Once a game answers the real question for a peer, the inferred pair is never consulted again for
+/// that peer. Mixing them would re-centre a peer on its avatar the moment the declared centre was
+/// momentarily unavailable — and, worse, would put it back in its avatar's world.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum PeerAnchor {
+    /// Nothing declared: fall back to [`OrbitNet::collect_observers`].
+    #[default]
+    Inferred,
+    /// A fixed world position — a spectator camera, a strategic view, an observation post.
+    Fixed([f32; 3]),
+    /// Track an entity by id, wherever it is this tick.
+    Entity(u64),
+}
+
 #[derive(Default)]
 struct PeerState {
     /// Whether the handshake completed (server side: Hello received and answered).
     synced: bool,
+    /// Where this peer observes from, declared by the game. See [`PeerAnchor`].
+    anchor: PeerAnchor,
+    /// The last position [`PeerAnchor::Entity`] resolved to, and the answer once it no longer can.
+    ///
+    /// **A tracked entity that despawns leaves the peer where it was.** The alternative — dropping
+    /// to "no centre", which means "no distance filter" — hands a peer every body in its world at
+    /// the exact moment its avatar died. A stale centre is wrong by however far the peer would have
+    /// travelled; the open one is wrong by the size of the world.
+    ///
+    /// It is also what carries a declaration made BEFORE the named entity has a state row: the
+    /// declaration survives on this struct and starts resolving the tick that entity does.
+    anchor_last: Option<[f32; 3]>,
+    /// The world declared alongside [`Self::anchor`]. Read ONLY when a declaration exists, so an
+    /// undeclared peer still takes its world from the body it drives.
+    ///
+    /// It rides the anchor declaration rather than standing alone because the two are one statement
+    /// — "this peer is at this point, in this world" — and a centre without the world it is measured
+    /// in is precisely the pairing the inferred path takes from one row to keep consistent.
+    anchor_membership: MembershipId,
     /// Per-entity newest tick sent — drives send priority.
     last_sent: HashMap<u64, u64>,
     /// Per-entity newest tick sent as a full block. Drives the keyframe interval.
@@ -962,6 +1040,92 @@ impl OrbitNet {
             Some(ms) => f64::from(ms),
             None => -1.0,
         }
+    }
+
+    /// Declare where one peer observes from, and which world it observes in.
+    ///
+    /// SERVER-SIDE ONLY, and the answer to a question the backend cannot infer. Undeclared, a peer
+    /// is centred on — and put in the world of — the lowest-id entity its input drives, which
+    /// answers what that peer CONTROLS when interest management asks what it OBSERVES. Use this for
+    /// a spectator, a strategic camera, an observation post, or any peer whose view is not bolted to
+    /// a body it drives. [`Self::set_peer_anchor_entity`] is the same declaration for a centre that
+    /// moves with an entity.
+    ///
+    /// `membership` is the same id `membership_property` names on an entity, with the same rule:
+    /// `0` is `MEMBERSHIP_GLOBAL` and matches every world. Declaring it here is what makes a peer's
+    /// world a **fact rather than a pick** — the inferred path reads it off whichever of a peer's
+    /// bodies sorts lowest by FNV hash, and a peer driving two bodies that declare different worlds
+    /// has no defined world without this call.
+    ///
+    /// It rides the anchor call rather than standing alone because the two are one statement: "this
+    /// peer is at this point, in this world". [`Self::clear_peer_anchor`] retracts both together.
+    ///
+    /// May be called before the peer completes its handshake; the declaration is held until it does.
+    #[func]
+    fn set_peer_anchor(&mut self, peer: i32, position: Vector3, membership: i64) {
+        let state = self.peers.entry(peer).or_default();
+        state.anchor = PeerAnchor::Fixed([position.x, position.y, position.z]);
+        state.anchor_last = None;
+        state.anchor_membership = membership as MembershipId;
+    }
+
+    /// Declare that one peer observes from an ENTITY, and which world it observes in.
+    ///
+    /// `entity_id` is the token `get_entity_id()` returns on either synchronizer — reached from
+    /// GDScript through the rollback or state handle, never computed. `0` retracts, exactly as
+    /// [`Self::clear_peer_anchor`] does, since `0` is what an unresolved synchronizer reports and
+    /// centring a peer on "no entity" is not a state worth having.
+    ///
+    /// The same statement as [`Self::set_peer_anchor`], differing in what it costs the caller: a
+    /// tracked centre follows the entity with no per-tick call. The entity NEED NOT be one the peer
+    /// drives, and that is the point.
+    ///
+    /// **When the tracked entity stops resolving — it despawns, or it has no state row yet — the
+    /// peer keeps the last position it did resolve to, and stays in the world it was declared into.**
+    /// A membership is a declaration and did not fail; see [`resolve_observer`]. A declaration made
+    /// before the entity exists simply starts resolving on the tick it does.
+    #[func]
+    fn set_peer_anchor_entity(&mut self, peer: i32, entity_id: i64, membership: i64) {
+        let state = self.peers.entry(peer).or_default();
+        state.anchor = if entity_id == 0 {
+            PeerAnchor::Inferred
+        } else {
+            PeerAnchor::Entity(entity_id as u64)
+        };
+        state.anchor_last = None;
+        state.anchor_membership = membership as MembershipId;
+    }
+
+    /// Retract a peer's anchor declaration AND its world, together.
+    ///
+    /// The peer returns to the inferred pair: centred on the lowest-id body its input drives, in
+    /// that body's world. Retracting one axis without the other would leave a peer declared into a
+    /// world with no declared position in it, or positioned in a world it is no longer in — and the
+    /// inferred path exists precisely to keep those two answers about one entity.
+    #[func]
+    fn clear_peer_anchor(&mut self, peer: i32) {
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.anchor = PeerAnchor::Inferred;
+            state.anchor_last = None;
+            state.anchor_membership = MEMBERSHIP_GLOBAL;
+        }
+    }
+
+    /// The world DECLARED for one peer, or `0` when nothing was declared for it.
+    ///
+    /// **Not the world an undeclared peer is filtered in.** That one is read off the body the peer
+    /// drives and is reported by `NetRollbackHandle.membership()`, which is where a misconfigured
+    /// `membership_property` shows. `0` here means "no declaration", which is also `MEMBERSHIP_GLOBAL`
+    /// — the two have the same consequence for a peer that declared nothing, so they are not
+    /// distinguished.
+    #[func]
+    fn peer_membership(&self, peer: i32) -> i64 {
+        self.peers
+            .get(&peer)
+            .map_or(MEMBERSHIP_GLOBAL, |state| match state.anchor {
+                PeerAnchor::Inferred => MEMBERSHIP_GLOBAL,
+                _ => state.anchor_membership,
+            }) as i64
     }
 
     /// Remote-resim lever: when true, un-exempt display-only entities so this client predicts
@@ -2010,7 +2174,7 @@ impl OrbitNet {
         let interest_started = Instant::now();
         let mut rows = std::mem::take(&mut self.aoi_rows);
         let mut observers = std::mem::take(&mut self.aoi_observers);
-        self.collect_entity_rows(&mut rows, &mut observers);
+        self.collect_entity_rows(&mut rows);
         // Ascending by id, so the per-peer walk over an (ascending) interest set can binary-search
         // back to the row rather than carrying a per-tick map — and so the anchor pick below is a
         // fact about the scene rather than about `HashMap` iteration order.
@@ -2346,15 +2510,9 @@ impl OrbitNet {
     ///
     /// `input_owner_peer()` is a Godot `get_multiplayer_authority()` call, and `position_hint()` and
     /// `membership_hint()` are live property reads; doing any of them once per peer is the
-    /// O(peers × entities) cost this pass exists to delete. `observers` is cleared here and filled
-    /// by [`Self::collect_observers`] once the rows are sorted.
-    fn collect_entity_rows(
-        &self,
-        rows: &mut Vec<EntityRow>,
-        observers: &mut HashMap<i32, PeerObserver>,
-    ) {
+    /// O(peers × entities) cost this pass exists to delete.
+    fn collect_entity_rows(&self, rows: &mut Vec<EntityRow>) {
         rows.clear();
-        observers.clear();
         for (&id, sync) in &self.rollback_entities {
             let Some(sync) = live_handle(sync) else {
                 continue;
@@ -2399,6 +2557,11 @@ impl OrbitNet {
     /// Where each peer observes from and which world it is in: both read off the entity that peer
     /// drives.
     ///
+    /// **THE FALLBACK, consulted only for a peer that declared nothing.** `OrbitNet::set_peer_anchor`
+    /// and `set_peer_anchor_entity` answer both questions outright, and [`resolve_observer`] does not
+    /// look here for a peer that used either. This remains the default because a game with one world
+    /// and one avatar per player gets the right answer from it with no declaration at all.
+    ///
     /// **Called on rows already sorted by id, and it keeps the LOWEST id per owner.** `rows` is
     /// gathered by walking a `HashMap`, so a last-writer-wins insert would pick a different entity
     /// on different runs — and a peer that drives more than one rollback entity would have its
@@ -2421,9 +2584,11 @@ impl OrbitNet {
     ///
     /// It takes a peer driving **two anchored bodies that declare different worlds** (or one
     /// declaring a world and one not) to reach, which is a misconfiguration rather than a shape a
-    /// game wants — a peer is in one world. Declare the same membership on every body a peer drives.
-    /// `NetRollbackHandle.membership()` reports what the filter reads, which is where the mistake
-    /// shows.
+    /// game wants — a peer is in one world. Two ways out, and the second is the one that removes the
+    /// pick rather than making it agree with itself: declare the same membership on every body a
+    /// peer drives, or declare the peer's world directly with `OrbitNet::set_peer_anchor`.
+    /// `NetRollbackHandle.membership()` reports what the filter reads for an undeclared peer, which
+    /// is where the mistake shows.
     fn collect_observers(rows: &[EntityRow], observers: &mut HashMap<i32, PeerObserver>) {
         observers.clear();
         for row in rows {
@@ -2440,6 +2605,10 @@ impl OrbitNet {
     }
 
     /// Recompute every peer's interest set, and clear the delta bookkeeping of what left.
+    ///
+    /// Each peer is centred and placed in a world by [`resolve_observer`] — its own declaration when
+    /// it made one, the body it drives when it did not — and then filtered on membership first and
+    /// distance second, which is [`candidate_for_row`] plus `update_linear_into`.
     ///
     /// The leave half is the correctness requirement here. Re-entry is already *safe* — a
     /// delta against a base the peer dropped is rejected and raises `WANT_FULL` — but `want_full` is
@@ -2461,14 +2630,35 @@ impl OrbitNet {
         let mut culled = 0u64;
 
         for &peer_id in peer_ids {
-            let observer = observers.get(&peer_id).copied();
-            // No radius, or no body to measure from: everything stays relevant *on distance*.
+            let Some(state) = self.peers.get(&peer_id) else {
+                continue;
+            };
+            let (anchor, last, declared) =
+                (state.anchor, state.anchor_last, state.anchor_membership);
+            // Where a tracked entity is THIS tick, if it is still here and still has a position.
+            // `rows` is sorted by id, which is what makes this a binary search rather than the
+            // per-tick map that sort exists to avoid.
+            let tracked = match anchor {
+                PeerAnchor::Entity(id) => rows
+                    .binary_search_by_key(&id, |row| row.id)
+                    .ok()
+                    .and_then(|index| rows[index].anchor),
+                _ => None,
+            };
+            let (center, observer_membership) = resolve_observer(
+                anchor,
+                declared,
+                tracked,
+                last,
+                observers.get(&peer_id).copied(),
+            );
+            // No radius, or no centre to measure from: everything stays relevant *on distance*.
             // Blanking a peer's world because its avatar has not spawned yet is not a defensible
-            // failure mode. Membership is a separate axis and is not switched off here — an
-            // observer with no body reads as MEMBERSHIP_GLOBAL below, which matches every world, so
-            // that case fails open too.
-            let culling = cfg.enter_radius > 0.0 && observer.is_some();
-            let observer_membership = observer.map_or(MEMBERSHIP_GLOBAL, |o| o.membership);
+            // failure mode. Membership is a separate axis and is not switched off here — a peer with
+            // neither a declaration nor a body reads as MEMBERSHIP_GLOBAL, which matches every
+            // world, so that case fails open too, while a DECLARED peer keeps its world whether or
+            // not its centre resolved.
+            let culling = cfg.enter_radius > 0.0 && center.is_some();
             candidates.clear();
             candidates.extend(
                 rows.iter()
@@ -2477,9 +2667,14 @@ impl OrbitNet {
             let Some(peer) = self.peers.get_mut(&peer_id) else {
                 continue;
             };
+            // Remember where a tracked entity was, so its despawn leaves the peer here rather than
+            // opening its radius to the whole world. Only a resolved position is recorded.
+            if let Some(pos) = tracked {
+                peer.anchor_last = Some(pos);
+            }
             peer.interest.update_linear_into(
                 &cfg,
-                observer.map_or([0.0; 3], |o| o.center),
+                center.unwrap_or([0.0; 3]),
                 observer_membership,
                 &candidates,
                 &mut scratch,
@@ -2960,9 +3155,9 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 #[cfg(test)]
 mod tests {
     use super::{
-        band_for_row, candidate_for_row, classify_rx, full_block_due, EntityRow, OrbitNet,
-        PeerObserver, PeerState, RxOutcome, StateIntegration, FULL_STATE_INTERVAL,
-        RTT_SAMPLE_MAX_MS, RTT_WINDOW,
+        band_for_row, candidate_for_row, classify_rx, full_block_due, resolve_observer, EntityRow,
+        OrbitNet, PeerAnchor, PeerObserver, PeerState, RxOutcome, StateIntegration,
+        FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
     };
     use orbitnet_core::interest::{InterestCandidate, MembershipId, MEMBERSHIP_GLOBAL};
     use orbitnet_core::priority::Band;
@@ -3093,6 +3288,98 @@ mod tests {
         let mut observers: HashMap<i32, PeerObserver> = HashMap::new();
         OrbitNet::collect_observers(&rows, &mut observers);
         assert!(observers.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // A declared observer, and what it overrides.
+    // ------------------------------------------------------------------
+
+    const HERE: [f32; 3] = [1.0, 2.0, 3.0];
+    const THERE: [f32; 3] = [900.0, 0.0, -900.0];
+
+    fn body_in(center: [f32; 3], membership: MembershipId) -> Option<PeerObserver> {
+        Some(PeerObserver { center, membership })
+    }
+
+    /// The default, and the whole rule before a peer could declare one: both facts off the body the
+    /// peer drives.
+    #[test]
+    fn an_undeclared_peer_takes_both_facts_from_the_body_it_drives() {
+        assert_eq!(
+            resolve_observer(PeerAnchor::Inferred, 5, None, None, body_in(HERE, 8)),
+            (Some(HERE), 8),
+            "the declared field is not read at all without a declaration"
+        );
+        // Driving nothing: no centre, and every world. Both halves fail open together.
+        assert_eq!(
+            resolve_observer(PeerAnchor::Inferred, 5, None, None, None),
+            (None, MEMBERSHIP_GLOBAL)
+        );
+    }
+
+    /// THE POINT OF THE DECLARATION. A peer observing one world while driving a body in another must
+    /// be centred where it is LOOKING and filtered in the world it is WATCHING -- the body it drives
+    /// must pull it back on neither axis.
+    #[test]
+    fn a_declaration_overrides_the_driven_body_on_both_axes() {
+        assert_eq!(
+            resolve_observer(PeerAnchor::Fixed(HERE), 5, None, None, body_in(THERE, 8)),
+            (Some(HERE), 5)
+        );
+        assert_eq!(
+            resolve_observer(
+                PeerAnchor::Entity(7),
+                5,
+                Some(HERE),
+                None,
+                body_in(THERE, 8)
+            ),
+            (Some(HERE), 5)
+        );
+    }
+
+    /// A declaration of MEMBERSHIP_GLOBAL is a declaration, not an absence: a peer told to watch
+    /// every world must not be pulled back into its avatar's one.
+    #[test]
+    fn a_peer_declared_into_every_world_is_not_returned_to_its_bodys_world() {
+        assert_eq!(
+            resolve_observer(
+                PeerAnchor::Fixed(HERE),
+                MEMBERSHIP_GLOBAL,
+                None,
+                None,
+                body_in(THERE, 8)
+            ),
+            (Some(HERE), MEMBERSHIP_GLOBAL)
+        );
+    }
+
+    /// A tracked entity that despawns leaves the peer where it last was. Falling back to the driven
+    /// body would move the peer into whichever world that body is in, and falling back to "no centre"
+    /// would open its radius to the whole world at the moment its avatar died.
+    #[test]
+    fn a_tracked_centre_survives_the_entity_it_tracks() {
+        assert_eq!(
+            resolve_observer(
+                PeerAnchor::Entity(7),
+                5,
+                None,
+                Some(HERE),
+                body_in(THERE, 8)
+            ),
+            (Some(HERE), 5)
+        );
+    }
+
+    /// THE TWO AXES FAIL SEPARATELY. A tracked entity that has never resolved -- declared before it
+    /// spawned -- gives no centre, so nothing is distance-culled. The peer nonetheless stays in the
+    /// world it was DECLARED into: a membership is a declaration and did not fail.
+    #[test]
+    fn a_tracked_centre_that_never_resolved_keeps_its_declared_world() {
+        assert_eq!(
+            resolve_observer(PeerAnchor::Entity(7), 5, None, None, body_in(THERE, 8)),
+            (None, 5)
+        );
     }
 
     // ------------------------------------------------------------------

@@ -43,6 +43,10 @@ func add_input(node: Object, property: String) -> void:
 ## feature work at all; declaring it only on scenery filters nothing. A peer with no rollback body has no
 ## anchor and no world, and sees every world (the same fail-open as its radius).
 ##
+## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's centre and world directly, and
+## a peer that used it reads neither off any body -- which is the way out when a peer drives bodies in more than
+## one world, or drives none at all.
+##
 ## There is no relevancy switch on this lane and none is needed: a rollback body always carries a position, so
 ## it is always distance-cullable, and membership narrows that rather than replacing it.
 ##
@@ -99,3 +103,13 @@ func memo_set(tick: int, key: int, value: int) -> void:
 ## Read a per-tick memo value recorded by memo_set, or `fallback` when none was recorded (or inert).
 func memo_get(tick: int, key: int, fallback: int) -> int:
 	return _sync.memo_get(tick, key, fallback) if _sync != null else fallback
+
+## This body's stable replication id (0 when inert, or before process_settings() resolves a root inside the tree).
+##
+## The ONLY thing that takes one is [method Net.set_peer_anchor_entity], which is why it is published. It is a
+## 64-bit hash reinterpreted as a signed integer -- routinely NEGATIVE, and meaningless to compare or order. Pass
+## it back unmodified. A backend too old to answer reports 0, which that setter reads as a retraction.
+func entity_id() -> int:
+	if _sync == null or not _sync.has_method(&"get_entity_id"):
+		return 0
+	return _sync.get_entity_id()

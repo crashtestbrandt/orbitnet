@@ -424,6 +424,21 @@ impl OrbitRollbackSynchronizer {
         self.predicted_last
     }
 
+    /// This entity's stable replication id, as an opaque token.
+    ///
+    /// It is what `OrbitNet::set_peer_anchor_entity` names, and it is the ONLY reason it is
+    /// published: nothing else in the API takes one. Derived from the root's scene path, so it is
+    /// the same number on every peer, and it is `0` until `process_settings` has resolved a root
+    /// that is inside the tree.
+    ///
+    /// **A token, not a quantity.** It is a 64-bit FNV hash reinterpreted as a signed integer, so it
+    /// is routinely negative and comparing two of them for order means nothing — the same hash whose
+    /// arbitrary ordering picks a peer's inferred observer. Pass it back unmodified.
+    #[func]
+    fn get_entity_id(&self) -> i64 {
+        self.entity_id as i64
+    }
+
     /// The tick of the newest authoritative state known for this entity (-1 before any).
     #[func]
     fn get_last_known_state(&self) -> i64 {
@@ -1322,6 +1337,21 @@ impl OrbitStateSynchronizer {
         if self.entity_id != 0 {
             crate::orbit_net::register_state_entity(self.entity_id, self.to_gd());
         }
+    }
+
+    /// This entity's stable replication id, as an opaque token.
+    ///
+    /// It is what `OrbitNet::set_peer_anchor_entity` names, and it is the ONLY reason it is
+    /// published: nothing else in the API takes one. Derived from the root's scene path, so it is
+    /// the same number on every peer, and it is `0` until `process_settings` has resolved a root
+    /// that is inside the tree.
+    ///
+    /// **A token, not a quantity.** It is a 64-bit FNV hash reinterpreted as a signed integer, so it
+    /// is routinely negative and comparing two of them for order means nothing — the same hash whose
+    /// arbitrary ordering picks a peer's inferred observer. Pass it back unmodified.
+    #[func]
+    fn get_entity_id(&self) -> i64 {
+        self.entity_id as i64
     }
 
     /// Hash of the resolved schema.
