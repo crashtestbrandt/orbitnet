@@ -45,7 +45,17 @@ usage() {
 platform_parts() {
 	case "$1" in
 		linux)   BUILT_NAME="liborbitnet.so";  SHIP_PREFIX="liborbitnet.linux";  SHIP_SUFFIX="x86_64.so" ;;
-		windows) BUILT_NAME="orbitnet.dll";    SHIP_PREFIX="orbitnet.windows";   SHIP_SUFFIX="x86_64.dll" ;;
+		windows) BUILT_NAME="orbitnet.dll";    SHIP_PREFIX="orbitnet.windows";   SHIP_SUFFIX="x86_64.dll"
+			# THE MSVC ABI, PINNED. `rust-toolchain.toml` fixes the channel and not the host triple, so
+			# the ABI otherwise comes from whichever rustup the runner service's account owns -- and a
+			# box can carry several runner services under different accounts with different defaults.
+			# One such box built gnu-ABI here while the consuming project had always shipped msvc.
+			#
+			# It matters twice. A Godot Windows export template is msvc-linked, so a GDExtension beside
+			# it should be too; and the msvc linker is what writes a PDB. A gnu build keeps DWARF inside
+			# the DLL, which no Windows profiler reads: a PE records a CodeView key, and nothing in the
+			# image stands in for the PDB that key names.
+			WIN_TARGET="x86_64-pc-windows-msvc" ;;
 		macos)   BUILT_NAME="liborbitnet.dylib"; SHIP_PREFIX="liborbitnet.macos"; SHIP_SUFFIX="universal.dylib" ;;
 		*) printf 'build-native: unknown platform %s\n' "$1" >&2; exit 2 ;;
 	esac
@@ -103,6 +113,11 @@ build)
 	platform_parts "$PLATFORM"
 	mkdir -p "$OUTDIR"
 
+	if [ "$PLATFORM" = windows ]; then
+		# `cd native` FIRST, for the reason spelled out in the macOS branch below.
+		( cd "$NATIVE" && rustup target add "$WIN_TARGET" )
+	fi
+
 	if [ "$PLATFORM" = macos ]; then
 		# `cd native` FIRST. native/rust-toolchain.toml pins the toolchain cargo uses in that
 		# directory, while the repository root has no override and resolves to rustup's default.
@@ -155,12 +170,18 @@ build)
 				"$NATIVE/target/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
 			lipo -info "$OUTDIR/$ship"
 		else
-			if [ "${#RUSTC_ARGS[@]}" -gt 0 ]; then
-				( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" -p orbitnet-godot -- "${RUSTC_ARGS[@]}" )
-			else
-				( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot )
+			TARGET_ARGS=()
+			outdir="$NATIVE/target/$CARGO_DIR"
+			if [ "$PLATFORM" = windows ]; then
+				TARGET_ARGS=(--target "$WIN_TARGET")
+				outdir="$NATIVE/target/$WIN_TARGET/$CARGO_DIR"
 			fi
-			built="$NATIVE/target/$CARGO_DIR/$BUILT_NAME"
+			if [ "${#RUSTC_ARGS[@]}" -gt 0 ]; then
+				( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" "${TARGET_ARGS[@]}" -p orbitnet-godot -- "${RUSTC_ARGS[@]}" )
+			else
+				( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" "${TARGET_ARGS[@]}" -p orbitnet-godot )
+			fi
+			built="$outdir/$BUILT_NAME"
 			[ -s "$built" ] || { printf 'build-native: cargo produced nothing at %s\n' "$built" >&2; exit 1; }
 			install -m 0755 "$built" "$OUTDIR/$ship"
 		fi
@@ -173,34 +194,18 @@ build)
 				|| { printf 'build-native: %s has no ELF build ID\n' "$ship" >&2; exit 1; }
 		fi
 
-		# WHERE WINDOWS DEBUG INFORMATION LIVES DEPENDS ON THE ABI, and which ABI a runner has is a
-		# property of that box rather than of this repository:
-		#   *-pc-windows-msvc  the linker writes a separate PDB and stamps the image with the CodeView
-		#                      key naming it. The PDB must ride along, under the name the DLL records --
-		#                      that name is what dbghelp searches a symbol path for, so renaming it to
-		#                      match the platform-tagged library would hide it from every analyzer.
-		#   *-pc-windows-gnu   no PDB is ever produced; DWARF goes INTO the DLL, as on Linux.
-		# Requiring a PDB failed the build outright on a gnu-ABI runner even though the artifact it had
-		# just produced was perfectly symbolizable.
+		# The msvc linker always writes a PDB and stamps the image with the CodeView key naming it.
+		# The ABI is pinned above, so an absent PDB is a real failure rather than a toolchain
+		# difference. It keeps the name the DLL records: dbghelp searches a symbol path for that base
+		# name, so renaming it to match the platform-tagged library would hide it from every analyzer.
 		if [ "$PLATFORM" = windows ] && [ "$p" = profiling ]; then
-			pdb="$NATIVE/target/$CARGO_DIR/orbitnet.pdb"
-			host="$( cd "$NATIVE" && rustc -vV 2>/dev/null | sed -n 's/^host: //p' )"
-			if [ -s "$pdb" ]; then
-				printf 'build-native: msvc ABI (%s); shipping orbitnet.pdb beside the DLL\n' "${host:-unknown}"
-				cp -p "$pdb" "$OUTDIR/orbitnet.pdb"
-			else
-				printf 'build-native: no PDB; %s keeps DWARF inside the DLL\n' "${host:-this toolchain}"
-				# Prove the claim rather than assuming it: a DLL with neither a PDB nor debug sections
-				# is an unsymbolizable artifact that would publish looking fine.
-				if command -v objdump >/dev/null 2>&1; then
-					objdump -h "$OUTDIR/$ship" | grep -q 'debug_info' || {
-						printf 'build-native: %s has no PDB and no .debug_info -- not symbolizable\n' "$ship" >&2
-						exit 1; }
-					printf 'build-native: confirmed .debug_info inside %s\n' "$ship"
-				else
-					printf 'build-native: objdump absent; could not confirm debug sections in %s\n' "$ship" >&2
-				fi
-			fi
+			pdb="$outdir/orbitnet.pdb"
+			[ -s "$pdb" ] || {
+				printf 'build-native: no PDB at %s. The msvc linker always writes one, so this means the\n' "$pdb" >&2
+				printf '  build did not use %s. Check `rustup target list --installed`.\n' "$WIN_TARGET" >&2
+				exit 1; }
+			cp -p "$pdb" "$OUTDIR/orbitnet.pdb"
+			printf 'build-native: shipping orbitnet.pdb beside the DLL\n'
 		fi
 
 		[ -s "$OUTDIR/$ship" ] || { printf 'build-native: staged %s is empty\n' "$ship" >&2; exit 1; }
