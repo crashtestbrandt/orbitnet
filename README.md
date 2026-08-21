@@ -1,4 +1,8 @@
-# OrbitNet
+![OrbitNet](docs/img/banner.png)
+
+<sub>Banner render. Earth surface from NASA Visible Earth (Blue Marble Next Generation), city lights from NASA
+Earth Observatory (Black Marble 2016) and Milky Way from NASA/SVS *Deep Star Maps 2020* — all NASA imagery,
+public domain. Star positions from the Yale Bright Star Catalog, 5th edition.</sub>
 
 **Rollback netcode for Godot 4, in Rust.** Server-authoritative replication, owner prediction and
 reconciliation, batched delta state sync, clock discipline, and interest management — behind one GDScript
