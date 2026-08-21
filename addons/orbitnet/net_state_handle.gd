@@ -67,6 +67,60 @@ func set_anchor(entry: String) -> void:
 		_sync.set(&"anchor_property", entry)
 		_sync.set(&"relevancy", 1)   # ANCHORED; 0 = ALWAYS, the default
 
+## Declare which WORLD this channel belongs to, so it reaches only peers in that world.
+##
+## `entry` is a `"NodePath:property"` (or bare `"property"`) resolved against the channel's root, and it must
+## name an **int**. Like the anchor it need not be one of the replicated properties -- it costs no wire bytes
+## and is read live on the authority, the only peer that computes relevancy. `0` means every world.
+##
+## The problem it solves: several independent worlds inside one session, each rebased near its own coordinate
+## origin, overlap in coordinates. Interest is a distance test, and two entities at the same coordinates in
+## different worlds are zero metres apart, so a radius cannot separate them. A peer only ever replicates
+## channels whose world matches its own, whatever the radius says. A peer's own world is read off the rollback
+## body that anchors its interest radius -- see [method NetRollbackHandle.set_membership].
+##
+## MEMBERSHIP IS WHAT A POSITIONLESS CHANNEL HAS INSTEAD OF A RADIUS. Health, inventory, a door's state: none
+## of them replicate a position, so none of them can be distance-culled, and before this existed their only
+## lever was all-or-nothing -- every peer in every world. Calling this on a channel with no anchor leaves it
+## uncullable by distance and bounds it to one world.
+##
+## Composes with [method set_anchor]: call both and the channel is culled by distance WITHIN its world. Called
+## alone it only sets the world. A property that does not resolve, or is not an int, leaves the channel in
+## every world with an error -- the same fail-open direction the anchor takes.
+##
+## Call BEFORE process_settings(); the membership resolves with the property list.
+func set_membership(entry: String) -> void:
+	if _sync == null:
+		return
+	_sync.set(&"membership_property", entry)
+	# An EMPTY entry declares nothing, so it must not switch the policy. Promoting on one would leave the
+	# channel permanently non-ALWAYS, warning at every process_settings() about a membership_property it does
+	# not have, with no way back through this handle.
+	if entry.is_empty():
+		return
+	# Do not clobber ANCHORED: a channel with both an anchor and a world is culled by both. Only ALWAYS -- the
+	# default, and the declaration "this channel describes the session, not a place in it" -- is promoted.
+	#
+	# TYPE-CHECKED, NOT ASSIGNED STRAIGHT TO AN `int`. `Object.get()` on a property the backend does not expose
+	# returns `null`, and assigning Nil to a typed local is a hard runtime error that aborts the caller. The
+	# cdylib is committed separately from this GDScript, so new addon code legitimately runs against an older
+	# binary with no `relevancy` export -- the same mismatch last_known_state() guards against, and the same
+	# rule: a binary mismatch degrades a declaration, it never aborts the game.
+	var declared: Variant = _sync.get(&"relevancy")
+	if typeof(declared) != TYPE_INT:
+		return
+	var relevancy: int = declared
+	if relevancy == 0:               # ALWAYS
+		_sync.set(&"relevancy", 2)   # MEMBERSHIP: no distance test, one world
+
+## The world this channel is currently in, `0` meaning every world (0 OFFLINE, or on a backend too old to
+## answer). Reports what the filter would read this tick, so a `membership_property` that did not resolve
+## reports 0 rather than the value the game wrote -- which is how a misconfiguration is visible at all.
+func membership() -> int:
+	if _sync == null or not _sync.has_method(&"get_membership"):
+		return 0
+	return _sync.get_membership()
+
 ## Declare this channel's send-rota priority: 1..16, multiplying its distance-band weight when the
 ## byte budget cannot carry everything. The backend must not guess game semantics, so a channel worth more than
 ## an ordinary one says so here. Call before process_settings().

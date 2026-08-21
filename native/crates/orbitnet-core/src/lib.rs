@@ -41,7 +41,10 @@ pub use codec::{CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
 pub use columnar::ColumnarHistory;
 pub use freshness::{Confidence, FreshnessLedger, MemoRing};
 pub use history::{plan_cost, BodyId, BodyResim, DirtyWindow, ResimPlanner, ResimRange, TickRing};
-pub use interest::{AoiConfig, InterestCandidate, InterestGrid, PeerInterest};
+pub use interest::{
+    membership_matches, AoiConfig, InterestCandidate, InterestGrid, MembershipId, PeerInterest,
+    MEMBERSHIP_GLOBAL,
+};
 pub use pacing::{CoupledSlew, LeadTracker, SlewDecision};
 pub use priority::{Band, Candidate, WEIGHT_ONE, WEIGHT_OWNED};
 pub use protocol::{PropKind, PropRole, PropSchema, QuantKind, SchemaBuilder, PROTOCOL_VERSION};

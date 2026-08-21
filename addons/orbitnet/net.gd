@@ -363,7 +363,12 @@ func set_resim_force(ticks: int) -> void:
 
 ## Interest-management radius in metres, the 100-player lever: with a radius set, the SERVER sends each peer only
 ## the entities within it of that peer's own body (1.25x exit hysteresis so boundary entities don't flicker).
-## 0 = off, every peer receives everything. Server-side only; ignored on clients.
+## Server-side only; ignored on clients.
+##
+## **0 TURNS OFF THE DISTANCE FILTER, NOT INTEREST MANAGEMENT.** Membership is the other axis and is declared
+## per entity, not here: when anything calls `set_membership()`, the interest pass still runs at radius 0 and
+## still refuses the worlds a peer is not in. Only a game that declares no memberships at all gets the whole
+## pass skipped at 0 -- see [method NetStateHandle.set_membership].
 ##
 ## **Size it by the longest range at which a player can act on a body, never by what makes culling look
 ## effective.** A culled entity is not despawned -- it keeps its node on the peer and freezes at the last pose

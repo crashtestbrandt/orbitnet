@@ -123,9 +123,9 @@ Known and filed, not hidden:
 
 - **No per-peer visibility veto.** Interest culling stops an entity's rows; it never withholds the entity, so a
   game needing fog of war can be maphacked.
-- **Interest is spatial only, and the anchor is inferred.** A peer's radius is centred on the lowest-id rollback
-  entity that peer drives, so a peer driving more than one gets its world centred on whichever that is. There is
-  no membership key, so two worlds sharing a coordinate space cannot be told apart.
+- **The peer's own anchor is inferred.** A peer's radius is centred on the lowest-id rollback entity that peer
+  drives, so a peer driving more than one gets its world centred on whichever that is. That same body also
+  supplies the peer's **membership**, so a peer with no rollback body has neither and sees everything.
 - **Nothing despawns.** A culled entity freezes at its last received pose rather than leaving the scene.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
 - **`@half` silently no-ops on invalid pairings** instead of warning.

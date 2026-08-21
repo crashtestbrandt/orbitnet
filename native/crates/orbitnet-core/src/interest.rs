@@ -22,6 +22,24 @@
 //! full-state refreshes are phase-offset by entity id so each tick of an interval carries its own
 //! slice of the refresh traffic instead of tick zero carrying all of it.
 //!
+//! ## Membership
+//!
+//! Distance alone cannot separate **overlapping worlds**: several independent worlds inside one
+//! session, each rebased near its own coordinate origin, put unrelated entities at the same
+//! coordinates. Every candidate and every observer therefore carries a [`MembershipId`], and
+//! [`membership_matches`] refuses a candidate whose membership differs from the observer's
+//! whatever its distance says.
+//!
+//! [`MEMBERSHIP_GLOBAL`] (`0`) is the default on both sides and matches everything, so a game that
+//! declares no memberships is filtered exactly as before. It is also the fail-open value: an
+//! observer whose membership could not be resolved sees every world rather than none.
+//!
+//! Membership is a separate axis from the radius, which is what makes it usable by the channels
+//! that need it most. A state channel that replicates no position — health, inventory, a door's
+//! state — has no distance to be culled by, so its only previous setting was all-or-nothing: it
+//! reached every peer in every world. Declaring it always-relevant *within one membership* bounds
+//! it to its own world while leaving it uncullable inside it.
+//!
 //! ## Grid or scan
 //!
 //! [`PeerInterest`] has two update paths and the backend ships the *linear* one. A uniform grid can
@@ -227,12 +245,47 @@ impl InterestGrid {
     }
 }
 
+/// Which of several independent worlds an entity or an observer belongs to.
+///
+/// Opaque to this crate: the filter only ever compares two of them for equality, so a game may key
+/// it on a world index, an instance handle or a hash. `0` is [`MEMBERSHIP_GLOBAL`] and is the only
+/// value with a meaning attached.
+pub type MembershipId = u64;
+
+/// The membership that matches every other one, and the default on both sides of the comparison.
+///
+/// Two roles, both wanted:
+///
+/// * **Session-global.** A candidate in `MEMBERSHIP_GLOBAL` is offered to observers in every world
+///   — the setting for a channel that describes the session rather than a place in it.
+/// * **Fail open.** An observer whose membership could not be resolved lands here and sees every
+///   world. A misconfigured membership then costs bandwidth; the opposite default would delete
+///   every body from that peer's world.
+pub const MEMBERSHIP_GLOBAL: MembershipId = 0;
+
+/// Whether a candidate in membership `candidate` is offered to an observer in membership
+/// `observer`.
+///
+/// True when either side is [`MEMBERSHIP_GLOBAL`], or when the two are equal. The rule is
+/// symmetric, so a game that declares no memberships at all leaves every comparison true and is
+/// filtered on distance alone.
+#[must_use]
+pub fn membership_matches(observer: MembershipId, candidate: MembershipId) -> bool {
+    observer == MEMBERSHIP_GLOBAL || candidate == MEMBERSHIP_GLOBAL || observer == candidate
+}
+
 /// One entity offered to a peer's interest filter for a tick.
 ///
-/// `always` is the fail-open flag and carries three separate facts that all mean "never cull this":
-/// the peer's own body, an entity whose synchronizer declares no anchor at all, and an entity whose
-/// anchor could not be resolved this tick. Keeping them one flag is deliberate — the filter has no
-/// business distinguishing them, and every one of them must survive the cap as well as the radius.
+/// Two independent axes, and the separation is the point:
+///
+/// * `always` suppresses the **distance** test — never culled by radius, never evicted by
+///   `max_entities`. It is the fail-open flag and carries three facts that all mean "never cull
+///   this": the peer's own body, an entity whose synchronizer declares no anchor at all, and an
+///   entity whose anchor could not be resolved this tick. Keeping them one flag is deliberate —
+///   the filter has no business distinguishing them.
+/// * `membership` is checked **first and separately**, and `always` does not suppress it. An
+///   entity that is always-relevant within its own world is `always` plus a membership; one that
+///   is always-relevant in every world is `always` plus [`MEMBERSHIP_GLOBAL`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InterestCandidate {
     /// The entity id.
@@ -240,27 +293,49 @@ pub struct InterestCandidate {
     /// World-space anchor for the distance test. Ignored entirely when `always` is set.
     pub pos: [f32; 3],
     /// Unconditionally relevant: never culled by radius, never evicted by `max_entities`.
+    ///
+    /// Says nothing about `membership` — an `always` candidate in a world the observer is not in
+    /// is still refused.
     pub always: bool,
+    /// The world this entity belongs to, or [`MEMBERSHIP_GLOBAL`] for every world.
+    pub membership: MembershipId,
 }
 
 impl InterestCandidate {
-    /// A candidate culled by distance from `pos`.
+    /// A candidate in every world, culled by distance from `pos`.
     #[must_use]
     pub fn anchored(id: BodyId, pos: [f32; 3]) -> Self {
+        Self::anchored_in(id, pos, MEMBERSHIP_GLOBAL)
+    }
+
+    /// A candidate in `membership`, culled by distance from `pos`.
+    #[must_use]
+    pub fn anchored_in(id: BodyId, pos: [f32; 3], membership: MembershipId) -> Self {
         Self {
             id,
             pos,
             always: false,
+            membership,
         }
     }
 
-    /// A candidate that is always in interest.
+    /// A candidate that is always in interest, in every world.
     #[must_use]
     pub fn always(id: BodyId) -> Self {
+        Self::always_in(id, MEMBERSHIP_GLOBAL)
+    }
+
+    /// A candidate that is always in interest **within `membership`**, and refused outside it.
+    ///
+    /// The setting for a channel with no position to be culled by — health, inventory, a door's
+    /// state — that still belongs to one world rather than to the session.
+    #[must_use]
+    pub fn always_in(id: BodyId, membership: MembershipId) -> Self {
         Self {
             id,
             pos: [0.0; 3],
             always: true,
+            membership,
         }
     }
 }
@@ -304,6 +379,10 @@ impl PeerInterest {
     /// raises the per-peer all-entity `WANT_FULL` flag. This grid form returns nothing. Whoever adopts it for
     /// the entity counts a grid finally pays for has to give it the same leave diff first; swapping the call
     /// site alone would trade a linear scan for a full-state storm.
+    ///
+    /// It also carries no [`MembershipId`]. The grid keys its cells on XZ cell coordinates alone, so
+    /// overlapping worlds share buckets; an adoption has to key on `(membership, cell_x, cell_z)` or
+    /// filter the query results, on top of the leave diff.
     pub fn update(
         &mut self,
         grid: &InterestGrid,
@@ -341,19 +420,27 @@ impl PeerInterest {
     ///
     /// This is the path `orbit_net.rs` runs (see the module header for why the grid is not). The
     /// hysteresis, cap and tie-breaking rules are identical to [`Self::update`]; what differs is
-    /// only how candidates are found, plus two things [`Self::update`] cannot express:
+    /// only how candidates are found, plus three things [`Self::update`] cannot express:
     ///
     /// * [`InterestCandidate::always`] entities bypass both the radius and the cap. The cap bounds
     ///   the *cullable* set; an unconditionally-relevant entity is never evicted by it.
-    /// * `leaves` receives every id that was a member and is not one now — radius exits **and**
-    ///   cap evictions alike, because a cap eviction is a real leave that must re-enter through
-    ///   `enter_radius` like any newcomer. The caller uses this to clear its per-peer delta
+    /// * `observer` is the world the peer is in. A candidate [`membership_matches`] refuses is
+    ///   dropped **before** the radius and before `always` is consulted, so an overlapping world's
+    ///   entities never enter the set at any distance, and an always-relevant channel is bounded
+    ///   to its own world. [`MEMBERSHIP_GLOBAL`] on either side matches, which is why a game that
+    ///   declares no memberships keeps the distance-only behaviour exactly.
+    /// * `leaves` receives every id that was a member and is not one now — radius exits, membership
+    ///   refusals **and** cap evictions alike, because each is a real leave that must re-enter
+    ///   through `enter_radius` like any newcomer. The caller uses this to clear its per-peer delta
     ///   bookkeeping, so a re-entrant entity gets a full block rather than a delta against a base
     ///   the peer stopped tracking.
     ///
     /// A candidate whose position (or `center`) is non-finite is treated as `always` rather than
     /// dropped: an unbinnable body is a body the filter cannot reason about, and failing open
-    /// wastes bandwidth where failing closed would silently delete it from someone's world.
+    /// wastes bandwidth where failing closed would silently delete it from someone's world. That
+    /// fail-open covers the **distance** test only. An unbinnable candidate in another world is
+    /// still refused: its membership is a declaration rather than a measurement, and it did not
+    /// fail.
     ///
     /// `leaves` and `scratch` are both cleared on entry; `scratch` is caller-owned working storage
     /// so a warm per-peer update allocates nothing.
@@ -361,6 +448,7 @@ impl PeerInterest {
         &mut self,
         cfg: &AoiConfig,
         center: [f32; 3],
+        observer: MembershipId,
         candidates: &[InterestCandidate],
         scratch: &mut Vec<(BodyId, f32)>,
         leaves: &mut Vec<BodyId>,
@@ -375,6 +463,11 @@ impl PeerInterest {
 
         let mut cullable = 0usize;
         for candidate in candidates {
+            // Membership first. A candidate in a world the observer is not in is refused whatever
+            // its distance and whatever `always` says, so nothing below this line can readmit it.
+            if !membership_matches(observer, candidate.membership) {
+                continue;
+            }
             let pos = candidate.pos;
             let binnable =
                 center_ok && pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite();
@@ -946,6 +1039,7 @@ mod tests {
             via_linear.update_linear_into(
                 &cfg,
                 center,
+                MEMBERSHIP_GLOBAL,
                 &anchored(&entities),
                 &mut scratch,
                 &mut leaves,
@@ -971,6 +1065,7 @@ mod tests {
             peer.update_linear_into(
                 &cfg,
                 [0.0; 3],
+                MEMBERSHIP_GLOBAL,
                 &[InterestCandidate::anchored(1, [x, 0.0, 0.0])],
                 scratch,
                 leaves,
@@ -1003,6 +1098,7 @@ mod tests {
         peer.update_linear_into(
             &cfg,
             [0.0; 3],
+            MEMBERSHIP_GLOBAL,
             &[InterestCandidate::anchored(1, [110.0, 0.0, 0.0])],
             &mut scratch,
             &mut leaves,
@@ -1019,6 +1115,7 @@ mod tests {
         peer.update_linear_into(
             &cfg,
             [0.0; 3],
+            MEMBERSHIP_GLOBAL,
             &anchored(&[(1, [10.0, 0.0, 0.0]), (2, [20.0, 0.0, 0.0])]),
             &mut scratch,
             &mut leaves,
@@ -1030,6 +1127,7 @@ mod tests {
         peer.update_linear_into(
             &cfg,
             [0.0; 3],
+            MEMBERSHIP_GLOBAL,
             &anchored(&[
                 (1, [10.0, 0.0, 0.0]),
                 (2, [20.0, 0.0, 0.0]),
@@ -1054,6 +1152,7 @@ mod tests {
         peer.update_linear_into(
             &cfg,
             [0.0; 3],
+            MEMBERSHIP_GLOBAL,
             &[
                 InterestCandidate::always(7),
                 InterestCandidate::always(8),
@@ -1086,6 +1185,7 @@ mod tests {
         peer.update_linear_into(
             &cfg,
             [0.0; 3],
+            MEMBERSHIP_GLOBAL,
             &[
                 InterestCandidate::anchored(1, [f32::NAN, 0.0, 0.0]),
                 InterestCandidate::anchored(2, [0.0, f32::INFINITY, 0.0]),
@@ -1105,6 +1205,7 @@ mod tests {
         wide.update_linear_into(
             &cfg,
             [f32::NAN, 0.0, 0.0],
+            MEMBERSHIP_GLOBAL,
             &anchored(&[(1, [0.0; 3]), (2, [9_000.0, 0.0, 0.0])]),
             &mut scratch,
             &mut leaves,
@@ -1120,6 +1221,7 @@ mod tests {
         peer.update_linear_into(
             &cfg,
             [0.0; 3],
+            MEMBERSHIP_GLOBAL,
             &anchored(&[(9, [3.0, 0.0, 4.0]), (4, [10.0, 0.0, 0.0])]),
             &mut scratch,
             &mut leaves,
@@ -1127,6 +1229,211 @@ mod tests {
         assert_eq!(
             peer.iter_with_distance().collect::<Vec<_>>(),
             vec![(4, 100.0), (9, 25.0)]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Membership: the second axis, checked before the radius.
+    // ------------------------------------------------------------------
+
+    /// One update against a fixed `cfg`, returning the resulting member ids.
+    fn members_of(
+        peer: &mut PeerInterest,
+        cfg: &AoiConfig,
+        observer: MembershipId,
+        candidates: &[InterestCandidate],
+    ) -> Vec<BodyId> {
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_linear_into(
+            cfg,
+            [0.0; 3],
+            observer,
+            candidates,
+            &mut scratch,
+            &mut leaves,
+        );
+        peer.iter().collect()
+    }
+
+    /// The whole point of the feature: two worlds rebased on the same coordinates are one squared
+    /// distance apart — zero — so only the membership id can separate them.
+    #[test]
+    fn overlapping_worlds_at_identical_coordinates_are_separated_by_membership() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        // Same position, three different worlds, plus one session-global entity.
+        let candidates = [
+            InterestCandidate::anchored_in(1, [10.0, 0.0, 0.0], 1),
+            InterestCandidate::anchored_in(2, [10.0, 0.0, 0.0], 2),
+            InterestCandidate::anchored_in(3, [10.0, 0.0, 0.0], 3),
+            InterestCandidate::anchored(4, [10.0, 0.0, 0.0]),
+        ];
+        assert_eq!(
+            members_of(&mut PeerInterest::new(), &cfg, 1, &candidates),
+            vec![1, 4],
+            "an observer in world 1 sees world 1 and the global entity"
+        );
+        assert_eq!(
+            members_of(&mut PeerInterest::new(), &cfg, 2, &candidates),
+            vec![2, 4]
+        );
+        // An observer with no membership sees every world — the fail-open direction.
+        assert_eq!(
+            members_of(
+                &mut PeerInterest::new(),
+                &cfg,
+                MEMBERSHIP_GLOBAL,
+                &candidates
+            ),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    /// `always` suppresses the radius and the cap, and must not suppress membership. This is the
+    /// case the feature exists for: a channel with no position — health, inventory, a door — that
+    /// still belongs to one world.
+    #[test]
+    fn an_always_candidate_in_another_world_is_still_refused() {
+        let cfg = cfg(32.0, 1.0, 1.25, 0); // radius so small only `always` could get through
+        let candidates = [
+            InterestCandidate::always_in(1, 1),
+            InterestCandidate::always_in(2, 2),
+            InterestCandidate::always(3),
+        ];
+        assert_eq!(
+            members_of(&mut PeerInterest::new(), &cfg, 1, &candidates),
+            vec![1, 3],
+            "always-in-world-2 must not reach a world-1 observer; always-in-every-world must"
+        );
+    }
+
+    /// A membership refusal is a real leave, so the caller clears the delta bookkeeping and the
+    /// entity comes back as a full block rather than a delta against a base its peer dropped.
+    #[test]
+    fn a_membership_change_reports_the_refusal_as_a_leave() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let mut peer = PeerInterest::new();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+
+        peer.update_linear_into(
+            &cfg,
+            [0.0; 3],
+            1,
+            &[InterestCandidate::anchored_in(7, [10.0, 0.0, 0.0], 1)],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert!(peer.contains(7));
+        assert!(leaves.is_empty());
+
+        // The entity is rebased into world 2 without moving: distance says keep, membership says go.
+        peer.update_linear_into(
+            &cfg,
+            [0.0; 3],
+            1,
+            &[InterestCandidate::anchored_in(7, [10.0, 0.0, 0.0], 2)],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert!(!peer.contains(7));
+        assert_eq!(leaves, vec![7]);
+    }
+
+    /// Hysteresis retains a current member out to the exit radius. Membership is not a band and has
+    /// no hysteresis: a refused candidate leaves on the tick it is refused, member or not.
+    #[test]
+    fn membership_is_refused_without_a_hysteresis_band() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let mut peer = PeerInterest::new();
+        // Inside the enter radius in world 1, so it is a member...
+        assert_eq!(
+            members_of(
+                &mut peer,
+                &cfg,
+                1,
+                &[InterestCandidate::anchored_in(1, [90.0, 0.0, 0.0], 1)]
+            ),
+            vec![1]
+        );
+        // ...and still inside the exit radius, which retains a member on distance alone.
+        assert!(peer.dist_sq(1).is_some());
+        assert_eq!(
+            members_of(
+                &mut peer,
+                &cfg,
+                1,
+                &[InterestCandidate::anchored_in(1, [110.0, 0.0, 0.0], 2)]
+            ),
+            Vec::<BodyId>::new(),
+            "membership is checked before the band, so being a member does not retain it"
+        );
+    }
+
+    /// The cap bounds the cullable set. A candidate refused by membership was never cullable, so it
+    /// must not consume one of the N slots the nearest entities compete for.
+    #[test]
+    fn a_membership_refusal_does_not_consume_a_cap_slot() {
+        let cfg = cfg(32.0, 200.0, 1.25, 2); // nearest 2 win
+        let candidates = [
+            InterestCandidate::anchored_in(1, [1.0, 0.0, 0.0], 2), // nearest, wrong world
+            InterestCandidate::anchored_in(2, [2.0, 0.0, 0.0], 2), // second nearest, wrong world
+            InterestCandidate::anchored_in(3, [3.0, 0.0, 0.0], 1),
+            InterestCandidate::anchored_in(4, [4.0, 0.0, 0.0], 1),
+            InterestCandidate::anchored_in(5, [5.0, 0.0, 0.0], 1),
+        ];
+        assert_eq!(
+            members_of(&mut PeerInterest::new(), &cfg, 1, &candidates),
+            vec![3, 4],
+            "the two nearest entities IN THE OBSERVER'S WORLD win the cap"
+        );
+    }
+
+    /// Every existing call site passes [`MEMBERSHIP_GLOBAL`] on both sides, so the filter must be
+    /// bit-identical to the distance-only one it replaces.
+    #[test]
+    fn declaring_no_memberships_leaves_the_distance_filter_unchanged() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let entities = [
+            (1, [10.0, 0.0, 0.0]),
+            (2, [99.0, 0.0, 0.0]),
+            (3, [101.0, 0.0, 0.0]),
+            (4, [5_000.0, 0.0, 0.0]),
+        ];
+        assert_eq!(
+            members_of(
+                &mut PeerInterest::new(),
+                &cfg,
+                MEMBERSHIP_GLOBAL,
+                &anchored(&entities)
+            ),
+            vec![1, 2]
+        );
+    }
+
+    /// The match rule is symmetric in [`MEMBERSHIP_GLOBAL`] and is otherwise plain equality.
+    #[test]
+    fn membership_matches_on_either_side_being_global_or_on_equality() {
+        assert!(membership_matches(MEMBERSHIP_GLOBAL, MEMBERSHIP_GLOBAL));
+        assert!(membership_matches(MEMBERSHIP_GLOBAL, 7));
+        assert!(membership_matches(7, MEMBERSHIP_GLOBAL));
+        assert!(membership_matches(7, 7));
+        assert!(membership_matches(MembershipId::MAX, MembershipId::MAX));
+        assert!(!membership_matches(7, 8));
+        assert!(!membership_matches(1, MembershipId::MAX));
+    }
+
+    /// An unbinnable position fails open on **distance** only. Its membership is a declaration that
+    /// did not fail, so a `NaN`-positioned body in another world stays out of this observer's set.
+    #[test]
+    fn a_nonfinite_position_fails_open_on_distance_but_not_on_membership() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored_in(1, [f32::NAN, 0.0, 0.0], 1),
+            InterestCandidate::anchored_in(2, [f32::NAN, 0.0, 0.0], 2),
+            InterestCandidate::anchored(3, [f32::INFINITY, 0.0, 0.0]),
+        ];
+        assert_eq!(
+            members_of(&mut PeerInterest::new(), &cfg, 1, &candidates),
+            vec![1, 3]
         );
     }
 

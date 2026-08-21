@@ -27,6 +27,43 @@ func add_input(node: Object, property: String) -> void:
 	if _sync != null:
 		_sync.add_input(node, property)
 
+## Declare which WORLD this body belongs to, so it replicates only to peers in that world.
+##
+## `entry` is a `"NodePath:property"` (or bare `"property"`) resolved against the body's root, and it must name
+## an **int**. It need not be one of the state properties -- it costs no wire bytes and is read live on the
+## authority, the only peer that computes relevancy. `0` means every world, which is where every body starts.
+##
+## The problem it solves: several independent worlds inside one session, each rebased near its own coordinate
+## origin, overlap in coordinates. Interest is a distance test, and two bodies at the same coordinates in
+## different worlds are zero metres apart, so a radius cannot separate them.
+##
+## THIS ALSO SETS THE OWNING PEER'S OWN WORLD. A peer's world is read off the body that anchors its interest
+## radius -- the lowest-id body whose input authority is that peer. That body's membership is the world every
+## other entity is then filtered against for that peer, so declaring it on player bodies is what makes the
+## feature work at all; declaring it only on scenery filters nothing. A peer with no rollback body has no
+## anchor and no world, and sees every world (the same fail-open as its radius).
+##
+## There is no relevancy switch on this lane and none is needed: a rollback body always carries a position, so
+## it is always distance-cullable, and membership narrows that rather than replacing it.
+##
+## Call BEFORE process_settings(); the membership resolves with the property list. A body created through
+## `Net.register_rollback_body()` has already had its settings processed, so call process_settings() after.
+func set_membership(entry: String) -> void:
+	if _sync != null:
+		_sync.set(&"membership_property", entry)
+
+## The world this body is currently in, `0` meaning every world (0 when inert, or on a backend too old to answer).
+##
+## CHECK THIS FIRST WHEN MEMBERSHIP FILTERING SEEMS TO DO NOTHING. The OWNING PEER's world is read off this
+## body, so a body reporting 0 is a peer that sees every world, and every other entity's declaration is
+## irrelevant for that peer. It reports what the filter would read this tick, so a `membership_property` that
+## did not resolve -- or that was set after the last process_settings() -- reports 0 rather than the value the
+## game wrote, which is how a misconfiguration becomes visible at all.
+func membership() -> int:
+	if _sync == null or not _sync.has_method(&"get_membership"):
+		return 0
+	return _sync.get_membership()
+
 ## Re-read the synchronizer's configuration after its state/input sets change (the backend re-resolves its schema here).
 func process_settings() -> void:
 	if _sync != null:

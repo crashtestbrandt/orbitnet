@@ -91,10 +91,21 @@ entities do not flicker. A uniform grid in `core::interest` — rebuilt each tic
 already in native memory, zero Godot calls — is implemented and tested but not yet driving sends; wiring it in
 is a contained follow-up for when entity counts make the linear pass matter.
 
-**It filters rollback entities only.** The anchor is the entity whose *input* authority is that peer, and its
-first `Vector3` State-role property is the centre. A peer with no rollback body has no anchor, and the backend
-correctly falls back to "everything is in interest". This is the limitation most likely to surprise you — see
-[api.md](api.md#-aoi-culls-the-rollback-lane-only).
+**Membership is the second axis.** A radius cannot separate several independent worlds inside one session, each
+rebased near its own coordinate origin: two entities at the same coordinates in different worlds are zero
+metres apart. Every candidate and every observer carries a membership id, and a candidate whose id differs from
+the observer's is refused before any distance is computed. `0` is the default on both sides and matches every
+world, so a game that declares none is filtered on distance alone.
+
+The two axes are independent, which is what makes membership usable by the channels that need it most. A state
+channel that replicates no position — health, inventory, a door's state — has no distance to be culled by, so
+its only lever was all-or-nothing. Declaring it always-relevant *within one membership* bounds it to its own
+world while leaving it uncullable inside it.
+
+**A peer's centre and its world both come from one body**: the lowest-id entity whose *input* authority is that
+peer and which resolved an anchor. A peer with no such body has neither, and the backend correctly falls back
+to "everything is in interest" — every world, at every distance. This is the limitation most likely to surprise
+you — see [api.md](api.md#interest-two-axes-distance-and-membership).
 
 Tick tiers are assigned statically per synchronizer and dynamically by distance band, phase-offset by entity id
 so sends spread across ticks instead of spiking.
