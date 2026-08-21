@@ -459,6 +459,47 @@ func peer_membership(peer: int) -> int:
 		return 0
 	return _orbit.peer_membership(peer)
 
+## Withhold ONE entity from ONE peer, or stop withholding it. SERVER-SIDE ONLY; no-op OFFLINE or against a
+## backend that predates the call.
+##
+## The third interest axis, and the only per-(peer, entity) one. Distance and membership are both properties of
+## the ENTITY -- one position, one world, read the same by every peer -- so neither can say "not this peer". This
+## can, including the exception a membership id cannot express: a class of entities scoped by a declared key,
+## minus one. Use a membership for a whole world; use this for the one entity inside it that a given peer must
+## never receive.
+##
+## `entity_id` comes from `entity_id()` on the rollback or state handle -- an opaque token, routinely negative,
+## only ever passed back unmodified. `0` is ignored: it is what an unresolved handle reports.
+##
+## THE VETO BEATS EVERY OTHER ANSWER THE FILTER WOULD GIVE, including an always-relevant channel with no anchor,
+## and it refuses at the candidate rather than at the cap -- a withheld entity occupies no slot in
+## [method set_aoi_max_entities]. Starting one drops the entity from that peer's interest in this call and clears
+## its delta bookkeeping, so a later retraction sends a full block rather than a delta against a base the peer
+## dropped.
+##
+## THE CLIENT-SIDE CONTRACT, STATED PLAINLY: A VETO STOPS THE ROWS AND NOTHING ELSE. No despawn is sent, the
+## client's node is not removed, and the entity id stays session-global. What the client sees is
+## `get_last_known_state()` ceasing to advance -- exactly what a distance cull looks like -- and what to do with
+## an entity that stopped updating is your game's decision, as it already is for a cull.
+##
+## The veto is keyed on the entity id, so it SURVIVES THAT ENTITY'S DESPAWN. Ids are node-path-derived and a body
+## that respawns under its old name reclaims its old id; dropping the veto with the body would hand the peer that
+## entity on the tick it came back, which is the one moment nothing can re-declare in time.
+##
+## May be called before the peer finishes its handshake; the veto is held until it does. It is dropped when the
+## peer disconnects, along with the rest of that peer's state.
+func set_entity_hidden(peer: int, entity_id: int, hidden: bool) -> void:
+	if _mode == Mode.OFFLINE or not _backend_has(&"set_entity_hidden"):
+		return
+	_orbit.set_entity_hidden(peer, entity_id, hidden)
+
+## Whether `entity_id` is currently withheld from `peer`. False OFFLINE, for an unknown peer, and against a
+## backend that predates the call.
+func is_entity_hidden(peer: int, entity_id: int) -> bool:
+	if _mode == Mode.OFFLINE or not _backend_has(&"is_entity_hidden"):
+		return false
+	return _orbit.is_entity_hidden(peer, entity_id)
+
 ## Rate tiering by distance band: send the MID band every other tick and the FAR band every fourth, phase-offset
 ## by entity id so a band's traffic is level rather than spiking once per interval.
 ##
