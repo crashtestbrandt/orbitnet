@@ -93,9 +93,23 @@ func set_membership(entry: String) -> void:
 	if _sync == null:
 		return
 	_sync.set(&"membership_property", entry)
+	# An EMPTY entry declares nothing, so it must not switch the policy. Promoting on one would leave the
+	# channel permanently non-ALWAYS, warning at every process_settings() about a membership_property it does
+	# not have, with no way back through this handle.
+	if entry.is_empty():
+		return
 	# Do not clobber ANCHORED: a channel with both an anchor and a world is culled by both. Only ALWAYS -- the
 	# default, and the declaration "this channel describes the session, not a place in it" -- is promoted.
-	var relevancy: int = _sync.get(&"relevancy")
+	#
+	# TYPE-CHECKED, NOT ASSIGNED STRAIGHT TO AN `int`. `Object.get()` on a property the backend does not expose
+	# returns `null`, and assigning Nil to a typed local is a hard runtime error that aborts the caller. The
+	# cdylib is committed separately from this GDScript, so new addon code legitimately runs against an older
+	# binary with no `relevancy` export -- the same mismatch last_known_state() guards against, and the same
+	# rule: a binary mismatch degrades a declaration, it never aborts the game.
+	var declared: Variant = _sync.get(&"relevancy")
+	if typeof(declared) != TYPE_INT:
+		return
+	var relevancy: int = declared
 	if relevancy == 0:               # ALWAYS
 		_sync.set(&"relevancy", 2)   # MEMBERSHIP: no distance test, one world
 

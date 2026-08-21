@@ -466,13 +466,19 @@ pub struct OrbitNet {
     #[export]
     send_budget: i32,
 
-    /// Interest radius in metres (0 = off: every peer receives everything).
+    /// Interest radius in metres (0 = no **distance** filter).
     ///
     /// The 100-player lever: with a radius set, each peer receives only the entities within it of
     /// that peer's own body, with a 1.25x exit hysteresis so boundary entities don't flicker.
     /// This covers the **state lane** too, but only for channels that declare
-    /// `relevancy = ANCHORED` and a resolvable `anchor_property`; everything else stays
-    /// unconditionally relevant, which is what every state channel was before.
+    /// `relevancy = ANCHORED` and a resolvable `anchor_property`; everything else has no distance
+    /// to be culled by, which is what every state channel was before.
+    ///
+    /// **`0` IS NOT "NO INTEREST FILTER" — it is "no radius".** Membership is the other axis and is
+    /// not switched off here: when any entity declares one, the interest pass runs at radius `0`,
+    /// refuses the worlds a peer is not in, and is billed as `interest_ms` like any other tick. A
+    /// game that declares no memberships does get the whole pass skipped at `0`, which is what this
+    /// used to say unconditionally.
     #[export]
     aoi_radius: f64,
 
@@ -2015,6 +2021,15 @@ impl OrbitNet {
         // overlapping world is the only culling it asked for. Answered from the gathered rows rather
         // than from a config value, since a membership is a per-entity declaration and no setting
         // announces that any entity made one.
+        //
+        // READING LIVE VALUES RATHER THAN DECLARATIONS IS SAFE HERE, AND IT IS NOT OBVIOUS. This can
+        // flip to `false` on a tick where every membership happens to read `MEMBERSHIP_GLOBAL` —
+        // several entities sharing one world-id node, say, on the tick that node is freed. It leaks
+        // nothing, because the observer's membership is read from a row by the same rule: if every
+        // row is GLOBAL then the observer is GLOBAL, `membership_matches` is true for every pair,
+        // and running the pass would refuse exactly nothing. The two branches produce the same set.
+        // What that tick loses is one update of `peer.interest` — which is not read on that tick
+        // either, and whose next update diffs against it and emits the leaves as usual.
         let filtering = culling || rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL);
         if filtering {
             Self::collect_observers(&rows, &mut observers);
@@ -2395,6 +2410,20 @@ impl OrbitNet {
     /// than contributing its membership, so a peer's centre and its world always describe the same
     /// body. Splitting the picks would let a peer be centred on one entity and filtered against
     /// another's world, which is the same class of failure the lowest-id rule exists to prevent.
+    ///
+    /// **THE LIMIT THIS INHERITS, AND WHAT IT COSTS FOR MEMBERSHIP.** "Lowest id" is lowest FNV hash
+    /// of a node path, so among a peer's several bodies it is arbitrary — deterministic across peers
+    /// and runs, which is what matters for the centre, but not chosen. For the centre a change of
+    /// pick moves a radius. For the membership it changes the peer's *world*, and every entity in
+    /// that peer's set leaves on that one tick: `update_interest` clears `last_sent`, `last_full`
+    /// and `acked_base` for each, which is a full-state burst for the whole set rather than the
+    /// per-entity repair that clearing exists to buy.
+    ///
+    /// It takes a peer driving **two anchored bodies that declare different worlds** (or one
+    /// declaring a world and one not) to reach, which is a misconfiguration rather than a shape a
+    /// game wants — a peer is in one world. Declare the same membership on every body a peer drives.
+    /// `NetRollbackHandle.membership()` reports what the filter reads, which is where the mistake
+    /// shows.
     fn collect_observers(rows: &[EntityRow], observers: &mut HashMap<i32, PeerObserver>) {
         observers.clear();
         for row in rows {

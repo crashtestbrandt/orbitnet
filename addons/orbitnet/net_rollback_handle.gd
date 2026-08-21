@@ -52,6 +52,18 @@ func set_membership(entry: String) -> void:
 	if _sync != null:
 		_sync.set(&"membership_property", entry)
 
+## The world this body is currently in, `0` meaning every world (0 when inert, or on a backend too old to answer).
+##
+## CHECK THIS FIRST WHEN MEMBERSHIP FILTERING SEEMS TO DO NOTHING. The OWNING PEER's world is read off this
+## body, so a body reporting 0 is a peer that sees every world, and every other entity's declaration is
+## irrelevant for that peer. It reports what the filter would read this tick, so a `membership_property` that
+## did not resolve -- or that was set after the last process_settings() -- reports 0 rather than the value the
+## game wrote, which is how a misconfiguration becomes visible at all.
+func membership() -> int:
+	if _sync == null or not _sync.has_method(&"get_membership"):
+		return 0
+	return _sync.get_membership()
+
 ## Re-read the synchronizer's configuration after its state/input sets change (the backend re-resolves its schema here).
 func process_settings() -> void:
 	if _sync != null:

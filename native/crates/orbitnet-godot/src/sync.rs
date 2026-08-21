@@ -90,6 +90,20 @@ fn resolve_membership(
 /// of the same 64 bits**, not a conversion: every distinct declared value stays distinct, `0` stays
 /// [`MEMBERSHIP_GLOBAL`], and there is no value a game can write that the filter has to reject.
 /// Note that a game using `-1` as its own "unset" gets `u64::MAX`, which is a world like any other.
+///
+/// **TYPE THE PROPERTY.** A live read that stops converting to an `i64` falls back to
+/// [`MEMBERSHIP_GLOBAL`] here, silently and every tick, which puts the entity in every world. That is
+/// reachable without touching this export: [`resolve_membership`] validates the kind
+/// `binding::resolve_entry` reported, and for an *untyped* GDScript `var world_id = 0` that kind is
+/// sniffed from the value the property happened to hold at resolve time. Assign a float to that same
+/// untyped var later — `world_id = 1.0` — and the conversion starts failing. Declaring `var world_id:
+/// int = 0` makes the kind a fact about the property rather than about one moment.
+///
+/// It fails **open** rather than warning, deliberately and for the same reason as the rest of this
+/// feature: the alternative to a silent leak is a silent deletion, and this runs once per entity per
+/// tick, so a diagnostic here is a per-tick log flood on the authority. [`Self::get_membership`] on
+/// both lanes reports the value the filter actually reads, which is where a misconfiguration is meant
+/// to be caught.
 fn read_membership(pair: Option<&(Gd<Node>, StringName)>) -> MembershipId {
     let Some((node, name)) = pair else {
         return MEMBERSHIP_GLOBAL;
@@ -416,6 +430,18 @@ impl OrbitRollbackSynchronizer {
         self.latest_state_tick
     }
 
+    /// The world this body is currently in, `0` meaning every world (diagnostics and tests).
+    ///
+    /// **The value to check first when membership filtering "does nothing".** A peer's own world is read off
+    /// the body that anchors its interest radius, so a body reporting `0` here is a peer seeing every world,
+    /// and every other entity's declaration is then irrelevant for that peer. Reports what the filter would
+    /// read this tick, so a `membership_property` that did not resolve reports `0` rather than the value the
+    /// game wrote.
+    #[func]
+    fn get_membership(&self) -> i64 {
+        self.membership_hint() as i64
+    }
+
     /// The tick of the newest input known for this entity (-1 before any).
     #[func]
     fn get_last_known_input(&self) -> i64 {
@@ -481,7 +507,7 @@ impl OrbitRollbackSynchronizer {
         GString::from(
             format!(
                 "OrbitRollbackSynchronizer[{:#018x}]: {} state + {} input props, {} B/tick, \
-                 schema {:#010x}/{:#010x}, {} unresolved, {}",
+                 schema {:#010x}/{:#010x}, {} unresolved, world {}, {}",
                 self.entity_id,
                 self.state_schema.len(),
                 self.input_schema.len(),
@@ -489,6 +515,7 @@ impl OrbitRollbackSynchronizer {
                 self.state_schema.hash(),
                 self.input_schema.hash(),
                 self.unresolved.len(),
+                self.membership_hint(),
                 if self.exempt { "exempt" } else { "active" },
             )
             .as_str(),
