@@ -73,7 +73,34 @@ jobs:
             break
           done
           if ! command -v cargo >/dev/null 2>&1; then
-            echo "::error::cargo does not resolve on this runner. rustup=$(command -v rustup || echo none). The rustup shims in .cargo/bin are missing -- reinstall rustup for the account the runner service runs as."
+            # THE RUSTUP PROXIES ARE MISSING, NOT THE TOOLCHAIN. rustup installs `cargo`, `rustc` and the
+            # rest as copies of rustup.exe in the same directory; when those are deleted, `rustup` still
+            # answers and reports its toolchains while nothing else on PATH exists. Observed on a runner
+            # whose .cargo/bin held rustup.exe and nothing else.
+            #
+            # `rustup self update` reinstalls the proxies, which is the sanctioned repair. If it cannot
+            # (offline, or a rustup installed by a package manager), the proxies are recreated directly --
+            # copying rustup.exe under each name is exactly what rustup does internally.
+            rustup_bin="$(command -v rustup || true)"
+            if [ -z "$rustup_bin" ]; then
+              echo "::error::neither cargo nor rustup is on this runner. Install rustup for the account the runner service runs as."
+              exit 1
+            fi
+            bindir="$(dirname "$rustup_bin")"
+            echo "::warning::cargo is missing from ${bindir}; repairing the rustup proxies"
+            rustup self update || echo "rustup self update did not run; recreating the proxies directly"
+            if ! command -v cargo >/dev/null 2>&1; then
+              ext=""
+              case "$rustup_bin" in *.exe) ext=".exe" ;; esac
+              for tool in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+                [ -e "${bindir}/${tool}${ext}" ] || cp "$rustup_bin" "${bindir}/${tool}${ext}"
+              done
+              chmod 0755 "${bindir}"/* 2>/dev/null || true
+              hash -r 2>/dev/null || true
+            fi
+          fi
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::cargo still does not resolve after repair. rustup=$(command -v rustup || echo none). Reinstall rustup for the account the runner service runs as."
             exit 1
           fi
           echo "cargo: $(command -v cargo)"
