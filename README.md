@@ -130,8 +130,9 @@ Known and filed, not hidden:
 - **Nothing despawns.** A culled entity freezes at its last received pose rather than leaving the scene.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
 - **`@half` silently no-ops on invalid pairings** instead of warning.
-- **The retained interest grid is unused.** It reports no leave list, and a leave has to clear the peer's delta
-  bookkeeping, so the linear scan is what ships.
+- **The retained interest grid is unused.** It now matches the linear path rule for rule — leaves, always-set,
+  worlds — but it measures slower at the arena sizes a session runs at today, so the linear scan is what ships.
+  It overtakes the scan past about ±600 m of occupancy. The measured tables are in `interest.rs`'s header.
 - **No reconnection and no packet authentication.** A dropped client loses its entity, and the wire carries
   nothing beyond a per-entity authority check.
 

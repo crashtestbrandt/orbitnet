@@ -1,37 +1,60 @@
 //! Interest-pass cost measurement — the decision harness for adopting the grid.
 //!
-//! The epic owns one question this file exists to answer with a number rather than an opinion:
-//! **is adopting [`InterestGrid`] actually faster than the linear scan it replaces, at the entity
-//! counts a real session runs?** Wiring in tested code is only worth doing if it is faster; otherwise it
-//! is a refactor wearing an optimisation's clothes.
+//! This file exists to answer one question with a number rather than an opinion: **is adopting
+//! [`InterestGrid`] actually faster than the linear scan it replaces, at the entity counts a real
+//! session runs?** Both core paths compute the same sets and report the same leaves, so wiring the
+//! grid in is only worth doing if it is faster; otherwise it is a refactor wearing an
+//! optimisation's clothes.
 //!
-//! Three variants are timed over the same synthetic session:
+//! Five variants are timed over the same synthetic session. The three the decision rests on:
 //!
-//! * `legacy` — the shape `orbit_net.rs` shipped first: per peer, a nested scan to find
-//!   that peer's anchor body, then a linear distance pass over every entity, membership in a
-//!   `HashSet`. O(P·N) with an O(N) inner lookup.
+//! * `scan/shared` — **what ships**. One candidate list per tick, with the rows a peer drives
+//!   patched in and out around that peer's [`PeerInterest::update_linear_into`] call.
+//! * `scan/peer` — the shape that shipped before: a fresh list per peer, because a peer's own body
+//!   is `always` to that peer alone and the list was rebuilt around it. O(P·N) per tick on top of
+//!   the filter. Kept because the gap between the two columns is what deleting it bought.
+//! * `grid` — [`InterestGrid`] rebuilt once per tick plus [`PeerInterest::update_grid_into`] per
+//!   peer, the own body handed over as the `also` override. Cell size derived from the radius.
+//!
+//! Reading the three together is the point. `scan/shared` against `grid` is the adoption question —
+//! both share one list per tick, so the ratio is the index against the flat pass and nothing else.
+//! `scan/peer` against `scan/shared` is there because that gap once read as a grid win: measured
+//! against the old shape the grid appeared to win a multi-world session, and what it was actually
+//! deleting was the rebuild.
+//!
+//! Two more are kept because they are what the earlier restructure was measured against:
+//!
+//! * `legacy` — the shape `orbit_net.rs` shipped first: per peer, a nested scan to find that peer's
+//!   anchor body, then a linear distance pass over every entity, membership in a `HashSet`. O(P·N)
+//!   with an O(N) inner lookup.
 //! * `prepass` — one pass over the entities per tick builds the `peer → anchor` map, then the same
-//!   linear distance pass per peer. This isolates the *restructure* from the *grid*.
-//! * `grid` — the prepass plus [`InterestGrid`] / [`PeerInterest`], cell size derived from the
-//!   radius.
+//!   linear distance pass per peer.
+//!
+//! Three sweeps: by session scale, by arena extent, and by world count. The decision and the result
+//! tables live in `interest.rs`'s module header, next to the code they govern.
 //!
 //! What this harness deliberately does NOT measure is the half that dominates in the real backend:
 //! `legacy` calls `input_owner_peer()` — a Godot `get_multiplayer_authority()` round trip — once
-//! per entity *per peer*, while `prepass`/`grid` call it once per entity per tick. That is a P-fold
-//! reduction in engine calls no pure-Rust bench can show, and it is why the prepass is worth doing
-//! regardless of how the grid measures.
+//! per entity *per peer*, while every other variant calls it once per entity per tick. That is a
+//! P-fold reduction in engine calls no pure-Rust bench can show, and it is why the prepass is worth
+//! doing regardless of how the grid measures.
 //!
-//! Ignored by default so `cargo test` stays fast; run it with:
+//! Ignored by default so `cargo test` stays fast. **`--test-threads=1` is not optional**: all three
+//! sweeps are timing loops, and run concurrently they contend for the same cores and inflate every
+//! figure by around 12%.
 //!
 //! ```text
-//! cargo test -p orbitnet-core --release --test interest_bench -- --ignored --nocapture
+//! cargo test -p orbitnet-core --release --test interest_bench -- --ignored --nocapture \
+//!   --test-threads=1
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use orbitnet_core::history::BodyId;
-use orbitnet_core::{AoiConfig, InterestGrid, PeerInterest};
+use orbitnet_core::{
+    AoiConfig, InterestCandidate, InterestGrid, MembershipId, PeerInterest, MEMBERSHIP_GLOBAL,
+};
 
 /// Deterministic LCG — the same one the codec and interest suites use. No dev-dependency.
 fn lcg(state: &mut u32) -> u32 {
@@ -50,16 +73,46 @@ struct Scene {
     entities: Vec<(BodyId, [f32; 3])>,
     /// `entities[i]`'s input owner, or `0` for an unowned body (NPC, hazard, state channel).
     owners: Vec<i32>,
+    /// `entities[i]`'s world. All `MEMBERSHIP_GLOBAL` unless the scene was built with worlds.
+    memberships: Vec<MembershipId>,
+    /// `false` for a row that declares no anchor — a positionless state channel (health, a door),
+    /// which is always-relevant within its world. `orbit_net.rs` offers those as `always_in`.
+    anchored: Vec<bool>,
     peers: Vec<i32>,
     rng: u32,
     extent: f32,
 }
 
 impl Scene {
+    /// One world, every row anchored — the shape the `legacy` and `prepass` sketches understand.
     fn new(peers: usize, entities: usize, extent: f32, seed: u32) -> Self {
+        Self::session(peers, entities, extent, 1, 0, seed)
+    }
+
+    /// `worlds` independent worlds sharing one session, each **rebased on its own origin** — so
+    /// unrelated entities sit at the same coordinates and only the membership separates them.
+    /// That is the arrangement membership exists for, and the one a flat scan pays for most: every
+    /// peer measures every other world's entities before refusing them.
+    ///
+    /// Entities and peers are dealt round-robin, so each world holds `entities / worlds` bodies
+    /// and `peers / worlds` observers.
+    ///
+    /// One unowned row in `unanchored_every` declares no anchor (`0` for none). Those reach every
+    /// peer in their world at any distance, so they are what fills the grid's uncullable list and
+    /// what a scan cannot skip either — leaving them out measures a session no caller produces.
+    fn session(
+        peers: usize,
+        entities: usize,
+        extent: f32,
+        worlds: usize,
+        unanchored_every: usize,
+        seed: u32,
+    ) -> Self {
         let mut rng = seed;
         let mut ents = Vec::with_capacity(entities);
         let mut owners = Vec::with_capacity(entities);
+        let mut memberships = Vec::with_capacity(entities);
+        let mut anchored = Vec::with_capacity(entities);
         for index in 0..entities {
             let pos = [
                 coord(&mut rng, extent),
@@ -68,14 +121,67 @@ impl Scene {
             ];
             ents.push((index as BodyId + 1, pos));
             // The first `peers` entities are the player bodies; everything after is unowned.
-            owners.push(if index < peers { index as i32 + 2 } else { 0 });
+            let player = index < peers;
+            owners.push(if player { index as i32 + 2 } else { 0 });
+            memberships.push(if worlds <= 1 {
+                MEMBERSHIP_GLOBAL
+            } else {
+                (index % worlds) as MembershipId + 1
+            });
+            anchored.push(player || unanchored_every == 0 || index % unanchored_every != 0);
         }
         Self {
             entities: ents,
             owners,
+            memberships,
+            anchored,
             peers: (0..peers).map(|i| i as i32 + 2).collect(),
             rng,
             extent,
+        }
+    }
+
+    /// One candidate per entity, with no peer named — the shared list a grid is rebuilt from, and
+    /// the one `scan/shared` patches a single entry of per peer.
+    fn candidates_into(&self, out: &mut Vec<InterestCandidate>) {
+        out.clear();
+        out.extend(
+            self.entities
+                .iter()
+                .enumerate()
+                .map(|(index, &(id, pos))| self.candidate(index, id, pos, 0)),
+        );
+    }
+
+    /// How one row is offered to one peer, mirroring `orbit_net.rs`'s `candidate_for_row`: the
+    /// peer's own body is `always` in every world, an anchored row is distance-culled within its
+    /// own, and a row with no anchor is `always` within its own. `peer` of `0` names no peer.
+    fn candidate(&self, index: usize, id: BodyId, pos: [f32; 3], peer: i32) -> InterestCandidate {
+        if peer != 0 && self.owners[index] == peer {
+            InterestCandidate::always(id)
+        } else if self.anchored[index] {
+            InterestCandidate::anchored_in(id, pos, self.memberships[index])
+        } else {
+            InterestCandidate::always_in(id, self.memberships[index])
+        }
+    }
+
+    /// Where each peer observes from, which world it is in, and which row supplied both — gathered
+    /// once per tick, the prepass every core variant shares.
+    fn observers_into(&self, out: &mut HashMap<i32, Observer>) {
+        out.clear();
+        for (index, entry) in self.entities.iter().enumerate() {
+            let owner = self.owners[index];
+            if owner != 0 {
+                out.insert(
+                    owner,
+                    Observer {
+                        index,
+                        center: entry.1,
+                        membership: self.memberships[index],
+                    },
+                );
+            }
         }
     }
 
@@ -166,37 +272,237 @@ fn tick_prepass(
     total
 }
 
-/// The prepass plus one grid rebuild per tick and one query per peer.
-fn tick_grid(
+/// Where one peer observes from, which world it is in, and which row said so.
+#[derive(Clone, Copy)]
+struct Observer {
+    index: usize,
+    center: [f32; 3],
+    membership: MembershipId,
+}
+
+/// Caller-owned working storage, so a variant is timed doing the filter rather than allocating.
+#[derive(Default)]
+struct Buffers {
+    candidates: Vec<InterestCandidate>,
+    observers: HashMap<i32, Observer>,
+    scratch: Vec<(BodyId, f32)>,
+    leaves: Vec<BodyId>,
+}
+
+/// The shape the backend ran before the list was shared: the prepass, then per peer a fresh
+/// candidate list and one `update_linear_into`.
+///
+/// The rebuild was there because a peer's own body is `always` to it and to nobody else, and a peer
+/// with no resolved anchor reshaped every row — so the list looked peer-specific. Both facts moved
+/// (to a patch and to a non-finite centre) and the pass went with them. Retained here because a
+/// measurement that charges the scan for it reads a rebuild win as a grid win.
+fn tick_scan_per_peer(
     scene: &Scene,
-    grid: &mut InterestGrid,
     sets: &mut HashMap<i32, PeerInterest>,
-    scratch: &mut Vec<(BodyId, f32)>,
+    buf: &mut Buffers,
     cfg: &AoiConfig,
 ) -> usize {
-    let mut anchors: HashMap<i32, [f32; 3]> = HashMap::with_capacity(scene.peers.len());
-    for (index, entry) in scene.entities.iter().enumerate() {
-        let owner = scene.owners[index];
-        if owner != 0 {
-            anchors.insert(owner, entry.1);
-        }
-    }
-    grid.rebuild(cfg, &scene.entities);
+    scene.observers_into(&mut buf.observers);
     let mut total = 0;
     for &peer in &scene.peers {
-        let Some(&center) = anchors.get(&peer) else {
+        let Some(&observer) = buf.observers.get(&peer) else {
             continue;
         };
+        buf.candidates.clear();
+        buf.candidates.extend(
+            scene
+                .entities
+                .iter()
+                .enumerate()
+                .map(|(index, &(id, pos))| scene.candidate(index, id, pos, peer)),
+        );
         let set = sets.entry(peer).or_default();
-        set.update(grid, cfg, center, scratch);
+        set.update_linear_into(
+            cfg,
+            observer.center,
+            observer.membership,
+            &buf.candidates,
+            &mut buf.scratch,
+            &mut buf.leaves,
+        );
         total += set.len();
     }
     total
 }
 
+/// **The shipped shape**: one candidate list per tick, with the peer's own body patched in and out
+/// around each call (`orbit_net.rs`'s `update_interest`).
+///
+/// Sharing the list is what separates the two savings a grid adoption would otherwise collect at
+/// once. Dropping the per-peer rebuild needs no grid — the rows that vary per peer can be swapped
+/// in place — so whatever `scan/peer` recovers is not evidence for the grid, and whatever the grid
+/// beats *this* by is.
+fn tick_scan_shared(
+    scene: &Scene,
+    sets: &mut HashMap<i32, PeerInterest>,
+    buf: &mut Buffers,
+    cfg: &AoiConfig,
+) -> usize {
+    scene.candidates_into(&mut buf.candidates);
+    scene.observers_into(&mut buf.observers);
+    let mut total = 0;
+    for &peer in &scene.peers {
+        let Some(&observer) = buf.observers.get(&peer) else {
+            continue;
+        };
+        let shared = buf.candidates[observer.index];
+        buf.candidates[observer.index] = InterestCandidate::always(shared.id);
+        let set = sets.entry(peer).or_default();
+        set.update_linear_into(
+            cfg,
+            observer.center,
+            observer.membership,
+            &buf.candidates,
+            &mut buf.scratch,
+            &mut buf.leaves,
+        );
+        buf.candidates[observer.index] = shared;
+        total += set.len();
+    }
+    total
+}
+
+/// The prepass plus one grid rebuild per tick and one `update_grid_into` per peer, with the peer's
+/// own body handed over as the `also` override — the fact a grid shared by every peer cannot hold.
+fn tick_grid(
+    scene: &Scene,
+    grid: &mut InterestGrid,
+    sets: &mut HashMap<i32, PeerInterest>,
+    buf: &mut Buffers,
+    cfg: &AoiConfig,
+) -> usize {
+    scene.candidates_into(&mut buf.candidates);
+    scene.observers_into(&mut buf.observers);
+    grid.rebuild(cfg, &buf.candidates);
+    let mut total = 0;
+    for &peer in &scene.peers {
+        let Some(&observer) = buf.observers.get(&peer) else {
+            continue;
+        };
+        let own = [InterestCandidate::always(scene.entities[observer.index].0)];
+        let set = sets.entry(peer).or_default();
+        set.update_grid_into(
+            grid,
+            cfg,
+            observer.center,
+            observer.membership,
+            &own,
+            &mut buf.scratch,
+            &mut buf.leaves,
+        );
+        total += set.len();
+    }
+    total
+}
+
+/// The cell size both sweeps derive from the query radius: a scan rectangle of ~11x11 cells at the
+/// exit radius, rather than the 21x21 the fixed 32 m default would produce.
+fn grid_cfg(radius: f32, max_entities: usize) -> AoiConfig {
+    AoiConfig {
+        cell_size: (radius / 4.0).max(1.0),
+        enter_radius: radius,
+        exit_factor: 1.25,
+        max_entities,
+    }
+}
+
 /// Microseconds per tick, plus the checksum that proves the variant did the work.
 fn micros_per_tick(ticks: u32, elapsed_ns: u128) -> f64 {
     elapsed_ns as f64 / f64::from(ticks) / 1000.0
+}
+
+/// One row of the three-variant comparison: the timings, and the set sizes that prove all three
+/// computed the same membership.
+struct CoreRow {
+    per_peer_ns: u128,
+    shared_ns: u128,
+    grid_ns: u128,
+    set_sum: usize,
+}
+
+impl CoreRow {
+    fn print(&self, label: &str, ticks: u32, peers: usize) {
+        let per_peer = micros_per_tick(ticks, self.per_peer_ns);
+        let shared = micros_per_tick(ticks, self.shared_ns);
+        let grid = micros_per_tick(ticks, self.grid_ns);
+        let mean_set = self.set_sum as f64 / f64::from(ticks) / peers as f64;
+        // `rebuild` is what sharing one list bought; `vs shipped` is what adopting the grid
+        // would buy on top of it, and only the second decides anything.
+        println!(
+            "{label} {mean_set:>7.0} | {per_peer:>13.1} {shared:>13.1} {grid:>11.1} | \
+             {:>8.2}x {:>10.2}x",
+            per_peer / shared,
+            shared / grid,
+        );
+    }
+}
+
+fn print_core_header(first: &str) {
+    println!(
+        "{first:>8} {:>7} | {:>13} {:>13} {:>11} | {:>9} {:>11}",
+        "in-set", "scan/peer us/t", "scan/shared", "grid us/t", "rebuild", "vs shipped"
+    );
+}
+
+/// Time the three core variants over the same session, and refuse to report if they disagree.
+///
+/// `build` is called once per variant so each starts from an identical scene and walks the same
+/// jitter — the three timings then describe the same work, which is the only thing that makes the
+/// ratios mean anything.
+fn core_row(build: impl Fn() -> Scene, ticks: u32, cfg: &AoiConfig) -> CoreRow {
+    let mut buf = Buffers::default();
+
+    let mut scene = build();
+    let mut sets: HashMap<i32, PeerInterest> = HashMap::new();
+    let mut per_peer_sum = 0usize;
+    let started = Instant::now();
+    for _ in 0..ticks {
+        scene.step();
+        per_peer_sum += tick_scan_per_peer(&scene, &mut sets, &mut buf, cfg);
+    }
+    let per_peer_ns = started.elapsed().as_nanos();
+
+    scene = build();
+    let mut sets: HashMap<i32, PeerInterest> = HashMap::new();
+    let mut shared_sum = 0usize;
+    let started = Instant::now();
+    for _ in 0..ticks {
+        scene.step();
+        shared_sum += tick_scan_shared(&scene, &mut sets, &mut buf, cfg);
+    }
+    let shared_ns = started.elapsed().as_nanos();
+
+    scene = build();
+    let mut grid = InterestGrid::new();
+    let mut sets: HashMap<i32, PeerInterest> = HashMap::new();
+    let mut grid_sum = 0usize;
+    let started = Instant::now();
+    for _ in 0..ticks {
+        scene.step();
+        grid_sum += tick_grid(&scene, &mut grid, &mut sets, &mut buf, cfg);
+    }
+    let grid_ns = started.elapsed().as_nanos();
+
+    assert_eq!(
+        per_peer_sum, shared_sum,
+        "patching the shared list in place changed the sets"
+    );
+    assert_eq!(
+        per_peer_sum, grid_sum,
+        "the grid and the scan computed different sets"
+    );
+    assert!(grid_sum > 0, "the scene produced no interest at all");
+    CoreRow {
+        per_peer_ns,
+        shared_ns,
+        grid_ns,
+        set_sum: grid_sum,
+    }
 }
 
 #[test]
@@ -246,23 +552,16 @@ fn interest_pass_cost_by_scale() {
         }
         let prepass_ns = started.elapsed().as_nanos();
 
-        // Cell size derived from the radius, as S2 ships it: a scan rectangle of ~11x11 cells at
-        // the exit radius, rather than the 21x21 the fixed 32 m default would produce.
-        let cfg = AoiConfig {
-            cell_size: (RADIUS / 4.0).max(1.0),
-            enter_radius: RADIUS,
-            exit_factor: 1.25,
-            max_entities: 0,
-        };
+        let cfg = grid_cfg(RADIUS, 0);
         scene = Scene::new(peers, entities, EXTENT, 0x1234_5678);
         let mut grid = InterestGrid::new();
         let mut grid_sets: HashMap<i32, PeerInterest> = HashMap::new();
-        let mut scratch: Vec<(BodyId, f32)> = Vec::new();
+        let mut buf = Buffers::default();
         let mut grid_sum = 0usize;
         let started = Instant::now();
         for _ in 0..TICKS {
             scene.step();
-            grid_sum += tick_grid(&scene, &mut grid, &mut grid_sets, &mut scratch, &cfg);
+            grid_sum += tick_grid(&scene, &mut grid, &mut grid_sets, &mut buf, &cfg);
         }
         let grid_ns = started.elapsed().as_nanos();
 
@@ -294,9 +593,13 @@ fn interest_pass_cost_by_scale() {
 
 /// The first sweep holds the arena size fixed, which only answers the question for arenas that
 /// size. A uniform grid can only win when the query radius covers a small fraction of the occupied
-/// space — otherwise [`InterestGrid::query_within`]'s own guard (`interest.rs:175`) finds the scan
-/// rectangle larger than the occupancy and iterates every bucket, which *is* the linear scan, plus
-/// a rebuild. This sweep finds the crossover: at what arena extent does the grid start to pay?
+/// space — otherwise [`InterestGrid::query_within`]'s own guard finds the scan rectangle larger
+/// than the occupancy and iterates every bucket, which *is* the linear scan, plus a rebuild. This
+/// sweep finds the crossover: at what arena extent does the grid start to pay?
+///
+/// The three core variants run here, not the `prepass` sketch. All three apply identical rules and
+/// report identical leaves — the runner asserts they compute the same sets — so the ratios are the
+/// whole difference between adopting one and adopting another.
 #[test]
 #[ignore = "measurement harness; run with --ignored --nocapture"]
 fn interest_grid_crossover_by_arena_extent() {
@@ -307,59 +610,68 @@ fn interest_grid_crossover_by_arena_extent() {
     // 2fort's forts sit at +/-74 m and the container cube is 60 m on a side; the last entries are
     // hypothetical cislunar sprawl far beyond anything the game currently builds.
     const EXTENTS: &[f32] = &[300.0, 600.0, 1_200.0, 2_500.0, 5_000.0, 10_000.0, 25_000.0];
+    // One unowned row in eight declares no anchor. A session with none is a session with no
+    // positionless state channels at all, which is not one the backend produces.
+    const UNANCHORED: usize = 8;
 
     println!();
     println!(
-        "grid crossover, {PEERS} peers / {ENTITIES} entities, radius {RADIUS} m, {TICKS} ticks"
+        "grid crossover, {PEERS} peers / {ENTITIES} entities, radius {RADIUS} m, {TICKS} ticks, \
+         1 world, 1 unowned row in {UNANCHORED} positionless"
     );
-    println!(
-        "{:>8} {:>7} | {:>12} {:>12} | {:>10} {:>9}",
-        "extent", "in-set", "prepass us/t", "grid us/t", "vs prepass", "verdict"
-    );
+    print_core_header("extent");
 
     for &extent in EXTENTS {
-        let cfg = AoiConfig {
-            cell_size: (RADIUS / 4.0).max(1.0),
-            enter_radius: RADIUS,
-            exit_factor: 1.25,
-            max_entities: 0,
-        };
-
-        let mut scene = Scene::new(PEERS, ENTITIES, extent, 0x1234_5678);
-        let mut prepass_sets: HashMap<i32, BTreeMap<BodyId, f32>> = HashMap::new();
-        let mut prepass_sum = 0usize;
-        let started = Instant::now();
-        for _ in 0..TICKS {
-            scene.step();
-            prepass_sum += tick_prepass(&scene, &mut prepass_sets, RADIUS);
-        }
-        let prepass_ns = started.elapsed().as_nanos();
-
-        scene = Scene::new(PEERS, ENTITIES, extent, 0x1234_5678);
-        let mut grid = InterestGrid::new();
-        let mut grid_sets: HashMap<i32, PeerInterest> = HashMap::new();
-        let mut scratch: Vec<(BodyId, f32)> = Vec::new();
-        let mut grid_sum = 0usize;
-        let started = Instant::now();
-        for _ in 0..TICKS {
-            scene.step();
-            grid_sum += tick_grid(&scene, &mut grid, &mut grid_sets, &mut scratch, &cfg);
-        }
-        let grid_ns = started.elapsed().as_nanos();
-
-        let prepass_us = micros_per_tick(TICKS, prepass_ns);
-        let grid_us = micros_per_tick(TICKS, grid_ns);
-        let ratio = prepass_us / grid_us;
-        let mean_set = prepass_sum as f64 / f64::from(TICKS) / PEERS as f64;
-        println!(
-            "{extent:>8.0} {mean_set:>7.0} | {prepass_us:>12.1} {grid_us:>12.1} | {ratio:>9.2}x \
-             {:>9}",
-            if ratio > 1.0 { "grid" } else { "scan" }
+        let row = core_row(
+            || Scene::session(PEERS, ENTITIES, extent, 1, UNANCHORED, 0x1234_5678),
+            TICKS,
+            &grid_cfg(RADIUS, 0),
         );
-        assert_eq!(
-            prepass_sum, grid_sum,
-            "the two variants computed different sets"
+        row.print(&format!("{extent:>8.0}"), TICKS, PEERS);
+    }
+    println!();
+}
+
+/// Both sweeps above model one world. Several independent worlds in one session is the case the
+/// grid was expected to win: a peer is entitled to a shrinking share of a session that keeps its
+/// size. The flat scan measures every other world's entities before refusing them on membership;
+/// the grid never reads their cells at all.
+///
+/// The sweep holds the **total** entity count fixed and splits it across more and more worlds, so
+/// the only thing changing is how much of the session each peer may see — the mean set falls as the
+/// world count rises, and the entity count the filter walks does not. Every world is rebased on its
+/// own origin, which is what makes this different from spreading one world wider: the coordinates
+/// overlap exactly, and nothing but the membership separates them.
+///
+/// Read the two ratio columns against each other here. They disagree, and the disagreement is the
+/// finding.
+#[test]
+#[ignore = "measurement harness; run with --ignored --nocapture"]
+fn interest_grid_by_world_count() {
+    const PEERS: usize = 64;
+    const ENTITIES: usize = 1_200;
+    const TICKS: u32 = 240;
+    const RADIUS: f32 = 256.0;
+    // Each world is a 2fort-sized arena rebased on its own origin — a radius that covers all of it,
+    // which is precisely the occupancy the crossover sweep finds the grid losing at.
+    const EXTENT: f32 = 300.0;
+    const WORLDS: &[usize] = &[1, 2, 4, 8, 16, 32];
+    const UNANCHORED: usize = 8;
+
+    println!();
+    println!(
+        "worlds, {PEERS} peers / {ENTITIES} entities total, arena +/-{EXTENT} m, radius {RADIUS} m, \
+         1 unowned row in {UNANCHORED} positionless"
+    );
+    print_core_header("worlds");
+
+    for &worlds in WORLDS {
+        let row = core_row(
+            || Scene::session(PEERS, ENTITIES, EXTENT, worlds, UNANCHORED, 0x1234_5678),
+            TICKS,
+            &grid_cfg(RADIUS, 0),
         );
+        row.print(&format!("{worlds:>8}"), TICKS, PEERS);
     }
     println!();
 }

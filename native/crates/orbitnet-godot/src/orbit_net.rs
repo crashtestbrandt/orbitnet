@@ -679,6 +679,10 @@ pub struct OrbitNet {
     aoi_rows: Vec<EntityRow>,
     aoi_observers: HashMap<i32, PeerObserver>,
     aoi_candidates: Vec<InterestCandidate>,
+    /// `(owner, row index)` for every gathered row a peer drives, ascending — the index into
+    /// `aoi_candidates` that has to be swapped for that peer's own view of it. Pooled and rebuilt
+    /// once per tick; a peer's slice is found by binary search, not by rescanning the rows.
+    aoi_owned_rows: Vec<(i32, u32)>,
     aoi_dist_scratch: Vec<(u64, f32)>,
     /// This peer's candidate set for the order build: `(id, distance²)`. Filled from the peer's
     /// interest when culling is on and from every row when it is off, so the order loop has one
@@ -781,6 +785,7 @@ impl INode for OrbitNet {
             aoi_rows: Vec::new(),
             aoi_observers: HashMap::new(),
             aoi_candidates: Vec::new(),
+            aoi_owned_rows: Vec::new(),
             aoi_dist_scratch: Vec::new(),
             aoi_members: Vec::new(),
             aoi_leaves: Vec::new(),
@@ -2617,6 +2622,23 @@ impl OrbitNet {
     /// Clearing `last_sent` and `acked_base` at the leave instead (the same pair the unregister path
     /// clears, for the same reason) forces a full block for that entity alone, and sorts it to the
     /// front of the rota while it is at it.
+    ///
+    /// **ONE CANDIDATE LIST PER TICK, NOT ONE PER PEER.** This loop used to rebuild the whole list
+    /// inside itself, which is O(peers · entities) *before* the filter it feeds even runs — measured
+    /// at 58% of the interest pass in a session with several worlds, where the sets are small and the
+    /// filter is therefore cheap. Two facts forced the rebuild and neither needs it:
+    ///
+    /// * **A peer's own body is `always` to that peer and to nobody else.** That is a handful of
+    ///   rows out of the whole tick, so they are swapped in around the call and swapped back after
+    ///   ([`candidate_for_own_row`], [`owned_rows_of`]) rather than rebuilding everything around
+    ///   them. A peer may drive more than one body and every one of them is patched.
+    /// * **A peer with no radius or no resolved anchor culls on distance at all.** That used to
+    ///   reshape every row in the list; it is now [`UNLOCATABLE_CENTRE`], which reaches the same
+    ///   fail-open through the filter's own non-finite-centre rule.
+    ///
+    /// The sets this produces are identical — `shared_candidates_match_a_per_peer_rebuild` asserts
+    /// it row by row against a reference that rebuilds per peer, over every combination of owned,
+    /// unanchored and foreign-world rows.
     fn update_interest(
         &mut self,
         peer_ids: &[i32],
@@ -2625,9 +2647,14 @@ impl OrbitNet {
     ) {
         let cfg = self.aoi_config();
         let mut candidates = std::mem::take(&mut self.aoi_candidates);
+        let mut owned = std::mem::take(&mut self.aoi_owned_rows);
         let mut scratch = std::mem::take(&mut self.aoi_dist_scratch);
         let mut leaves = std::mem::take(&mut self.aoi_leaves);
         let mut culled = 0u64;
+
+        candidates.clear();
+        candidates.extend(rows.iter().map(candidate_for_row));
+        owned_rows_into(rows, &mut owned);
 
         for &peer_id in peer_ids {
             let Some(state) = self.peers.get(&peer_id) else {
@@ -2645,7 +2672,7 @@ impl OrbitNet {
                     .and_then(|index| rows[index].anchor),
                 _ => None,
             };
-            let (center, observer_membership) = resolve_observer(
+            let (resolved, observer_membership) = resolve_observer(
                 anchor,
                 declared,
                 tracked,
@@ -2658,37 +2685,45 @@ impl OrbitNet {
             // neither a declaration nor a body reads as MEMBERSHIP_GLOBAL, which matches every
             // world, so that case fails open too, while a DECLARED peer keeps its world whether or
             // not its centre resolved.
-            let culling = cfg.enter_radius > 0.0 && center.is_some();
-            candidates.clear();
-            candidates.extend(
-                rows.iter()
-                    .map(|row| candidate_for_row(row, peer_id, culling)),
-            );
-            let Some(peer) = self.peers.get_mut(&peer_id) else {
-                continue;
+            let center = match resolved {
+                Some(center) if cfg.enter_radius > 0.0 => center,
+                _ => UNLOCATABLE_CENTRE,
             };
-            // Remember where a tracked entity was, so its despawn leaves the peer here rather than
-            // opening its radius to the whole world. Only a resolved position is recorded.
-            if let Some(pos) = tracked {
-                peer.anchor_last = Some(pos);
+
+            // This peer's own rows, in and out around the call. Restored unconditionally below, so
+            // no path out of this body can leave the shared list describing the wrong peer.
+            let mine = owned_rows_of(&owned, peer_id);
+            for &(_, index) in mine {
+                candidates[index as usize] = candidate_for_own_row(&rows[index as usize]);
             }
-            peer.interest.update_linear_into(
-                &cfg,
-                center.unwrap_or([0.0; 3]),
-                observer_membership,
-                &candidates,
-                &mut scratch,
-                &mut leaves,
-            );
-            for &id in &leaves {
-                peer.last_sent.remove(&id);
-                peer.last_full.remove(&id);
-                peer.acked_base.remove(&id);
+            if let Some(peer) = self.peers.get_mut(&peer_id) {
+                // Remember where a tracked entity was, so its despawn leaves the peer here rather
+                // than opening its radius to the whole world. Only a resolved position is recorded.
+                if let Some(pos) = tracked {
+                    peer.anchor_last = Some(pos);
+                }
+                peer.interest.update_linear_into(
+                    &cfg,
+                    center,
+                    observer_membership,
+                    &candidates,
+                    &mut scratch,
+                    &mut leaves,
+                );
+                for &id in &leaves {
+                    peer.last_sent.remove(&id);
+                    peer.last_full.remove(&id);
+                    peer.acked_base.remove(&id);
+                }
+                culled += (rows.len() as u64).saturating_sub(peer.interest.len() as u64);
             }
-            culled += (rows.len() as u64).saturating_sub(peer.interest.len() as u64);
+            for &(_, index) in mine {
+                candidates[index as usize] = candidate_for_row(&rows[index as usize]);
+            }
         }
         self.acc_blocks_culled += culled;
 
+        self.aoi_owned_rows = owned;
         self.aoi_candidates = candidates;
         self.aoi_dist_scratch = scratch;
         self.aoi_leaves = leaves;
@@ -3098,34 +3133,83 @@ fn band_for_row(culling: bool, has_anchor: bool, dist_sq: f32, band_scale: f32) 
     }
 }
 
-/// How one gathered row is offered to one peer's interest filter. A free function so the rule the
-/// send loop runs is the rule a test can call.
+/// The centre handed to the filter for a peer whose position cannot be established: one whose
+/// avatar has not spawned, and every peer when no cull radius is configured.
 ///
-/// Three cases, in the order they are decided:
+/// [`PeerInterest::update_linear_into`] fails open on a non-finite centre — nothing is culled by
+/// distance, while the membership test still runs — which is exactly what both cases mean.
+/// Blanking a peer's world because its avatar has not spawned yet is not a defensible failure mode,
+/// and a radius of zero asks for no distance culling rather than for all of it.
 ///
-/// 1. **The peer's own body** — `always` in every world. Never culled by anything, and deliberately
-///    not membership-tested: the peer's membership was read off this very row, so the test could
-///    only restate a tautology, or, for a peer that drives bodies in two worlds, cull that peer's
-///    own avatar out of its own view.
-/// 2. **A row with a resolved anchor, with culling on** — distance-culled from that anchor, within
-///    the world the row declares.
-/// 3. **Everything else** — a row that declares no anchor, one whose anchor did not resolve, and
-///    every row when culling is off: `always` **within the world the row declares**. The distance
-///    half fails open because a missing anchor is a measurement that failed; the membership half
-///    does not, because a membership is a declaration and did not.
+/// **Saying it in the centre is what lets one candidate list serve every peer.** The alternative is
+/// a second list shaped for those peers, rebuilt per peer, which is the O(peers × entities) pass
+/// this constant exists to delete.
+const UNLOCATABLE_CENTRE: [f32; 3] = [f32::NAN; 3];
+
+/// How one gathered row is offered to the interest filter of every peer that does **not** drive it.
+/// A free function so the rule the send loop runs is the rule a test can call.
 ///
-/// Case 3 is the one the feature exists for. It is where a positionless state channel — health,
+/// Two cases:
+///
+/// 1. **A row with a resolved anchor** — distance-culled from that anchor, within the world the row
+///    declares.
+/// 2. **A row with none** — one that declares no anchor, and one whose anchor did not resolve:
+///    `always` **within the world the row declares**. The distance half fails open because a missing
+///    anchor is a measurement that failed; the membership half does not, because a membership is a
+///    declaration and did not.
+///
+/// Case 2 is the one the feature exists for. It is where a positionless state channel — health,
 /// inventory, a door's state — lands, and before a membership existed it had exactly one setting:
 /// every peer in every world.
+///
+/// **This says nothing about a peer that has no radius to cull by.** That used to be a third case
+/// here, which is what forced the list to be rebuilt per peer; it is now [`UNLOCATABLE_CENTRE`].
 #[must_use]
-fn candidate_for_row(row: &EntityRow, peer_id: i32, culling: bool) -> InterestCandidate {
-    if row.owner == peer_id {
-        return InterestCandidate::always(row.id);
+fn candidate_for_row(row: &EntityRow) -> InterestCandidate {
+    match row.anchor {
+        Some(pos) => InterestCandidate::anchored_in(row.id, pos, row.membership),
+        None => InterestCandidate::always_in(row.id, row.membership),
     }
-    match (culling, row.anchor) {
-        (true, Some(pos)) => InterestCandidate::anchored_in(row.id, pos, row.membership),
-        _ => InterestCandidate::always_in(row.id, row.membership),
-    }
+}
+
+/// How a row is offered to the peer that **drives** it: `always`, in every world.
+///
+/// Never culled by anything, and deliberately not membership-tested — the peer's membership was
+/// read off this very row, so the test could only restate a tautology, or, for a peer that drives
+/// bodies in two worlds, cull that peer's own avatar out of its own view.
+///
+/// This is the only row of the tick that differs between peers, and swapping it in and out around
+/// each call is what a shared candidate list costs.
+#[must_use]
+fn candidate_for_own_row(row: &EntityRow) -> InterestCandidate {
+    InterestCandidate::always(row.id)
+}
+
+/// Fill `out` with `(owner, row index)` for every row a peer drives, ascending by owner.
+///
+/// Sorted so [`owned_rows_of`] can binary-search a peer's slice. `rows` arrives sorted by id and
+/// owners are scattered through it, so the sort is real work — done once per tick rather than
+/// rescanning every row for every peer, which is the pass this replaces.
+fn owned_rows_into(rows: &[EntityRow], out: &mut Vec<(i32, u32)>) {
+    out.clear();
+    out.extend(
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.owner != 0)
+            .map(|(index, row)| (row.owner, index as u32)),
+    );
+    out.sort_unstable();
+}
+
+/// The slice of [`owned_rows_into`]'s output that belongs to `peer_id`.
+///
+/// Usually one entry, and never assumed to be: a peer may drive several bodies, and every one of
+/// them is `always` to it.
+#[must_use]
+fn owned_rows_of(owned: &[(i32, u32)], peer_id: i32) -> &[(i32, u32)] {
+    let start = owned.partition_point(|&(owner, _)| owner < peer_id);
+    let end = owned.partition_point(|&(owner, _)| owner <= peer_id);
+    &owned[start..end]
 }
 
 /// Whether this entity's next block for this peer must be a full row. A free function so the rule
@@ -3155,11 +3239,14 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 #[cfg(test)]
 mod tests {
     use super::{
-        band_for_row, candidate_for_row, classify_rx, full_block_due, resolve_observer, EntityRow,
-        OrbitNet, PeerAnchor, PeerObserver, PeerState, RxOutcome, StateIntegration,
-        FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
+        band_for_row, candidate_for_own_row, candidate_for_row, classify_rx, full_block_due,
+        owned_rows_into, owned_rows_of, resolve_observer, EntityRow, OrbitNet, PeerAnchor,
+        PeerObserver, PeerState, RxOutcome, StateIntegration, FULL_STATE_INTERVAL,
+        RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
-    use orbitnet_core::interest::{InterestCandidate, MembershipId, MEMBERSHIP_GLOBAL};
+    use orbitnet_core::interest::{
+        AoiConfig, InterestCandidate, MembershipId, PeerInterest, MEMBERSHIP_GLOBAL,
+    };
     use orbitnet_core::priority::Band;
     use std::collections::HashMap;
 
@@ -3182,7 +3269,7 @@ mod tests {
     /// one pre-membership setting of "every peer in every world".
     #[test]
     fn a_row_with_no_anchor_is_always_relevant_within_its_own_world() {
-        let candidate = candidate_for_row(&row(7, 0, None, 3), 42, true);
+        let candidate = candidate_for_row(&row(7, 0, None, 3));
         assert_eq!(candidate, InterestCandidate::always_in(7, 3));
         assert!(candidate.always, "no anchor still means no distance test");
         assert_eq!(
@@ -3195,15 +3282,59 @@ mod tests {
     /// than a measurement and did not fail, so it must not fail open too.
     #[test]
     fn an_unresolved_anchor_fails_open_on_distance_only() {
-        for culling in [true, false] {
-            let candidate = candidate_for_row(&row(7, 0, None, 9), 42, culling);
-            assert!(candidate.always);
-            assert_eq!(candidate.membership, 9);
-        }
-        // ...and with culling off, a row that DOES have an anchor takes the same treatment: no
-        // distance to test against, world still enforced.
-        let candidate = candidate_for_row(&row(7, 0, Some([1.0, 2.0, 3.0]), 9), 42, false);
-        assert_eq!(candidate, InterestCandidate::always_in(7, 9));
+        let candidate = candidate_for_row(&row(7, 0, None, 9));
+        assert!(candidate.always);
+        assert_eq!(candidate.membership, 9);
+    }
+
+    /// A peer that cannot be located culls nothing by distance, and the centre is where that is
+    /// said — not in the candidate list, which is why the list can be shared.
+    ///
+    /// The membership half does NOT fail open with it: an unlocatable peer reads as
+    /// `MEMBERSHIP_GLOBAL`, which matches every world, but a peer that is merely out of radius keeps
+    /// the world it declared.
+    #[test]
+    fn an_unlocatable_centre_admits_every_row_it_is_offered() {
+        let cfg = AoiConfig {
+            cell_size: 8.0,
+            enter_radius: 4.0,
+            exit_factor: 1.25,
+            max_entities: 1,
+        };
+        let rows = [
+            row(1, 0, Some([9_000.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+            row(2, 0, Some([0.0, 0.0, 0.0]), 5),
+            row(3, 0, None, 7),
+        ];
+        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+
+        let mut interest = PeerInterest::new();
+        interest.update_linear_into(
+            &cfg,
+            UNLOCATABLE_CENTRE,
+            MEMBERSHIP_GLOBAL,
+            &candidates,
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(
+            interest.iter().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "9 km away and a cap of one, and nothing is culled: the peer measured nothing"
+        );
+
+        // The same rows from a centre that IS locatable, to prove the list itself culls normally.
+        let mut located = PeerInterest::new();
+        located.update_linear_into(
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &candidates,
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(located.iter().collect::<Vec<_>>(), vec![2, 3]);
     }
 
     /// A peer's own body is never culled by anything, membership included — the peer's world was read
@@ -3211,8 +3342,7 @@ mod tests {
     #[test]
     fn a_peers_own_body_is_always_relevant_in_every_world() {
         for membership in [MEMBERSHIP_GLOBAL, 1, MembershipId::MAX] {
-            let candidate =
-                candidate_for_row(&row(7, 42, Some([500.0, 0.0, 0.0]), membership), 42, true);
+            let candidate = candidate_for_own_row(&row(7, 42, Some([500.0, 0.0, 0.0]), membership));
             assert_eq!(
                 candidate,
                 InterestCandidate::always(7),
@@ -3221,11 +3351,11 @@ mod tests {
         }
     }
 
-    /// An anchored row under culling carries both axes: the position for the radius, the declared
-    /// world for the membership test.
+    /// An anchored row carries both axes: the position for the radius, the declared world for the
+    /// membership test.
     #[test]
     fn an_anchored_row_carries_its_position_and_its_world() {
-        let candidate = candidate_for_row(&row(7, 5, Some([1.0, 2.0, 3.0]), 4), 42, true);
+        let candidate = candidate_for_row(&row(7, 5, Some([1.0, 2.0, 3.0]), 4));
         assert_eq!(
             candidate,
             InterestCandidate::anchored_in(7, [1.0, 2.0, 3.0], 4)
@@ -3238,17 +3368,89 @@ mod tests {
     #[test]
     fn declaring_no_membership_reproduces_the_pre_membership_candidates() {
         assert_eq!(
-            candidate_for_row(
-                &row(7, 5, Some([1.0, 2.0, 3.0]), MEMBERSHIP_GLOBAL),
-                42,
-                true
-            ),
+            candidate_for_row(&row(7, 5, Some([1.0, 2.0, 3.0]), MEMBERSHIP_GLOBAL)),
             InterestCandidate::anchored(7, [1.0, 2.0, 3.0])
         );
         assert_eq!(
-            candidate_for_row(&row(7, 5, None, MEMBERSHIP_GLOBAL), 42, true),
-            InterestCandidate::always(7)
+            candidate_for_row(&row(7, 5, None, MEMBERSHIP_GLOBAL)),
+            InterestCandidate::always_in(7, MEMBERSHIP_GLOBAL)
         );
+    }
+
+    /// A peer's owned rows are found by binary search over one sorted table, and a peer driving
+    /// several bodies gets all of them.
+    #[test]
+    fn owned_rows_are_indexed_once_and_looked_up_per_peer() {
+        let rows = [
+            row(1, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row(2, 7, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row(3, 4, None, MEMBERSHIP_GLOBAL),
+            row(4, 7, None, MEMBERSHIP_GLOBAL),
+        ];
+        let mut owned = vec![(999, 999)]; // must be cleared, not appended to
+        owned_rows_into(&rows, &mut owned);
+        assert_eq!(
+            owned,
+            vec![(4, 2), (7, 1), (7, 3)],
+            "unowned rows are absent"
+        );
+        assert_eq!(owned_rows_of(&owned, 7), &[(7, 1), (7, 3)]);
+        assert_eq!(owned_rows_of(&owned, 4), &[(4, 2)]);
+        assert_eq!(owned_rows_of(&owned, 9), &[], "a peer driving nothing");
+        assert_eq!(owned_rows_of(&owned, 1), &[], "and one below every owner");
+    }
+
+    /// **The equivalence the shared list rests on.** One list per tick with the peer's own rows
+    /// patched in must equal the list a per-peer rebuild would have produced, row for row.
+    ///
+    /// The reference below is the rule as it was written before the list was shared. If the two ever
+    /// part, a peer is filtered against somebody else's view of the tick — which is silent, because
+    /// every candidate is individually well-formed.
+    #[test]
+    fn shared_candidates_match_a_per_peer_rebuild() {
+        /// The rule `update_interest` ran when it rebuilt the list inside the per-peer loop.
+        fn reference(row: &EntityRow, peer_id: i32) -> InterestCandidate {
+            if row.owner == peer_id {
+                return InterestCandidate::always(row.id);
+            }
+            match row.anchor {
+                Some(pos) => InterestCandidate::anchored_in(row.id, pos, row.membership),
+                None => InterestCandidate::always_in(row.id, row.membership),
+            }
+        }
+
+        let rows = [
+            row(1, 0, Some([1.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // unowned, anchored, global
+            row(2, 7, Some([2.0, 0.0, 0.0]), 3),                 // peer 7's body, in world 3
+            row(3, 0, None, 4),                                  // positionless channel, world 4
+            row(4, 9, None, MEMBERSHIP_GLOBAL),                  // peer 9's body, unanchored
+            row(5, 7, Some([5.0, 0.0, 0.0]), 8),                 // peer 7's SECOND body
+            row(6, 0, Some([6.0, 0.0, 0.0]), MembershipId::MAX), // a far world's body
+        ];
+        let mut shared: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        let mut owned = Vec::new();
+        owned_rows_into(&rows, &mut owned);
+
+        // 7 drives two bodies, 9 drives one, 42 is a peer with no body at all. `0` is not in the
+        // list because it is the unowned sentinel rather than a peer id — Godot's sender id is
+        // always positive — and the reference would read every unowned row as peer 0's own body.
+        for peer_id in [7, 9, 42] {
+            let mine = owned_rows_of(&owned, peer_id);
+            for &(_, index) in mine {
+                shared[index as usize] = candidate_for_own_row(&rows[index as usize]);
+            }
+            let expected: Vec<InterestCandidate> =
+                rows.iter().map(|row| reference(row, peer_id)).collect();
+            assert_eq!(shared, expected, "peer {peer_id} saw the wrong tick");
+            for &(_, index) in mine {
+                shared[index as usize] = candidate_for_row(&rows[index as usize]);
+            }
+        }
+
+        // And the list is back to its peer-independent shape, so the next tick's peers are not
+        // filtered against the last peer of this one.
+        let fresh: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        assert_eq!(shared, fresh, "the patch was not restored");
     }
 
     /// The peer's own world comes from the same row its interest centre does: the LOWEST-id owned row

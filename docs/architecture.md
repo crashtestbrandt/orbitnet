@@ -87,9 +87,19 @@ Cosmetic properties ride the same packets on a slow lane without widening the re
 ## Interest management
 
 AOI is a **radius + hysteresis filter on the send path**: enter at the radius, leave at 1.25×, so boundary
-entities do not flicker. A uniform grid in `core::interest` — rebuilt each tick from the position column
-already in native memory, zero Godot calls — is implemented and tested but not yet driving sends; wiring it in
-is a contained follow-up for when entity counts make the linear pass matter.
+entities do not flicker. Sends run through a flat scan over the tick's candidates.
+
+A uniform grid in `core::interest` — rebuilt each tick from the position column already in native memory, zero
+Godot calls — is implemented, tested, and applies the same rules as the scan: the same hysteresis, the same
+cap and tie-breaks, the same leave list, the same always-set, and one set of cells per world. It is not driving
+sends because it is **slower** at the arena extents a session runs at. It overtakes the scan between ±300 m and
+±600 m of occupancy and is about twice as fast past ±1200 m; the shipped arenas are ±74 m. A high world count
+looked like a grid win and was not — what the grid saved there was the per-peer candidate rebuild, and that is
+now dropped without a grid: **one candidate list per tick**, with the rows a peer drives patched in around its
+call and "this peer cannot be located" said in the centre rather than by reshaping every row. Worth 2.35× of
+the interest pass in a 32-world session, and it removes the only reading under which the grid won one. The
+measured tables and the decision are in that module's header, and `net.perf`'s `interest_ms` is the live number
+that would reopen it.
 
 **Membership is the second axis.** A radius cannot separate several independent worlds inside one session, each
 rebased near its own coordinate origin: two entities at the same coordinates in different worlds are zero
