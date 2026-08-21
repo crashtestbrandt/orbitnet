@@ -335,6 +335,11 @@ func set_display_offset(ticks: int) -> void:
 # client then predicts remote bodies FORWARD from their latest authoritative state with held input
 # (dead-reckoning through the real sim). This needs no O(N^2) input broadcast: prediction extrapolates the
 # last known state instead of replaying peer input.
+# An un-exempted body RECONCILES rather than merely coasting: its authoritative rows take the PREDICTING
+# integration path, so a mispredict rewinds and replays it exactly as an owned body's would. Without that it
+# would predict forward from its own drift and never re-base on anything the server said -- which an INPUTLESS
+# shared body (a puck, a ball, a physics prop) exposes within seconds, and a remote player body hides, because
+# its owner's own corrections keep the pose roughly plausible. See docs/protocol.md.
 # Per-client and live (the console cvar net.remote_resim flips it mid-session); peers need not agree.
 var _remote_resim: bool = false
 

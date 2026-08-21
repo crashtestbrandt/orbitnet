@@ -59,6 +59,38 @@ One invariant that is easy to break and expensive to debug: if your handler re-q
 the restored pose — a shapecast, a raycast — the rollback loop must run in `_physics_process` **before** the
 physics step. A phase change silently breaks determinism.
 
+### Within-tick entity ordering
+
+The rollback loop replays **one tick across every planned entity at a time**, in three phases — restore all,
+simulate all, record all — and within a tick it visits entities in **ascending entity id**. `ResimPlanner`
+keeps them in a `BTreeMap` for exactly that reason: a consumer may gate on a bit-exact resim, and a
+nondeterministic iteration order would surface there as a phantom desync.
+
+An entity id is FNV-1a of the node path, so **that order is identical on every peer** and is already covered by
+whatever gate proves the peers built the same paths. What it is *not* is game-meaningful: whether entity A has
+already advanced when entity B's tick runs falls out of two hashes.
+
+The rule that follows: **one direction of cross-entity read per pair, and no cross-entity writes.** A body that
+reads another's replicated state sees it either at the start or the end of the tick depending on that fixed
+order — the same answer on every peer, which is what matters. A body that *writes* into another's restored
+state would have the write land before or after that body's own simulation depending on the same hashes, which
+is a coin flip nobody can see.
+
+## Remote prediction reconciles
+
+`net.remote_resim` un-exempts bodies this peer owns neither the state nor the input of, so they join the
+rollback loop and are simulated forward every tick. An authoritative row for such a body takes the **predicting**
+integration path, exactly as an owner's own body does: the row is compared against the recorded prediction, a
+difference marks the planner, and the loop replays from that tick.
+
+It has to. A body that predicted forward without ever re-basing on the server's rows would drift for the whole
+session with nothing erroring — and an **inputless shared body** (a puck, a ball, a physics prop) makes that
+obvious within seconds, where a remote player body hides it because its own owner's corrections keep the pose
+roughly plausible.
+
+Exempt bodies — the default, since `remote_resim` is off unless a game asks for it — are unaffected: they
+apply the newest row at the tick boundary and never simulate.
+
 ## `is_fresh`
 
 Keyed on **input novelty**, not tick visitation. The backend tracks per-`(entity, tick)` input confidence:
