@@ -46,6 +46,39 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # SELF-HOSTED WINDOWS: rustup is on PATH but its SHIM DIRECTORY is not, so `rustup toolchain
+      # install` and `rustup default` both succeed while `rustc` is not found. dtolnay/rust-toolchain
+      # only repairs PATH when it installs rustup itself, so on a box where rustup is already present
+      # the failure surfaces inside the action's own cachekey step as "rustc: command not found" --
+      # which reads like a missing toolchain rather than a missing PATH entry.
+      #
+      # The SHIM directory, not the toolchain's own bin: the shims are what honour
+      # native/rust-toolchain.toml. Putting the toolchain bin on PATH instead would silently ignore the
+      # pin.
+      - name: Put the rustup shims on PATH
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v rustc >/dev/null 2>&1; then
+            echo "rustc already resolves: $(command -v rustc)"
+            exit 0
+          fi
+          for dir in \
+            "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
+            "${CARGO_HOME:-}/bin" \
+            "${USERPROFILE:-}/.cargo/bin"
+          do
+            [ -n "$dir" ] || continue
+            if [ -x "$dir/rustc.exe" ] || [ -x "$dir/rustc" ]; then
+              echo "found the rustc shim in $dir"
+              echo "$dir" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          echo "::error::no rustc shim on this runner. rustup=$(command -v rustup || echo none), CARGO_HOME=${CARGO_HOME:-unset}. Reinstall rustup for the account the runner service runs as."
+          exit 1
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
