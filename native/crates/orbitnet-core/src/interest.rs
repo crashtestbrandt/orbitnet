@@ -40,6 +40,23 @@
 //! reached every peer in every world. Declaring it always-relevant *within one membership* bounds
 //! it to its own world while leaving it uncullable inside it.
 //!
+//! ## The visibility veto
+//!
+//! Distance and membership both describe an entity: a candidate carries one position and one world,
+//! and every peer reads the same pair. Neither can express **one peer and one entity** — the
+//! exception a class-wide key does not cover. [`PeerInterest::set_hidden`] is that third axis: a
+//! per-(peer, entity) refusal held on the peer's own set, checked before membership and before the
+//! radius, and beating [`InterestCandidate::always`] as well.
+//!
+//! It refuses at the candidate, not at the cap, so a vetoed entity occupies no slot in
+//! `max_entities` and never lands in the always-set. [`PeerInterest::set_hidden`] also drops the
+//! entity from the set on the spot rather than at the next update, so the caller clears its delta
+//! bookkeeping once, at the call, instead of watching for a leave that has already happened.
+//!
+//! **A veto stops the rows and nothing else.** It is the same client-side contract a distance cull
+//! has: the entity's updates stop arriving and its node is never removed, so the consuming project
+//! decides what an entity that stopped updating means.
+//!
 //! ## Grid or scan
 //!
 //! [`PeerInterest`] has two update paths and the backend ships the *linear* one.
@@ -105,7 +122,7 @@
 //! per-peer loop. **An arena past about ±600 m of occupancy is what would justify making that
 //! switch**, and `net.perf`'s `interest_ms` is the live number to watch. A high world count is not.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::history::BodyId;
 
@@ -462,14 +479,24 @@ impl InterestCandidate {
     }
 }
 
-/// One peer's hysteretic interest set.
+/// One peer's hysteretic interest set, and the entities vetoed out of it.
 ///
 /// Members are stored in a [`BTreeMap`] keyed by id (value: the distance squared observed on the
 /// last update), so [`PeerInterest::iter`] walks in ascending id order for free — the wire order
 /// must not vary run to run.
+///
+/// The two fields have opposite lifetimes and that is the point. `members` is recomputed from
+/// scratch every update; `hidden` is a standing declaration by the game and survives every one of
+/// them, until the same caller retracts it. Holding the veto here rather than beside the set is
+/// what lets [`Self::classify`] apply it, so both update paths refuse a vetoed entity by the same
+/// line and neither can be given the set without the veto.
 #[derive(Debug, Clone, Default)]
 pub struct PeerInterest {
     members: BTreeMap<BodyId, f32>,
+    /// Entities this peer may never be sent, whatever their distance, world or `always` flag. See
+    /// [`Self::set_hidden`]. Never iterated — only probed — so a `HashSet` costs the wire order
+    /// nothing.
+    hidden: HashSet<BodyId>,
 }
 
 impl PeerInterest {
@@ -493,6 +520,9 @@ impl PeerInterest {
     /// * `observer` is the world the peer is in. [`InterestGrid::rebuild`] bins each world
     ///   separately and the query reads only the ones [`membership_matches`] admits, so an
     ///   overlapping world's entities never enter the set at any distance.
+    /// * An entity [`Self::set_hidden`] vetoed for this peer is refused wherever it arrives from —
+    ///   the binned hits, the uncullable list, `also`, or the whole world an unlocatable centre
+    ///   admits.
     /// * [`InterestCandidate::always`] entities, and any whose position could not be binned, arrive
     ///   from [`InterestGrid::uncullable_for`] and bypass both the radius and the cap.
     /// * When `cfg.max_entities > 0`, only the nearest N **cullable** entities survive, ordered by
@@ -553,11 +583,13 @@ impl PeerInterest {
             grid.query_within(cfg, observer, center, exit_radius, scratch);
             let members = &self.members;
             scratch.retain(|&(id, dist_sq)| {
-                !overridden(id) && (members.contains_key(&id) || dist_sq <= enter_sq)
+                !overridden(id)
+                    && !self.is_hidden(id)
+                    && (members.contains_key(&id) || dist_sq <= enter_sq)
             });
             cullable = scratch.len();
             for id in grid.uncullable_for(observer) {
-                if !overridden(id) {
+                if !overridden(id) && !self.is_hidden(id) {
                     // Sorting below `0.0` is impossible, so an uncullable entity can never be
                     // reordered ahead of a genuinely closer one by the cap sort — it is excluded
                     // from that sort's population instead.
@@ -566,7 +598,7 @@ impl PeerInterest {
             }
         } else {
             for id in grid.visible_to(observer) {
-                if !overridden(id) {
+                if !overridden(id) && !self.is_hidden(id) {
                     scratch.push((id, f32::NEG_INFINITY));
                 }
             }
@@ -591,6 +623,9 @@ impl PeerInterest {
     /// is only how candidates are found. Three of them are worth restating where the shipped caller
     /// will read them:
     ///
+    /// * An entity [`Self::set_hidden`] vetoed for this peer is refused before either test runs,
+    ///   `always` included. The veto is the only per-(peer, entity) fact in the filter; everything
+    ///   else here is a property of the candidate and reads the same for every peer.
     /// * [`InterestCandidate::always`] entities bypass both the radius and the cap. The cap bounds
     ///   the *cullable* set; an unconditionally-relevant entity is never evicted by it.
     /// * `observer` is the world the peer is in. A candidate [`membership_matches`] refuses is
@@ -652,8 +687,10 @@ impl PeerInterest {
     /// entity that bypassed the distance test — those carry [`f32::NEG_INFINITY`] and are excluded
     /// from the cap's population rather than merely sorted to the front of it.
     ///
-    /// Membership is decided first. A candidate in a world the observer is not in is refused
-    /// whatever its distance and whatever `always` says, so nothing below that line can readmit it.
+    /// The veto is decided first and membership second. Both refuse outright: a candidate either
+    /// test rejects is refused whatever its distance and whatever `always` says, so nothing below
+    /// those two lines can readmit it. Refusing here rather than at the cap is what keeps a vetoed
+    /// entity out of `max_entities`' population entirely.
     fn classify(
         &self,
         candidate: &InterestCandidate,
@@ -663,6 +700,9 @@ impl PeerInterest {
         enter_sq: f32,
         exit_sq: f32,
     ) -> Option<(f32, bool)> {
+        if self.is_hidden(candidate.id) {
+            return None;
+        }
         if !membership_matches(observer, candidate.membership) {
             return None;
         }
@@ -769,6 +809,47 @@ impl PeerInterest {
     /// update to fall out of the grid.
     pub fn remove(&mut self, id: BodyId) {
         self.members.remove(&id);
+    }
+
+    /// Veto `id` for this peer, or retract that veto.
+    ///
+    /// A vetoed entity is refused by [`Self::classify`] before membership and before the radius,
+    /// and `always` does not survive it. It therefore occupies no slot in `cfg.max_entities` and
+    /// never reaches the always-set — a cap that admits N cullable entities still admits N of them
+    /// with a veto in force.
+    ///
+    /// **Starting a veto drops `id` from the set on the spot**, rather than leaving it to the next
+    /// update. The removal is deliberately *not* reported as a leave, because there is no update to
+    /// report it on: the caller is standing right here and clears its per-entity delta bookkeeping
+    /// at this call, the same three entries an update clears from `leaves`. Without that clearing a
+    /// later retraction sends a delta against a base the peer has long dropped.
+    ///
+    /// **Retracting one re-admits `id` as a newcomer**, through `enter_radius` like any other —
+    /// the hysteresis band retains *members*, and a vetoed entity is not one.
+    ///
+    /// The veto is keyed on the entity id and nothing else, so it **survives that entity's
+    /// despawn**. Entity ids are node-path-derived and a body that respawns under its old name
+    /// reclaims its old id; clearing the veto with the body would hand that peer the entity on the
+    /// tick it came back, which is the one moment the game cannot re-declare in time.
+    pub fn set_hidden(&mut self, id: BodyId, hidden: bool) {
+        if hidden {
+            self.hidden.insert(id);
+            self.members.remove(&id);
+        } else {
+            self.hidden.remove(&id);
+        }
+    }
+
+    /// Whether `id` is vetoed for this peer. See [`Self::set_hidden`].
+    #[must_use]
+    pub fn is_hidden(&self, id: BodyId) -> bool {
+        !self.hidden.is_empty() && self.hidden.contains(&id)
+    }
+
+    /// How many entities are vetoed for this peer.
+    #[must_use]
+    pub fn hidden_len(&self) -> usize {
+        self.hidden.len()
     }
 }
 
@@ -1519,9 +1600,9 @@ mod tests {
         // measurement that chose between them was comparing different work. Everything that can
         // differ between them is varied here at once: three worlds at overlapping coordinates,
         // always-relevant channels, positions that go non-finite mid-walk, a cap that bites, an
-        // observer whose centre cannot be resolved, and a per-peer override that shadows a binned
-        // body. Members *and* leaves are compared every step, because the send path's correctness
-        // rests on the leaves rather than on the set.
+        // observer whose centre cannot be resolved, a per-peer override that shadows a binned body,
+        // and a visibility veto that comes and goes. Members *and* leaves are compared every step,
+        // because the send path's correctness rests on the leaves rather than on the set.
         let cfg = cfg(64.0, 100.0, 1.25, 12);
         let mut state = 0x0bad_f00du32;
         let mut candidates: Vec<InterestCandidate> = (0..64u64)
@@ -1548,6 +1629,7 @@ mod tests {
         let mut via_linear = PeerInterest::new();
         let mut scratch = Vec::new();
         let (mut grid_leaves, mut linear_leaves) = (Vec::new(), Vec::new());
+        let mut veto_bites = 0u32;
 
         for step in 0..120u32 {
             for candidate in candidates.iter_mut() {
@@ -1573,6 +1655,16 @@ mod tests {
                 ]
             };
             let also: &[InterestCandidate] = if step % 3 == 0 { &overrides } else { &[] };
+            // At most one veto at a time, declared on both sets alike and moved along the low ids so
+            // it covers an override (4 and 5), an always channel (1, 9) and ordinary anchored
+            // bodies. Retracted on the steps the parity says, so both re-admission and refusal run.
+            let vetoed = u64::from(step % 11) + 1;
+            let vetoing = step % 10 < 5;
+            for peer in [&mut via_grid, &mut via_linear] {
+                for id in 1..=11u64 {
+                    peer.set_hidden(id, vetoing && id == vetoed);
+                }
+            }
             // The linear path sees one flat list, so an override replaces the row it names.
             let flat: Vec<InterestCandidate> = candidates
                 .iter()
@@ -1606,11 +1698,26 @@ mod tests {
                 grid_leaves, linear_leaves,
                 "grid and linear diverged on leaves at step {step}"
             );
+            // Entity 1 is `always` in MEMBERSHIP_GLOBAL: admitted by every observer at every
+            // distance, and never shadowed by an override. On the steps it is vetoed its absence is
+            // the veto and nothing else, which is what stops this walk agreeing about a rule neither
+            // path ever reached.
+            if vetoing && vetoed == 1 {
+                assert!(
+                    !via_grid.contains(1) && !via_linear.contains(1),
+                    "an always-relevant entity survived its veto at step {step}"
+                );
+                veto_bites += 1;
+            }
             candidates[sick].pos = restore;
         }
         // The walk has to actually exercise the rules it varies, or it proves the two paths agree
         // about nothing.
         assert!(!via_grid.is_empty());
+        assert!(
+            veto_bites > 0,
+            "no veto was exercised against an admitted entity"
+        );
     }
     #[test]
     fn linear_holds_through_the_band_and_reports_the_exit_as_a_leave() {
@@ -1995,6 +2102,228 @@ mod tests {
             members_of(&mut PeerInterest::new(), &cfg, 1, &candidates),
             vec![1, 3]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The visibility veto: the third axis, and the only per-(peer, entity) one.
+    // ------------------------------------------------------------------
+
+    /// The case the veto exists for. Distance and membership both admit the entity; only a fact
+    /// about this one peer can refuse it.
+    #[test]
+    fn a_veto_refuses_an_entity_both_other_axes_admit() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [1.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [2.0, 0.0, 0.0]),
+        ];
+        let mut peer = PeerInterest::new();
+        peer.set_hidden(2, true);
+        assert_eq!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &candidates),
+            vec![1]
+        );
+        assert!(peer.is_hidden(2));
+        assert_eq!(peer.hidden_len(), 1);
+    }
+
+    /// `always` is the fail-open flag and the veto is a declaration, so the veto wins. An
+    /// unanchored channel is exactly the row a game most needs to withhold: it has no distance to
+    /// be culled by at all.
+    #[test]
+    fn a_veto_beats_always_and_beats_a_matching_membership() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::always_in(1, 7),
+            InterestCandidate::always_in(2, 7),
+            InterestCandidate::always(3),
+        ];
+        let mut peer = PeerInterest::new();
+        peer.set_hidden(2, true);
+        peer.set_hidden(3, true);
+        assert_eq!(members_of(&mut peer, &cfg, 7, &candidates), vec![1]);
+    }
+
+    /// The veto refuses at the candidate rather than at the cap, so a withheld entity must not
+    /// consume one of the N slots the nearest entities compete for — the same rule a membership
+    /// refusal follows.
+    #[test]
+    fn a_veto_does_not_consume_a_cap_slot() {
+        let cfg = cfg(32.0, 200.0, 1.25, 2); // nearest 2 win
+        let candidates = [
+            InterestCandidate::anchored(1, [1.0, 0.0, 0.0]), // nearest, vetoed
+            InterestCandidate::anchored(2, [2.0, 0.0, 0.0]),
+            InterestCandidate::anchored(3, [3.0, 0.0, 0.0]),
+            InterestCandidate::anchored(4, [4.0, 0.0, 0.0]),
+        ];
+        let mut peer = PeerInterest::new();
+        peer.set_hidden(1, true);
+        assert_eq!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &candidates),
+            vec![2, 3],
+            "the cap still admits two, and the vetoed entity is not one of them"
+        );
+    }
+
+    /// Starting a veto drops the entity in the same call. The caller clears its delta bookkeeping
+    /// here, which is why the removal is not also reported as a leave by the next update.
+    #[test]
+    fn starting_a_veto_drops_a_current_member_on_the_spot() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [1.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [2.0, 0.0, 0.0]),
+        ];
+        let mut peer = PeerInterest::new();
+        assert_eq!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &candidates),
+            vec![1, 2]
+        );
+
+        peer.set_hidden(2, true);
+        assert!(!peer.contains(2), "gone before the next update runs");
+        assert_eq!(peer.len(), 1);
+
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_linear_into(
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &candidates,
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(peer.iter().collect::<Vec<BodyId>>(), vec![1]);
+        assert!(
+            leaves.is_empty(),
+            "the leave was consumed by set_hidden, not deferred to the update"
+        );
+    }
+
+    /// Retracting a veto re-admits the entity as a NEWCOMER: the hysteresis band retains members,
+    /// and a vetoed entity is not one. Inside the band it stays out until it crosses `enter_radius`.
+    #[test]
+    fn retracting_a_veto_re_admits_through_the_enter_radius() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0); // enter 100, exit 125
+        let inside = [InterestCandidate::anchored(1, [90.0, 0.0, 0.0])];
+        let in_band = [InterestCandidate::anchored(1, [110.0, 0.0, 0.0])];
+        let mut peer = PeerInterest::new();
+
+        assert_eq!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &inside),
+            vec![1]
+        );
+        assert_eq!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &in_band),
+            vec![1],
+            "a member is retained through the band"
+        );
+
+        peer.set_hidden(1, true);
+        assert!(members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &in_band).is_empty());
+
+        peer.set_hidden(1, false);
+        assert!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &in_band).is_empty(),
+            "re-admitted as a newcomer, so the band refuses it"
+        );
+        assert_eq!(
+            members_of(&mut peer, &cfg, MEMBERSHIP_GLOBAL, &inside),
+            vec![1],
+            "and it enters again on crossing the enter radius"
+        );
+    }
+
+    /// The veto is per peer. Two sets over the same candidates must disagree, which is the whole
+    /// difference between this axis and the two that are properties of the candidate.
+    #[test]
+    fn a_veto_applies_to_one_peer_and_leaves_the_others_alone() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [1.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [2.0, 0.0, 0.0]),
+        ];
+        let (mut hidden_from, mut everyone_else) = (PeerInterest::new(), PeerInterest::new());
+        hidden_from.set_hidden(2, true);
+        assert_eq!(
+            members_of(&mut hidden_from, &cfg, MEMBERSHIP_GLOBAL, &candidates),
+            vec![1]
+        );
+        assert_eq!(
+            members_of(&mut everyone_else, &cfg, MEMBERSHIP_GLOBAL, &candidates),
+            vec![1, 2]
+        );
+        assert!(!everyone_else.is_hidden(2));
+    }
+
+    /// Both update paths apply the same rules, so the veto has to reach every source the grid path
+    /// merges from: the binned hits, the uncullable list and this peer's `also` overrides.
+    #[test]
+    fn the_grid_path_refuses_a_vetoed_entity_from_every_source() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [1.0, 0.0, 0.0]), // binned
+            InterestCandidate::always(2),                    // uncullable
+            InterestCandidate::anchored(3, [3.0, 0.0, 0.0]), // binned, kept
+        ];
+        let own = [InterestCandidate::always(4)]; // this peer's own body, via `also`
+        let mut grid = InterestGrid::new();
+        grid.rebuild(&cfg, &candidates);
+
+        let mut peer = PeerInterest::new();
+        for id in [1u64, 2, 4] {
+            peer.set_hidden(id, true);
+        }
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        peer.update_grid_into(
+            &grid,
+            &cfg,
+            [0.0; 3],
+            MEMBERSHIP_GLOBAL,
+            &own,
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(peer.iter().collect::<Vec<BodyId>>(), vec![3]);
+    }
+
+    /// An unlocatable observer fails open on distance — it sees everything its world admits — and
+    /// the veto is a declaration rather than a measurement, so it still holds there.
+    #[test]
+    fn a_veto_survives_the_non_finite_centre_that_fails_distance_open() {
+        let cfg = cfg(32.0, 200.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [10_000.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [20_000.0, 0.0, 0.0]),
+        ];
+        let mut grid = InterestGrid::new();
+        grid.rebuild(&cfg, &candidates);
+
+        let (mut scratch, mut leaves) = (Vec::new(), Vec::new());
+        let mut linear = PeerInterest::new();
+        linear.set_hidden(2, true);
+        linear.update_linear_into(
+            &cfg,
+            [f32::NAN; 3],
+            MEMBERSHIP_GLOBAL,
+            &candidates,
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(linear.iter().collect::<Vec<BodyId>>(), vec![1]);
+
+        let mut gridded = PeerInterest::new();
+        gridded.set_hidden(2, true);
+        gridded.update_grid_into(
+            &grid,
+            &cfg,
+            [f32::NAN; 3],
+            MEMBERSHIP_GLOBAL,
+            &[],
+            &mut scratch,
+            &mut leaves,
+        );
+        assert_eq!(gridded.iter().collect::<Vec<BodyId>>(), vec![1]);
     }
 
     #[test]

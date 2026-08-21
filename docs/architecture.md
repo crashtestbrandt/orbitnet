@@ -112,10 +112,23 @@ channel that replicates no position — health, inventory, a door's state — ha
 its only lever was all-or-nothing. Declaring it always-relevant *within one membership* bounds it to its own
 world while leaving it uncullable inside it.
 
+**The per-peer veto is the third axis.** Distance and membership are both properties of the entity: one
+position, one world, read the same way by every peer. Neither can express "not this peer", which is the
+exception a class-wide key leaves over. `Net.set_entity_hidden(peer, entity_id, hidden)` records that refusal on
+the peer's own `PeerInterest`, where the filter applies it before membership and before the radius, and where
+`always` does not survive it. Refusing at the candidate rather than at the cap is what keeps a withheld entity
+out of `max_entities`' population; starting a veto also drops the entity from the set in that call and clears
+the three delta entries a leave clears, because no `leaves` list will ever name a removal that happened between
+updates. The shared candidate list is untouched by any of it, so the veto costs the per-tick pass nothing.
+
+The veto stops the rows and nothing else. That is the client-side contract a distance cull already has, and it
+inherits the same limit — nothing despawns, so the withheld entity's node stays where it was. Ids stay
+session-global either way: the entity manifest goes to every synced peer whatever any one of them receives.
+
 **A peer's centre and its world both come from one body**: the lowest-id entity whose *input* authority is that
 peer and which resolved an anchor. A peer with no such body has neither, and the backend correctly falls back
 to "everything is in interest" — every world, at every distance. This is the limitation most likely to surprise
-you — see [api.md](api.md#interest-two-axes-distance-and-membership).
+you — see [api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
 
 **That inference is a fallback, and `Net.set_peer_anchor()` replaces it.** What a peer observes is a different
 question from what its input drives — a spectator drives nothing, and a peer with a body in each of two worlds
