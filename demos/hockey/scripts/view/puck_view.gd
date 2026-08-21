@@ -13,6 +13,11 @@ class_name PuckView
 ##   offset    -= correction          # the drawn puck does not move at all this frame
 ##   offset    *= decay               # and the offset bleeds away over the next few frames
 ##
+## That extrapolation is a straight line while the simulation damps and substeps, so every tick disagrees by a
+## fraction of a millimetre whether or not anything was corrected. HockeyConfig.CORRECTION_DEADBAND_M is what
+## keeps those out of the counters -- without it the blended count climbs once per tick forever, including
+## offline, where nothing is being corrected at all.
+##
 ## Two discontinuities are the simulation's own and must NOT be absorbed, or the puck would render passing
 ## through a rail and sliding back into it:
 ##
@@ -57,8 +62,10 @@ func build(body: PuckBody) -> void:
 func _physics_process(delta: float) -> void:
 	if puck == null:
 		return
-	var tick: int = Net.current_tick()
-	if Net.is_offline() or tick != _last_tick:
+	# The puck's own tick, not the facade's: Net.current_tick() is pinned at 0 offline, so gating on it there
+	# ran this every physics frame and counted the gap between two frames that shared one tick as a correction.
+	var tick: int = puck.sim_tick()
+	if tick != _last_tick:
 		_last_tick = tick
 		_absorb()
 	# The offset bleeds away on the RENDER clock, not the tick clock, so the blend takes the same wall-clock
@@ -91,7 +98,7 @@ func _absorb() -> void:
 	if magnitude > HockeyConfig.CORRECTION_SNAP_M:
 		_offset = Vector3.ZERO
 		_snaps += 1
-	elif magnitude > 0.0:
+	elif magnitude > HockeyConfig.CORRECTION_DEADBAND_M:
 		_offset -= correction
 		_smoothed += 1
 	_previous_position = actual

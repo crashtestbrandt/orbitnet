@@ -12,6 +12,13 @@ just hockey-host   # terminal 1
 just hockey-join   # terminal 2, and 3, and 4 …
 ```
 
+`hockey-join` takes `ADDR` or `ADDR:PORT`, defaulting to `127.0.0.1:47800` — so a session hosted on a
+non-default port with `just hockey-host 47900` is reached with `just hockey-join 127.0.0.1:47900`.
+
+![A client's view of a three-peer air hockey session](img/hockey-demo.png)
+
+<sub>A client at seat 2, with a host and one other client connected. Every number on the left is live.</sub>
+
 ## The configuration, and why it is a separate project
 
 `demos/rts/project.godot` names this demo before it existed: *"a second demo shaped like a shooter would want
@@ -105,9 +112,28 @@ correctly calls the *wrong* definition of `is_fresh`. Both are right about their
 The HUD prints the measurement's floor beside it:
 
 ```
-PUCK CORRECTION  p50=4.8 mm  p99=41.2 mm  peak=96.0 mm  n=240
-        replayed 61 of 1440 ticks   view: 58 blended, 3 snapped   wire floor ~0.98 mm (@half)
+PUCK CORRECTION  p50=141.6 mm  p99=598.5 mm  peak=673.9 mm  n=228
+        replayed 228 of 1408 ticks   view: 18 blended, 42 snapped   wire floor ~0.98 mm (@half)
 ```
+
+**Expect roughly one round trip of puck travel.** The puck runs at up to 6 m/s, so at a 17 ms round trip a
+strike this peer could not know about is already ~100 mm stale by the time the row lands, and the divergence
+keeps growing across the replayed window. The figures above are three bots chasing the puck continuously,
+which is harsher than people playing; leave the table untouched and the client's prediction is **exact**, to
+the sample — a deterministic body with no input has nothing to get wrong.
+
+### What is deliberately not in the distribution
+
+Two things are corrections and are not *drift*, and each was large enough to be the entire number before it was
+excluded:
+
+| Excluded | Why |
+|---|---|
+| **The join sync** | A client builds its own puck and predicts it forward before any authoritative row has arrived, so the first row rewinds it onto a puck that was somewhere else. A third of a metre is typical. It happens once per session, but the percentile window holds it for the rest of the run — measured on an otherwise untouched puck it was the *only* sample ever taken, so p50, p99 and peak all reported that one join. |
+| **A face-off** | The puck is teleported to the centre spot, so a peer that placed the goal one tick differently differs by half a table. Real, and a different quantity from drift. |
+
+So a sample is recorded only for a tick the puck was **live on both passes**, and only after the first
+authoritative row has landed. The number then means one thing.
 
 `net_pos` rides as three IEEE-754 binary16s, whose spacing near a table coordinate of 1 m is about a
 millimetre, and the backend writes the quantized value back after every record so every peer replays from the
@@ -126,6 +152,17 @@ rail and sliding back into it — a **rail or mallet contact**, and a **face-off
 contact count for exactly that reason. Anything past `CORRECTION_SNAP_M` snaps instead of blending, and the
 blended and snapped counts are what `BenchSubject.KEY_RECONCILE_SMOOTH` and `KEY_RECONCILE_SNAP` were defined
 for. This demo is the first to fill them.
+
+The counts are worth reading together with the p50: under three bots the median correction is above the snap
+threshold, so most of them **snap rather than blend** — the smoothing arm cannot hide a correction bigger than
+the distance a blend could plausibly cover in its half-life. Raising the threshold would move corrections out
+of the snap column and into a visible slide, which is worse; the honest reading is that at that intensity there
+is nothing to hide.
+
+A correction below `CORRECTION_DEADBAND_M` is not counted at all. The extrapolation the detector compares
+against is a straight line while the simulation damps and substeps, so every tick disagrees by a fraction of a
+millimetre whether or not anything was corrected — without the deadband the blended count climbed once per
+tick forever, including offline, where nothing is corrected.
 
 ## Teams and seating
 

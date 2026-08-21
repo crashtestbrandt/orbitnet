@@ -92,6 +92,14 @@ feels and what ping does not measure. Six keybound levers change it live.
 
 ## The air hockey demo
 
+![A client's view of a three-peer air hockey session](docs/img/hockey-demo.png)
+
+<sub>A **client** at seat 2, with a host and one other client connected, all three driven by bench bots that
+chase the puck continuously. `p50=141.6 mm` is how far this peer's predicted puck was from the authoritative
+one — roughly the distance the puck travels in one round trip, which is the number a rollback demo exists to
+show. Each orange spike is one correction. The two blue mallets at the near end are team 0's; the one behind is
+a team-mate, faded because it overlaps.</sub>
+
 `demos/hockey/` is the coupled 60 Hz counterpart — the configuration the RTS demo's `project.godot` names as
 unable to coexist with its own — and it exists to show that **the rollback lane is not only for the body you
 author**:

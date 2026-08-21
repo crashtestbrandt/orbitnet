@@ -30,6 +30,7 @@ var _label: Label = null
 var _rtt_history: PackedFloat32Array = PackedFloat32Array()
 var _error_history: PackedFloat32Array = PackedFloat32Array()
 var _last_rejection: String = ""
+var _seen_corrections: int = 0
 var _last_goal: String = ""
 
 # --- lever state (all per-client and live) ---------------------------------------------------------
@@ -78,9 +79,18 @@ func _sample() -> void:
 	_rtt_history.push_back(clock["rtt_ms"])
 	while _rtt_history.size() > SPARK_SAMPLES:
 		_rtt_history.remove_at(0)
+	# A SPIKE TRAIN, not a percentile trace. Corrections are sparse -- a few dozen replayed ticks in a thousand
+	# -- so a rolling percentile sampled every frame is a staircase that sits pinned at the window maximum and
+	# shows neither when they arrive nor how they cluster. Pushing each correction's own magnitude on the frame
+	# it lands, and zero otherwise, draws the thing that actually happened.
 	var meter: ReconcileMeter = _meter()
 	if meter != null:
-		_error_history.push_back(meter.percentile_mm(0.5))
+		var corrections: int = meter.corrections()
+		var spike: float = 0.0
+		if corrections != _seen_corrections:
+			_seen_corrections = corrections
+			spike = meter.last_error_mm()
+		_error_history.push_back(spike)
 		while _error_history.size() > SPARK_SAMPLES:
 			_error_history.remove_at(0)
 
@@ -230,10 +240,21 @@ func _unhandled_input(event: InputEvent) -> void:
 
 # --- drawing ---------------------------------------------------------------------------------------
 func _draw() -> void:
-	var top: float = 330.0
+	var top: float = _spark_top()
 	_draw_spark(_rtt_history, Rect2(14.0, top, PANEL_WIDTH, 46.0), Color(0.45, 0.78, 1.0), "clock rtt ms")
 	_draw_spark(_error_history, Rect2(14.0, top + 58.0, PANEL_WIDTH, 46.0), Color(1.0, 0.72, 0.35),
-		"puck correction p50 mm")
+		"puck corrections mm (one spike each)")
+
+# Where the sparklines start: BELOW the readout, measured, never a constant.
+#
+# A fixed y is a guess about how tall the text is, and the text is not fixed -- the readout gains a line when a
+# serve is refused or a goal is scored, and its height also moves with the font size and the display scale. The
+# guess was wrong often enough to render the readout straight over the graphs. `get_minimum_size()` asks the
+# label how tall its current text actually is, which is the only number that cannot drift out of step with it.
+func _spark_top() -> float:
+	if _label == null:
+		return 330.0
+	return _label.position.y + _label.get_minimum_size().y + 22.0
 
 # A polyline in _draw rather than a Line2D node: identical output, and it keeps the whole HUD one Control
 # instead of a CanvasLayer with Node2D children whose coordinates would need keeping in step with it.

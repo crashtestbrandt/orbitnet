@@ -69,6 +69,17 @@ func percentile_mm(fraction: float) -> float:
 	var index: int = roundi(clampf(fraction, 0.0, 1.0) * float(sorted.size() - 1))
 	return sorted[index] * 1000.0
 
+## The most recent recorded correction, in millimetres. 0.0 before the first one.
+##
+## Separate from the percentiles because it is the only one of these figures with a TIME to it. A percentile
+## over a rolling window barely moves frame to frame, so plotting one produces a staircase pinned at whatever
+## the window maximum happens to be -- which says nothing about when corrections arrive or how they cluster.
+## Corrections are sparse and spiky, and this is what lets them be drawn that way.
+func last_error_mm() -> float:
+	if _errors.is_empty():
+		return 0.0
+	return _errors[_errors.size() - 1] * 1000.0
+
 ## The largest correction in the window, in millimetres.
 func peak_mm() -> float:
 	var peak: float = 0.0

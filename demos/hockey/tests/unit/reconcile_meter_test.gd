@@ -82,3 +82,23 @@ func test_reset_clears_the_record() -> void:
 	assert_eq(meter.sample_count(), 0, "session teardown empties the window")
 	assert_eq(meter.corrections(), 0, "and the counters")
 	assert_almost_eq(meter.note(5, Vector3.ZERO), -1.0, 0.0001, "and the ring, so tick 5 is new again")
+
+func test_the_latest_correction_is_readable_on_its_own() -> void:
+	# What the HUD draws as a spike. A percentile over a rolling window barely moves frame to frame, so it
+	# renders as a staircase pinned at the window maximum -- which says nothing about when corrections arrive.
+	var meter: ReconcileMeter = ReconcileMeter.new()
+	assert_almost_eq(meter.last_error_mm(), 0.0, 0.0001, "nothing recorded yet")
+	meter.note(1, Vector3.ZERO)
+	meter.note(1, Vector3(0.02, 0.0, 0.0))
+	assert_almost_eq(meter.last_error_mm(), 20.0, 0.01, "the most recent correction, in millimetres")
+	meter.note(2, Vector3.ZERO)
+	meter.note(2, Vector3(0.005, 0.0, 0.0))
+	assert_almost_eq(meter.last_error_mm(), 5.0, 0.01, "and it follows the newest one, not the largest")
+	assert_almost_eq(meter.peak_mm(), 20.0, 0.01, "while the peak still remembers the largest")
+
+func test_the_latest_correction_survives_a_reset() -> void:
+	var meter: ReconcileMeter = ReconcileMeter.new()
+	meter.note(1, Vector3.ZERO)
+	meter.note(1, Vector3(0.02, 0.0, 0.0))
+	meter.reset()
+	assert_almost_eq(meter.last_error_mm(), 0.0, 0.0001, "teardown leaves nothing to draw")

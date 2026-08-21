@@ -85,6 +85,12 @@ var _serve_pending: bool = false
 # the view reads it to tell an intended discontinuity from a correction, and a wrong answer costs one frame of
 # smoothing rather than a wrong puck.
 var _contacts: int = 0
+# The tick this puck last simulated, in WHICHEVER clock is driving it. Net.current_tick() is pinned at 0
+# OFFLINE, so a consumer that needs to know when a tick actually advanced -- the view, to tell a correction
+# from ordinary motion -- cannot ask the facade and asks here instead.
+var _sim_tick: int = -1
+# The tick after which a correction counts as DRIFT. See _measures().
+var _armed_after: int = -1
 
 func _init() -> void:
 	name = HockeyNames.PUCK_NODE
@@ -124,6 +130,7 @@ func request_serve() -> void:
 ## accumulator when there is no session.
 func advance(delta: float, tick: int, is_fresh: bool) -> void:
 	var live: bool = flags_live(net_flags)
+	var was_live: bool = live
 	var faceoff: int = flags_faceoff(net_flags)
 	var sequence: int = flags_sequence(net_flags)
 	var to_team: int = flags_to_team(net_flags)
@@ -167,11 +174,13 @@ func advance(delta: float, tick: int, is_fresh: bool) -> void:
 
 	net_flags = pack_flags(live, faceoff, sequence, to_team)
 	position = net_pos
+	_sim_tick = tick
 	# Measured on EVERY peer, including the server. A client's correction comes from an opponent's strike it
 	# could not know about; the server's comes from a client's input landing late enough that it had already
 	# simulated the tick without it. Same quantity, same cause -- somebody simulated a tick before the truth
 	# about it arrived.
-	_meter.note(tick, net_pos)
+	if _measures(tick, was_live, live):
+		_meter.note(tick, net_pos)
 
 func _rollback_tick(delta: float, tick: int, is_fresh: bool) -> void:
 	advance(delta, tick, is_fresh)
@@ -188,6 +197,10 @@ func is_live() -> bool:
 func faceoff_ticks() -> int:
 	return flags_faceoff(net_flags)
 
+## The tick this puck last simulated, under either clock. See `_sim_tick`.
+func sim_tick() -> int:
+	return _sim_tick
+
 ## Rail or mallet contacts in the most recent step. The view blends a correction and snaps a bounce, and this
 ## is what tells the two apart.
 func contacts() -> int:
@@ -198,6 +211,36 @@ func is_at_rest() -> bool:
 	return PuckPhysics.is_at_rest(net_vel)
 
 # --- internals -------------------------------------------------------------------------------------
+# Whether this tick's answer belongs in the correction distribution.
+#
+# The meter measures DRIFT: how far a PREDICTED puck moved away from the authoritative one while both were
+# simulating the same live puck. Two things are not drift, and both were large enough to be the entire number
+# before they were excluded:
+#
+#   THE JOIN SYNC. A client builds its own puck and predicts it forward before any authoritative row has
+#   arrived. The first row rewinds it onto a puck that was somewhere else entirely -- a third of a metre is
+#   typical, and it is a state TRANSFER rather than a mispredicted simulation. It happens exactly once per
+#   session, but a percentile window holds it for the rest of the run: measured on an otherwise untouched
+#   puck, it was the only sample ever recorded, so p50, p99 and peak all reported that one join.
+#
+#   A FACE-OFF. The puck is teleported to the centre spot, so a peer that placed the goal one tick differently
+#   differs by half a table. That is real, and it is a different quantity from drift -- reported through the
+#   score, which is what a player actually reads it from.
+#
+# A server (and offline) is armed immediately: it has no join to sync and its corrections come from a client's
+# input landing after it had already simulated the tick, which is drift.
+func _measures(tick: int, was_live: bool, still_live: bool) -> bool:
+	if not was_live or not still_live:
+		return false
+	if Net.is_offline() or Net.is_server():
+		return true
+	if _armed_after < 0:
+		var known: int = -1 if _handle == null else _handle.get_last_known_state()
+		if known <= 0:
+			return false
+		_armed_after = known
+	return tick > _armed_after
+
 # Consume a pending serve request, ONCE, in a way a resim reproduces.
 #
 # The request is written outside the tick by a command handler, so the flag is gone by the time anything

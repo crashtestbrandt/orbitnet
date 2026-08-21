@@ -85,19 +85,30 @@ const SERVE_SPREAD_RAD: float = 0.5
 
 # --- presentation ------------------------------------------------------------------------------------
 ## Degrees the rink is tilted about its x axis so a fixed camera sees the whole surface in perspective.
-const TABLE_TILT_DEGREES: float = 34.0
+const TABLE_TILT_DEGREES: float = 40.0
 ## Camera pitch and field of view the framing is solved for.
-const CAMERA_PITCH_DEGREES: float = -18.0
-const CAMERA_FOV_DEGREES: float = 44.0
+const CAMERA_PITCH_DEGREES: float = -22.0
+const CAMERA_FOV_DEGREES: float = 22.0
 ## Fraction of the frustum left empty around the table. 0.12 keeps the rails clear of the window edge at every
 ## aspect the framing solve is asked about.
-const FRAMING_MARGIN: float = 0.12
+const FRAMING_MARGIN: float = 0.10
 
 ## Distance at which a teammate's mallet starts fading, and the alpha it never drops below. Mallets do not
 ## collide with each other, so two teammates can overlap; fading the other one keeps your own readable without
 ## ever hiding where a team-mate actually is.
 const FADE_START: float = 0.22
 const FADE_FLOOR: float = 0.12
+
+## Metres of disagreement below which a correction is not a correction.
+##
+## The view detects a correction by extrapolating the previous pose forward and comparing, and that
+## extrapolation is a straight line while the simulation damps and substeps -- so EVERY tick disagrees by a
+## little, correction or not. Without a deadband the blended counter climbs once per tick forever, including
+## offline where nothing is being corrected at all.
+##
+## Sized at the wire's own resolution: `net_pos` rides as binary16, whose spacing at this table's scale is
+## about a millimetre, so a disagreement below that is not distinguishable from quantization anyway.
+const CORRECTION_DEADBAND_M: float = 0.0012
 
 ## Metres of correction above which the puck's render position SNAPS instead of blending. Below it the view
 ## absorbs the correction over CORRECTION_HALF_LIFE seconds and the player never sees a jump.
