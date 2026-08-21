@@ -1,25 +1,33 @@
 //! Interest-pass cost measurement — the decision harness for adopting the grid.
 //!
-//! The epic owns one question this file exists to answer with a number rather than an opinion:
-//! **is adopting [`InterestGrid`] actually faster than the linear scan it replaces, at the entity
-//! counts a real session runs?** Wiring in tested code is only worth doing if it is faster; otherwise it
-//! is a refactor wearing an optimisation's clothes.
+//! This file exists to answer one question with a number rather than an opinion: **is adopting
+//! [`InterestGrid`] actually faster than the linear scan it replaces, at the entity counts a real
+//! session runs?** Both core paths compute the same sets and report the same leaves, so wiring the
+//! grid in is only worth doing if it is faster; otherwise it is a refactor wearing an
+//! optimisation's clothes.
 //!
-//! Three variants are timed over the same synthetic session:
+//! Four variants are timed over the same synthetic session:
 //!
 //! * `legacy` — the shape `orbit_net.rs` shipped first: per peer, a nested scan to find
 //!   that peer's anchor body, then a linear distance pass over every entity, membership in a
 //!   `HashSet`. O(P·N) with an O(N) inner lookup.
 //! * `prepass` — one pass over the entities per tick builds the `peer → anchor` map, then the same
 //!   linear distance pass per peer. This isolates the *restructure* from the *grid*.
-//! * `grid` — the prepass plus [`InterestGrid`] / [`PeerInterest`], cell size derived from the
-//!   radius.
+//! * `scan` — the shipped core call, [`PeerInterest::update_linear_into`], over the same prepass.
+//! * `grid` — the prepass plus [`InterestGrid`] and [`PeerInterest::update_grid_into`], cell size
+//!   derived from the radius.
+//!
+//! `scan` against `grid` is the comparison the decision rests on; `legacy` and `prepass` are kept
+//! because they are what the restructure was measured against.
+//!
+//! Three sweeps: by session scale, by arena extent, and by world count. The decision and both
+//! result tables live in `interest.rs`'s module header, next to the code they govern.
 //!
 //! What this harness deliberately does NOT measure is the half that dominates in the real backend:
 //! `legacy` calls `input_owner_peer()` — a Godot `get_multiplayer_authority()` round trip — once
-//! per entity *per peer*, while `prepass`/`grid` call it once per entity per tick. That is a P-fold
-//! reduction in engine calls no pure-Rust bench can show, and it is why the prepass is worth doing
-//! regardless of how the grid measures.
+//! per entity *per peer*, while every other variant calls it once per entity per tick. That is a
+//! P-fold reduction in engine calls no pure-Rust bench can show, and it is why the prepass is worth
+//! doing regardless of how the grid measures.
 //!
 //! Ignored by default so `cargo test` stays fast; run it with:
 //!
