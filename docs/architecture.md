@@ -92,9 +92,11 @@ entities do not flicker. Sends run through a flat scan over the tick's candidate
 A uniform grid in `core::interest` — rebuilt each tick from the position column already in native memory, zero
 Godot calls — is implemented, tested, and applies the same rules as the scan: the same hysteresis, the same
 cap and tie-breaks, the same leave list, the same always-set, and one set of cells per world. It is not driving
-sends because it is **slower** at the arena extents and world counts a session runs at; it starts to pay past
-about ±1200 m of occupancy with a small set per peer. The measured tables and the decision are in that module's
-header, and `net.perf`'s `interest_ms` is the live number that would reopen it.
+sends because it is **slower** at the arena extents a session runs at. It overtakes the scan between ±300 m and
+±600 m of occupancy and is about twice as fast past ±1200 m; the shipped arenas are ±74 m. A high world count
+looks like a grid win and is not — what the grid saves there is the per-peer candidate rebuild, which can be
+dropped without a grid. The measured tables and the decision are in that module's header, and `net.perf`'s
+`interest_ms` is the live number that would reopen it.
 
 **Membership is the second axis.** A radius cannot separate several independent worlds inside one session, each
 rebased near its own coordinate origin: two entities at the same coordinates in different worlds are zero

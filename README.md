@@ -130,8 +130,11 @@ Known and filed, not hidden:
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
 - **`@half` silently no-ops on invalid pairings** instead of warning.
 - **The retained interest grid is unused.** It now matches the linear path rule for rule — leaves, always-set,
-  worlds — but it measures slower at every arena size and world count a session runs at today, so the linear
-  scan is what ships. The measured tables are in `interest.rs`'s header.
+  worlds — but it measures slower at the arena sizes a session runs at today, so the linear scan is what ships.
+  It overtakes the scan past about ±600 m of occupancy. The measured tables are in `interest.rs`'s header.
+- **The candidate list is rebuilt per peer.** One row varies by peer — that peer's own body — and the whole
+  list is rebuilt for it, which is O(peers × entities) per tick before the filter runs. Measured at 2.4× the
+  filter's own cost in a 32-world session.
 - **No reconnection and no packet authentication.** A dropped client loses its entity, and the wire carries
   nothing beyond a per-entity authority check.
 
