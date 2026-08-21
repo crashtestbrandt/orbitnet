@@ -99,9 +99,12 @@ jobs:
     permissions:
       contents: write   # the only place in this repo that needs it: commit binaries + create a release
     steps:
+      # THE TAG, not main. This job assembles the zip from the working tree, and the binaries it downloads
+      # were built from the tag's sources -- so checking out main shipped a zip pairing the tag's backend
+      # with whatever GDScript main had drifted to. The manifest commit below re-targets main explicitly
+      # rather than relying on this checkout.
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
@@ -147,18 +150,52 @@ jobs:
                 addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
           unzip -l "build/orbitnet-${version}.zip" | tail -3
 
-      - name: Commit the refreshed binaries
+      # THE DIGEST, NOT THE BINARY. What lands on main is a manifest naming each published asset and its
+      # sha256, plus the version this tag stamped into plugin.cfg. A consumer pins the tag and verifies the
+      # bytes it fetched against a digest that lives in the commit graph, which a checksum file published
+      # beside the asset cannot do -- that verifies transport, not tamper.
+      #
+      # The manifest is written AFTER the assets are built, so a tag commit cannot contain its own digest;
+      # main gets it one commit later. Harmless, because CI builds rather than fetches.
+      - name: Write the binaries manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          {
+            printf '{\n  "tag": "%s",\n  "binaries": {\n' "$tag"
+            first=1
+            for f in addons/orbitnet_native/bin/*; do
+              name="$(basename "$f")"
+              [ "$first" -eq 1 ] || printf ',\n'
+              first=0
+              printf '    "%s": { "size": %s, "sha256": "%s" }' \
+                "$name" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            printf '\n  }\n}\n'
+          } > addons/orbitnet_native/binaries.json
+          cat addons/orbitnet_native/binaries.json
+
+      - name: Commit the manifest to main
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add addons/orbitnet_native/bin addons/orbitnet/plugin.cfg
+          # This checkout is the TAG and detached, so the manifest is replayed onto main rather than
+          # pushed from here -- pushing a detached HEAD to main would move main to the tag.
+          manifest="$(cat addons/orbitnet_native/binaries.json)"
+          plugin="$(cat addons/orbitnet/plugin.cfg)"
+          git fetch origin main
+          git checkout -B release-manifest origin/main
+          printf '%s' "$manifest" > addons/orbitnet_native/binaries.json
+          printf '%s' "$plugin"   > addons/orbitnet/plugin.cfg
+          git add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
           if git diff --cached --quiet; then
-            echo "binaries unchanged; nothing to commit"
+            echo "manifest unchanged; nothing to commit"
             exit 0
           fi
-          git commit -m "release: extension binaries and plugin version for ${GITHUB_REF_NAME}"
+          git commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
           git push origin HEAD:main
 
       - name: Publish the release

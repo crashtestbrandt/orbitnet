@@ -46,6 +46,12 @@ jobs:
       - name: Facade boundary (net-check)
         run: tools/net-check.sh
 
+      # A descriptor entry naming a library nothing builds fails at dlopen on that platform and nowhere
+      # else, so every Linux gate stays green while a Windows checkout is broken. This compares the two
+      # lists instead of testing for files CI cannot see.
+      - name: Descriptor / build-matrix parity
+        run: tools/check-descriptor-parity.sh
+
   native:
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +74,14 @@ jobs:
     needs: [gates, native]
     steps:
       - uses: actions/checkout@v4
+
+      # This job builds the cdylib it loads, so it needs the toolchain. The cache is shared with the
+      # `native` job above by using the same workspace key, so the second build is warm.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: godot-gate
 
       - name: Cache the Godot binary
         id: godot-cache
@@ -92,12 +106,31 @@ jobs:
 
       # The addon must be mirrored into each project before anything can load. Doing it here rather than
       # committing the copies is what keeps one canonical source in the tree.
+
+      # THE GATE BUILDS THE LIBRARY IT LOADS. It used to load whatever binary happened to be committed,
+      # which is how a stale one went unnoticed for three `native/**` commits: the Rust changed, the blob did
+      # not, and every run was green against the old code. Building here means the GDScript under test and
+      # the backend under test come from the same commit, always.
+      #
+      # `template-debug` rather than `release`, because that is the profile Godot selects for a project run
+      # from source -- which is every step below. It inherits `release` (same opt-level, LTO and strip), and
+      # differs only by carrying `debug-assertions` and `overflow-checks`. Without this the workspace's
+      # `debug_assert!`s are compiled out of every binary the gate has ever loaded.
+      #
+      # Release builds stay proven by binaries.yml, which compiles all three platforms on every `native/**`
+      # push. This job is Linux-only and cannot speak for the other two.
+      - name: Build this commit's own cdylib
+        run: |
+          set -euo pipefail
+          cd native && cargo build --profile template-debug -p orbitnet-godot
+          cd "$GITHUB_WORKSPACE"
+          install -m 0755 native/target/template-debug/liborbitnet.so \
+            addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so
+
+      # After the build, so every project mirrors the freshly built bin/ rather than a stale copy.
       - name: Sync the addon into every project
         run: tools/sync-addons.sh
 
-      # The committed binary is a plain git blob, so a fresh checkout already has a working extension --
-      # nothing to fetch, nothing to build. That is the whole point of the no-LFS policy: if this step were
-      # needed, an AssetLib user would need it too, and they have no way to run it.
       - name: Confirm the extension binary is real (not a pointer, not empty)
         run: |
           set -euo pipefail
@@ -121,9 +154,9 @@ jobs:
           godot --headless --path harness --script tests/support/run_unit_tests.gd
           godot --headless --path demos/rts --script tests/support/run_unit_tests.gd
 
-      # --skip-build with no local cargo output falls back to the COMMITTED binary, which is what an
-      # Asset Library user receives. That is the version worth smoke-testing here.
-      - name: Extension load smoke (throwaway project, committed binary)
+      # --skip-build because the build already happened above; the smoke loads what that step installed
+      # rather than compiling a second copy.
+      - name: Extension load smoke (throwaway project)
         run: tools/orbitnet-smoke.sh --skip-build
 
       - name: Two-peer RTS probe
