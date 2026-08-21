@@ -36,55 +36,84 @@ environment for no benefit here.
 | | |
 |---|---|
 | `just native-test` | `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace`. No Godot. |
-| `just native-build` | The release cdylib. |
-| `just native-smoke` | Loads the extension in a **throwaway** project and asserts the Rust classes register, exported properties round-trip, signals reach GDScript, ticks advance, and freeing a registered entity does not panic the frame. With no local build it falls back to the *committed* binary — which is what an AssetLib user actually receives, and therefore the more meaningful thing to test. |
-| `just native-install` | Build, install this host's binary into `addons/orbitnet_native/bin/`, and re-sync it into every project. |
+| `just native-build` | Both descriptor profiles for this host, into `addons/orbitnet_native/bin/`. |
+| `just native-smoke` | Loads the extension in a **throwaway** project and asserts the Rust classes register, exported properties round-trip, signals reach GDScript, ticks advance, and freeing a registered entity does not panic the frame. It checks every name the descriptor resolves, so a profile that failed to stage fails here rather than one export later. |
+| `just native-install` | `native-build` plus a re-sync into every project. A fresh clone has no binary until this runs. |
 | `just native-check` | All of the above, in the order CI runs them. |
 
-**Always the release profile.** Godot selects the `template_debug` entry whenever a project runs *from
-source* — every dev run, every probe, every CI job. A cargo *debug* build there would be 10–50× slower and
-would poison every performance number taken from a dev run, so both descriptor entries point at one release
-artifact.
+## Profiles
 
-Two profile settings are load-bearing:
+**Never the cargo debug profile.** Godot selects the `template_debug` entry whenever a project runs *from
+source* — every dev run, every probe, every CI job — and a cargo *debug* build there would be 10–50× slower
+and would poison every performance number taken from a dev run. All three profiles below inherit
+`[profile.release]`.
 
-- **`strip = "debuginfo"`.** An unstripped gdext cdylib is 30–80 MB; stripped it is 2–5 MB. That ratio is
-  what makes committing the binaries to plain git viable at all.
+| Profile | Cargo | Who loads it | Measured (Linux) |
+|---|---|---|---|
+| `template_debug` | `--profile template-debug` | a project run from source | 4.41 MB |
+| `template_release` | `--release` | an exported game | 3.99 MB |
+| `profiling` | `--profile profiling` | a developer, by hand | 15.0 MB |
+
+**`template_debug` adds `debug-assertions` and `overflow-checks`, and nothing else.** That is what makes
+`debug_assert!` reachable at all. With the codec's declared-size check deliberately falsified, `--release`
+passes 189/189 silently and this profile fails 2 of them; that check is the encoder agreeing with itself
+about how many bytes it wrote, and disagreement there corrupts a delta chain.
+
+**`profiling` retains debug information** (`debug = 1`, `strip = "none"`) so a native profiler can attribute
+frames to Rust functions and source lines. It is published as a release asset and is deliberately not a
+descriptor entry — shipping it would put 11 MB of debug information nobody loads into every export.
+
+Two settings on `[profile.release]` are load-bearing, and every profile inherits them:
+
+- **`strip = "debuginfo"`.** An unstripped gdext cdylib is 30–80 MB; stripped it is 2–5 MB.
 - **`panic = "abort"` is deliberately NOT set.** gdext converts a panic at the `#[func]` boundary into a
   Godot error. Aborting would turn a recoverable bug into a hard process kill that takes the editor with it.
 
+**`tools/build-native.sh` is the only place that maps a platform and a profile onto a filename.** Both build
+workflows, the load smoke, the PR gate and `just native-install` ask it rather than spelling names out, and
+`tools/check-descriptor-parity.sh` fails the PR when the descriptor and that script disagree.
+
 ## The binary distribution policy
 
-**The committed binaries are plain git blobs. Git LFS is not an option here**, for two independent and
-individually fatal reasons:
+**No binary is committed to this repository.** `addons/orbitnet_native/bin/` is gitignored and empty in a
+fresh clone. Three ways to fill it:
+
+| Path | Who uses it |
+|---|---|
+| `just native-install` | a contributor, and every CI job before it loads anything |
+| the release zip `orbitnet-<version>.zip` | an Asset Library or manual install |
+| the loose release assets, pinned to a tag | a consuming project that fetches at setup |
+
+**What the repository commits instead is a digest.** `release.yml` writes
+`addons/orbitnet_native/binaries.json` — the size and sha256 of every asset it published — and commits that
+to `main`. A consumer verifies a download against something in the commit graph, which a checksum file
+published beside the asset cannot do: that verifies transport, not tamper.
+
+**Git LFS is not an option for the shipped artifact either way**, for two independent and individually fatal
+reasons:
 
 1. **The Asset Library installs from a repository tarball.** LFS content arrives in a tarball as *pointer
    files* — a few hundred bytes of text. `dlopen` then fails with "invalid ELF header" behind a confusing
-   parse cascade, and the user has no way to distinguish that from a broken build. An addon distributed
-   through AssetLib cannot use LFS for the thing it ships.
+   parse cascade, and the user has no way to distinguish that from a broken build.
 2. **GitHub's free LFS allowance is account-wide**, not per-repository: 1 GiB of storage and 1 GiB per month
    of bandwidth. A public addon's download volume is unbounded by construction, and when the quota is
    exhausted the smudge filter silently leaves pointer files — producing failure mode 1 for everyone.
 
-The cost is history growth, and it is managed by *when* binaries are committed:
-
-| Workflow | Trigger | What it does with binaries |
+| Workflow | Trigger | What it does |
 |---|---|---|
-| `check.yml` | every PR and push | Verifies the committed Linux binary is a real ELF object, not a pointer. Builds nothing. |
-| `binaries.yml` | push to main touching `native/**` | Builds all three platforms, uploads them as **artifacts**. Commits nothing. |
-| `release.yml` | a `v*` tag | Builds all three, **commits** them, builds the AssetLib zip, publishes a Release. |
+| `check.yml` | every PR and push | Builds both descriptor profiles for Linux, confirms each is a real ELF object, and runs every gate against them. |
+| `binaries.yml` | push to main touching `native/**` | Builds both descriptor profiles on all three platforms, uploads them as **artifacts**. |
+| `release.yml` | a `v*` tag | Builds all three profiles on all three platforms, publishes the binaries and the AssetLib zip as Release assets, and commits the manifest. |
 
-So main is always *proven* to build on every platform, while history only grows when a version is actually
-cut. `binaries.yml` existing is what makes committing-only-on-tags safe.
+So main is always *proven* to build on every platform, and history carries digests rather than bytes.
 
-**One file per platform**, with both `.gdextension` entries pointing at it. The two entries were already
-byte-identical — both are cargo release builds — so two names for one artifact only doubled the git weight.
+**Two builds per platform, and they are not the same bytes.** `template_debug` and `template_release` differ
+by their checks, which is the whole reason the descriptor names both.
 
-**macOS is built universal.** `binaries.yml` and `release.yml` build both `x86_64-apple-darwin` and
-`aarch64-apple-darwin` and `lipo` them together. A single-arch dylib works on the machine that built it and
-fails on the other half of the Mac install base — a bug that only ever arrives as an unreproducible report.
-`just native-install` on a Mac produces a **host-arch** binary under the universal filename, which is correct
-for local development and must not be committed.
+**macOS is built universal.** Every profile builds both `x86_64-apple-darwin` and `aarch64-apple-darwin` and
+`lipo`s them together, including a local `just native-install`. A single-arch dylib works on the machine that
+built it and fails on the other half of the Mac install base — a bug that only ever arrives as an
+unreproducible report.
 
 ## CI runs on GitHub-hosted runners
 
@@ -100,10 +129,13 @@ mirror into a project that *does* nest `native/` inside the addon idempotent.
 
 ## Adding a platform
 
-1. Add a `[libraries]` entry to `addons/orbitnet_native/orbitnet.gdextension` (both `debug` and `release`
-   pointing at one file, per the policy above).
-2. Add a matrix entry to `.github/workflows/binaries.yml` and `.github/workflows/release.yml`.
-3. Add a `cp` arm to `just native-install` if a developer can build it locally.
+1. Add a platform case to `tools/build-native.sh` — the cargo output filename and the two halves of the
+   shipped name around the profile.
+2. Add `[libraries]` entries to `addons/orbitnet_native/orbitnet.gdextension`, one per descriptor profile.
+3. Add a matrix leg to `.github/workflows/binaries.yml` and `.github/workflows/release.yml`, and add the
+   platform to `PLATFORMS` in `tools/check-descriptor-parity.sh`.
+
+That gate fails the PR if any of the three disagree, so a half-added platform cannot reach a tag.
 
 The Rust itself is architecture-agnostic; `linux.arm64` is absent only because nothing builds it yet. There
 are no web entries because Godot's web export cannot load a GDExtension at all.

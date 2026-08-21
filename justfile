@@ -78,7 +78,8 @@ check: addon-tracked addon-drift net-check native-test lint test rts-probe
 #
 # Sources in native/ -- a cargo workspace at the REPO ROOT, deliberately outside the shipped addon, so the
 # AssetLib payload is exactly the two addons/ directories. The loaded binaries live in
-# addons/orbitnet_native/bin/ as plain git blobs (never LFS -- see the .gdextension header).
+# addons/orbitnet_native/bin/, which is GITIGNORED: no binary is committed to this repository. A fresh
+# clone has none until `just native-install` builds them. See the .gdextension header.
 # =====================================================================================================
 
 # Pure-Rust gates: fmt, clippy as errors, and the orbitnet-core suites. No Godot involved.
@@ -87,11 +88,12 @@ native-test:
     cd native && cargo clippy --workspace --all-targets -- -D warnings
     cd native && cargo test --workspace
 
-# Always the RELEASE profile. Godot picks the .gdextension's template_debug entry when a project runs from
-# source, which is every dev run and every CI probe -- so a cargo debug build there would be 10-50x slower
-# and would poison every measurement taken from a dev run. Both entries point at this one artifact.
+# Both descriptor profiles, into addons/orbitnet_native/bin/ under the shipped names. `template_debug` is
+# what Godot loads when a project runs from source (every dev run, every CI probe) and is the only build
+# carrying `debug-assertions`; `template_release` is what an exported game loads. Neither is the 10-50x
+# slower cargo debug build -- both inherit `[profile.release]`. tools/build-native.sh owns the naming.
 native-build:
-    cd native && cargo build --release -p orbitnet-godot
+    tools/build-native.sh build "$(tools/build-native.sh host)" addons/orbitnet_native/bin
 
 # Load the freshly built extension in a throwaway project and assert the Rust classes register, exported
 # properties round-trip, signals reach GDScript, ticks advance, and freeing a registered entity does not
@@ -99,31 +101,11 @@ native-build:
 native-smoke:
     GODOT="{{godot}}" tools/orbitnet-smoke.sh
 
-# Build and install THIS host's binary into addons/orbitnet_native/bin/, then re-sync it into the projects.
-# Host-detected, so it works wherever a developer runs from source. ONE file per platform: both
-# .gdextension entries point at it.
+# native-build plus a re-sync into every project. Nothing here is committed -- bin/ is gitignored, so this
+# is how a fresh clone gets a backend at all.
 native-install: native-build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    case "$(uname -s)" in
-      Linux)
-        cp native/target/release/liborbitnet.so addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so
-        ;;
-      Darwin)
-        # A local cargo build is HOST-arch only. That is fine for the machine it was built on; the
-        # genuinely universal arm64+x86_64 lipo binary comes from release.yml.
-        cp native/target/release/liborbitnet.dylib addons/orbitnet_native/bin/liborbitnet.macos.universal.dylib
-        ;;
-      MINGW*|MSYS*|CYGWIN*|Windows_NT)
-        cp native/target/release/orbitnet.dll addons/orbitnet_native/bin/orbitnet.windows.x86_64.dll
-        ;;
-      *)
-        echo "native-install: unsupported host '$(uname -s)' -- copy from native/target/release/ by hand" >&2
-        exit 1
-        ;;
-    esac
     tools/sync-addons.sh
-    echo "orbitnet: installed the release cdylib and re-synced every project"
+    echo "orbitnet: built both descriptor profiles and re-synced every project"
 
 # native-test + native-build + native-smoke, in the order CI runs them.
 native-check: native-test native-build native-smoke

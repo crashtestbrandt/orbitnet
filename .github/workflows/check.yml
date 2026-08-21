@@ -112,20 +112,15 @@ jobs:
       # not, and every run was green against the old code. Building here means the GDScript under test and
       # the backend under test come from the same commit, always.
       #
-      # `template-debug` rather than `release`, because that is the profile Godot selects for a project run
-      # from source -- which is every step below. It inherits `release` (same opt-level, LTO and strip), and
-      # differs only by carrying `debug-assertions` and `overflow-checks`. Without this the workspace's
-      # `debug_assert!`s are compiled out of every binary the gate has ever loaded.
-      #
-      # Release builds stay proven by binaries.yml, which compiles all three platforms on every `native/**`
-      # push. This job is Linux-only and cannot speak for the other two.
+      # BOTH descriptor profiles. Every step below runs a project from source, so Godot loads the
+      # `template_debug` entry -- and that profile is the only one carrying `debug-assertions` and
+      # `overflow-checks`, without which the workspace's `debug_assert!`s are compiled out of every
+      # binary the gate has ever loaded. `template_release` is built here too because nothing else in a
+      # PR compiles it: `cargo test` and `clippy --all-targets` both use the dev profile, so an LTO or
+      # codegen failure in the shipping profile would surface at tag time. binaries.yml proves the other
+      # two platforms; this job is Linux-only and cannot speak for them.
       - name: Build this commit's own cdylib
-        run: |
-          set -euo pipefail
-          cd native && cargo build --profile template-debug -p orbitnet-godot
-          cd "$GITHUB_WORKSPACE"
-          install -m 0755 native/target/template-debug/liborbitnet.so \
-            addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so
+        run: tools/build-native.sh build linux addons/orbitnet_native/bin
 
       # After the build, so every project mirrors the freshly built bin/ rather than a stale copy.
       - name: Sync the addon into every project
@@ -134,15 +129,19 @@ jobs:
       - name: Confirm the extension binary is real (not a pointer, not empty)
         run: |
           set -euo pipefail
-          lib=addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so
-          test -s "$lib" || { echo "::error::$lib is missing or empty"; exit 1; }
-          if head -c 64 "$lib" | grep -q 'git-lfs.github.com'; then
-            echo "::error::$lib is a Git LFS POINTER, not a library. See the .gdextension header."
-            exit 1
-          fi
-          magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
-          test "$magic" = "7f454c46" || { echo "::error::$lib is not an ELF object (magic=$magic)"; exit 1; }
-          ls -l "$lib"
+          # Every name this platform's descriptor entries resolve to, asked of the script that owns the
+          # mapping. A `for` over the directory would pass vacuously if the build staged nothing.
+          for name in $(tools/build-native.sh names linux); do
+            lib="addons/orbitnet_native/bin/$name"
+            test -s "$lib" || { echo "::error::$lib is missing or empty"; exit 1; }
+            if head -c 64 "$lib" | grep -q 'git-lfs.github.com'; then
+              echo "::error::$lib is a Git LFS POINTER, not a library. See the .gdextension header."
+              exit 1
+            fi
+            magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
+            test "$magic" = "7f454c46" || { echo "::error::$lib is not an ELF object (magic=$magic)"; exit 1; }
+            ls -l "$lib"
+          done
 
       - name: Lint (headless project load, warnings-as-errors)
         run: |

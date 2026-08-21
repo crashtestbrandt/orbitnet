@@ -1,21 +1,21 @@
 name: binaries
 
 # Build the extension for all three platforms whenever the Rust changes, and upload the results as
-# workflow ARTIFACTS. It does NOT commit anything.
+# workflow ARTIFACTS. It commits nothing.
 #
-# That is the deliberate half of the no-LFS trade-off. Committing a ~4 MB binary per platform on every push
-# to main would grow history by tens of megabytes a month for changes nobody downloads. Committing them only
-# on release tags (release.yml) keeps the repository small, and this workflow is what makes that safe: main
-# is always PROVEN to build on every platform, even though only tags refresh the committed artifacts.
+# NO BINARY IS COMMITTED TO THIS REPOSITORY at all -- not on a push, not on a tag. `release.yml` commits
+# a sha256 MANIFEST and attaches the bytes to the GitHub Release. This workflow is what keeps that safe:
+# main is always PROVEN to build on every platform, even though nothing in the tree carries the result.
 #
-# So: a contributor's `native/**` change is verified everywhere immediately, and the committed binaries are
-# refreshed when a version is actually cut.
+# Both descriptor profiles per platform, because they are different builds and only one of them is what a
+# project running from source loads. See tools/build-native.sh.
 
 on:
   push:
     branches: [main]
     paths:
       - 'native/**'
+      - 'tools/build-native.sh'
       - '.github/workflows/binaries.yml'
   workflow_dispatch:
 
@@ -28,22 +28,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: linux
-            # Pushes to main and workflow_dispatch both require write access to this repository, unlike
-            # check.yml's pull_request gate -- see that file's header for why THAT one must stay
-            # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
-            # here.
+          # `platform` is what tools/build-native.sh is called with, and what
+          # tools/check-descriptor-parity.sh looks for to prove every platform the script knows has a leg
+          # that runs it.
+          #
+          # Pushes to main and workflow_dispatch both require write access to this repository, unlike
+          # check.yml's pull_request gate -- see that file's header for why THAT one must stay
+          # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
+          # here.
+          - platform: linux
             runner: [self-hosted, Linux, X64, legion]
-            artifact: liborbitnet.linux.x86_64.so
-            built: native/target/release/liborbitnet.so
-          - os: windows
+          - platform: windows
             runner: [self-hosted, Windows, X64, legion-win]
-            artifact: orbitnet.windows.x86_64.dll
-            built: native/target/release/orbitnet.dll
-          - os: macos
+          - platform: macos
             runner: [self-hosted, macOS, ARM64, legion-mac]
-            artifact: liborbitnet.macos.universal.dylib
-            built: native/target/release/liborbitnet.dylib
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -51,47 +49,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
-          key: ${{ matrix.os }}
+          key: ${{ matrix.platform }}
 
-      # macOS builds BOTH architectures and lipos them together. A single-arch dylib works on the machine
-      # that built it and fails on the other half of the Mac install base, which is the kind of bug that
-      # only shows up in a bug report from a user you cannot reproduce. legion-mac is ARM64, but that is
-      # only the HOST -- both targets are cross-built and combined regardless of which arch the runner is.
-      - name: Build (macOS universal)
-        if: matrix.os == 'macos'
+      # One script for both workflows and all three platforms. macOS cross-builds both architectures and
+      # lipos them per profile; legion-mac is ARM64, but that is only the HOST.
+      - name: Build both descriptor profiles
         shell: bash
-        run: |
-          set -euo pipefail
-          # `cd native` FIRST. native/rust-toolchain.toml pins the toolchain cargo uses in that directory,
-          # while the repository root has no override and resolves to whatever rustup's default is. Running
-          # `rustup target add` from the root installs the std libraries onto the DEFAULT toolchain, which the
-          # pinned one cannot see, and the cross build then fails with "can't find crate for `std`" for
-          # x86_64-apple-darwin on an arm64 runner.
-          cd native
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release -p orbitnet-godot --target x86_64-apple-darwin
-          cargo build --release -p orbitnet-godot --target aarch64-apple-darwin
-          mkdir -p target/release
-          lipo -create -output target/release/liborbitnet.dylib \
-            target/x86_64-apple-darwin/release/liborbitnet.dylib \
-            target/aarch64-apple-darwin/release/liborbitnet.dylib
-          lipo -info target/release/liborbitnet.dylib
-
-      - name: Build
-        if: matrix.os != 'macos'
-        shell: bash
-        run: cd native && cargo build --release -p orbitnet-godot
-
-      - name: Stage under the shipped filename
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p staged
-          cp "${{ matrix.built }}" "staged/${{ matrix.artifact }}"
-          ls -l staged
+        run: tools/build-native.sh build ${{ matrix.platform }} staged
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: staged/${{ matrix.artifact }}
+          name: orbitnet-${{ matrix.platform }}
+          path: staged/
           retention-days: 30

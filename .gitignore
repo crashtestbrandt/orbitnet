@@ -16,6 +16,12 @@ export_presets.cfg.bak
 native/target/
 **/*.rs.bk
 
+# --- the compiled extension ------------------------------------------------------------------------
+# NO BINARY IS COMMITTED TO THIS REPOSITORY. `just native-install` builds this host's copy here, CI
+# builds its own, and a release publishes all three platforms as assets plus a sha256 manifest
+# (addons/orbitnet_native/binaries.json) that IS committed. See the .gdextension header.
+addons/orbitnet_native/bin/
+
 # --- build outputs ---------------------------------------------------------------------------------
 build/
 dist/
