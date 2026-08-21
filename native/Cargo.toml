@@ -30,3 +30,25 @@ strip = "debuginfo"
 inherits = "release"
 debug = 1
 strip = "none"
+
+# The build Godot loads whenever a project runs FROM SOURCE -- every CI probe, every two-peer probe,
+# every editor run. It inherits `release`, so it is NOT the 10-50x slower cargo debug build: the
+# optimizer settings, the strip and the debug level are all unchanged, and ONLY the checks differ.
+#
+# `debug-assertions` is what makes `debug_assert!` reachable at all. Measured: with the codec's
+# declared-size check deliberately falsified, `--release` passes 189/189 silently and this profile
+# fails 2 of them. That check is the encoder agreeing with itself about how many bytes it wrote, and
+# disagreement there corrupts a delta chain.
+#
+# `overflow-checks` follows it. Cargo defaults it to the same value; it is stated rather than
+# inherited so a future edit to one is a deliberate edit to both. The one site that wraps by design
+# is FNV-1a, which already uses `wrapping_mul` explicitly.
+#
+# NOT symbolized, deliberately. `debug = 1` / `strip = "none"` here measured 16.6 MB against release's
+# 4.0 MB, and these binaries are plain git blobs rather than LFS (see the .gdextension header), so the
+# debuginfo would land in history on every tag. Stripped, the whole cost of the checks is ~0.4 MB.
+# Symbolized builds are what `[profile.profiling]` below is for.
+[profile.template-debug]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

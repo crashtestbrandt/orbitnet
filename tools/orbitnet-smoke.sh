@@ -12,49 +12,50 @@
 #
 # Usage: tools/orbitnet-smoke.sh [--skip-build]
 # Env:   GODOT (binary or wrapper to run; default: tools/godot-quiet.sh)
+#
+# Linux only: it reads ELF magic and asks `nm -D` for the entry symbol.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NATIVE="$ROOT/native"
+BIN="$ROOT/addons/orbitnet_native/bin"
 GODOT="${GODOT:-$ROOT/tools/godot-quiet.sh}"
 
 if [ "${1:-}" != "--skip-build" ]; then
-	printf 'orbitnet-smoke: building the extension (release)\n'
-	( cd "$NATIVE" && cargo build --release -p orbitnet-godot )
+	printf 'orbitnet-smoke: building both descriptor profiles\n'
+	"$ROOT/tools/build-native.sh" build linux "$BIN"
 fi
 
-LIB="$NATIVE/target/release/liborbitnet.so"
-if [ ! -s "$LIB" ]; then
-	# Fall back to the COMMITTED binary. This is not a convenience -- it is the more meaningful check in
-	# CI and on a fresh clone, because the committed blob is what an Asset Library user actually receives.
-	# If it is a Git LFS pointer, the wrong architecture, or truncated, this is where that surfaces, in a
-	# project with nothing else in it.
-	COMMITTED="$ROOT/addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so"
-	if [ -s "$COMMITTED" ]; then
-		printf 'orbitnet-smoke: no local build; testing the COMMITTED binary instead\n'
-		LIB="$COMMITTED"
-	else
-		printf 'orbitnet-smoke FAILED: neither %s nor %s exists. Run `just native-build`.\n' \
-			"$LIB" "$COMMITTED" >&2
-		exit 1
-	fi
-fi
-
-# A pointer file is a few hundred bytes of text that dlopen rejects with "invalid ELF header" behind a
-# confusing cascade. Name the real cause here rather than letting Godot guess at it.
-if head -c 64 "$LIB" | grep -q 'git-lfs.github.com' 2>/dev/null; then
-	printf 'orbitnet-smoke FAILED: %s is a Git LFS POINTER, not a library.\n' "$LIB" >&2
+# Every name this platform's descriptor entries resolve to. Checking the SET rather than one file is
+# what catches a profile that failed to stage: the throwaway project runs from source and loads only
+# `template_debug`, so a missing `template_release` would pass here and fail one export later.
+NAMES="$("$ROOT/tools/build-native.sh" names linux)"
+missing=""
+for name in $NAMES; do
+	[ -s "$BIN/$name" ] || missing="$missing $name"
+done
+if [ -n "$missing" ]; then
+	printf 'orbitnet-smoke FAILED: %s holds no library named:%s\n' "$BIN" "$missing" >&2
+	printf 'No binary is committed to this repository. Run `just native-install`.\n' >&2
 	exit 1
 fi
 
-# The entry symbol the .gdextension names. If this is absent the library will load and then do
-# nothing, which presents as "class not found" far from the real cause.
-if command -v nm >/dev/null 2>&1; then
-	if ! nm -D "$LIB" | grep -q 'gdext_rust_init'; then
-		printf 'orbitnet-smoke FAILED: %s exports no gdext_rust_init symbol.\n' "$LIB" >&2
+for name in $NAMES; do
+	lib="$BIN/$name"
+	# A pointer file is a few hundred bytes of text that dlopen rejects with "invalid ELF header" behind
+	# a confusing cascade. Name the real cause here rather than letting Godot guess at it.
+	if head -c 64 "$lib" | grep -q 'git-lfs.github.com' 2>/dev/null; then
+		printf 'orbitnet-smoke FAILED: %s is a Git LFS POINTER, not a library.\n' "$lib" >&2
 		exit 1
 	fi
-fi
+	# The entry symbol the .gdextension names. If this is absent the library will load and then do
+	# nothing, which presents as "class not found" far from the real cause.
+	if command -v nm >/dev/null 2>&1; then
+		if ! nm -D "$lib" | grep -q 'gdext_rust_init'; then
+			printf 'orbitnet-smoke FAILED: %s exports no gdext_rust_init symbol.\n' "$lib" >&2
+			exit 1
+		fi
+	fi
+done
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -62,8 +63,10 @@ BIN_DIR="$WORK/addons/orbitnet_native/bin"
 mkdir -p "$BIN_DIR"
 
 cp "$ROOT/addons/orbitnet_native/orbitnet.gdextension" "$WORK/addons/orbitnet_native/orbitnet.gdextension"
-# ONE file, both descriptor entries pointing at it -- exactly as the shipped .gdextension declares.
-cp "$LIB" "$BIN_DIR/liborbitnet.linux.x86_64.so"
+# The whole set, under the shipped names, so the descriptor copied beside it resolves verbatim.
+for name in $NAMES; do
+	cp "$BIN/$name" "$BIN_DIR/$name"
+done
 
 cat > "$WORK/project.godot" <<'PROJECT'
 config_version=5
@@ -130,9 +133,9 @@ func _initialize() -> void:
 
 func _on_before_tick(_delta: float, tick: int) -> void:
 	_ticks += 1
-	# current_tick() inside a handler must equal the tick being run. Game code stamps captured state
-	# with it (weapon_authority.gd does exactly this inside the rollback tick), and the backend being
-	# replaced guarantees the equality, so a divergence here would be an invisible off-by-one.
+	# current_tick() inside a handler must equal the tick being run. Consuming code stamps captured
+	# state with it from inside the rollback tick, so a divergence here would be an invisible
+	# off-by-one rather than a visible failure.
 	var seen: int = int(_net.call("current_tick"))
 	if seen != tick and _tick_mismatch == "":
 		_tick_mismatch = "current_tick()=%d but the signal says %d" % [seen, tick]

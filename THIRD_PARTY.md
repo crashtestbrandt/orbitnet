@@ -14,7 +14,8 @@ a real obligation, and it is on you rather than on OrbitNet.
 
 ## What ships in the compiled extension
 
-The binaries under `addons/orbitnet_native/bin/` are Rust cdylibs statically linked from the crates below.
+The libraries published with each release, and built into `addons/orbitnet_native/bin/` by
+`just native-install`, are Rust cdylibs statically linked from the crates below.
 Regenerate this list with `cargo tree` in `native/` after any dependency change.
 
 | Crate | Licence | Why it is here |

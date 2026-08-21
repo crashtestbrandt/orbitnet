@@ -46,6 +46,12 @@ jobs:
       - name: Facade boundary (net-check)
         run: tools/net-check.sh
 
+      # A descriptor entry naming a library nothing builds fails at dlopen on that platform and nowhere
+      # else, so every Linux gate stays green while a Windows checkout is broken. This compares the two
+      # lists instead of testing for files CI cannot see.
+      - name: Descriptor / build-matrix parity
+        run: tools/check-descriptor-parity.sh
+
   native:
     runs-on: ubuntu-latest
     steps:
@@ -68,6 +74,14 @@ jobs:
     needs: [gates, native]
     steps:
       - uses: actions/checkout@v4
+
+      # This job builds the cdylib it loads, so it needs the toolchain. The cache is shared with the
+      # `native` job above by using the same workspace key, so the second build is warm.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: godot-gate
 
       - name: Cache the Godot binary
         id: godot-cache
@@ -92,24 +106,42 @@ jobs:
 
       # The addon must be mirrored into each project before anything can load. Doing it here rather than
       # committing the copies is what keeps one canonical source in the tree.
+
+      # THE GATE BUILDS THE LIBRARY IT LOADS. It used to load whatever binary happened to be committed,
+      # which is how a stale one went unnoticed for three `native/**` commits: the Rust changed, the blob did
+      # not, and every run was green against the old code. Building here means the GDScript under test and
+      # the backend under test come from the same commit, always.
+      #
+      # BOTH descriptor profiles. Every step below runs a project from source, so Godot loads the
+      # `template_debug` entry -- and that profile is the only one carrying `debug-assertions` and
+      # `overflow-checks`, without which the workspace's `debug_assert!`s are compiled out of every
+      # binary the gate has ever loaded. `template_release` is built here too because nothing else in a
+      # PR compiles it: `cargo test` and `clippy --all-targets` both use the dev profile, so an LTO or
+      # codegen failure in the shipping profile would surface at tag time. binaries.yml proves the other
+      # two platforms; this job is Linux-only and cannot speak for them.
+      - name: Build this commit's own cdylib
+        run: tools/build-native.sh build linux addons/orbitnet_native/bin
+
+      # After the build, so every project mirrors the freshly built bin/ rather than a stale copy.
       - name: Sync the addon into every project
         run: tools/sync-addons.sh
 
-      # The committed binary is a plain git blob, so a fresh checkout already has a working extension --
-      # nothing to fetch, nothing to build. That is the whole point of the no-LFS policy: if this step were
-      # needed, an AssetLib user would need it too, and they have no way to run it.
       - name: Confirm the extension binary is real (not a pointer, not empty)
         run: |
           set -euo pipefail
-          lib=addons/orbitnet_native/bin/liborbitnet.linux.x86_64.so
-          test -s "$lib" || { echo "::error::$lib is missing or empty"; exit 1; }
-          if head -c 64 "$lib" | grep -q 'git-lfs.github.com'; then
-            echo "::error::$lib is a Git LFS POINTER, not a library. See the .gdextension header."
-            exit 1
-          fi
-          magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
-          test "$magic" = "7f454c46" || { echo "::error::$lib is not an ELF object (magic=$magic)"; exit 1; }
-          ls -l "$lib"
+          # Every name this platform's descriptor entries resolve to, asked of the script that owns the
+          # mapping. A `for` over the directory would pass vacuously if the build staged nothing.
+          for name in $(tools/build-native.sh names linux); do
+            lib="addons/orbitnet_native/bin/$name"
+            test -s "$lib" || { echo "::error::$lib is missing or empty"; exit 1; }
+            if head -c 64 "$lib" | grep -q 'git-lfs.github.com'; then
+              echo "::error::$lib is a Git LFS POINTER, not a library. See the .gdextension header."
+              exit 1
+            fi
+            magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
+            test "$magic" = "7f454c46" || { echo "::error::$lib is not an ELF object (magic=$magic)"; exit 1; }
+            ls -l "$lib"
+          done
 
       - name: Lint (headless project load, warnings-as-errors)
         run: |
@@ -121,9 +153,9 @@ jobs:
           godot --headless --path harness --script tests/support/run_unit_tests.gd
           godot --headless --path demos/rts --script tests/support/run_unit_tests.gd
 
-      # --skip-build with no local cargo output falls back to the COMMITTED binary, which is what an
-      # Asset Library user receives. That is the version worth smoke-testing here.
-      - name: Extension load smoke (throwaway project, committed binary)
+      # --skip-build because the build already happened above; the smoke loads what that step installed
+      # rather than compiling a second copy.
+      - name: Extension load smoke (throwaway project)
         run: tools/orbitnet-smoke.sh --skip-build
 
       - name: Two-peer RTS probe

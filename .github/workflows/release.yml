@@ -1,16 +1,19 @@
 name: release
 
-# Cut a release from a `v*` tag: build the extension on all three platforms, COMMIT the refreshed binaries
-# to main, build the Asset Library zip, and publish a GitHub Release.
+# Cut a release from a `v*` tag: build the extension on all three platforms, publish the binaries as
+# Release assets, build the Asset Library zip, and commit a sha256 MANIFEST of what was published.
 #
-# This is the only workflow that writes to the repository, and the only one that grows history. Committing
-# binaries here rather than on every push is what keeps a no-LFS repository small enough to stay pleasant to
-# clone -- see the header of addons/orbitnet_native/orbitnet.gdextension for why LFS is not an option for an
-# addon distributed through the Asset Library.
+# NO BINARY IS COMMITTED, HERE OR ANYWHERE. What lands on main is `addons/orbitnet_native/binaries.json`
+# -- the size and sha256 of every published asset, plus the version this tag stamped into plugin.cfg. A
+# consumer pins the tag, downloads the assets and verifies them against a digest that lives in the commit
+# graph, which a checksum file published beside the asset cannot do: that verifies transport, not tamper.
 #
-# The commit lands on the DEFAULT BRANCH, not on the tag: a tag is immutable and already points at the
-# source the binaries were built from, while main is what a `git clone` gets. The tag's release assets carry
-# the same binaries, so a user has both paths.
+# The manifest is written AFTER the assets are built, so a tag commit cannot contain its own digest; main
+# gets it one commit later. Harmless, because CI builds rather than fetches.
+#
+# THREE PROFILES. `template_debug` and `template_release` are what the .gdextension names and what the
+# zip carries. `profiling` is a symbolized developer build, published as an asset only -- shipping it
+# would put debug information nobody loads into every export. See tools/build-native.sh.
 
 on:
   push:
@@ -18,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build (e.g. v0.2.0). Manual runs do not commit or publish.'
+        description: 'Version to build (e.g. v0.2.0). Manual runs do not publish.'
         required: true
 
 permissions:
@@ -27,100 +30,128 @@ permissions:
 jobs:
   build:
     strategy:
-      fail-fast: true   # a partial set of binaries must never be committed
+      fail-fast: true   # a partial set of binaries must never be published
       matrix:
         include:
-          - os: linux
-            # Tag pushes and workflow_dispatch both require write access to this repository, unlike
-            # check.yml's pull_request gate -- see that file's header for why THAT one must stay
-            # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
-            # here.
+          # Tag pushes and workflow_dispatch both require write access to this repository, unlike
+          # check.yml's pull_request gate -- see that file's header for why THAT one must stay
+          # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
+          # here.
+          - platform: linux
             runner: [self-hosted, Linux, X64, legion]
-            artifact: liborbitnet.linux.x86_64.so
-            built: native/target/release/liborbitnet.so
-          - os: windows
+          - platform: windows
             runner: [self-hosted, Windows, X64, legion-win]
-            artifact: orbitnet.windows.x86_64.dll
-            built: native/target/release/orbitnet.dll
-          - os: macos
+          - platform: macos
             runner: [self-hosted, macOS, ARM64, legion-mac]
-            artifact: liborbitnet.macos.universal.dylib
-            built: native/target/release/liborbitnet.dylib
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # SELF-HOSTED WINDOWS: rustup is on PATH but its SHIM DIRECTORY is not, so `rustup toolchain
+      # install` and `rustup default` both succeed while `rustc` is not found. dtolnay/rust-toolchain
+      # only repairs PATH when it installs rustup itself, so on a box where rustup is already present
+      # the failure surfaces inside the action's own cachekey step as "rustc: command not found" --
+      # which reads like a missing toolchain rather than a missing PATH entry.
+      #
+      # The SHIM directory, not the toolchain's own bin: the shims are what honour
+      # native/rust-toolchain.toml. Putting the toolchain bin on PATH instead would silently ignore the
+      # pin.
+      - name: Put the rustup shims on PATH
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v rustc >/dev/null 2>&1; then
+            echo "rustc already resolves: $(command -v rustc)"
+            exit 0
+          fi
+          for dir in \
+            "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
+            "${CARGO_HOME:-}/bin" \
+            "${USERPROFILE:-}/.cargo/bin"
+          do
+            [ -n "$dir" ] || continue
+            if [ -x "$dir/rustc.exe" ] || [ -x "$dir/rustc" ]; then
+              echo "found the rustc shim in $dir"
+              echo "$dir" >> "$GITHUB_PATH"
+              exit 0
+            fi
+          done
+          echo "::error::no rustc shim on this runner. rustup=$(command -v rustup || echo none), CARGO_HOME=${CARGO_HOME:-unset}. Reinstall rustup for the account the runner service runs as."
+          exit 1
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
-          key: release-${{ matrix.os }}
+          key: release-${{ matrix.platform }}
 
-      # legion-mac is ARM64, but that is only the HOST -- both targets are cross-built and combined
-      # regardless of which arch the runner is, same as binaries.yml.
-      - name: Build (macOS universal)
-        if: matrix.os == 'macos'
+      - name: Build both descriptor profiles
         shell: bash
-        run: |
-          set -euo pipefail
-          # `cd native` FIRST. native/rust-toolchain.toml pins the toolchain cargo uses in that directory,
-          # while the repository root has no override and resolves to whatever rustup's default is. Running
-          # `rustup target add` from the root installs the std libraries onto the DEFAULT toolchain, which the
-          # pinned one cannot see, and the cross build then fails with "can't find crate for `std`" for
-          # x86_64-apple-darwin on an arm64 runner.
-          cd native
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release -p orbitnet-godot --target x86_64-apple-darwin
-          cargo build --release -p orbitnet-godot --target aarch64-apple-darwin
-          mkdir -p target/release
-          lipo -create -output target/release/liborbitnet.dylib \
-            target/x86_64-apple-darwin/release/liborbitnet.dylib \
-            target/aarch64-apple-darwin/release/liborbitnet.dylib
+        run: tools/build-native.sh build ${{ matrix.platform }} staged
 
-      - name: Build
-        if: matrix.os != 'macos'
+      # Separate directory, separate artifact: these must not reach the zip or the descriptor.
+      - name: Build the symbolized profiling library
         shell: bash
-        run: cd native && cargo build --release -p orbitnet-godot
-
-      - name: Stage
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p staged
-          cp "${{ matrix.built }}" "staged/${{ matrix.artifact }}"
+        run: tools/build-native.sh build ${{ matrix.platform }} staged-profiling profiling
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: staged/${{ matrix.artifact }}
+          name: orbitnet-${{ matrix.platform }}
+          path: staged/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbitnet-profiling-${{ matrix.platform }}
+          path: staged-profiling/
 
   publish:
     needs: build
     runs-on: [self-hosted, Linux, X64, legion]
     permissions:
-      contents: write   # the only place in this repo that needs it: commit binaries + create a release
+      contents: write   # the only place in this repo that needs it: commit the manifest + create a release
     steps:
+      # THE TAG, not main. This job assembles the zip from the working tree, and the binaries it downloads
+      # were built from the tag's sources -- so checking out main shipped a zip pairing the tag's backend
+      # with whatever GDScript main had drifted to. The manifest commit below re-targets main explicitly
+      # rather than relying on this checkout.
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
+          pattern: orbitnet-*
           path: incoming
-          merge-multiple: true
+          merge-multiple: false
 
+      # bin/ is gitignored and empty in a fresh checkout, so this is what fills it.
       - name: Install the binaries
         run: |
           set -euo pipefail
-          mkdir -p addons/orbitnet_native/bin
-          cp incoming/liborbitnet.linux.x86_64.so        addons/orbitnet_native/bin/
-          cp incoming/orbitnet.windows.x86_64.dll        addons/orbitnet_native/bin/
-          cp incoming/liborbitnet.macos.universal.dylib  addons/orbitnet_native/bin/
-          ls -l addons/orbitnet_native/bin
-          # A pointer, a truncated download, or an empty file here would ship a release that cannot load.
-          for f in addons/orbitnet_native/bin/*; do
+          mkdir -p addons/orbitnet_native/bin profiling
+          for p in linux windows macos; do
+            cp incoming/orbitnet-$p/*            addons/orbitnet_native/bin/
+            cp incoming/orbitnet-profiling-$p/*  profiling/
+          done
+          ls -l addons/orbitnet_native/bin profiling
+          # A truncated download or an empty file here would publish a release that cannot load.
+          for f in addons/orbitnet_native/bin/* profiling/*; do
             test -s "$f" || { echo "::error::$f is empty"; exit 1; }
           done
+
+      # The bytes about to be published must be exactly the ones the descriptor names. A missing platform
+      # or a renamed profile passes every Linux gate and fails at dlopen on a user's machine.
+      - name: The published set is the set the descriptor names
+        run: |
+          set -euo pipefail
+          named="$(grep -oE 'res://addons/orbitnet_native/bin/[^"]+' \
+            addons/orbitnet_native/orbitnet.gdextension | sed 's|.*/||' | sort -u)"
+          have="$(ls addons/orbitnet_native/bin | sort -u)"
+          if ! diff <(printf '%s\n' "$named") <(printf '%s\n' "$have"); then
+            echo "::error::the built set and the descriptor's set differ (< descriptor, > built)"
+            exit 1
+          fi
+          echo "publishing exactly the $(printf '%s\n' "$named" | grep -c .) libraries the descriptor names"
 
       - name: Stamp the plugin version from the tag
         run: |
@@ -145,20 +176,60 @@ jobs:
           zip -qr "build/orbitnet-${version}.zip" addons/orbitnet addons/orbitnet_native
           rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT \
                 addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
+          # bin/ is gitignored, so `zip -r` on a clean checkout would silently ship an addon with no
+          # backend at all. Prove the libraries are in there rather than trusting the glob.
+          zipped="$(unzip -l "build/orbitnet-${version}.zip" | grep -c 'addons/orbitnet_native/bin/.' || true)"
+          expected="$(ls addons/orbitnet_native/bin | grep -c .)"
+          if [ "$zipped" -ne "$expected" ]; then
+            echo "::error::the zip carries ${zipped} libraries; the descriptor needs ${expected}"
+            exit 1
+          fi
           unzip -l "build/orbitnet-${version}.zip" | tail -3
 
-      - name: Commit the refreshed binaries
+      # EVERY published asset, including the AssetLib zip. A consumer that pins this tag can fetch the
+      # single zip -- which carries both addon directories and all six libraries -- and verify one digest,
+      # rather than fetching six files and trusting the set was complete. Written after the zip is built,
+      # so a tag commit cannot contain its own digest; main gets it one commit later. Harmless, because CI
+      # builds rather than fetches.
+      - name: Write the asset manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          {
+            printf '{\n  "tag": "%s",\n  "assets": {\n' "$tag"
+            first=1
+            for f in build/orbitnet-*.zip addons/orbitnet_native/bin/* profiling/*; do
+              name="$(basename "$f")"
+              [ "$first" -eq 1 ] || printf ',\n'
+              first=0
+              printf '    "%s": { "size": %s, "sha256": "%s" }' \
+                "$name" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            printf '\n  }\n}\n'
+          } > addons/orbitnet_native/binaries.json
+          cat addons/orbitnet_native/binaries.json
+
+      - name: Commit the manifest to main
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git add addons/orbitnet_native/bin addons/orbitnet/plugin.cfg
+          # This checkout is the TAG and detached, so the manifest is replayed onto main rather than
+          # pushed from here -- pushing a detached HEAD to main would move main to the tag.
+          manifest="$(cat addons/orbitnet_native/binaries.json)"
+          plugin="$(cat addons/orbitnet/plugin.cfg)"
+          git fetch origin main
+          git checkout -B release-manifest origin/main
+          printf '%s' "$manifest" > addons/orbitnet_native/binaries.json
+          printf '%s' "$plugin"   > addons/orbitnet/plugin.cfg
+          git add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
           if git diff --cached --quiet; then
-            echo "binaries unchanged; nothing to commit"
+            echo "manifest unchanged; nothing to commit"
             exit 0
           fi
-          git commit -m "release: extension binaries and plugin version for ${GITHUB_REF_NAME}"
+          git commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
           git push origin HEAD:main
 
       - name: Publish the release
@@ -168,6 +239,8 @@ jobs:
           files: |
             build/orbitnet-*.zip
             addons/orbitnet_native/bin/*
+            addons/orbitnet_native/binaries.json
+            profiling/*
           generate_release_notes: true
           body: |
             ## Install
@@ -178,6 +251,22 @@ jobs:
             **Manual:** copy `addons/orbitnet/` and `addons/orbitnet_native/` from the zip into your project.
             Both directories are required — `Net` without the extension is a facade over nothing.
 
-            The binaries are plain files, not Git LFS pointers: they work straight out of the zip.
+            The binaries in the zip are plain files, not Git LFS pointers: they work straight out of it.
+
+            ## Pinning this release from a build
+
+            `binaries.json` carries the size and sha256 of every asset on this release and is committed
+            to `main`, so a fetch is verified against the commit graph rather than against a checksum
+            published beside the file it describes.
+
+            Fetch the **zip** to get both addon directories and all six libraries against one digest. The
+            loose binaries are also attached individually, for a project that wants only the files its
+            own `.gdextension` names.
+
+            | Asset | What it is |
+            | --- | --- |
+            | `*.template_debug.*` | Loaded when a project runs from source. Carries `debug-assertions` and `overflow-checks`. |
+            | `*.template_release.*` | Loaded by an exported game. |
+            | `*.profiling.*` | Release build with debug information retained, for a native profiler. Not named by the descriptor. |
 
             OrbitNet is 0.x. The `Net` facade is the stable surface; everything behind it may change.

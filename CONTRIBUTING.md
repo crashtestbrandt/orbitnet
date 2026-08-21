@@ -17,7 +17,7 @@ The repository root is **not** a Godot project — OrbitNet is configured throug
 
 ```
 addons/orbitnet/          CANONICAL addon source — the AssetLib payload
-addons/orbitnet_native/   the .gdextension + committed binaries
+addons/orbitnet_native/   the .gdextension + the binaries manifest (bin/ is gitignored)
 native/                   the Rust workspace
 harness/                  the addon's own suites + the load smoke
 demos/rts/                the RTS demo
@@ -93,8 +93,9 @@ just native-check    # fmt + clippy -D warnings + tests + build + the load smoke
 One rule: **`orbitnet-core` never sees a `Variant`.** Zero dependencies, no `godot`, which is why its tests
 run in milliseconds. A `godot` type in a core signature means logic has leaked across the boundary.
 
-**Do not commit binaries.** `binaries.yml` proves every platform builds on every `native/**` push;
-`release.yml` commits them on a tag. Committing by hand is how a repository without LFS gets fat.
+**Do not commit binaries.** `addons/orbitnet_native/bin/` is gitignored and no workflow ever adds to it.
+`binaries.yml` proves every platform builds on every `native/**` push; `release.yml` publishes the bytes as
+Release assets and commits only their sha256 manifest. Build your own with `just native-install`.
 
 ## Recording decisions
 

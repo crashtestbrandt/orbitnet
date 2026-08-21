@@ -40,12 +40,17 @@ This is the most common OrbitNet bug and it raises no error.
 
 ## Install
 
-Copy **both** `addons/orbitnet/` and `addons/orbitnet_native/` into your project, then enable **OrbitNet** in
-*Project → Project Settings → Plugins*. Both directories are required: `Net` without the extension is a facade
-over nothing.
-
 From a [release](https://github.com/crashtestbrandt/orbitnet/releases), use *AssetLib → Install from file* on
-the `orbitnet-*.zip`. Binaries in it are plain files, not LFS pointers, so they work straight out of the zip.
+the `orbitnet-*.zip`, then enable **OrbitNet** in *Project → Project Settings → Plugins*. Binaries in the zip
+are plain files, not LFS pointers, so they work straight out of it.
+
+To install by hand, copy **both** `addons/orbitnet/` and `addons/orbitnet_native/` from that zip into your
+project. Both directories are required: `Net` without the extension is a facade over nothing.
+
+**A `git clone` of this repository carries no binaries** — `addons/orbitnet_native/bin/` is gitignored, and
+`just native-install` builds this host's copy. A release also attaches the libraries individually, plus a
+`binaries.json` naming the size and sha256 of each, so a project can pin a tag, fetch what its
+`.gdextension` names, and verify it.
 
 | | |
 |---|---|
