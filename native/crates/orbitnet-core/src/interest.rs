@@ -91,9 +91,9 @@
 //! **The two scan columns disagree, and the disagreement is the finding.** From 16 worlds up the
 //! grid beats what ships — but it beats it by deleting the per-peer candidate rebuild, not by
 //! indexing space, and `scan/shared` deletes the same rebuild without a grid and is then 1.7× ahead
-//! of the grid. The multi-world win is a rebuild win wearing a grid's clothes. Refusing another
-//! world costs a scan one integer comparison per candidate, which is already less than binning that
-//! candidate costs the grid.
+//! of the grid. What the grid saves at a high world count is the rebuild, not the distance pass.
+//! Refusing another world costs a scan one integer comparison per candidate, which is already less
+//! than binning that candidate costs the grid.
 //!
 //! So [`PeerInterest::update_linear_into`] is what `orbit_net.rs` calls, and the grid is retained
 //! and tested rather than adopted. What changed is that it is now *adoptable*: it reports the leaves
