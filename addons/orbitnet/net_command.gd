@@ -21,6 +21,22 @@ class_name NetCommand
 ## peer must build it identically). Validators run only on the applying peer (server, or the local peer
 ## offline). No rollback-backend symbols (the `just net-check` gate): plain Godot @rpc plus the `Net` facade
 ## for the offline / role checks.
+##
+## A COMMAND IS PER CONNECTION, NOT PER SEAT, AND THAT IS A DECISION RATHER THAN A GAP.
+##
+## A seat is one owned, predicted body behind a connection -- local split-screen is two or more on one socket,
+## and the interest pass keys an anchor on `(peer, seat)`. The handler is still handed one identity, the sender
+## id, because that is the only identity the transport supplies and therefore the only one a client cannot
+## author. A per-seat sender id would have to be carried in the payload, where it is the client's own claim
+## about itself, and every ownership check downstream would then be checking the attacker's claim.
+##
+## So a game with several seats on one connection DISAMBIGUATES INSIDE THE PAYLOAD, and its validator checks
+## the claimed seat against the seats the SERVER assigned to that sender -- the server assigned them, so it can.
+## An unchecked seat field in a payload is a forged order on somebody else's units, and it is the one new
+## mistake this shape makes available.
+##
+## Nothing here changes for a game with one seat per connection: the sender id resolves to exactly one seat,
+## which is what the demos' roster is.
 
 ## Fired on the peer that APPLIED a validated command (server, or local offline) after the handler returned true.
 signal applied(verb: StringName, payload: Dictionary)

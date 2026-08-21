@@ -33,11 +33,13 @@ use orbitnet_core::codec::{
     input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
     Handshake, ManifestEntry, Ping, Pong, Reader, Welcome, Writer, MAGIC, MAX_FRAME_PAYLOAD,
 };
-use orbitnet_core::interest::{InterestCandidate, MembershipId, MEMBERSHIP_GLOBAL};
+use orbitnet_core::interest::{
+    ConnectionInterest, InterestCandidate, MembershipId, SeatObserver, SeatScratch,
+    MEMBERSHIP_GLOBAL,
+};
 use orbitnet_core::priority::{self, Band};
 use orbitnet_core::{
-    AoiConfig, ClockEstimator, CoupledSlew, LeadTracker, PeerInterest, ResimPlanner,
-    TickAccumulator, TickRate,
+    AoiConfig, ClockEstimator, CoupledSlew, LeadTracker, ResimPlanner, TickAccumulator, TickRate,
 };
 
 use crate::sync::{OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration};
@@ -96,6 +98,37 @@ const WIRE_OVERHEAD_BYTES: u64 = 28 + 12 + 1;
 /// Seconds per accounting window — the period the per-second bandwidth figures are averaged over.
 const BANDWIDTH_WINDOW_SECONDS: f64 = 1.0;
 
+/// Which seat on a connection a body belongs to, as the game declared it.
+///
+/// A `u16` because it is a **label** rather than a count: the interest pass holds one set per
+/// distinct label present on a connection, so the numbers need not be small or contiguous, and
+/// nothing is sized by the value.
+pub(crate) type SeatIndex = u16;
+
+/// One owned viewpoint: a connection, and which of its seats.
+///
+/// **The identity ownership could not express before.** `input_owner_peer()` answers "which
+/// connection", and that is the whole answer only while a connection drives one predicted body.
+/// Local split-screen drives several — two players on one couch behind one socket — and each needs
+/// its own interest anchor, its own centre and its own world, because the second player's
+/// surroundings are not the first player's.
+///
+/// **Seat is the word the demos already use for a player side**, and this is the same idea: a seat
+/// is a player position, and what changes is only that a connection may hold more than one of them.
+/// A game whose bodies all leave `seat` at `0` has one seat per connection, which is the bijection
+/// the demos assume and is unchanged by any of this.
+///
+/// Ordered peer-major so [`owned_rows_into`]'s sort groups a connection's rows together and its
+/// seats in ascending label order within that group — which is what makes both lookups a
+/// `partition_point` rather than a per-tick map.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct SeatId {
+    /// The connection this seat sits on.
+    peer: i32,
+    /// Which seat on it. `0` for every body that declares nothing.
+    seat: SeatIndex,
+}
+
 /// One replicated entity as the send path sees it, gathered once per tick before any peer is
 /// considered.
 ///
@@ -107,6 +140,9 @@ struct EntityRow {
     id: u64,
     /// The peer whose input drives this entity, or 0 when nobody's does.
     owner: i32,
+    /// Which of that peer's seats drives it. `0` unless the game declared otherwise, and
+    /// meaningless when `owner` is 0.
+    seat: SeatIndex,
     /// World-space interest anchor, or `None` when the entity declares none — which means it is
     /// unconditionally relevant *within its membership*, the direction that fails open.
     anchor: Option<[f32; 3]>,
@@ -120,22 +156,35 @@ struct EntityRow {
     priority: u32,
 }
 
-/// What one peer's interest is measured against: where it observes from, and which world it is in.
+impl EntityRow {
+    /// The seat this row is driven by. Meaningless for an unowned row, and never asked for one.
+    #[must_use]
+    fn seat_id(&self) -> SeatId {
+        SeatId {
+            peer: self.owner,
+            seat: self.seat,
+        }
+    }
+}
+
+/// What one SEAT's interest is measured against: where it observes from, and which world it is in.
 ///
-/// Both facts come from the **same row** — the lowest-id entity whose input authority is that peer
-/// and which resolved an anchor. A peer's membership has no home of its own on the wire or in the
-/// registry, and taking it from the body that already anchors the peer's radius keeps the two
-/// answers about one entity rather than about two that could disagree.
+/// Both facts come from the **same row** — the lowest-id entity whose input authority is that seat's
+/// peer, which declares that seat, and which resolved an anchor. A seat's membership has no home of
+/// its own on the wire or in the registry, and taking it from the body that already anchors the
+/// seat's radius keeps the two answers about one entity rather than about two that could disagree.
 ///
-/// A peer with no such row has no entry here at all: it is not distance-culled, and its membership
+/// A seat with no such row has no entry here at all: it is not distance-culled, and its membership
 /// reads as [`MEMBERSHIP_GLOBAL`], so it sees every world. Both halves fail open together, which is
-/// the only defensible direction — blanking a peer's world because its avatar has not spawned yet
-/// is not.
+/// the only defensible direction — blanking a seat's world because its body has not spawned yet is
+/// not. **That failure is now per seat.** It used to be per connection: one anchored seat supplied
+/// the centre for the whole connection, so a second seat had its surroundings culled around a
+/// position it was nowhere near.
 #[derive(Clone, Copy)]
 struct PeerObserver {
-    /// The centre the peer's interest radius is measured from.
+    /// The centre this seat's interest radius is measured from.
     center: [f32; 3],
-    /// The world the peer is in.
+    /// The world this seat is in.
     membership: MembershipId,
 }
 
@@ -156,6 +205,13 @@ struct PeerObserver {
 /// declaration and did not fail; a centre is a measurement and did. Collapsing them would drop a
 /// peer whose avatar has not spawned into every world at once, which is the failure the declaration
 /// exists to remove.
+///
+/// **A DECLARATION IS PER CONNECTION, AND IT COLLAPSES THAT CONNECTION TO ONE SEAT.** Only
+/// [`PeerAnchor::Inferred`] is resolved per seat, because only the inferred pair is read off a body
+/// and only bodies carry seats. A game that declares a centre for a split-screen connection has
+/// stated where that connection observes from, and the backend does not then re-split it — the same
+/// precedence that stops a declared centre from falling back to an avatar's. A game that wants a
+/// centre per seat declares nothing and lets each seat's body anchor it.
 #[must_use]
 fn resolve_observer(
     anchor: PeerAnchor,
@@ -373,9 +429,16 @@ struct PeerState {
     newest_input_tick: i64,
     /// Input-arrival margin reported back in snapshot headers.
     margin_last: i8,
-    /// Entities — **both lanes** — inside this peer's interest, with the squared
-    /// distance the last update measured, which the priority scorer reads back as a band.
-    interest: PeerInterest,
+    /// Entities — **both lanes** — inside this connection's interest, with the squared distance
+    /// the last update measured, which the priority scorer reads back as a band.
+    ///
+    /// **One hysteretic set per seat, unioned.** The set is what the datagram carries and the
+    /// datagram is per connection, so the union lives here beside `last_sent`, `last_full` and
+    /// `acked_base` — all four are properties of one packet stream. Relevancy is not: it is a
+    /// property of a viewpoint, and a split-screen connection has several. The distance stored per
+    /// member is the nearest seat's, and a leave is a leave from the union. See
+    /// [`ConnectionInterest`].
+    interest: ConnectionInterest,
     /// Recent snapshot sends awaiting acknowledgement: (frame tick, entity ticks it carried).
     sent_log: std::collections::VecDeque<(u64, Vec<(u64, u64)>)>,
     /// Per-entity newest tick this peer CONFIRMED receiving (via ack_tick/ack_bits) — the only
@@ -637,6 +700,11 @@ pub struct OrbitNet {
     snapshot_ack_bits: u32,
     /// Client: raise WANT_FULL on the next input frame.
     want_full: bool,
+    /// Client: which owned body the next input frame's admission walk starts at.
+    ///
+    /// Only ever off zero when the frame is full, which takes several seats on one connection. See
+    /// [`admit_input_blocks`].
+    input_rotor: usize,
 
     m_resim_ticks: f64,
     m_rollback_ms: f64,
@@ -677,13 +745,22 @@ pub struct OrbitNet {
 
     // --- send-path allocation pools, reused every tick so a warm frame allocates nothing ---
     aoi_rows: Vec<EntityRow>,
-    aoi_observers: HashMap<i32, PeerObserver>,
+    /// Where each SEAT observes from, ascending by `(peer, seat)` — so one connection's seats are a
+    /// contiguous slice, found by `partition_point` rather than by a per-tick map.
+    aoi_observers: Vec<(SeatId, PeerObserver)>,
     aoi_candidates: Vec<InterestCandidate>,
-    /// `(owner, row index)` for every gathered row a peer drives, ascending — the index into
+    /// `(seat, row index)` for every gathered row a peer drives, ascending — the index into
     /// `aoi_candidates` that has to be swapped for that peer's own view of it. Pooled and rebuilt
     /// once per tick; a peer's slice is found by binary search, not by rescanning the rows.
-    aoi_owned_rows: Vec<(i32, u32)>,
-    aoi_dist_scratch: Vec<(u64, f32)>,
+    ///
+    /// Keyed by seat rather than by owner because it answers two questions now: which candidates to
+    /// patch for a connection (all of them, whatever seat drives them — the datagram is shared), and
+    /// **which seats that connection has at all**, including one whose body has no anchor yet and so
+    /// appears in no observer.
+    aoi_owned_rows: Vec<(SeatId, u32)>,
+    /// The observer slice handed to [`ConnectionInterest::update_linear_into`], rebuilt per peer.
+    aoi_seats: Vec<SeatObserver>,
+    aoi_seat_scratch: SeatScratch,
     /// This peer's candidate set for the order build: `(id, distance²)`. Filled from the peer's
     /// interest when culling is on and from every row when it is off, so the order loop has one
     /// shape either way. Pooled, so a warm frame allocates nothing.
@@ -753,6 +830,7 @@ impl INode for OrbitNet {
             newest_snapshot_tick: 0,
             snapshot_ack_bits: 0,
             want_full: false,
+            input_rotor: 0,
             m_resim_ticks: 0.0,
             m_rollback_ms: 0.0,
             m_restore_ms: 0.0,
@@ -783,10 +861,11 @@ impl INode for OrbitNet {
             win_starve_ticks_max: 0,
             win_unsent_backlog_max: 0,
             aoi_rows: Vec::new(),
-            aoi_observers: HashMap::new(),
+            aoi_observers: Vec::new(),
             aoi_candidates: Vec::new(),
             aoi_owned_rows: Vec::new(),
-            aoi_dist_scratch: Vec::new(),
+            aoi_seats: Vec::new(),
+            aoi_seat_scratch: SeatScratch::default(),
             aoi_members: Vec::new(),
             aoi_leaves: Vec::new(),
             order_scratch: Vec::new(),
@@ -2060,6 +2139,31 @@ impl OrbitNet {
         self.m_net_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
 
+    /// Build and send this client's input frame: one block per owned body, bounded to one datagram.
+    ///
+    /// **THE FRAME IS BOUNDED, AND THE BOUND IS WHY THE ROTA EXISTS.** One body per connection made
+    /// the size question moot; several — local split-screen, two players behind one socket — do not,
+    /// because each carries [`INPUT_REDUNDANCY`] rows per frame and the sum has no reason to fit.
+    /// Past the path MTU an unreliable datagram fragments, and losing one fragment loses the whole
+    /// frame, which is the input lane of every seat on the connection rather than of one.
+    ///
+    /// So the frame is capped at [`MAX_FRAME_PAYLOAD`] — the same ceiling the snapshot path spends,
+    /// and the header rides above it there too — and what does not fit is carried on a later tick.
+    /// `input_rotor` is where the next walk starts, so a body refused this tick is offered first
+    /// next tick and no body can be starved by the ones that sort ahead of it.
+    ///
+    /// **What a deferred body costs, and why it is small.** A block carries the last
+    /// `INPUT_REDUNDANCY` ticks of that body's input, so a body skipped for up to three consecutive
+    /// frames loses nothing at all: the next frame it appears in re-sends every tick it missed. Past
+    /// that the oldest ticks fall out of the redundancy window and the server extrapolates them, the
+    /// same as it does for a lost datagram. That is the real bound on how many seats a connection
+    /// can carry, and it is a function of the input schema's width rather than a constant worth
+    /// declaring.
+    ///
+    /// **A single block larger than the whole payload is refused every tick, and starves nobody
+    /// else.** The walk continues past it rather than stopping, and the rotor stays parked on it, so
+    /// the other seats are admitted normally. Such a block cannot be sent at all — no rota fixes an
+    /// input row wider than a datagram — and the fix is the schema, not the send path.
     fn send_client_input(&mut self, current: u64) {
         let mut blocks: Vec<Vec<u8>> = Vec::new();
         for sync in self.rollback_entities.values() {
@@ -2078,7 +2182,13 @@ impl OrbitNet {
             return;
         }
 
-        let mut writer = Writer::with_capacity(256);
+        let mut carried: Vec<usize> = Vec::with_capacity(blocks.len());
+        let lengths: Vec<usize> = blocks.iter().map(Vec::len).collect();
+        self.input_rotor =
+            admit_input_blocks(&lengths, self.input_rotor, MAX_FRAME_PAYLOAD, &mut carried);
+        let payload: usize = carried.iter().map(|&index| lengths[index]).sum();
+
+        let mut writer = Writer::with_capacity(payload + 64);
         let header = FrameHeader {
             kind: FrameKind::ClientInput,
             tick: u32::try_from(current).unwrap_or(u32::MAX),
@@ -2090,11 +2200,11 @@ impl OrbitNet {
             } else {
                 0
             },
-            entity_count: blocks.len() as u32,
+            entity_count: carried.len() as u32,
         };
         header.encode(&mut writer);
-        for block in &blocks {
-            writer.bytes(block);
+        for &index in &carried {
+            writer.bytes(&blocks[index]);
         }
         self.want_full = false;
         self.send_to(SERVER_PEER, writer.as_slice(), TransferMode::UNRELIABLE);
@@ -2524,6 +2634,7 @@ impl OrbitNet {
             };
             let bound = sync.bind();
             let owner = bound.input_owner_hint();
+            let seat = bound.seat_hint();
             let anchor = bound.position_hint();
             let membership = bound.membership_hint();
             let priority = bound.send_priority();
@@ -2531,6 +2642,7 @@ impl OrbitNet {
             rows.push(EntityRow {
                 id,
                 owner,
+                seat,
                 anchor,
                 membership,
                 priority,
@@ -2552,6 +2664,9 @@ impl OrbitNet {
             rows.push(EntityRow {
                 id,
                 owner: 0,
+                // The state lane has no input authority, so it drives no seat and takes the
+                // default. `owner == 0` is what every reader keys on; this is never consulted.
+                seat: 0,
                 anchor,
                 membership,
                 priority,
@@ -2559,54 +2674,78 @@ impl OrbitNet {
         }
     }
 
-    /// Where each peer observes from and which world it is in: both read off the entity that peer
+    /// Where each SEAT observes from and which world it is in: both read off the entity that seat
     /// drives.
+    ///
+    /// **KEYED BY SEAT, NOT BY CONNECTION**, which is the change local split-screen needs. Keyed by
+    /// peer, a connection driving two bodies got one centre — whichever body sorted lowest — and the
+    /// other player's surroundings were culled around a position that player was nowhere near.
     ///
     /// **THE FALLBACK, consulted only for a peer that declared nothing.** `OrbitNet::set_peer_anchor`
     /// and `set_peer_anchor_entity` answer both questions outright, and [`resolve_observer`] does not
     /// look here for a peer that used either. This remains the default because a game with one world
     /// and one avatar per player gets the right answer from it with no declaration at all.
     ///
-    /// **Called on rows already sorted by id, and it keeps the LOWEST id per owner.** `rows` is
+    /// **Called on rows already sorted by id, and it keeps the LOWEST id per seat.** `rows` is
     /// gathered by walking a `HashMap`, so a last-writer-wins insert would pick a different entity
-    /// on different runs — and a peer that drives more than one rollback entity would have its
-    /// interest centred somewhere iteration order chose. In a game where each peer drives exactly
-    /// one rollback body the rule is unobservable; it is written down because the failure it
-    /// prevents is a whole peer's world quietly centring on the wrong thing.
+    /// on different runs — and a seat driving more than one rollback entity would have its interest
+    /// centred somewhere iteration order chose. Where each seat drives exactly one rollback body the
+    /// rule is unobservable; it is written down because the failure it prevents is a whole
+    /// viewpoint's world quietly centring on the wrong thing. The sort below is `sort_by_key`, which
+    /// is STABLE, so the ascending-id order the scan collected in survives it.
     ///
     /// **One row supplies both facts.** A row with no resolved anchor is skipped entirely rather
-    /// than contributing its membership, so a peer's centre and its world always describe the same
-    /// body. Splitting the picks would let a peer be centred on one entity and filtered against
-    /// another's world, which is the same class of failure the lowest-id rule exists to prevent.
+    /// than contributing its membership, so a seat's centre and its world always describe the same
+    /// body. Splitting the picks would let a seat be centred on one entity and filtered against
+    /// another's world, which is the same class of failure the lowest-id rule exists to prevent. A
+    /// seat that contributes no row at all still exists — [`Self::update_interest`] finds it in
+    /// [`owned_rows_into`]'s output and gives it an unresolvable centre, which fails open.
     ///
     /// **THE LIMIT THIS INHERITS, AND WHAT IT COSTS FOR MEMBERSHIP.** "Lowest id" is lowest FNV hash
-    /// of a node path, so among a peer's several bodies it is arbitrary — deterministic across peers
+    /// of a node path, so among a seat's several bodies it is arbitrary — deterministic across peers
     /// and runs, which is what matters for the centre, but not chosen. For the centre a change of
-    /// pick moves a radius. For the membership it changes the peer's *world*, and every entity in
-    /// that peer's set leaves on that one tick: `update_interest` clears `last_sent`, `last_full`
-    /// and `acked_base` for each, which is a full-state burst for the whole set rather than the
-    /// per-entity repair that clearing exists to buy.
+    /// pick moves a radius. For the membership it changes the seat's *world*, and everything only
+    /// that seat held leaves the connection's union on that one tick: `update_interest` clears
+    /// `last_sent`, `last_full` and `acked_base` for each, which is a full-state burst rather than
+    /// the per-entity repair that clearing exists to buy.
     ///
-    /// It takes a peer driving **two anchored bodies that declare different worlds** (or one
+    /// It takes a seat driving **two anchored bodies that declare different worlds** (or one
     /// declaring a world and one not) to reach, which is a misconfiguration rather than a shape a
-    /// game wants — a peer is in one world. Two ways out, and the second is the one that removes the
-    /// pick rather than making it agree with itself: declare the same membership on every body a
-    /// peer drives, or declare the peer's world directly with `OrbitNet::set_peer_anchor`.
-    /// `NetRollbackHandle.membership()` reports what the filter reads for an undeclared peer, which
-    /// is where the mistake shows.
-    fn collect_observers(rows: &[EntityRow], observers: &mut HashMap<i32, PeerObserver>) {
+    /// game wants — a viewpoint is in one world. Three ways out, and the last two remove the pick
+    /// rather than making it agree with itself: declare the same membership on every body a seat
+    /// drives, put the bodies on separate seats, or declare the connection's world directly with
+    /// `OrbitNet::set_peer_anchor`. `NetRollbackHandle.membership()` reports what the filter reads
+    /// for an undeclared peer, which is where the mistake shows.
+    fn collect_observers(rows: &[EntityRow], observers: &mut Vec<(SeatId, PeerObserver)>) {
         observers.clear();
         for row in rows {
             if row.owner <= 0 {
                 continue;
             }
             if let Some(center) = row.anchor {
-                observers.entry(row.owner).or_insert(PeerObserver {
-                    center,
-                    membership: row.membership,
-                });
+                observers.push((
+                    row.seat_id(),
+                    PeerObserver {
+                        center,
+                        membership: row.membership,
+                    },
+                ));
             }
         }
+        observers.sort_by_key(|&(seat, _)| seat);
+        observers.dedup_by_key(|&mut (seat, _)| seat);
+    }
+
+    /// The slice of [`Self::collect_observers`]'s output that belongs to one connection, ascending
+    /// by seat.
+    #[must_use]
+    fn observers_of(
+        observers: &[(SeatId, PeerObserver)],
+        peer_id: i32,
+    ) -> &[(SeatId, PeerObserver)] {
+        let start = observers.partition_point(|&(seat, _)| seat.peer < peer_id);
+        let end = observers.partition_point(|&(seat, _)| seat.peer <= peer_id);
+        &observers[start..end]
     }
 
     /// Recompute every peer's interest set, and clear the delta bookkeeping of what left.
@@ -2639,16 +2778,33 @@ impl OrbitNet {
     /// The sets this produces are identical — `shared_candidates_match_a_per_peer_rebuild` asserts
     /// it row by row against a reference that rebuilds per peer, over every combination of owned,
     /// unanchored and foreign-world rows.
+    ///
+    /// **ONE FILTER PASS PER SEAT, ONE SET PER CONNECTION.** A connection may drive several
+    /// predicted bodies — local split-screen behind one socket — and each is a viewpoint with its
+    /// own centre and its own world. [`ConnectionInterest`] runs the filter once per seat and unions
+    /// the results, because relevancy is a property of a viewpoint while the delta base, the ack
+    /// window and the byte budget are properties of the datagram. Three consequences, all of them
+    /// the reason the union is not simply the widest seat:
+    ///
+    /// * **A leave is a leave from the UNION.** Clearing `last_sent` when one seat lets go would
+    ///   break the delta chain of a body the other seat is still watching.
+    /// * **Culling is decided per seat.** A seat whose body has no state row yet gets
+    ///   [`UNLOCATABLE_CENTRE`] of its own and stays relevant, instead of inheriting the centre of a
+    ///   seat it is nowhere near.
+    /// * **A declaration is per connection and collapses it to one seat.** See
+    ///   [`resolve_observer`]: a game that stated where a connection observes from is not then
+    ///   re-split by seat.
     fn update_interest(
         &mut self,
         peer_ids: &[i32],
         rows: &[EntityRow],
-        observers: &HashMap<i32, PeerObserver>,
+        observers: &[(SeatId, PeerObserver)],
     ) {
         let cfg = self.aoi_config();
         let mut candidates = std::mem::take(&mut self.aoi_candidates);
         let mut owned = std::mem::take(&mut self.aoi_owned_rows);
-        let mut scratch = std::mem::take(&mut self.aoi_dist_scratch);
+        let mut seats = std::mem::take(&mut self.aoi_seats);
+        let mut scratch = std::mem::take(&mut self.aoi_seat_scratch);
         let mut leaves = std::mem::take(&mut self.aoi_leaves);
         let mut culled = 0u64;
 
@@ -2672,30 +2828,48 @@ impl OrbitNet {
                     .and_then(|index| rows[index].anchor),
                 _ => None,
             };
-            let (resolved, observer_membership) = resolve_observer(
-                anchor,
-                declared,
-                tracked,
-                last,
-                observers.get(&peer_id).copied(),
-            );
-            // No radius, or no centre to measure from: everything stays relevant *on distance*.
-            // Blanking a peer's world because its avatar has not spawned yet is not a defensible
-            // failure mode. Membership is a separate axis and is not switched off here — a peer with
-            // neither a declaration nor a body reads as MEMBERSHIP_GLOBAL, which matches every
-            // world, so that case fails open too, while a DECLARED peer keeps its world whether or
-            // not its centre resolved.
-            let center = match resolved {
-                Some(center) if cfg.enter_radius > 0.0 => center,
-                _ => UNLOCATABLE_CENTRE,
-            };
 
             // This peer's own rows, in and out around the call. Restored unconditionally below, so
-            // no path out of this body can leave the shared list describing the wrong peer.
+            // no path out of this body can leave the shared list describing the wrong peer. Every
+            // seat on the connection gets every one of them as `always`: the datagram is shared, so
+            // a body one seat drives rides on it whatever the others can see.
             let mine = owned_rows_of(&owned, peer_id);
             for &(_, index) in mine {
                 candidates[index as usize] = candidate_for_own_row(&rows[index as usize]);
             }
+
+            seats.clear();
+            if matches!(anchor, PeerAnchor::Inferred) {
+                // One seat per distinct label the connection's own rows declare. `mine` is sorted by
+                // seat, so the run check is what deduplicates it — several bodies on one seat are
+                // one viewpoint, anchored by the lowest-id one of them.
+                let seen = Self::observers_of(observers, peer_id);
+                let mut previous: Option<SeatIndex> = None;
+                for &(seat_id, _) in mine {
+                    if previous == Some(seat_id.seat) {
+                        continue;
+                    }
+                    previous = Some(seat_id.seat);
+                    let inferred = seen
+                        .binary_search_by_key(&seat_id, |&(seat, _)| seat)
+                        .ok()
+                        .map(|index| seen[index].1);
+                    let (resolved, membership) =
+                        resolve_observer(anchor, declared, tracked, last, inferred);
+                    seats.push(seat_observer(&cfg, resolved, membership));
+                }
+            }
+            // Reached two ways, and they are one statement: this connection observes from ONE place.
+            // A declaration says so outright, and an undeclared connection that drives nothing has
+            // no seat to read a centre off — the fail-open every peer without a body has always
+            // taken. An EMPTY slice is the different claim that there is no viewpoint at all, which
+            // the filter reads as an empty set, so neither case may leave it empty.
+            if seats.is_empty() {
+                let (resolved, membership) =
+                    resolve_observer(anchor, declared, tracked, last, None);
+                seats.push(seat_observer(&cfg, resolved, membership));
+            }
+
             if let Some(peer) = self.peers.get_mut(&peer_id) {
                 // Remember where a tracked entity was, so its despawn leaves the peer here rather
                 // than opening its radius to the whole world. Only a resolved position is recorded.
@@ -2704,8 +2878,7 @@ impl OrbitNet {
                 }
                 peer.interest.update_linear_into(
                     &cfg,
-                    center,
-                    observer_membership,
+                    &seats,
                     &candidates,
                     &mut scratch,
                     &mut leaves,
@@ -2725,7 +2898,8 @@ impl OrbitNet {
 
         self.aoi_owned_rows = owned;
         self.aoi_candidates = candidates;
-        self.aoi_dist_scratch = scratch;
+        self.aoi_seats = seats;
+        self.aoi_seat_scratch = scratch;
         self.aoi_leaves = leaves;
     }
 
@@ -3185,30 +3359,97 @@ fn candidate_for_own_row(row: &EntityRow) -> InterestCandidate {
     InterestCandidate::always(row.id)
 }
 
-/// Fill `out` with `(owner, row index)` for every row a peer drives, ascending by owner.
+/// Which of a client input frame's blocks ride this tick, and where the next walk starts.
 ///
-/// Sorted so [`owned_rows_of`] can binary-search a peer's slice. `rows` arrives sorted by id and
-/// owners are scattered through it, so the sort is real work — done once per tick rather than
-/// rescanning every row for every peer, which is the pass this replaces.
-fn owned_rows_into(rows: &[EntityRow], out: &mut Vec<(i32, u32)>) {
+/// A free function so the rule the send loop runs is the rule a test can call.
+/// [`OrbitNet::send_client_input`] carries the reasoning; the mechanics, in order:
+///
+/// * The walk starts at `rotor` (taken modulo the block count, so a shrinking owned set cannot
+///   index past the end) and wraps once, so every block is offered exactly once per tick.
+/// * A block is admitted when it fits under `budget`; the walk **continues** past one that does
+///   not, so an oversized block cannot starve the ones behind it.
+/// * The returned rotor is the FIRST refusal, so next tick offers it first — which is what bounds
+///   how long any block waits. With everything admitted the rotor holds still, since a rota with
+///   nothing to rotate is one that already sends everything.
+///
+/// `out` is filled with the admitted indices in **ascending** order, not walk order: the rota
+/// decides which blocks ride, never what the wire looks like.
+fn admit_input_blocks(
+    lengths: &[usize],
+    rotor: usize,
+    budget: usize,
+    out: &mut Vec<usize>,
+) -> usize {
+    out.clear();
+    if lengths.is_empty() {
+        return 0;
+    }
+    let start = rotor % lengths.len();
+    let mut payload = 0usize;
+    let mut refused: Option<usize> = None;
+    for step in 0..lengths.len() {
+        let index = (start + step) % lengths.len();
+        if payload + lengths[index] <= budget {
+            payload += lengths[index];
+            out.push(index);
+        } else if refused.is_none() {
+            refused = Some(index);
+        }
+    }
+    out.sort_unstable();
+    refused.unwrap_or(start)
+}
+
+/// One seat's observer as the filter takes it: the resolved centre, or [`UNLOCATABLE_CENTRE`] when
+/// there is none to measure from.
+///
+/// **The centre and the world fail separately, and only the centre fails here.** No radius
+/// configured, or no position resolved, means this seat culls nothing *by distance*; its declared
+/// world is passed through untouched, because a membership is a declaration and did not fail.
+/// Blanking a viewpoint's world because its body has not spawned yet is not a defensible failure
+/// mode — and deciding it per seat is what stops one seat's missing body from opening, or one seat's
+/// present body from closing, the whole connection.
+#[must_use]
+fn seat_observer(
+    cfg: &AoiConfig,
+    resolved: Option<[f32; 3]>,
+    membership: MembershipId,
+) -> SeatObserver {
+    let center = match resolved {
+        Some(center) if cfg.enter_radius > 0.0 => center,
+        _ => UNLOCATABLE_CENTRE,
+    };
+    SeatObserver { center, membership }
+}
+
+/// Fill `out` with `(seat, row index)` for every row a peer drives, ascending by seat.
+///
+/// Sorted so [`owned_rows_of`] can binary-search a peer's slice — and, within that slice, so a run
+/// of equal seat labels is contiguous, which is what lets [`OrbitNet::update_interest`] count a
+/// connection's seats without a set. `rows` arrives sorted by id and owners are scattered through
+/// it, so the sort is real work, done once per tick rather than rescanning every row for every peer.
+///
+/// **This is where a connection's seats are enumerated**, not [`OrbitNet::collect_observers`]: a
+/// seat whose body has no anchor yet contributes no observer and must still get its own set.
+fn owned_rows_into(rows: &[EntityRow], out: &mut Vec<(SeatId, u32)>) {
     out.clear();
     out.extend(
         rows.iter()
             .enumerate()
             .filter(|(_, row)| row.owner != 0)
-            .map(|(index, row)| (row.owner, index as u32)),
+            .map(|(index, row)| (row.seat_id(), index as u32)),
     );
     out.sort_unstable();
 }
 
-/// The slice of [`owned_rows_into`]'s output that belongs to `peer_id`.
+/// The slice of [`owned_rows_into`]'s output that belongs to `peer_id`, ascending by seat.
 ///
-/// Usually one entry, and never assumed to be: a peer may drive several bodies, and every one of
-/// them is `always` to it.
+/// Usually one entry, and never assumed to be: a connection may drive several bodies across several
+/// seats, and every one of them is `always` to it.
 #[must_use]
-fn owned_rows_of(owned: &[(i32, u32)], peer_id: i32) -> &[(i32, u32)] {
-    let start = owned.partition_point(|&(owner, _)| owner < peer_id);
-    let end = owned.partition_point(|&(owner, _)| owner <= peer_id);
+fn owned_rows_of(owned: &[(SeatId, u32)], peer_id: i32) -> &[(SeatId, u32)] {
+    let start = owned.partition_point(|&(seat, _)| seat.peer < peer_id);
+    let end = owned.partition_point(|&(seat, _)| seat.peer <= peer_id);
     &owned[start..end]
 }
 
@@ -3239,29 +3480,45 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 #[cfg(test)]
 mod tests {
     use super::{
-        band_for_row, candidate_for_own_row, candidate_for_row, classify_rx, full_block_due,
-        owned_rows_into, owned_rows_of, resolve_observer, EntityRow, OrbitNet, PeerAnchor,
-        PeerObserver, PeerState, RxOutcome, StateIntegration, FULL_STATE_INTERVAL,
-        RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
+        admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
+        full_block_due, owned_rows_into, owned_rows_of, resolve_observer, seat_observer, EntityRow,
+        OrbitNet, PeerAnchor, PeerObserver, PeerState, RxOutcome, SeatId, SeatIndex,
+        StateIntegration, FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
     use orbitnet_core::interest::{
-        AoiConfig, InterestCandidate, MembershipId, PeerInterest, MEMBERSHIP_GLOBAL,
+        AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatScratch,
+        MEMBERSHIP_GLOBAL,
     };
     use orbitnet_core::priority::Band;
-    use std::collections::HashMap;
 
     // ------------------------------------------------------------------
     // Membership: how a gathered row reaches the filter, and where a peer's own world comes from.
     // ------------------------------------------------------------------
 
     fn row(id: u64, owner: i32, anchor: Option<[f32; 3]>, membership: MembershipId) -> EntityRow {
+        row_seat(id, owner, 0, anchor, membership)
+    }
+
+    /// The same row, driven by a named seat on `owner`'s connection.
+    fn row_seat(
+        id: u64,
+        owner: i32,
+        seat: SeatIndex,
+        anchor: Option<[f32; 3]>,
+        membership: MembershipId,
+    ) -> EntityRow {
         EntityRow {
             id,
             owner,
+            seat,
             anchor,
             membership,
             priority: 1,
         }
+    }
+
+    fn seat_of(peer: i32, seat: SeatIndex) -> SeatId {
+        SeatId { peer, seat }
     }
 
     /// The case the feature exists for. A channel with no anchor has no distance to be culled by, so
@@ -3337,6 +3594,144 @@ mod tests {
         assert_eq!(located.iter().collect::<Vec<_>>(), vec![2, 3]);
     }
 
+    /// The centre fails open per SEAT and the world does not fail at all — the pair
+    /// `update_interest` hands the filter for one viewpoint.
+    #[test]
+    fn a_seat_without_a_centre_culls_nothing_by_distance_and_keeps_its_world() {
+        let cfg = AoiConfig {
+            cell_size: 8.0,
+            enter_radius: 100.0,
+            exit_factor: 1.25,
+            max_entities: 0,
+        };
+        let unlocated = seat_observer(&cfg, None, 5);
+        assert!(unlocated.center[0].is_nan(), "no centre, no distance test");
+        assert_eq!(unlocated.membership, 5, "a declared world did not fail");
+
+        // A radius of zero asks for no distance culling rather than for all of it, and it says so
+        // in the centre — which is what lets every seat share one candidate list.
+        let no_radius = AoiConfig {
+            enter_radius: 0.0,
+            ..cfg
+        };
+        assert!(seat_observer(&no_radius, Some([1.0; 3]), 5).center[0].is_nan());
+
+        let located = seat_observer(&cfg, Some([1.0, 2.0, 3.0]), 5);
+        assert_eq!(located.center, [1.0, 2.0, 3.0]);
+    }
+
+    /// **The failure the per-seat centre removes**, composed the way `update_interest` composes it:
+    /// two seats on one connection, one anchored and one whose body has no state row yet.
+    ///
+    /// Culling used to be decided per connection, so the anchored seat supplied the centre for both
+    /// and the unspawned seat had its surroundings culled around a position it was nowhere near.
+    /// Per seat, the unanchored one measures nothing and refuses nothing.
+    #[test]
+    fn an_unanchored_seat_does_not_inherit_the_other_seats_centre() {
+        let cfg = AoiConfig {
+            cell_size: 8.0,
+            enter_radius: 50.0,
+            exit_factor: 1.25,
+            max_entities: 0,
+        };
+        let rows = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL), // seat 0's body, anchored
+            row_seat(2, 42, 1, None, MEMBERSHIP_GLOBAL),           // seat 1's body, not yet spawned
+            row(3, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // far scenery
+        ];
+        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        let mut observers = Vec::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+        let seen = OrbitNet::observers_of(&observers, 42);
+
+        // Seat 0 resolved; seat 1 has no observer at all and takes the unlocatable centre.
+        let seats = [
+            seat_observer(&cfg, Some(seen[0].1.center), seen[0].1.membership),
+            seat_observer(&cfg, None, MEMBERSHIP_GLOBAL),
+        ];
+        let mut connection = ConnectionInterest::new();
+        let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
+        connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut leaves);
+        assert_eq!(
+            connection.iter().collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the far row rides on the unlocatable seat"
+        );
+
+        // The same connection with both seats anchored at the origin culls the far row — so the
+        // admission above is the unlocatable seat's doing, not the candidate list's.
+        let both = [seats[0], seats[0]];
+        connection.update_linear_into(&cfg, &both, &candidates, &mut scratch, &mut leaves);
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(leaves, vec![3]);
+    }
+
+    // ------------------------------------------------------------------
+    // The client input frame's byte bound
+    // ------------------------------------------------------------------
+
+    /// One body per connection never filled a datagram; several can. Everything that fits rides,
+    /// in ascending block order, and the rotor holds still while nothing is being deferred.
+    #[test]
+    fn an_input_frame_that_fits_carries_every_block_and_does_not_rotate() {
+        let mut carried = vec![99]; // must be cleared, not appended to
+        let rotor = admit_input_blocks(&[10, 20, 30], 0, 1200, &mut carried);
+        assert_eq!(carried, vec![0, 1, 2]);
+        assert_eq!(rotor, 0, "nothing was refused, so nothing needs a turn");
+
+        // No owned bodies at all: no blocks, and a rotor that cannot index anything.
+        assert_eq!(admit_input_blocks(&[], 7, 1200, &mut carried), 0);
+        assert!(carried.is_empty());
+    }
+
+    /// The rota. Past the budget, the refused block is what the next tick offers first, so no seat
+    /// can be starved by the ones that sort ahead of it.
+    #[test]
+    fn a_full_input_frame_defers_to_the_next_tick_and_rotates() {
+        let lengths = [400usize, 400, 400, 400];
+        let mut carried = Vec::new();
+
+        let rotor = admit_input_blocks(&lengths, 0, 1000, &mut carried);
+        assert_eq!(carried, vec![0, 1], "800 fits, 1200 does not");
+        assert_eq!(rotor, 2);
+
+        // Next tick starts at 2 and wraps, so the two that waited go first.
+        let rotor = admit_input_blocks(&lengths, rotor, 1000, &mut carried);
+        assert_eq!(carried, vec![2, 3]);
+        assert_eq!(rotor, 0, "and the walk wrapped to refuse 0");
+
+        // Over two ticks every block rode exactly once — which is the starvation-freedom claim.
+        let rotor = admit_input_blocks(&lengths, rotor, 1000, &mut carried);
+        assert_eq!(carried, vec![0, 1]);
+        assert_eq!(rotor, 2);
+    }
+
+    /// A block wider than the whole payload can never be sent — no rota fixes an input row larger
+    /// than a datagram — and it must not take the other seats down with it. The walk continues past
+    /// it, and the rotor parks on it rather than advancing past the blocks it refused.
+    #[test]
+    fn an_oversized_input_block_starves_nobody() {
+        let mut carried = Vec::new();
+        let rotor = admit_input_blocks(&[2000, 100, 100], 0, 1200, &mut carried);
+        assert_eq!(carried, vec![1, 2], "the other two still ride");
+        assert_eq!(rotor, 0);
+
+        // And it stays that way tick after tick rather than converging on sending nothing.
+        let rotor = admit_input_blocks(&[2000, 100, 100], rotor, 1200, &mut carried);
+        assert_eq!(carried, vec![1, 2]);
+        assert_eq!(rotor, 0);
+    }
+
+    /// The rotor is a position in a list that changes size — a body despawns, a seat leaves — so it
+    /// is taken modulo the block count rather than trusted as an index.
+    #[test]
+    fn the_rotor_survives_a_shrinking_owned_set() {
+        let mut carried = Vec::new();
+        let rotor = admit_input_blocks(&[100], 9, 1200, &mut carried);
+        assert_eq!(carried, vec![0]);
+        assert_eq!(rotor, 0);
+    }
+
     /// A peer's own body is never culled by anything, membership included — the peer's world was read
     /// off this very row, and a peer driving bodies in two worlds must not lose its own avatar.
     #[test]
@@ -3387,17 +3782,43 @@ mod tests {
             row(3, 4, None, MEMBERSHIP_GLOBAL),
             row(4, 7, None, MEMBERSHIP_GLOBAL),
         ];
-        let mut owned = vec![(999, 999)]; // must be cleared, not appended to
+        let mut owned = vec![(seat_of(999, 9), 999)]; // must be cleared, not appended to
         owned_rows_into(&rows, &mut owned);
         assert_eq!(
             owned,
-            vec![(4, 2), (7, 1), (7, 3)],
+            vec![(seat_of(4, 0), 2), (seat_of(7, 0), 1), (seat_of(7, 0), 3)],
             "unowned rows are absent"
         );
-        assert_eq!(owned_rows_of(&owned, 7), &[(7, 1), (7, 3)]);
-        assert_eq!(owned_rows_of(&owned, 4), &[(4, 2)]);
+        assert_eq!(
+            owned_rows_of(&owned, 7),
+            &[(seat_of(7, 0), 1), (seat_of(7, 0), 3)]
+        );
+        assert_eq!(owned_rows_of(&owned, 4), &[(seat_of(4, 0), 2)]);
         assert_eq!(owned_rows_of(&owned, 9), &[], "a peer driving nothing");
         assert_eq!(owned_rows_of(&owned, 1), &[], "and one below every owner");
+    }
+
+    /// The table is keyed by seat, and a connection's slice is ascending by seat label with a run
+    /// per seat — which is what lets `update_interest` count a connection's seats without a set.
+    /// Every row is still that CONNECTION's, whichever seat drives it: the datagram is shared.
+    #[test]
+    fn owned_rows_group_a_connections_seats_in_label_order() {
+        let rows = [
+            row_seat(1, 7, 2, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row_seat(2, 7, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row_seat(3, 7, 2, None, MEMBERSHIP_GLOBAL),
+            row_seat(4, 8, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+        ];
+        let mut owned = Vec::new();
+        owned_rows_into(&rows, &mut owned);
+        assert_eq!(
+            owned_rows_of(&owned, 7),
+            &[(seat_of(7, 0), 1), (seat_of(7, 2), 0), (seat_of(7, 2), 2)],
+            "one connection's rows, ascending by seat, each seat's rows contiguous"
+        );
+        // A seat label decides the grouping and nothing else — the labels need not be contiguous,
+        // and seat 1 being absent costs nothing.
+        assert_eq!(owned_rows_of(&owned, 8), &[(seat_of(8, 0), 3)]);
     }
 
     /// **The equivalence the shared list rests on.** One list per tick with the peer's own rows
@@ -3453,11 +3874,11 @@ mod tests {
         assert_eq!(shared, fresh, "the patch was not restored");
     }
 
-    /// The peer's own world comes from the same row its interest centre does: the LOWEST-id owned row
-    /// that resolved an anchor. Rows arrive sorted by id, and a peer driving more than one body must
-    /// not have either answer decided by `HashMap` iteration order.
+    /// The seat's own world comes from the same row its interest centre does: the LOWEST-id owned row
+    /// on that seat that resolved an anchor. Rows arrive sorted by id, and a seat driving more than
+    /// one body must not have either answer decided by `HashMap` iteration order.
     #[test]
-    fn a_peers_centre_and_world_both_come_from_its_lowest_id_anchored_body() {
+    fn a_seats_centre_and_world_both_come_from_its_lowest_id_anchored_body() {
         let rows = [
             // Owned but unanchored, and the lowest id: skipped, so it supplies NEITHER fact.
             row(1, 42, None, 77),
@@ -3467,29 +3888,77 @@ mod tests {
             row(4, 43, Some([30.0, 0.0, 0.0]), 8),
             row(5, 0, Some([40.0, 0.0, 0.0]), 9),
         ];
-        let mut observers = HashMap::new();
+        let mut observers = vec![(
+            seat_of(999, 9),
+            PeerObserver {
+                center: [7.0; 3],
+                membership: 1,
+            },
+        )];
         OrbitNet::collect_observers(&rows, &mut observers);
 
-        let peer = observers[&42];
+        let peer = OrbitNet::observers_of(&observers, 42)[0].1;
         assert_eq!(peer.center, [10.0, 0.0, 0.0]);
         assert_eq!(
             peer.membership, 5,
             "the world comes from the row that supplied the centre, not from a lower unanchored one"
         );
-        assert_eq!(observers[&43].membership, 8);
-        assert!(!observers.contains_key(&0), "an unowned row anchors nobody");
-        assert_eq!(observers.len(), 2);
+        assert_eq!(OrbitNet::observers_of(&observers, 43)[0].1.membership, 8);
+        assert!(
+            OrbitNet::observers_of(&observers, 0).is_empty(),
+            "an unowned row anchors nobody"
+        );
+        assert_eq!(
+            observers.len(),
+            2,
+            "the stale entry was cleared, not appended to"
+        );
     }
 
-    /// A peer with no anchored body gets no entry, so it is neither distance-culled nor
-    /// membership-filtered: `update_interest` reads the absence as MEMBERSHIP_GLOBAL and it sees
-    /// every world. Both halves fail open together.
+    /// **The change local split-screen needs.** One connection driving two bodies on two seats gets
+    /// two centres and two worlds. Keyed by connection, the lower entity id won and the other
+    /// player's surroundings were culled around a position that player was nowhere near.
     #[test]
-    fn a_peer_with_no_anchored_body_has_no_observer_at_all() {
+    fn each_seat_on_one_connection_anchors_itself() {
+        let rows = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), 5),
+            row_seat(2, 42, 1, Some([900.0, 0.0, 0.0]), 6),
+            // A second body on seat 1, higher id: the lowest-id rule still picks per seat.
+            row_seat(3, 42, 1, Some([950.0, 0.0, 0.0]), 7),
+        ];
+        let mut observers = Vec::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+
+        let seats = OrbitNet::observers_of(&observers, 42);
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].0, seat_of(42, 0));
+        assert_eq!(seats[0].1.center, [10.0, 0.0, 0.0]);
+        assert_eq!(seats[0].1.membership, 5);
+        assert_eq!(seats[1].0, seat_of(42, 1));
+        assert_eq!(seats[1].1.center, [900.0, 0.0, 0.0]);
+        assert_eq!(seats[1].1.membership, 6);
+    }
+
+    /// A seat with no anchored body gets no entry, so it is neither distance-culled nor
+    /// membership-filtered: `update_interest` reads the absence as MEMBERSHIP_GLOBAL and it sees
+    /// every world. Both halves fail open together, and now they fail open FOR THAT SEAT — the
+    /// other seat on the same connection keeps its centre.
+    #[test]
+    fn a_seat_with_no_anchored_body_has_no_observer_at_all() {
         let rows = [row(1, 42, None, 77), row(2, 0, Some([1.0, 0.0, 0.0]), 5)];
-        let mut observers: HashMap<i32, PeerObserver> = HashMap::new();
+        let mut observers: Vec<(SeatId, PeerObserver)> = Vec::new();
         OrbitNet::collect_observers(&rows, &mut observers);
         assert!(observers.is_empty());
+
+        // The same, with a second seat that DID resolve one: the unanchored seat is still absent,
+        // and the located one is unaffected by it.
+        let rows = [
+            row_seat(1, 42, 0, None, 77),
+            row_seat(2, 42, 1, Some([4.0, 0.0, 0.0]), 5),
+        ];
+        OrbitNet::collect_observers(&rows, &mut observers);
+        assert_eq!(observers.len(), 1);
+        assert_eq!(observers[0].0, seat_of(42, 1));
     }
 
     // ------------------------------------------------------------------

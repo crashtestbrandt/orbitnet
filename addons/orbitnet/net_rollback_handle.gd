@@ -37,11 +37,13 @@ func add_input(node: Object, property: String) -> void:
 ## origin, overlap in coordinates. Interest is a distance test, and two bodies at the same coordinates in
 ## different worlds are zero metres apart, so a radius cannot separate them.
 ##
-## THIS ALSO SETS THE OWNING PEER'S OWN WORLD. A peer's world is read off the body that anchors its interest
-## radius -- the lowest-id body whose input authority is that peer. That body's membership is the world every
-## other entity is then filtered against for that peer, so declaring it on player bodies is what makes the
-## feature work at all; declaring it only on scenery filters nothing. A peer with no rollback body has no
-## anchor and no world, and sees every world (the same fail-open as its radius).
+## THIS ALSO SETS THE OWNING SEAT'S OWN WORLD. A seat's world is read off the body that anchors its interest
+## radius -- the lowest-id body whose input authority is that peer and which declares that seat. That body's
+## membership is the world every other entity is then filtered against for that seat, so declaring it on player
+## bodies is what makes the feature work at all; declaring it only on scenery filters nothing. A seat with no
+## rollback body has no anchor and no world, and sees every world (the same fail-open as its radius). A
+## connection carries the union of its seats' sets, so a peer with a body in each of two worlds sees both --
+## see [method set_seat].
 ##
 ## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's centre and world directly, and
 ## a peer that used it reads neither off any body -- which is the way out when a peer drives bodies in more than
@@ -67,6 +69,46 @@ func membership() -> int:
 	if _sync == null or not _sync.has_method(&"get_membership"):
 		return 0
 	return _sync.get_membership()
+
+## Declare which SEAT on the owning connection drives this body. 0 unless you say otherwise.
+##
+## A seat is one owned, predicted body behind one connection. Local split-screen over a network session is two
+## or more locally-owned bodies on a single socket, and each needs its own interest anchor -- the second
+## player's surroundings are not the first player's. The owning peer comes from the input node's multiplayer
+## authority; this is the other half, and `(peer, seat)` is what the interest pass anchors on.
+##
+## CALL IT ON THE SERVER. Interest is computed only where state authority is, so this is read only there, and
+## nothing on the wire carries a seat. The server assigns seats, so it declares them on its own copy of the
+## scene; a client may leave every body at 0. The anti-forgery check on received input is per entity and is
+## unaffected either way.
+##
+## A LABEL, NOT A SLOT INDEX. Two bodies on the same connection with the same value share one anchor (the
+## lowest-id one supplies it); every distinct value is one more interest set the server maintains for that
+## connection. The numbers need not be contiguous.
+##
+## What it costs to skip: with two bodies at the default 0, the connection gets ONE centre -- whichever body
+## the id hash sorts lowest -- and the other player's surroundings are culled around a position that player is
+## nowhere near. Visible only with a cull radius set.
+##
+## COMMANDS ARE NOT SEATED BY THIS. [NetCommand] hands its validator the sender's peer id; a game with several
+## seats on one connection puts the seat in the payload and validates it against the seats it assigned. See
+## the header of `net_command.gd`.
+func set_seat(seat: int) -> void:
+	if _sync != null:
+		_sync.set(&"seat", seat)
+
+## The seat declared for this body (0 when inert, or on a backend too old to carry one).
+##
+## Read as a PROPERTY rather than through a getter, and checked for type: a backend without the export answers
+## `null`, which is the "too old" case rather than a value to convert.
+func seat() -> int:
+	if _sync == null:
+		return 0
+	var declared: Variant = _sync.get(&"seat")
+	if typeof(declared) != TYPE_INT:
+		return 0
+	var index: int = declared
+	return index
 
 ## Re-read the synchronizer's configuration after its state/input sets change (the backend re-resolves its schema here).
 func process_settings() -> void:

@@ -13,6 +13,17 @@ class_name SeatRoster
 ## authority, so there is nobody to lie to -- but the resolution still has to be defined, or the offline path
 ## would take a different branch through the validator than the networked one, and the offline path is the one
 ## people develop against.
+##
+## THIS TABLE IS A BIJECTION, AND THAT IS THIS DEMO'S CHOICE RATHER THAN THE BACKEND'S. The backend seats a
+## body, not a connection: `NetRollbackHandle.set_seat()` lets one connection drive several owned bodies, each
+## with its own interest anchor, which is what local split-screen needs. This demo seats one player per peer and
+## leaves every body at seat 0, so `assign()` refusing a second seat to the same peer is a rule about THIS game.
+##
+## A game that does hold several seats on one connection cannot resolve a seat from the sender id alone, because
+## the sender id names the connection. It carries the seat in the command payload and validates it against the
+## seats the SERVER assigned to that sender -- which keeps the security model intact, since the server assigned
+## them. What must never happen is trusting the payload's seat unchecked; that is a forged order on somebody
+## else's units.
 
 ## NetCommand's sentinel for "applied locally with no session".
 const OFFLINE_SENDER: int = 0

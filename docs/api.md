@@ -115,8 +115,10 @@ A peer replicates an entity when **both** filters admit it. They are independent
 | **Distance** — within `aoi_radius` of the peer's centre | always on; the anchor is the body's first `Vector3` **State** property, so register position first | opt in with `NetStateHandle.set_anchor(entry)`, naming a `Vector3` explicitly |
 | **Membership** — in the same world as the peer | opt in with `NetRollbackHandle.set_membership(entry)`, naming an `int` | opt in with `NetStateHandle.set_membership(entry)`, naming an `int` |
 
-**The peer's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
-authority is that peer, and which resolved an anchor — unless the peer declares them, below.
+**The seat's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
+authority is that peer, which declares that seat, and which resolved an anchor — unless the peer declares them,
+below. A **seat** is one owned, predicted body behind a connection; every body is on seat `0` until
+`NetRollbackHandle.set_seat()` says otherwise, which is one seat per connection.
 
 Three consequences people find the hard way:
 
@@ -133,6 +135,35 @@ Three consequences people find the hard way:
 Membership matters when one session hosts **several independent worlds**, each rebased near its own coordinate
 origin. Two entities at the same coordinates in different worlds are zero metres apart, so no radius can
 separate them. `0` is the default id on both sides and matches every world.
+
+### Seats: several owned bodies on one connection
+
+Local split-screen over a network session is two or more locally-owned, locally-predicted bodies behind a
+single transport peer. Each is a **seat**, and the second player's surroundings are not the first player's.
+
+| | |
+|---|---|
+| Declaring a seat | `NetRollbackHandle.set_seat(index)`, **on the server**. Every body starts at `0`. |
+| What a seat gets | Its own interest anchor, its own centre, its own world, its own hysteresis band and its own nearest-N cap. |
+| What the connection gets | The **union** of its seats' sets, with the **nearest** seat's distance kept per entity — which is the band the send rota scores it in. |
+| What stays per connection | The delta base, the ack window, `want_full` and the byte budget. Those are properties of a datagram, and a datagram is per connection. |
+
+- **A seat with no body yet culls nothing of its own.** Culling is decided per seat, so a seat whose body has
+  not spawned does not inherit another seat's centre and have its surroundings culled around a position it is
+  nowhere near.
+- **A leave is a leave from the union.** An entity one seat lets go of keeps its delta chain while another seat
+  still holds it.
+- **`Net.set_peer_anchor()` collapses the connection to one viewpoint.** A declaration states where a
+  *connection* observes from; a game that wants a centre per seat declares nothing and lets each seat's body
+  anchor it.
+- **The input frame is bounded to one datagram.** Each owned body carries four ticks of input per frame, so
+  several seats can overrun the payload; what does not fit is offered first on the next tick. A body skipped
+  for up to three frames loses nothing, because the next frame it rides in re-sends the ticks it missed.
+- **Commands are per connection, not per seat.** `NetCommand` hands its validator the sender's peer id — the
+  only identity a client cannot author. A game with several seats on one connection puts the seat in the
+  payload and validates it against the seats the server assigned to that sender.
+- **Nothing on the wire carries a seat.** Interest runs where state authority is, so a seat is a server-side
+  declaration; the anti-forgery check on received input is per entity and is unchanged.
 
 ```gdscript
 # A player body: its world is also the OWNING PEER's world.
@@ -157,11 +188,11 @@ worlds observes exactly one of them.
 |---|---|
 | `set_peer_anchor(peer, position, membership = 0)` | Observe from a fixed world position, in this world. |
 | `set_peer_anchor_entity(peer, entity_id, membership = 0)` | Observe from an entity, wherever it is, in this world. `entity_id` comes from `entity_id()` on a rollback or state handle; `0` retracts. |
-| `clear_peer_anchor(peer)` | Retract the centre **and** the world, back to the inferred body. |
+| `clear_peer_anchor(peer)` | Retract the centre **and** the world, back to the inferred body — one per seat. |
 | `peer_membership(peer)` | The **declared** world, 0 when nothing was declared. Not what an undeclared peer is filtered in — that is `NetRollbackHandle.membership()`. |
 
 - **A declaration replaces inference on both axes at once.** The driven body is consulted for neither until
-  `clear_peer_anchor()`.
+  `clear_peer_anchor()`, and a connection with several seats is collapsed to the one declared viewpoint.
 - **It makes a peer's world a fact rather than a pick.** The inferred path reads it off whichever of the peer's
   bodies sorts lowest by hash, so a peer driving two bodies in different worlds has no defined world without
   this call.
@@ -186,7 +217,9 @@ Net.set_peer_anchor_entity(peer_id, body.entity_id(), 2)
 |---|---|
 | `is_active() -> bool` | False when inert (OFFLINE). |
 | `add_state(node, property)` / `add_input(node, property)` | For handles built with `make_rollback()`. |
-| `set_membership(entry) -> void` | Declare which **world** this body is in, as a `"NodePath:property"` naming an `int`. Also sets the owning peer's own world, unless that peer declared its own with `Net.set_peer_anchor()`. Call before `process_settings()`. |
+| `set_membership(entry) -> void` | Declare which **world** this body is in, as a `"NodePath:property"` naming an `int`. Also sets the owning seat's own world, unless that peer declared its own with `Net.set_peer_anchor()`. Call before `process_settings()`. |
+| `set_seat(index) -> void` | Declare which **seat** on the owning connection drives this body. Server-side; `0` unless set, which is one seat per connection. |
+| `seat() -> int` | The declared seat, `0` when inert. |
 | `entity_id() -> int` | This body's stable replication id, for `Net.set_peer_anchor_entity()`. An opaque token — routinely negative, never compared or ordered. 0 when inert or unresolved. |
 | `process_settings() -> void` | Re-resolve after the property set changes. |
 | `process_authority() -> void` | Re-evaluate prediction after an authority change. Call on **every** peer when ownership moves. |

@@ -17,7 +17,8 @@
 //! * [`codec`] — the wire encoding: varints, frame headers, handshake, entity blocks.
 //! * [`freshness`] — the #67 fix: per-(entity, tick) input confidence, so `is_fresh` keys on
 //!   input *novelty* rather than tick visitation, plus the tick-indexed memo ring.
-//! * [`interest`] — AOI: the uniform grid and per-peer interest sets with hysteresis.
+//! * [`interest`] — AOI: the uniform grid, per-seat interest sets with hysteresis, and the
+//!   per-connection union of them.
 //! * [`priority`] — the send rota: distance bands, weights, and `staleness × weight` ordering.
 //! * [`pacing`] — coupled-mode tick slewing and the input-lead margin tracker.
 
@@ -42,8 +43,8 @@ pub use columnar::ColumnarHistory;
 pub use freshness::{Confidence, FreshnessLedger, MemoRing};
 pub use history::{plan_cost, BodyId, BodyResim, DirtyWindow, ResimPlanner, ResimRange, TickRing};
 pub use interest::{
-    membership_matches, AoiConfig, InterestCandidate, InterestGrid, MembershipId, PeerInterest,
-    MEMBERSHIP_GLOBAL,
+    membership_matches, AoiConfig, ConnectionInterest, InterestCandidate, InterestGrid,
+    MembershipId, PeerInterest, SeatObserver, SeatScratch, MEMBERSHIP_GLOBAL,
 };
 pub use pacing::{CoupledSlew, LeadTracker, SlewDecision};
 pub use priority::{Band, Candidate, WEIGHT_ONE, WEIGHT_OWNED};
