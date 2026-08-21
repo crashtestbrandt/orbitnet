@@ -64,6 +64,13 @@ profile_parts() {
 
 shipped_name() {
 	platform_parts "$1"
+	# macOS PROFILING is arm64, not universal. A universal profiling dylib would need two debug maps
+	# lipo'd together, which produces nothing dsymutil can turn into a usable .dSYM -- and the profile
+	# export presets target arm64 anyway. The two descriptor profiles stay universal.
+	if [ "$1" = macos ] && [ "$2" = profiling ]; then
+		printf '%s.profiling.arm64.dylib\n' "$SHIP_PREFIX"
+		return
+	fi
 	printf '%s.%s.%s\n' "$SHIP_PREFIX" "$2" "$SHIP_SUFFIX"
 }
 
@@ -110,7 +117,37 @@ build)
 		ship="$(shipped_name "$PLATFORM" "$p")"
 		printf '\nbuild-native: %s / %s -> %s\n' "$PLATFORM" "$p" "$ship"
 
-		if [ "$PLATFORM" = macos ]; then
+		# A PROFILING build needs a per-platform rustc flag that a plain `cargo build` does not pass,
+		# and without it the artifact is published but unusable by a profiler:
+		#   linux  a Rust cdylib link does not request a GNU build ID in this toolchain, and perf
+		#          records build IDs when locating ELF images.
+		#   macos  rustc's default leaves DWARF in the object files and links only a debug map, so the
+		#          dylib alone is unsymbolizable. `packed` runs dsymutil and emits the .dSYM.
+		#   windows nothing extra -- the MSVC linker always writes a PDB and stamps the image with the
+		#          CodeView key naming it.
+		if [ "$p" = profiling ]; then
+			case "$PLATFORM" in
+				linux)   RUSTC_ARGS=(-C link-arg=-Wl,--build-id) ;;
+				macos)   RUSTC_ARGS=(-C split-debuginfo=packed) ;;
+				windows) RUSTC_ARGS=() ;;
+			esac
+		else
+			RUSTC_ARGS=()
+		fi
+
+		if [ "$PLATFORM" = macos ] && [ "$p" = profiling ]; then
+			# arm64 only, and the .dSYM rides beside it. See shipped_name().
+			( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" -p orbitnet-godot \
+				--target aarch64-apple-darwin -- "${RUSTC_ARGS[@]}" )
+			built="$NATIVE/target/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
+			[ -s "$built" ] || { printf 'build-native: cargo produced nothing at %s\n' "$built" >&2; exit 1; }
+			install -m 0755 "$built" "$OUTDIR/$ship"
+			[ -d "$built.dSYM" ] || { printf 'build-native: no .dSYM beside %s\n' "$built" >&2; exit 1; }
+			rm -rf "$OUTDIR/$ship.dSYM"
+			# -L dereferences: cargo leaves target/<profile>/*.dSYM as a symlink into deps/, and a
+			# staged symlink points back at a tree the next build rewrites.
+			cp -RLp "$built.dSYM" "$OUTDIR/$ship.dSYM"
+		elif [ "$PLATFORM" = macos ]; then
 			( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot --target x86_64-apple-darwin )
 			( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot --target aarch64-apple-darwin )
 			lipo -create -output "$OUTDIR/$ship" \
@@ -118,10 +155,22 @@ build)
 				"$NATIVE/target/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
 			lipo -info "$OUTDIR/$ship"
 		else
-			( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot )
+			if [ "${#RUSTC_ARGS[@]}" -gt 0 ]; then
+				( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" -p orbitnet-godot -- "${RUSTC_ARGS[@]}" )
+			else
+				( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot )
+			fi
 			built="$NATIVE/target/$CARGO_DIR/$BUILT_NAME"
 			[ -s "$built" ] || { printf 'build-native: cargo produced nothing at %s\n' "$built" >&2; exit 1; }
 			install -m 0755 "$built" "$OUTDIR/$ship"
+		fi
+
+		# Prove the profiling artifact is actually symbolizable, rather than trusting the flag.
+		if [ "$p" = profiling ] && [ "$PLATFORM" = linux ] && command -v readelf >/dev/null 2>&1; then
+			readelf -S --wide "$OUTDIR/$ship" | grep -q '\.debug_info' \
+				|| { printf 'build-native: %s has no .debug_info\n' "$ship" >&2; exit 1; }
+			readelf -n "$OUTDIR/$ship" | grep -q 'Build ID' \
+				|| { printf 'build-native: %s has no ELF build ID\n' "$ship" >&2; exit 1; }
 		fi
 
 		# The Windows profiling build's symbols live in a separate PDB rather than inside the image.
