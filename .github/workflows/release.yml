@@ -333,12 +333,8 @@ jobs:
           git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
           git -C "$wt" push --force origin "HEAD:refs/heads/${branch}"
           git worktree remove --force "$wt"
-          # A PR may already exist if this tag was re-run; creating a duplicate is an error, not a
-          # failure worth stopping the run for.
-          curl -sS -X POST \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            -d "{\"title\":\"release: binaries manifest for ${GITHUB_REF_NAME}\",\"head\":\"${branch}\",\"base\":\"main\",\"body\":\"Digest of every asset published on \`${GITHUB_REF_NAME}\`, so a consumer can verify a download against the commit graph rather than against a checksum published beside the file it describes.\\n\\nOpened by \`release.yml\`; \`main\` is protected, so this cannot be a direct push.\"}" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print('PR:', d.get('html_url') or d.get('message'))"
+          # The API's answer decides this step's exit code. Piping curl into a printer exits 0 whatever
+          # GitHub said, which is how v0.1.1's refusal ("GitHub Actions is not permitted to create or
+          # approve pull requests") was reported as success while the manifest sat on an unmerged branch.
+          # A pull request already open for this branch -- a re-run of the same tag -- is success.
+          tools/propose-manifest-pr.py "${GITHUB_REPOSITORY}" "${branch}" main "${GITHUB_REF_NAME}"
