@@ -3,7 +3,7 @@
 Short, because most of the rules are enforced rather than described.
 
 ```sh
-just sync-addons     # required once after cloning
+just native-install  # required once after cloning: builds the extension and syncs it
 just check           # everything a PR must pass
 ```
 

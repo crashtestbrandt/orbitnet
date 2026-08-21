@@ -2,8 +2,9 @@
 
 The Rust toolchain, the build recipes, and the binary distribution policy.
 
-**You do not need any of this to use OrbitNet.** The binaries are committed as plain files, so a fresh clone
-— or an Asset Library install — already has a working extension. This page is for changing the backend.
+**You do not need any of this to consume OrbitNet.** An Asset Library install or a release zip carries the
+binaries already built. A `git clone` does not — `just native-install` builds them. This page is for
+changing the backend.
 
 ## Toolchain
 

@@ -199,7 +199,11 @@ jobs:
           # The licences ride along inside it, because an addon installed from a zip carries no repository
           # with it and a user who cannot find the terms will assume the worst.
           cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
-          zip -qr "build/orbitnet-${version}.zip" addons/orbitnet addons/orbitnet_native
+          # -x the manifest: it is written AFTER this zip, because it hashes the zip. The copy sitting in
+          # the tree is therefore the PREVIOUS tag's, and shipping it inside the payload would hand a user
+          # digests matching none of the six libraries beside it.
+          zip -qr "build/orbitnet-${version}.zip" addons/orbitnet addons/orbitnet_native \
+            -x 'addons/orbitnet_native/binaries.json'
           rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT \
                 addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
           # bin/ is gitignored, so `zip -r` on a clean checkout would silently ship an addon with no
@@ -235,28 +239,6 @@ jobs:
             printf '\n  }\n}\n'
           } > addons/orbitnet_native/binaries.json
           cat addons/orbitnet_native/binaries.json
-
-      - name: Commit the manifest to main
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -euo pipefail
-          git config user.name  'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-          # This checkout is the TAG and detached, so the manifest is replayed onto main rather than
-          # pushed from here -- pushing a detached HEAD to main would move main to the tag.
-          manifest="$(cat addons/orbitnet_native/binaries.json)"
-          plugin="$(cat addons/orbitnet/plugin.cfg)"
-          git fetch origin main
-          git checkout -B release-manifest origin/main
-          printf '%s' "$manifest" > addons/orbitnet_native/binaries.json
-          printf '%s' "$plugin"   > addons/orbitnet/plugin.cfg
-          git add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
-          if git diff --cached --quiet; then
-            echo "manifest unchanged; nothing to commit"
-            exit 0
-          fi
-          git commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
-          git push origin HEAD:main
 
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -296,3 +278,35 @@ jobs:
             | `*.profiling.*` | Release build with debug information retained, for a native profiler. Not named by the descriptor. |
 
             OrbitNet is 0.x. The `Net` facade is the stable surface; everything behind it may change.
+
+      # AFTER the release exists, and in a SEPARATE WORKTREE. This checkout is the TAG and it is dirty:
+      # plugin.cfg has been stamped and binaries.json freshly written. `git checkout -B ... origin/main`
+      # in THIS tree aborts whenever either file differs between the tag and main -- a re-run after the
+      # manifest has landed, a patch tag cut below main's last manifest commit, a re-tag of an older
+      # commit -- and because the publish step below carries an implicit `success()`, that abort used to
+      # skip the publish entirely. Three cross-platform builds, no release, and a tag that cannot be
+      # re-run without editing this file.
+      #
+      # `cp` rather than a `$(cat ...)` / `printf '%s'` round trip: command substitution strips trailing
+      # newlines, which silently rewrote plugin.cfg from 424 bytes to 423 on every release.
+      - name: Commit the manifest to main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          wt="$RUNNER_TEMP/main-worktree"
+          rm -rf "$wt"
+          git worktree prune
+          git fetch origin main
+          git worktree add --detach "$wt" origin/main
+          cp addons/orbitnet_native/binaries.json "$wt/addons/orbitnet_native/binaries.json"
+          cp addons/orbitnet/plugin.cfg           "$wt/addons/orbitnet/plugin.cfg"
+          git -C "$wt" add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
+          if git -C "$wt" diff --cached --quiet; then
+            echo "manifest unchanged; nothing to commit"
+          else
+            git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
+            git -C "$wt" push origin HEAD:main
+          fi
+          git worktree remove --force "$wt"

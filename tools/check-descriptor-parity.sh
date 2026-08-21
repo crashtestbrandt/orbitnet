@@ -19,8 +19,15 @@ WORKFLOW=".github/workflows/binaries.yml"
 PLATFORMS=(linux windows macos)
 
 # Filenames the descriptor points at, deduplicated: several entries may name one file.
+# `|| true` then an explicit emptiness check: under `set -euo pipefail` a grep that matches nothing kills
+# the assignment and the script exits 1 having printed nothing, which is indistinguishable in an Actions
+# log from a real parity break.
 named="$(grep -oE 'res://addons/orbitnet_native/bin/[^"]+' "$DESCRIPTOR" \
-	| sed 's|.*/||' | sort -u)"
+	| sed 's|.*/||' | sort -u || true)"
+if [ -z "$named" ]; then
+	printf '::error::found no bin/ library paths in %s -- the descriptor shape changed and this check needs updating.\n' "$DESCRIPTOR"
+	exit 1
+fi
 
 # Filenames the build path stages, asked of the script that owns the mapping rather than scraped out of
 # YAML. Only the descriptor profiles: `profiling` is a release asset and deliberately not an entry.
@@ -32,13 +39,13 @@ unused="$(comm -13 <(printf '%s\n' "$named") <(printf '%s\n' "$built") || true)"
 status=0
 if [ -n "$missing" ]; then
 	printf '::error::descriptor names libraries the build path does not produce:\n'
-	printf '  %s\n' $missing
+	printf '%s\n' "$missing" | sed 's/^/  /'
 	printf '\nEither add a platform case to tools/build-native.sh or drop the entry from %s.\n' "$DESCRIPTOR"
 	status=1
 fi
 if [ -n "$unused" ]; then
 	printf '::error::the build path stages libraries the descriptor never loads:\n'
-	printf '  %s\n' $unused
+	printf '%s\n' "$unused" | sed 's/^/  /'
 	printf '\nA built artifact nothing names is dead weight in every release.\n'
 	status=1
 fi

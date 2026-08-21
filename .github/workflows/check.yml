@@ -75,8 +75,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # This job builds the cdylib it loads, so it needs the toolchain. The cache is shared with the
-      # `native` job above by using the same workspace key, so the second build is warm.
+      # This job builds the cdylib it loads, so it needs the toolchain. Its cache is its OWN, not the
+      # `native` job's: rust-cache keys on the job id unless `shared-key` is set, and `key` only adds a
+      # further discriminator. Sharing would not help anyway -- `native` compiles the dev profile for
+      # clippy and tests, this job compiles `template-debug` and `release`, which are different target
+      # directories with no artifact overlap.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
