@@ -1,0 +1,101 @@
+name: Claude PR review
+
+# An automatic Claude Code review when a pull request is OPENED (and is not a draft), or when a draft is
+# marked READY FOR REVIEW. Advisory only: this workflow never gates a merge, and `check.yml` remains the
+# gate. Nothing here runs a build, so a red review comment and a green `check` are both possible and mean
+# different things.
+#
+# DRAFTS ARE SKIPPED. GitHub fires `opened` for draft PRs too, so the job guards on `draft == false`;
+# `ready_for_review` only ever fires for a non-draft, so it always passes that guard.
+#
+# FORK PRs ARE SKIPPED, and this is a security decision rather than an oversight. `pull_request` gives a fork
+# no secrets, so the action would fail at authentication rather than review anything; the alternative that
+# would work, `pull_request_target`, runs with a WRITE token and repository secrets against code the fork
+# author controls, which is the standard way a public repository leaks its own credentials. The same
+# reasoning that keeps `check.yml` on GitHub-hosted runners applies here. A maintainer who wants a fork PR
+# reviewed pushes the branch to this repository.
+#
+# GITHUB-HOSTED RUNNER. A public repository must never point PR CI at a self-hosted runner.
+#
+# REQUIRES a repository secret named CLAUDE_CODE_OAUTH_TOKEN (Settings -> Secrets and variables -> Actions ->
+# New repository secret). Generate it with `claude setup-token` locally; it bills against a Claude
+# subscription. For Anthropic API-credit billing instead, store a Console API key as ANTHROPIC_API_KEY and
+# swap the `claude_code_oauth_token:` line below for `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
+# With neither secret set, the job fails; it does not silently pass.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+# One review per PR. Don't pile up runs if events arrive close together for the same pull request.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # One updatable comment instead of a new thread on each run.
+          use_sticky_comment: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request. The PR branch is already checked out in the working directory. Read
+            CONTRIBUTING.md and CLAUDE.md first -- CONTRIBUTING.md is the authority on this repository -- and
+            honor the project's conventions. Focus, in priority order, on:
+
+            - Correctness: bugs, logic errors, unhandled edge cases, race/ordering hazards. Netcode
+              specifically: a value that must be identical on every peer, a filter that fails CLOSED where it
+              should fail open, and per-peer delta bookkeeping that is not cleared when an entity leaves a
+              peer's interest set.
+            - Project invariants. Flag any violation:
+              * FACADE BOUNDARY -- `addons/orbitnet/net.gd` is the only file that may name a backend class
+                (OrbitNet, OrbitRollbackSynchronizer, OrbitStateSynchronizer, OrbitInterpolator), and
+                `steam_transport.gd` is the only file that may name Steamworks. The gate is
+                `tools/net-check.sh`, and it scans the demos too. A demo reaching past the facade means the
+                facade has a hole: widen the facade, do not exempt the caller.
+              * CORE PURITY -- `orbitnet-core` never sees a `Variant` and never depends on `godot`. A godot
+                type in a core signature means logic has leaked across the boundary.
+              * STRICT GDSCRIPT -- every var, parameter and return is annotated; Array and Dictionary are
+                typed; a Variant is never `as`-cast or passed to a typed constructor (assign it to a typed
+                local instead); `@warning_ignore` needs a comment explaining the false positive; no Python
+                idioms (`size()` not `len()`, `push_back()` not `append()`, `append_array()` not `+=`).
+              * CANONICAL ADDON -- `addons/orbitnet/` and `addons/orbitnet_native/` at the repository root
+                are the only sources. A per-project copy under `harness/` or `demos/` is a gitignored build
+                artifact and must never be edited or committed. No binaries in
+                `addons/orbitnet_native/bin/`.
+              * COVERAGE -- a pure function belongs in a `tests/unit/*_test.gd` suite or a Rust `#[cfg(test)]`
+                module, not a probe. Exactly one probe gates PRs (`tools/rts-probe.sh`); flag any new one.
+              * RECORDED DECISIONS -- there are no ADRs, so a decision lives in the header comment of the
+                file it governs. A changed decision with an unchanged comment is a finding.
+              * WRITTEN FOR A READER WHO HAS ONLY THIS REPOSITORY -- no other project's class, scene or
+                issue numbers in comments or docs, and no title's real Steam app id or lobby tag as a
+                default.
+            - Security implications and performance, especially per-tick work that scales with
+              peers x entities.
+
+            Be concise and high-signal: only flag issues that genuinely matter; skip nits, style and praise.
+            If the change looks good, say so briefly. Use `gh pr comment` for a short top-level summary and
+            `mcp__github_inline_comment__create_inline_comment` (with confirmed: true) for line-level
+            findings. Only post GitHub comments -- do not return review text as a chat message.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(tools/net-check.sh),Bash(tools/sync-addons.sh --check-tracked),Bash(grep:*),Read,Glob,Grep"
