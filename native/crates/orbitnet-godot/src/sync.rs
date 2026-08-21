@@ -866,7 +866,7 @@ impl OrbitRollbackSynchronizer {
         }
         self.latest_state_tick = tick_i;
 
-        if !self.simulates() {
+        if !self.simulates() && !self.predicts_remotely() {
             // Display path: hold the newest row for the next tick boundary and keep it in history
             // so `restore_tick` has a pose to draw from. The delta base is the `auth_rows` copy
             // written above, so nothing here needs to survive a replay.
@@ -875,6 +875,24 @@ impl OrbitRollbackSynchronizer {
             return StateIntegration::Buffered;
         }
 
+        // A REMOTELY PREDICTED BODY RECONCILES; it does not merely display.
+        //
+        // `predicts_remotely()` is what `net.remote_resim` turns on: the entity is un-exempted, joins the
+        // rollback loop, and is simulated forward every tick even though this peer owns neither its state nor
+        // its input. Guarding only on `simulates()` sent it down the display path anyway, which buffers the row
+        // for the next tick boundary and returns `Buffered` -- never `Mispredict`, so the planner is never
+        // marked and the loop never replays from the authoritative tick. The row was then overwritten by the
+        // very next `restore_tick`, which reads the body's own recorded prediction.
+        //
+        // The result was a body that predicted forward from its own drift and NEVER RE-BASED on anything the
+        // server said, for the whole session, with no error anywhere. That contradicts what the lever
+        // documents itself as doing -- "predicts remote bodies forward from their latest authoritative state"
+        // -- and what the comment below has always claimed. An inputless shared body (a puck, a ball, a
+        // physics prop) makes it obvious within seconds; a remote player body hides it, because its own owner's
+        // corrections keep the pose roughly plausible.
+        //
+        // Bodies that are exempt are unaffected, and exempt is the default: `remote_resim` is off unless a game
+        // asks for it, so no existing configuration changes behaviour here.
         // Predicting path (owner reconcile, or the un-exempted remote-resim mode).
         if self.state_history.is_stale(tick) {
             // Older than the rollback ring can hold. A full block for the same tick would be just

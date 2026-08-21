@@ -200,9 +200,20 @@ func _unhandled_input(event: InputEvent) -> void:
 # --- drawing -------------------------------------------------------------------------------------
 func _draw() -> void:
 	_draw_drag_box()
-	var top: float = 300.0
+	var top: float = _spark_top()
 	_draw_spark(_rtt_history, Rect2(14.0, top, PANEL_WIDTH, 46.0), Color(0.45, 0.78, 1.0), "clock rtt ms")
 	_draw_spark(_order_history, Rect2(14.0, top + 58.0, PANEL_WIDTH, 46.0), Color(1.0, 0.72, 0.35), "order rtt p50 ms")
+
+# Where the sparklines start: BELOW the readout, measured, never a constant.
+#
+# A fixed y is a guess about how tall the text is, and the text is not fixed -- the readout gains a line when a
+# seat is taken or an order is refused, and its height also moves with the font size and the display scale. The
+# guess was wrong often enough to render the readout straight over the graphs. `get_minimum_size()` asks the
+# label how tall its current text actually is, which is the only number that cannot drift out of step with it.
+func _spark_top() -> float:
+	if _label == null:
+		return 300.0
+	return _label.position.y + _label.get_minimum_size().y + 22.0
 
 func _draw_drag_box() -> void:
 	if controller == null:

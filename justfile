@@ -50,20 +50,23 @@ descriptor-parity:
 
 # Headless project load for each Godot project -- catches every GDScript compile and parse error, with the
 # project's warnings-as-errors promotion applied.
-lint: (lint-project "harness") (lint-project "demos/rts")
+lint: (lint-project "harness") (lint-project "demos/rts") (lint-project "demos/hockey")
 
 lint-project PROJECT:
     GODOT="{{godot}}" tools/lint-gdscript.sh {{PROJECT}}
 
 # The unit suites. Sub-second, no scene tree, no physics, no sockets. This is where coverage belongs unless
 # it genuinely needs a live session -- see CONTRIBUTING.md.
-test: harness-test rts-test
+test: harness-test rts-test hockey-test
 
 harness-test:
     "{{godot}}" --headless --path harness --script tests/support/run_unit_tests.gd
 
 rts-test:
     "{{godot}}" --headless --path demos/rts --script tests/support/run_unit_tests.gd
+
+hockey-test:
+    "{{godot}}" --headless --path demos/hockey --script tests/support/run_unit_tests.gd
 
 # Prove the extension loads and registers its classes in a THROWAWAY project -- no autoload, no plugin, no
 # addon GDScript. Catches the pointer-file / wrong-architecture / stale-filename class of failure.
@@ -146,6 +149,44 @@ rts-stress SECONDS="120":
         --bench-duration={{SECONDS}} --quit-after={{SECONDS}}
 
 rts-lint: (lint-project "demos/rts")
+
+# =====================================================================================================
+# the air-hockey demo
+#
+# The COUPLED configuration -- a 60 Hz net tick inside the physics step, a 128-tick history -- which is the
+# one demos/rts/project.godot names as unable to coexist with its own. Everything is on the rollback lane,
+# including the puck, which has no input and is predicted on every peer.
+# =====================================================================================================
+
+# Single player. No peer, no socket -- the facade stays OFFLINE and every handle it hands out is inert, so
+# this is the same code path a hosted session takes, minus the network.
+hockey:
+    "{{godot}}" --path demos/hockey
+
+hockey-editor:
+    "{{godot}}" --editor --path demos/hockey
+
+# Listen server: authoritative AND a local player. Run this, then `just hockey-join` in more terminals --
+# players are seated on alternating ends as they arrive, and a seat is released the moment one leaves.
+hockey-host PORT="47800":
+    "{{godot}}" --path demos/hockey -- --host={{PORT}}
+
+hockey-join ADDR="127.0.0.1":
+    "{{godot}}" --path demos/hockey -- --join={{ADDR}}
+
+# Dedicated server: authoritative, headless, no local player.
+hockey-serve PORT="47800":
+    "{{godot}}" --headless --path demos/hockey -- --dedicated={{PORT}}
+
+# A single-peer soak with the bench bot playing itself, writing the per-tick metrics CSV. This is how the
+# reconcile-error columns get exercised without standing up a second machine -- BenchSubject defines them and
+# the RTS demo cannot fill them, because a commander cursor whose whole simulation is a clamp never
+# mispredicts.
+hockey-stress SECONDS="60":
+    "{{godot}}" --headless --path demos/hockey -- --host --bench --bench-bot=strafe_fire \
+        --bench-duration={{SECONDS}} --quit-after={{SECONDS}}
+
+hockey-lint: (lint-project "demos/hockey")
 
 # =====================================================================================================
 # netbench -- the netcode test bench
