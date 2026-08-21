@@ -10,9 +10,9 @@
 ;   * A release zip (`orbitnet-<version>.zip`) ships bin/ already populated for all three platforms.
 ;     That is the Asset Library payload and what a manual install copies.
 ;   * A consumer pins a release tag and downloads its assets, verifying the bytes against
-;     addons/orbitnet_native/binaries.json -- the sha256 digest this repository commits INSTEAD of the
-;     binaries themselves, so a tampered download is caught against something in the commit graph
-;     rather than against a checksum published beside the file it describes.
+;     addons/orbitnet_native/binaries.json -- the sha256 of every published asset, including the zip,
+;     committed INSTEAD of the binaries themselves, so a tampered download is caught against something in
+;     the commit graph rather than against a checksum published beside the file it describes.
 ;
 ; Git LFS is not an option for the shipped artifact either way: the Asset Library installs an addon from
 ; a repository TARBALL, and LFS content arrives in a tarball as POINTER FILES -- a few hundred bytes of

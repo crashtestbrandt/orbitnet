@@ -153,15 +153,20 @@ jobs:
           fi
           unzip -l "build/orbitnet-${version}.zip" | tail -3
 
-      - name: Write the binaries manifest
+      # EVERY published asset, including the AssetLib zip. A consumer that pins this tag can fetch the
+      # single zip -- which carries both addon directories and all six libraries -- and verify one digest,
+      # rather than fetching six files and trusting the set was complete. Written after the zip is built,
+      # so a tag commit cannot contain its own digest; main gets it one commit later. Harmless, because CI
+      # builds rather than fetches.
+      - name: Write the asset manifest
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           {
-            printf '{\n  "tag": "%s",\n  "binaries": {\n' "$tag"
+            printf '{\n  "tag": "%s",\n  "assets": {\n' "$tag"
             first=1
-            for f in addons/orbitnet_native/bin/* profiling/*; do
+            for f in build/orbitnet-*.zip addons/orbitnet_native/bin/* profiling/*; do
               name="$(basename "$f")"
               [ "$first" -eq 1 ] || printf ',\n'
               first=0
@@ -217,10 +222,13 @@ jobs:
 
             ## Pinning this release from a build
 
-            The loose binaries are attached individually so a consuming project can fetch exactly the
-            files its `.gdextension` names. `binaries.json` carries the size and sha256 of every asset
-            here and is committed to `main`, so a fetch can be verified against the commit graph rather
-            than against a checksum published beside the file it describes.
+            `binaries.json` carries the size and sha256 of every asset on this release and is committed
+            to `main`, so a fetch is verified against the commit graph rather than against a checksum
+            published beside the file it describes.
+
+            Fetch the **zip** to get both addon directories and all six libraries against one digest. The
+            loose binaries are also attached individually, for a project that wants only the files its
+            own `.gdextension` names.
 
             | Asset | What it is |
             | --- | --- |
