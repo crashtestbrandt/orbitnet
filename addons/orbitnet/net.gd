@@ -33,7 +33,7 @@ extends Node
 ## across physics frames and renders as judder -- so clock error is absorbed by rare, hysteresis-gated
 ## whole-tick slews instead.
 
-## Network role of this peer. OFFLINE at boot (offline demo); the session layer (#62) sets it.
+## Network role of this peer. OFFLINE at boot (offline demo); the session layer sets it.
 ## HOST = a listen server (authoritative server + a co-located local client).
 enum Mode { OFFLINE, CLIENT, SERVER, HOST }
 
@@ -148,7 +148,7 @@ func _backend_float(name: StringName, fallback: float) -> float:
 	var value: float = raw
 	return value
 
-# --- physics/net decouple (#214) -----------------------------------------------------------------
+# --- physics/net decouple -----------------------------------------------------------------
 ## Run the network tick DECOUPLED from (slower than) the physics tick: the net loop paces off the wall clock at
 ## `tick_hz` in _process while physics stays at its project rate, so the per-second sim/collide-and-slide/state-
 ## broadcast/resim cost drops. Bodies then interpolate/extrapolate their render pose between net ticks
@@ -163,7 +163,7 @@ func set_net_tick_decoupled(tick_hz: int) -> void:
 func set_net_tick_coupled() -> void:
 	_orbit.sync_to_physics = true
 
-## Whether the net tick currently runs decoupled from the physics tick (#214). A body renders interpolated when
+## Whether the net tick currently runs decoupled from the physics tick. A body renders interpolated when
 ## true, and writes the authoritative pose directly (physics-synced) when false. False OFFLINE.
 func is_decoupled() -> bool:
 	return _mode != Mode.OFFLINE and not _orbit.sync_to_physics
@@ -207,7 +207,7 @@ func effective_tickrate() -> int:
 	return _orbit.effective_tickrate()
 
 # --- mode ----------------------------------------------------------------------------------------
-## The current network mode. OFFLINE at boot; asserted by the #61 acceptance test (Net.current_mode() == OFFLINE).
+## The current network mode. OFFLINE at boot; asserted by the acceptance test (Net.current_mode == OFFLINE).
 func current_mode() -> Mode:
 	return _mode
 
@@ -249,7 +249,7 @@ func set_mode(mode: Mode) -> void:
 
 # --- tick loop -----------------------------------------------------------------------------------
 ## Start the networked tick loop. OFFLINE no-ops (the sim runs on the engine physics tick as today). A peer must
-## already be assigned to the SceneTree multiplayer before calling this (the session layer guarantees it, #62).
+## already be assigned to the SceneTree multiplayer before calling this (the session layer guarantees it).
 func start_tick_loop() -> void:
 	if _mode == Mode.OFFLINE:
 		return
@@ -271,7 +271,7 @@ func current_tick() -> int:
 
 ## The current network time in seconds (0 while OFFLINE), measured from the session's start and continuously
 ## synced to the server. The single source game code reads instead of touching the backend directly -- a SHARED
-## clock every peer agrees on, so deterministic scripted motion (#140's moving platform) computes the same pose
+## clock every peer agrees on, so deterministic scripted motion (moving platform) computes the same pose
 ## everywhere with no per-frame replication. Continuous + monotonic, but it can be re-stepped on a large
 ## local/server drift (a hard clock resync), so a consumer must tolerate the occasional small jump.
 func current_time() -> float:
@@ -281,14 +281,14 @@ func current_time() -> float:
 
 ## The backend ROLLBACK/resim tick -- the tick a rewindable's advance()/_rollback_tick is currently replaying,
 ## which during a resim is an OLDER tick than the frontier. Game code keys per-tick rollback history off this
-## (e.g. #103's held-cat memo) so a resim restores the value recorded for that exact tick. Only meaningful
+## (e.g. held-cat memo) so a resim restores the value recorded for that exact tick. Only meaningful
 ## inside the rollback loop; 0 OFFLINE (no loop). Named here only (the facade boundary).
 func rollback_tick() -> int:
 	if _mode == Mode.OFFLINE:
 		return 0
 	return _orbit.rollback_tick()
 
-## Diagnostic (#75 net-probe): the live backend tickrate + sync_to_physics, so instrumentation can confirm the
+## Diagnostic (net-probe): the live backend tickrate + sync_to_physics, so instrumentation can confirm the
 ## net tick runs at the physics rate (SPIKE B Option A) rather than the decoupled default.
 func debug_timing() -> String:
 	if _mode == Mode.OFFLINE:
@@ -297,7 +297,7 @@ func debug_timing() -> String:
 		_orbit.effective_tickrate(), str(_orbit.sync_to_physics), Engine.physics_ticks_per_second]
 
 ## The CONFIGURED network tickrate (Hz) -- the value the tick loop runs at when NOT synced to physics, and the
-## value the join handshake advertises. The `net.tickrate` console cvar (#64) reads/writes this, so it
+## value the join handshake advertises. The `net.tickrate` console cvar reads/writes this, so it
 ## round-trips. NOTE: with sync_to_physics the EFFECTIVE rate is the physics rate regardless of this value --
 ## debug_timing() reports the effective rate. Reading the configured value keeps the cvar a faithful round-trip.
 func tickrate() -> int:
@@ -308,12 +308,12 @@ func tickrate() -> int:
 func set_tickrate(rate: int) -> void:
 	_orbit.tickrate = clampi(rate, 1, 240)
 
-# --- resim-depth knobs + perf diagnostics (#214) ---------------------------------------------------
+# --- resim-depth knobs + perf diagnostics ---------------------------------------------------
 # input_delay shrinks the unconfirmed window directly (input is stamped into the future); display_offset
 # trades a little view delay for fewer visible corrections (it does NOT change resim cost). Both are plain
 # backend properties now -- the old private-var + ProjectSettings-mirror reach-in is gone by construction.
 
-## Ticks of intentional input delay (the #214 resim-depth knob). Read fresh by the backend at every input
+## Ticks of intentional input delay (the resim-depth knob). Read fresh by the backend at every input
 ## record/transmit, so a runtime change applies from the very next tick. Per-client; peers need not agree.
 func input_delay() -> int:
 	return _orbit.input_delay
@@ -329,7 +329,7 @@ func display_offset() -> int:
 func set_display_offset(ticks: int) -> void:
 	_orbit.display_offset = clampi(ticks, 0, 32)
 
-# #214 remote-resim lever: whether a client's LOCAL rollback loop carries REMOTE bodies. Default FALSE
+# remote-resim lever: whether a client's LOCAL rollback loop carries REMOTE bodies. Default FALSE
 # (exempt): remote bodies are display-only on non-owning clients -- they apply the latest authoritative
 # server state each tick and render engine-interpolated at that DELAYED tick. TRUE un-exempts them: the
 # client then predicts remote bodies FORWARD from their latest authoritative state with held input
@@ -347,7 +347,7 @@ func set_remote_resim(on: bool) -> void:
 	_remote_resim = on
 	_orbit.set_remote_resim(on)
 
-# #214 TEST HOOK: force the rollback LOOP at least this deep every tick. This deepens the loop's per-tick
+# TEST HOOK: force the rollback LOOP at least this deep every tick. This deepens the loop's per-tick
 # restore/record bookkeeping for every simulated body -- the resim-cost measurement lever the perf probe
 # drives. Capped well under history_limit (128) so the backend never replays past evicted history. 0 = off.
 func resim_force() -> int:
@@ -417,7 +417,7 @@ func send_budget() -> int:
 func set_send_budget(bytes: int) -> void:
 	_orbit.send_budget = clampi(bytes, 256, 1200)
 
-## Diagnostic (#214 net.perf): last-loop rollback counters from the backend. resim_ticks is the effective
+## Diagnostic (net.perf): last-loop rollback counters from the backend. resim_ticks is the effective
 ## resim window depth (ticks re-simulated in the latest rollback loop). Live in EVERY build, release
 ## included -- the counters are a byproduct of the native loop, not debug monitors.
 func perf_summary() -> String:
@@ -432,7 +432,7 @@ func perf_summary() -> String:
 		int(resim), rb_ms, int(rb_nodes), net_ms,
 		input_delay(), display_offset(), resim_force(), 1 if _remote_resim else 0]
 
-## The raw counters behind perf_summary(), typed for harnesses (the #214 perf probe samples these each
+## The raw counters behind perf_summary, typed for harnesses (the perf probe samples these each
 ## frame). Zeros OFFLINE.
 func perf_metrics() -> Dictionary[String, float]:
 	if _mode == Mode.OFFLINE:
@@ -621,7 +621,7 @@ func peer_rtt_ms(peer: int) -> float:
 	return _orbit.peer_rtt_ms(peer)
 
 # --- rollback / state / interpolation handles (created here so the backend is named only here) ----
-## Create a rollback handle for a predicted body (#63 owner prediction + reconciliation). OFFLINE returns an
+## Create a rollback handle for a predicted body (owner prediction + reconciliation). OFFLINE returns an
 ## INERT handle (no synchronizer), so callers can wire the same code unconditionally. The backend synchronizer
 ## is created here and handed to the handle as an opaque Node so no game code names it.
 func make_rollback(root: Node) -> NetRollbackHandle:
@@ -633,7 +633,7 @@ func make_rollback(root: Node) -> NetRollbackHandle:
 	root.add_child(sync)
 	return NetRollbackHandle.new(sync)
 
-## Create a state-replication handle for non-predicted, server-driven state (#63 remote avatars / events; #93
+## Create a state-replication handle for non-predicted, server-driven state (remote avatars / events;
 ## holster containers). The synchronizer is SERVER-AUTHORITATIVE (default node authority = peer 1): the server
 ## extracts + broadcasts the registered props each tick, every other peer applies them -- with NO rollback
 ## restore, so a value set OUTSIDE the tick (e.g. a NetCommand handler) is not clobbered (unlike the rollback
@@ -669,14 +669,14 @@ func make_interpolator(root: Node) -> NetInterpolatorHandle:
 	root.add_child(interp)
 	return NetInterpolatorHandle.new(interp)
 
-## Register a player body for owner prediction + reconciliation + remote interpolation (#63). Creates an
+## Register a player body for owner prediction + reconciliation + remote interpolation. Creates an
 ## OrbitRollbackSynchronizer on `root`, sets prediction per role, registers the serialized STATE props on
 ## `root`, the INPUT props on `input_node`, and the COSMETIC props (replicated but never restored / never a
-## misprediction -- the #318 prop-role diet) on `root`, then processes settings -- all here so no game code
+## misprediction -- the prop-role diet) on `root`, then processes settings -- all here so no game code
 ## names the backend. OFFLINE returns an inert handle, so the body wires this unconditionally and the offline
 ## demo runs untouched.
 ##
-## SERVER-AUTHORITATIVE split (#63): `root`'s multiplayer authority is the SERVER, so the server owns every
+## SERVER-AUTHORITATIVE split: `root`'s multiplayer authority is the SERVER, so the server owns every
 ## body's STATE -- it simulates each body from the received input and broadcasts the authoritative state --
 ## while `input_node`'s authority is the OWNING CLIENT, so each client authors only its OWN input (the
 ## backend validates the sender against that authority, the anti-forgery check). The owning client also
@@ -698,7 +698,7 @@ func register_rollback_body(root: Node, input_node: Node, state_properties: Arra
 	sync.root = root
 	sync.input_authority_node = input_node
 	sync.enable_prediction = predict   # the owner-prediction switch -- set here, the only legal place
-	# #214: a non-predicting synchronizer exists only on a peer that owns neither this body's state nor its
+	# a non-predicting synchronizer exists only on a peer that owns neither this body's state nor its
 	# input -- a display-only peer. Exempt it from the rollback loop (the default), unless the
 	# net.remote_resim lever asked for remote prediction; the backend re-applies the lever live.
 	if not predict:

@@ -1,14 +1,14 @@
 extends RefCounted
 class_name NetTransport
-## Transport factory for the netcode facade (#61 skeleton; #62 wires it into the session manager). Produces the
+## Transport factory for the netcode facade (skeleton; wires it into the session manager). Produces the
 ## Godot MultiplayerPeer for a session, branching on the build's feature tags: native ENet (ENetMultiplayerPeer)
 ## on non-Steam builds, and Steam (SteamMultiplayerPeer, via addons/orbitnet/steam_transport.gd) on a build
-## exported with the `Steam` preset (#45). OFFLINE uses NO peer (the offline demo runs on the default
+## exported with the `Steam` preset. OFFLINE uses NO peer (the offline demo runs on the default
 ## OfflineMultiplayerPeer). Transport is Godot-native here -- this file does NOT name the rollback backend (only
 ## orbitnet/net.gd touches it), and it does NOT name Steamworks (only steam_transport.gd touches it): both stay
 ## behind their one facade boundary, so the session layer only ever sees the resulting MultiplayerPeer.
 ##
-## #280 adds three more Steam-blind seams here (still the only place besides steam_transport.gd that knows Steam is
+## adds three more Steam-blind seams here (still the only place besides steam_transport.gd that knows Steam is
 ## involved): the local player's DISPLAY NAME + platform id for the [PlayerRoster], joinable-SESSION discovery for
 ## the join browser, and PLAY INVITES (accept + send + the session advertisement's teardown). All degrade cleanly
 ## on ENet (name -> "" / the local override; sessions -> empty list; invites -> never fire, can_invite() false).
@@ -34,7 +34,7 @@ static func preferred_kind() -> Kind:
 
 ## A transport kind's stable lowercase name ("offline" / "enet" / "steam"). Lives here because this file is the
 ## only one allowed to name a concrete transport -- callers that merely need to PRINT which one is in play (the
-## #346 Build ID, a status line) ask for the name instead of matching on the enum themselves.
+## Build ID, a status line) ask for the name instead of matching on the enum themselves.
 static func kind_name(kind: Kind) -> String:
 	match kind:
 		Kind.ENET:
@@ -49,7 +49,7 @@ static func kind_name(kind: Kind) -> String:
 static func preferred_kind_name() -> String:
 	return kind_name(preferred_kind())
 
-## Build a server (host) peer listening on `port` for up to `max_clients`, optionally FRIENDS-ONLY (#280). Returns
+## Build a server (host) peer listening on `port` for up to `max_clients`, optionally FRIENDS-ONLY. Returns
 ## null on failure (the caller stays OFFLINE / surfaces an error). On a Steam build the concrete peer + Steam
 ## registration live in steam_transport.gd; a dedicated-server build (dedicated_server feature) registers a Steam
 ## game server, a listen host uses the logged-in user's client + advertises a discoverable lobby carrying the cap /
@@ -89,7 +89,7 @@ static func create_client(address: String, port: int = DEFAULT_PORT) -> Multipla
 		_:
 			return null
 
-# --- player identity (#280; Steam-blind seam) ------------------------------------------------------------------
+# --- player identity (Steam-blind seam) ------------------------------------------------------------------
 ## Set (or clear, with "") this peer's local display-name override -- the `net.name` console cvar routes here. It
 ## wins over the transport's own name, so a handle works on ENet too and the name pipeline is testable offline.
 static func set_local_display_name(name: String) -> void:
@@ -122,7 +122,7 @@ static func local_steam_id() -> int:
 		return SteamTransport.service().local_steam_id()
 	return 0
 
-# --- session discovery (#280; the join browser's Steam-blind seam) --------------------------------------------
+# --- session discovery (the join browser's Steam-blind seam) --------------------------------------------
 ## Ask the transport to (re)discover joinable sessions. Fires-and-returns; results arrive asynchronously and are
 ## read via [method sessions] (bind [method bind_sessions_updated] for the change signal). A no-op on ENet -- native
 ## builds have no session discovery (you join by address), so the browser stays empty there.
@@ -145,7 +145,7 @@ static func bind_sessions_updated(cb: Callable) -> void:
 	if not svc.sessions_updated.is_connected(cb):
 		svc.sessions_updated.connect(cb)
 
-# --- play invites (#280; the platform-invite seam, still Steam-blind) -----------------------------------------
+# --- play invites (the platform-invite seam, still Steam-blind) -----------------------------------------
 ## Bind `cb` to "the player accepted a platform invite and it resolved to a joinable session". `cb` receives a
 ## connect target string suitable for [method create_client] / the session layer's join path -- the caller never learns that a
 ## Steam lobby was involved. A no-op on ENet (native builds have no invite concept), so this can be wired

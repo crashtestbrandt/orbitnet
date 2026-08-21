@@ -1,6 +1,6 @@
 extends RefCounted
 class_name NetRay
-## Hitscan ray facade (#65, OrbitNet). A thin wrapper over Godot's physics ray query so the weapon AUTHORITY --
+## Hitscan ray facade. A thin wrapper over Godot's physics ray query so the weapon AUTHORITY --
 ## and, later, the survival INTERACTION system (use / pickup / mine / scan rays for crafting) -- cast through ONE
 ## seam instead of poking PhysicsDirectSpaceState3D inline at every call site. Pure Godot physics: it names no
 ## rollback-backend symbols (the `just net-check` gate), so it lives in the facade as netcode-adjacent infra.
@@ -52,7 +52,7 @@ static func cast(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3
 	return hit
 
 ## Sweep a SPHERE of `radius` from `origin` along unit `dir` for `dist` metres in `space` -- the "forgiving shape
-## cast" the survival INTERACTION pickup (#94 `take`) wants instead of a thin ray: a fat tube down the aim so a
+## cast" the survival INTERACTION pickup (`take`) wants instead of a thin ray: a fat tube down the aim so a
 ## near-miss still grabs the item. `mask` restricts the cast to a layer set (the take cast masks to the dedicated
 ## WorldItem layer so station geometry is invisible to it); NEAREST contact along the sweep wins. Returns a Hit
 ## (valid=false on a miss / bad args); the struck body is Hit.collider (a WorldItem for a pickup). Same space-lock

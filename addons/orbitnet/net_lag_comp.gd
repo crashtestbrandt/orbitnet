@@ -1,6 +1,6 @@
 extends RefCounted
 class_name NetLagComp
-## Server-side hit resolution with a tick-indexed history ring (#65, OrbitNet). The authoritative weapon model
+## Server-side hit resolution with a tick-indexed history ring. The authoritative weapon model
 ## resolves shots through here so lag compensation has ONE home. Each server tick the ring records the poses of
 ## the hittable bodies; a shot then RESOLVES against either:
 ##   * the PRESENT tick -- a live-space ray cast (NetRay), which is what S7 ships and is correct on a localhost
@@ -232,7 +232,7 @@ class Sample extends RefCounted:
 var _ring_ticks: PackedInt64Array = PackedInt64Array()
 var _ring_snaps: Array[Array] = []
 
-# #214 perf instrumentation: the O(N^2) lag-comp cost made visible. record() runs once per hittable body per
+# perf instrumentation: the O(N^2) lag-comp cost made visible. `record()` runs once per hittable body per
 # server tick and snapshots every OTHER body's region capsules into fresh Samples, so today's N per-body rings
 # allocate ~N*(N-1)*regions Samples/tick. These counters are STATIC so they SUM across every ring into one
 # server-wide figure the net.perf report reads, and they survive the shared-ring refactor (one ring -> the same
@@ -261,7 +261,7 @@ static func perf_take_resolve() -> Dictionary[String, int]:
 	_perf_resolve_usec = 0
 	return out
 
-## Read-and-reset the server-wide lag-comp perf counters (net.perf, #214): total Samples recorded, total usec
+## Read-and-reset the server-wide lag-comp perf counters (net.perf): total Samples recorded, total usec
 ## spent in record(), and the span of distinct server ticks those covered (0 if nothing recorded since the last
 ## call -- e.g. a pure client, which never records, or offline). The caller derives samples/tick + usec/tick.
 static func perf_take_static() -> Dictionary[String, int]:
@@ -306,7 +306,7 @@ func record(tick: int, retain: int = 0) -> void:
 		if stale_slot != slot and _ring_ticks[stale_slot] >= 0:
 			_ring_ticks[stale_slot] = -1
 			_ring_snaps[stale_slot] = []
-	# #214 perf: accumulate the server-side lag-comp cost. Static -- sums across every body's ring so net.perf
+	# perf: accumulate the server-side lag-comp cost. Static -- sums across every body's ring so net.perf
 	# reads the whole-server figure; the wall-clock captures the Sample allocation cost the pooling step will cut.
 	_perf_samples += samples.size()
 	_perf_record_usec += Time.get_ticks_usec() - t0
@@ -332,7 +332,7 @@ func has_tick(tick: int) -> bool:
 
 ## Resolve a shot. `at_tick` is the shooter's command tick and `present_tick` the server's current tick; when they
 ## match (or the snapshot is missing) this is a live present-tick cast. A PAST `at_tick` is the rewind case: the
-## bits in `dynamic_mask` (the per-region hit layer, #89c) are reconstructed from the ring at `at_tick` and tested
+## bits in `dynamic_mask` (the per-region hit layer) are reconstructed from the ring at `at_tick` and tested
 ## analytically, while the remaining (static) mask bits -- walls, tick-invariant -- are cast live, nearest wins.
 ## Returns a NetRay.Hit (valid=false on a miss). `space` must be queried where the physics space is unlocked (server net tick).
 func resolve_hit(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3, dist: float, exclude: Array[RID], mask: int, at_tick: int, present_tick: int, dynamic_mask: int = 0) -> NetRay.Hit:
@@ -385,7 +385,7 @@ func _resolve_rewound(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Ve
 		# the host crash that lands "right after somebody died": the shot resolves against a corpse's stale sample.
 		if not is_instance_valid(sample.collider):
 			continue
-		# #214 self-exclusion: the shared server ring records EVERY body (including the shooter), so drop any sample
+		# self-exclusion: the shared server ring records EVERY body (including the shooter), so drop any sample
 		# whose region collider is in the caller's exclude set (projectile.gd passes shooter.region_rids()). Harmless
 		# for a legacy per-body ring -- it never records self, so nothing here ever matches.
 		var co: CollisionObject3D = sample.collider as CollisionObject3D

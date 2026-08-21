@@ -1,6 +1,6 @@
 extends Node
 class_name SteamTransport
-## The Steam arm of the transport factory (#45, M2). This is the ONE first-party file that names Steamworks --
+## The Steam arm of the transport factory. This is the ONE first-party file that names Steamworks --
 ## the same one-facade-boundary discipline addons/orbitnet/net.gd keeps around the rollback backend, and
 ## net_transport.gd keeps around the concrete MultiplayerPeer: NetTransport.create_server/create_client delegate
 ## their Kind.STEAM arm here, and NOTHING else in the tree touches Steam. The session layer, the spawn directors, Net's
@@ -26,11 +26,11 @@ class_name SteamTransport
 ## GodotSteam version you vendor; docs/steam.md is the runbook.
 
 ## A joining peer's Steam auth ticket was validated (or rejected) by beginAuthSession's response callback -- the
-## dedicated-server trust boundary (#45): the server ends the session / kicks on `owns == false`. Re-emitted from
+## dedicated-server trust boundary: the server ends the session / kicks on `owns == false`. Re-emitted from
 ## Steam's validate_auth_ticket_response so no game code names the Steam signal.
 signal auth_validated(steam_id: int, owns_game: bool)
 
-## The discovered joinable-session list changed (#280) -- re-emitted from Steam's lobby_match_list so the join
+## The discovered joinable-session list changed -- re-emitted from Steam's lobby_match_list so the join
 ## browser refreshes without naming Steam. Read the current list via [method sessions].
 signal sessions_updated()
 
@@ -53,12 +53,12 @@ const _APP_ID_SETTING: String = "steam/app_id"
 const _SERVER_MODE_AUTH_SECURE: int = 3
 const _AUTH_RESPONSE_OK: int = 0
 
-# Steam lobby types (#280) inlined as ints (the enum lives on the Steam singleton, possibly absent at parse time):
+# Steam lobby types inlined as ints (the enum lives on the Steam singleton, possibly absent at parse time):
 # 1 == k_ELobbyTypeFriendsOnly (invite/friends-visible), 2 == k_ELobbyTypePublic (matchmaking-discoverable). A
 # listen host advertises one of these so the join browser can discover it; friends-only just picks the narrower type.
 const _LOBBY_TYPE_FRIENDS_ONLY: int = 1
 const _LOBBY_TYPE_PUBLIC: int = 2
-# Lobby metadata keys (#280): the browser reads these off each discovered lobby. All of them are set by the HOST;
+# Lobby metadata keys: the browser reads these off each discovered lobby. All of them are set by the HOST;
 # `game` tags the lobby as ours so a stray lobby from another app on the same account is filtered out.
 #
 # `host_id` carries the host's own 64-bit Steam id, and it is load-bearing: the browser is NOT a member of the
@@ -82,7 +82,7 @@ const _LOBBY_KEY_PLAYERS: String = "players"
 const _LOBBY_KEY_MAX: String = "max"
 const _LOBBY_KEY_FRIENDS: String = "friends_only"
 
-# Lobby-query knobs (#280), inlined as ints like the enums above. Steam's DEFAULT distance filter restricts results
+# Lobby-query knobs, inlined as ints like the enums above. Steam's DEFAULT distance filter restricts results
 # to the caller's own region, which silently hides every session hosted on another continent -- a browser is
 # supposed to span the world, so we ask for WORLDWIDE (3) explicitly. Comparison 0 == k_ELobbyComparisonEqual for
 # the `game` tag filter; the result cap is Steam's own default, stated rather than implied.
@@ -126,7 +126,7 @@ var _steam_obj: Object = null
 # never gates -- so the handshake below is inert everywhere except a dedicated server that actually validates.
 var _peer_steam: Dictionary[int, int] = {}
 
-# --- #280 session lobbies (discovery + advertisement) -------------------------------------------------------
+# --- session lobbies (discovery + advertisement) -------------------------------------------------------
 # The lobby THIS host advertises (0 == not hosting / not yet created). Created best-effort alongside the listen
 # host so the join browser can discover the session; the actual connection still rides the host's Steam id.
 var _hosted_lobby_id: int = 0
@@ -193,11 +193,11 @@ func _ready() -> void:
 		mp.connected_to_server.connect(_on_connected_to_server)
 	if not mp.peer_disconnected.is_connected(_on_peer_disconnected):
 		mp.peer_disconnected.connect(_on_peer_disconnected)
-	# #280 headcount: the advertised `players` metadata is republished off the same peer churn, so a browser row
+	# headcount: the advertised `players` metadata is republished off the same peer churn, so a browser row
 	# tracks the live session instead of showing "1/8" forever. Inert until we actually host a lobby.
 	if not mp.peer_connected.is_connected(_on_peer_connected):
 		mp.peer_connected.connect(_on_peer_connected)
-	# #280 invites: a session we joined off an invite may never come up, and the lobby staged for it has to be
+	# invites: a session we joined off an invite may never come up, and the lobby staged for it has to be
 	# released when that happens (release_session cannot see the staging slot -- that is the point of it).
 	if not mp.connection_failed.is_connected(_on_connection_failed):
 		mp.connection_failed.connect(_on_connection_failed)
@@ -226,7 +226,7 @@ func create_listen_host(_port: int, max_clients: int, friends_only: bool = false
 		# Surface this host's Steam ID so a second account can join it (the SessionMenu join field / --join= carries a
 		# Steam ID on a Steam build, not an IP). The relay needs no port-forwarding -- just this 64-bit id.
 		print("SteamTransport: Steam listen host ready -- joiners use this host's Steam ID: %d" % _local_steam_id())
-		# #280: advertise a discoverable lobby carrying the cap + friends-only flag so the join browser can find this
+		# advertise a discoverable lobby carrying the cap + friends-only flag so the join browser can find this
 		# session (best-effort; a lobby-create failure never blocks the host -- the direct-Steam-ID join still works).
 		_advertise_lobby(max_clients, friends_only)
 	return peer
@@ -234,13 +234,13 @@ func create_listen_host(_port: int, max_clients: int, friends_only: bool = false
 ## Build a Steam DEDICATED-server host peer -- the headless, no-local-player path (the session layer's dedicated path).
 ## Unlike the listen host this registers a Steam GAME SERVER (anonymous logon, no user account) so a client can
 ## discover + connect to it over Steam's relay by lobby / server id, mirroring the ENet dedicated server's raw
-## IP:port reachability but over Steam (#45 dedicated-server deliverable). The factory is the ONLY thing that
+## IP:port reachability but over Steam (dedicated-server deliverable). The factory is the ONLY thing that
 ## knows the server registered itself with Steam -- host_dedicated is unchanged.
 func create_dedicated_host(_port: int, max_clients: int, friends_only: bool = false) -> MultiplayerPeer:
 	if not _ensure_game_server():
 		return null
 	var peer: MultiplayerPeer = _create_host_peer(max_clients)
-	# #280: a dedicated server has no logged-in Steam user, so it cannot create a client-owned matchmaking lobby the
+	# a dedicated server has no logged-in Steam user, so it cannot create a client-owned matchmaking lobby the
 	# way a listen host does -- discovery for a dedicated server rides the game-server registration
 	# (setAdvertiseServerActive, wired in _ensure_game_server). The friends-only flag is a client-lobby concept and
 	# is inert here; kept in the signature for parity with the listen path.
@@ -329,7 +329,7 @@ func _ensure_client() -> bool:
 # Ensure a DEDICATED-server Steam context: a Steam GAME SERVER with anonymous logon (no user account), then
 # advertise it so clients can find it. Idempotent. This is the headless-server path -- it does NOT require a
 # logged-in Steam user the way _ensure_client does. Connects Steam's auth-validation callback so joining clients'
-# ownership tickets can be checked (the #45 trust boundary the ENet server never had).
+# ownership tickets can be checked (the trust boundary the ENet server never had).
 func _ensure_game_server() -> bool:
 	if _server_ready:
 		return true
@@ -360,7 +360,7 @@ func _ensure_game_server() -> bool:
 	_server_ready = true
 	return true
 
-# --- auth session tickets (dedicated-server ownership trust boundary, #45) -----------------------
+# --- auth session tickets (dedicated-server ownership trust boundary) -----------------------
 
 ## Issue a Steam auth session ticket for THIS client to hand to a server it is joining, proving app ownership.
 ## Returns the ticket bytes (empty on failure). The over-the-wire hand-off (client -> server at join) and the
@@ -407,7 +407,7 @@ func _connect_auth_response(steam: Object) -> void:
 # GodotSteam emits validate_auth_ticket_response(auth_id: int, response: int, owner_id: int). response == 0
 # (k_EAuthSessionResponseOK) means the ticket holder owns the app; anything else is a reject (not owned / ticket
 # cancelled / VAC banned). Re-emit as the ownership verdict for the server's join gate, AND enforce it: on a
-# negative verdict, kick the peer that claimed this Steam id (the #45 dedicated-server trust boundary). auth_id is
+# negative verdict, kick the peer that claimed this Steam id (the dedicated-server trust boundary). auth_id is
 # the joining user's Steam id (GodotSteam's first arg), which is exactly the key _peer_steam is stored under.
 func _on_validate_auth_ticket_response(auth_id: int, response: int, _owner_id: int) -> void:
 	var owns: bool = response == _AUTH_RESPONSE_OK
@@ -415,7 +415,7 @@ func _on_validate_auth_ticket_response(auth_id: int, response: int, _owner_id: i
 	if not owns:
 		_kick_steam_id(auth_id, "auth failed (response %d)" % response)
 
-# --- auth handshake (end-to-end ticket exchange, #45) --------------------------------------------
+# --- auth handshake (end-to-end ticket exchange) --------------------------------------------
 # The seam above (issue/begin/end + the auth_validated signal) is wired together here so the exchange never names
 # Steam outside this file. It rides the MultiplayerAPI connect signals (_ready): the client hands its ownership
 # ticket to the server on connect, the server begins validation and kicks on a negative ownership verdict. All of
@@ -487,7 +487,7 @@ func _local_steam_id() -> int:
 	var raw: Variant = _call_first(_steam_obj, [&"getSteamID"], [])
 	return raw if raw is int else 0
 
-# --- #280 player identity (persona names) --------------------------------------------------------
+# --- player identity (persona names) --------------------------------------------------------
 ## This client's own Steam persona (display) name, or "" when unavailable (GodotSteam absent / not a Steam build /
 ## the user isn't logged in). Steam-blind callers reach it via NetTransport.local_display_name(); the roster then
 ## advertises it. Guarded so a non-Steam build simply gets "".
@@ -513,7 +513,7 @@ func persona_name_for(steam_id: int) -> String:
 	var raw: Variant = _call_first(_steam_obj, [&"getFriendPersonaName"], [steam_id])
 	return raw if raw is String else ""
 
-# --- #280 session lobbies (advertise a host, discover joinable sessions) --------------------------
+# --- session lobbies (advertise a host, discover joinable sessions) --------------------------
 ## The most recently discovered joinable sessions (Steam-blind rows). Read by NetTransport.sessions() -> the join
 ## browser. Empty until a request_session_list() result arrives (or when GodotSteam is absent).
 func sessions() -> Array[NetSessionInfo]:
@@ -671,7 +671,7 @@ func _lobby_host_id(lobby_id: int) -> int:
 	var owner: Variant = _call_first(_steam_obj, [&"getLobbyOwner"], [lobby_id])
 	return owner if owner is int else 0
 
-# --- #280 play invites (accept an invite, send an invite) ----------------------------------------------------
+# --- play invites (accept an invite, send an invite) ----------------------------------------------------
 ## Parse a Steam launch command line for the `+connect_lobby <id>` token Steam appends when a player accepts an
 ## invite while the game is NOT running, returning the lobby id (0 when absent/malformed). PURE + static so the
 ## cold-start path is unit-testable without Steam, a scene tree, or a process relaunch (tests/unit/steam_invite_test.gd).
