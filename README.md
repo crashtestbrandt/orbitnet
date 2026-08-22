@@ -148,6 +148,11 @@ Known and filed, not hidden:
   the session's traffic cannot forge a datagram, and one connected peer cannot forge another's — but **an
   on-path observer who reads the handshake can do everything the client can.** Closing that needs a key
   exchange, and therefore an asymmetric primitive `orbitnet-core` has no dependency for.
+- **A peer's reported round trip is checked, not bounded.** The server mints a token per snapshot frame from
+  a secret it never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot
+  acknowledge a frame that never reached it. It can still acknowledge a frame **older** than the newest it
+  holds, which reads as a slow link and is believed. That buys a deeper per-shooter rewind, bounded by
+  `NetLagComp.max_delay_ms` — 250 ms by default, the deepest rewind the game will grant anyone.
 - **Input values are not validated.** The backend checks who wrote a row, not what is in it: a row that
   decodes at the right stride is stored as-is. Clamping and plausibility are the game's job inside
   `_rollback_tick`. The full split is in

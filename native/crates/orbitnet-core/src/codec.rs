@@ -412,6 +412,22 @@ pub struct FrameHeader {
     /// Acks ride the hot frame rather than a separate reliable message, which is one whole class of
     /// per-peer RPC the GDScript backend sent every tick and this one does not.
     pub ack_bits: u32,
+    /// The proof that `ack_tick` names a frame the sender received, rather than a number it chose.
+    ///
+    /// Two roles, one slot, decided by [`FrameHeader::kind`]:
+    ///
+    /// | Kind | What it carries |
+    /// | --- | --- |
+    /// | [`FrameKind::ServerSnapshot`] | The token this frame is minted with, for the client to quote back. |
+    /// | [`FrameKind::ClientInput`] | The token of the snapshot frame `ack_tick` names. |
+    ///
+    /// **The server mints it from a per-peer secret it never transmits**, so a client cannot compute the
+    /// token of a frame that never reached it. The server recomputes the expected value on arrival and
+    /// discards an ack that does not carry it — no round-trip sample, no `acked_base` promotion.
+    ///
+    /// `0` when there is nothing to prove: an input frame with `ack_tick` still at `0`, and every peer
+    /// that has yet to receive a snapshot.
+    pub ack_token: u32,
     /// How early (positive) or late (negative) the recipient's newest input arrived.
     ///
     /// The client steers its tick lead to hold this slightly positive, which is what keeps the
@@ -439,6 +455,7 @@ impl FrameHeader {
         // so the difference genuinely takes both signs.
         writer.zigzag(i64::from(self.tick) - i64::from(self.ack_tick));
         writer.u32(self.ack_bits);
+        writer.u32(self.ack_token);
         writer.i8(self.margin_ticks);
         writer.u8(self.flags);
         writer.varint(u64::from(self.entity_count));
@@ -459,6 +476,7 @@ impl FrameHeader {
         )
         .map_err(|_| CodecError::VarintOverflow)?;
         let ack_bits = reader.u32()?;
+        let ack_token = reader.u32()?;
         let margin_ticks = reader.i8()?;
         let flags = reader.u8()?;
         let entity_count =
@@ -468,6 +486,7 @@ impl FrameHeader {
             tick,
             ack_tick,
             ack_bits,
+            ack_token,
             margin_ticks,
             flags,
             entity_count,
@@ -1155,6 +1174,7 @@ mod tests {
             tick: 12_345,
             ack_tick: 12_340,
             ack_bits: 0b1011,
+            ack_token: 0xdead_beef,
             margin_ticks: -3,
             flags: FrameHeader::FLAG_WANT_FULL,
             entity_count: 17,
@@ -1179,6 +1199,7 @@ mod tests {
             tick: 100,
             ack_tick: 140,
             ack_bits: 0,
+            ack_token: 7,
             margin_ticks: 2,
             flags: 0,
             entity_count: 1,
@@ -1208,6 +1229,7 @@ mod tests {
             writer.varint(10); // tick
             writer.varint(encoded_delta); // ack delta, zigzag
             writer.u32(0); // ack bits
+            writer.u32(0); // ack token
             writer.i8(0); // margin
             writer.u8(0); // flags
             writer.varint(1); // entity count
@@ -1225,7 +1247,7 @@ mod tests {
 
     #[test]
     fn frame_header_rejects_an_unknown_kind() {
-        let bytes = [0x7f, 0x01, 0x00, 0, 0, 0, 0, 0, 0x00];
+        let bytes = [0x7f, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00];
         assert_eq!(
             FrameHeader::decode(&mut Reader::new(&bytes)),
             Err(CodecError::UnknownFrameKind(0x7f))

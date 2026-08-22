@@ -30,7 +30,7 @@ use godot::classes::{
 };
 use godot::prelude::*;
 
-use orbitnet_core::auth::TRAILER_LEN;
+use orbitnet_core::auth::{siphash24, TRAILER_LEN};
 use orbitnet_core::codec::{
     decode_input_block_meta, decode_manifest, decode_state_block_meta, encode_manifest,
     input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
@@ -275,6 +275,14 @@ struct BandwidthMetrics {
     /// `WANT_FULL` NACKs received. **SERVER-SIDE ONLY** — it is incremented where a client's input
     /// frame is decoded, so a client reads a structural 0.00 here whatever its link is doing.
     want_full_nacks_s: f64,
+    /// Acks discarded because the frame token the peer quoted was not the one the server minted for
+    /// the tick it named. **SERVER-SIDE ONLY**, for the same reason `want_full_nacks_s` is.
+    ///
+    /// An honest client cannot produce one, so any sustained reading is a peer sending acks it cannot
+    /// substantiate — a forged or replayed input frame, or a build on the wrong protocol major that got
+    /// past the handshake. The cost to that peer is visible beside this: its acks buy it nothing, so
+    /// `acked_base` never advances and `blocks_full_s` climbs toward `blocks_admitted_s`.
+    unproven_acks_s: f64,
     /// State blocks discarded because a newer row for that entity had already been applied —
     /// reordered or duplicated datagrams. **Not** a fault: it is what the link does.
     ///
@@ -466,6 +474,18 @@ struct PeerState {
     acked_base: HashMap<u64, u64>,
     /// Highest ack tick seen from this peer, for expiring the sent log.
     newest_ack: u64,
+    /// Server: the secret this peer's frame tokens are minted from, or `None` before its handshake.
+    ///
+    /// **It is never transmitted.** That is the whole of what makes a token proof of receipt: the client
+    /// knows the session key (it minted it) and it knows every tick number, so anything derived from
+    /// those two it could compute for a frame that never reached it. It cannot compute this.
+    ///
+    /// **Minted once per connection, and not rotated on a rekey.** A hello is retried, and a retry
+    /// carrying a new key reseats [`PeerState::auth`]; rotating this alongside it would invalidate every
+    /// token the client is already holding, so its next several acks would be refused and the server
+    /// would fall back to full blocks for a peer that did nothing wrong. The salt guards nothing that a
+    /// rekey changes — it is a per-connection secret, and the connection is the same one.
+    token_salt: Option<[u8; KEY_LEN]>,
     /// Recent round-trip samples in MILLISECONDS, for the per-shooter rewind depth. Each is
     /// `server tick now - the newest snapshot frame this peer has confirmed`, taken at the instant
     /// that confirmation arrives, so it spans exactly send -> receive -> reply -> receive.
@@ -582,6 +602,19 @@ const RTT_WINDOW: usize = 64;
 /// what it says, and the server decides what it is willing to believe.
 const RTT_SAMPLE_MAX_MS: f32 = 10_000.0;
 
+/// What an arriving acknowledgement bought its sender. See [`PeerState::consume_ack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckOutcome {
+    /// Nothing was claimed — `ack_tick` is still `0`, which is every peer that has yet to receive a
+    /// snapshot. Not a refusal.
+    Empty,
+    /// Claimed, and refused: the frame token quoted is not the one the server minted for that tick, so
+    /// the peer cannot have received the frame it named. Nothing was consumed and nothing was granted.
+    Unproven,
+    /// Claimed, proven, and consumed.
+    Consumed,
+}
+
 /// What a received state block did to this peer's bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RxOutcome {
@@ -642,6 +675,92 @@ impl PeerState {
         }
     }
 
+    /// The token the snapshot frame at `tick` is minted with, or `None` for a peer with no salt yet.
+    ///
+    /// Derived rather than stored, so verifying an ack costs no per-frame bookkeeping and works for any
+    /// tick — including one the sent log has already expired, which is exactly the range a round-trip
+    /// sample may still be drawn from.
+    fn frame_token(&self, tick: u64) -> Option<u32> {
+        self.token_salt
+            .map(|salt| siphash24(&salt, &tick.to_le_bytes()) as u32)
+    }
+
+    /// Whether `token` is the value this peer could only be holding because the frame at `ack` reached
+    /// it. `false` for a peer with no salt, which is a peer that has been sent no frame to prove.
+    ///
+    /// **A bare comparison, deliberately**, where [`orbitnet_core::auth`] folds its MAC comparison to a
+    /// single test. Two reasons, and the first alone would not be enough:
+    ///
+    /// 1. It compares two `u32`s, which is one machine comparison. The leak that folding closes is a
+    ///    walk that returns at the first differing BYTE, turning 2^64 guesses into 8 × 256.
+    /// 2. **A correct guess is worth less than no guess at all.** The only ack a peer cannot already
+    ///    prove is one for a frame it does not hold — a HIGHER ack than it earned — and [`note_ack`]
+    ///    measures `current - ack`, so a higher ack reports a SHORTER round trip and shrinks that peer's
+    ///    own rewind window. It also promotes an `acked_base` for a row the peer does not hold, so the
+    ///    next masked delta against that row is undecodable and the peer NACKs itself into full blocks.
+    ///    The profitable direction is a LOWER ack, and there the peer quotes a token it genuinely holds.
+    ///
+    /// A forged MAC buys entry to the session, which is why that one is folded. This buys a self-inflicted
+    /// `want_full` storm.
+    ///
+    /// [`note_ack`]: PeerState::note_ack
+    fn ack_is_proven(&self, ack: u64, token: u32) -> bool {
+        self.frame_token(ack) == Some(token)
+    }
+
+    /// Consume one arriving acknowledgement whole: check its proof, raise `newest_ack`, take a
+    /// round-trip sample, and promote to `acked_base` every entity tick the frames it confirms carried.
+    ///
+    /// **The proof gate is first, and it gates everything after it.** `ack_tick`, `ack_bits` and the
+    /// entity ticks they promote are all grants made on the strength of one claim — that the frame at
+    /// `ack` arrived — so a claim that does not carry the token the server minted for that tick buys
+    /// none of them. See [`FrameHeader::ack_token`] and [`PeerState::token_salt`].
+    ///
+    /// `ack_bits` rides on the proven tick rather than proving itself: it names the 32 frames before
+    /// `ack`, all of them older, and an entity tick promoted from one of those is only ever a base the
+    /// server may delta against. A peer that lies in the bits breaks its own delta chain and NACKs.
+    ///
+    /// The whole of what an arriving ack does, as a method a test can call without a `SceneTree`.
+    fn consume_ack(
+        &mut self,
+        ack: u64,
+        token: u32,
+        ack_bits: u32,
+        current: u64,
+        tick_ms: f64,
+    ) -> AckOutcome {
+        if ack == 0 {
+            return AckOutcome::Empty;
+        }
+        if !self.ack_is_proven(ack, token) {
+            return AckOutcome::Unproven;
+        }
+        // Raise `newest_ack` and measure the round trip, but ONLY when the ack has actually advanced
+        // -- see `note_ack` for why an unadvanced one must not be measured. `note_ack` uses
+        // `saturating_sub` because an ack can name a frame the accumulator has not reached: ticks are
+        // published before the send phase runs, and a peer's clock leads.
+        self.note_ack(ack, current, tick_ms);
+        let newest_ack = self.newest_ack;
+        let mut promoted: Vec<(u64, u64)> = Vec::new();
+        self.sent_log.retain(|(frame, entities)| {
+            let confirmed = *frame == ack
+                || (*frame < ack
+                    && ack - *frame <= 32
+                    && (ack_bits >> (ack - *frame - 1)) & 1 == 1);
+            if confirmed {
+                promoted.extend_from_slice(entities);
+                return false;
+            }
+            // Older than the ack window can reach: it will never be confirmed.
+            frame.saturating_add(32) >= newest_ack
+        });
+        for (id, tick) in promoted {
+            let entry = self.acked_base.entry(id).or_insert(0);
+            *entry = (*entry).max(tick);
+        }
+        AckOutcome::Consumed
+    }
+
     /// Consume an arriving acknowledgement: raise `newest_ack`, and take a round-trip sample IF the
     /// ack advanced. Returns whether it did.
     ///
@@ -655,16 +774,20 @@ impl PeerState {
     /// frozen at its last honest measurement, while a peer on a genuinely lossy or slower route
     /// still acks whenever a packet lands and is measured correctly.
     ///
-    /// **What this does NOT do**, because the claim has been overstated twice already: nothing here
-    /// ties the reported ack to the highest frame the peer actually received, and any advance is
-    /// accepted however small. A client that advances at full rate while holding a constant lag is
-    /// measured at that lag and reads exactly like a genuinely slow peer — see the residual tests
-    /// below. There is no server-side figure to cross-check it against (the ping/pong clock is
-    /// client-initiated and `integrate_pong` runs only on clients), and pinning it would need a
-    /// server-chosen value the client must echo, which is a wire change this rules out. The
-    /// containment is the millisecond ceiling in `NetLagComp`, and it is adequate for the reason
-    /// every rewind system relies on: a client that under-reports gains nothing a client routing
-    /// through a traffic shaper does not already gain honestly, and the two are indistinguishable.
+    /// **The ack this measures has already been proven.** Production reaches here only through
+    /// [`PeerState::consume_ack`], which has matched the frame token the peer quoted back against the one
+    /// the server minted for that tick, so `ack` names a frame that provably arrived rather than a number
+    /// the peer chose. An ack for a frame the peer never received — forged, guessed, or replayed out of another
+    /// session — carries the wrong token and never reaches this function.
+    ///
+    /// **What proof does NOT settle**, because the claim has been overstated twice already: a token says
+    /// the peer received the frame it names, not that the peer received nothing newer. A client that
+    /// advances at full rate while holding a constant lag quotes a real token every time, is measured at
+    /// that lag, and reads exactly like a genuinely slow peer — see the residual test below. No wire field
+    /// closes that one: `current - ack` is the whole round trip whatever lead the client runs at, so there
+    /// is no second quantity for the server to derive an independent figure from, and a client that
+    /// under-reports gains nothing a client routing through a traffic shaper does not already gain
+    /// honestly. The containment for the remainder is the millisecond ceiling in `NetLagComp`.
     fn note_ack(&mut self, ack: u64, current: u64, tick_ms: f64) -> bool {
         if ack <= self.newest_ack {
             return false;
@@ -864,6 +987,11 @@ pub struct OrbitNet {
     /// Client: which of the 32 frame ticks before `newest_snapshot_tick` also arrived — rides
     /// every input header so the server deltas only against bases we provably hold.
     snapshot_ack_bits: u32,
+    /// Client: the token the frame at `newest_snapshot_tick` carried, quoted back in every input
+    /// header. It is what turns `newest_snapshot_tick` from an assertion into a claim the server can
+    /// check; see [`FrameHeader::ack_token`]. Moves only when `newest_snapshot_tick` moves, so it always
+    /// names the frame the ack names.
+    snapshot_ack_token: u32,
     /// Client: raise WANT_FULL on the next input frame.
     want_full: bool,
     /// Client: which owned body the next input frame's admission walk starts at.
@@ -898,6 +1026,7 @@ pub struct OrbitNet {
     acc_blocks_oversize: u64,
     acc_blocks_full: u64,
     acc_want_full_nacks: u64,
+    acc_unproven_acks: u64,
     acc_stale_blocks: u64,
     acc_interest_us: u64,
     acc_interest_ticks: u64,
@@ -1006,6 +1135,7 @@ impl INode for OrbitNet {
             expected_schemas: HashMap::new(),
             newest_snapshot_tick: 0,
             snapshot_ack_bits: 0,
+            snapshot_ack_token: 0,
             want_full: false,
             input_rotor: 0,
             m_resim_ticks: 0.0,
@@ -1027,6 +1157,7 @@ impl INode for OrbitNet {
             acc_blocks_oversize: 0,
             acc_blocks_full: 0,
             acc_want_full_nacks: 0,
+            acc_unproven_acks: 0,
             acc_stale_blocks: 0,
             acc_interest_us: 0,
             acc_interest_ticks: 0,
@@ -1193,6 +1324,7 @@ impl OrbitNet {
         self.planner.clear();
         self.newest_snapshot_tick = 0;
         self.snapshot_ack_bits = 0;
+        self.snapshot_ack_token = 0;
         self.lead.clear();
         self.lead_bias_ticks = 0.0;
         self.want_full = false;
@@ -1598,6 +1730,7 @@ impl OrbitNet {
             "blocks_oversize_s" => bw.blocks_oversize_s,
             "blocks_full_s" => bw.blocks_full_s,
             "want_full_nacks_s" => bw.want_full_nacks_s,
+            "unproven_acks_s" => bw.unproven_acks_s,
             "stale_blocks_s" => bw.stale_blocks_s,
             "starve_ticks_max" => bw.starve_ticks_max,
             "unsent_backlog_max" => bw.unsent_backlog_max,
@@ -2034,6 +2167,7 @@ impl OrbitNet {
         self.clock.clear();
         self.newest_snapshot_tick = 0;
         self.snapshot_ack_bits = 0;
+        self.snapshot_ack_token = 0;
         // The margin window described the old timeline; the dialed-in bias is still the best
         // guess for steady-state need, so it survives the reseek.
         self.lead.clear();
@@ -2524,6 +2658,7 @@ impl OrbitNet {
             blocks_oversize_s: self.acc_blocks_oversize as f64 * per_second,
             blocks_full_s: self.acc_blocks_full as f64 * per_second,
             want_full_nacks_s: self.acc_want_full_nacks as f64 * per_second,
+            unproven_acks_s: self.acc_unproven_acks as f64 * per_second,
             stale_blocks_s: self.acc_stale_blocks as f64 * per_second,
             starve_ticks_max: self.win_starve_ticks_max as f64,
             unsent_backlog_max: self.win_unsent_backlog_max as f64,
@@ -2555,6 +2690,7 @@ impl OrbitNet {
         self.acc_blocks_oversize = 0;
         self.acc_blocks_full = 0;
         self.acc_want_full_nacks = 0;
+        self.acc_unproven_acks = 0;
         self.acc_stale_blocks = 0;
         self.acc_interest_us = 0;
         self.acc_interest_ticks = 0;
@@ -2651,6 +2787,7 @@ impl OrbitNet {
             tick: u32::try_from(current).unwrap_or(u32::MAX),
             ack_tick: u32::try_from(self.newest_snapshot_tick).unwrap_or(u32::MAX),
             ack_bits: self.snapshot_ack_bits,
+            ack_token: self.snapshot_ack_token,
             margin_ticks: 0,
             flags: if self.want_full {
                 FrameHeader::FLAG_WANT_FULL
@@ -2784,13 +2921,15 @@ impl OrbitNet {
         let mut members = std::mem::take(&mut self.aoi_members);
 
         for peer_id in peer_ids {
-            let (want_full, ack_tick, margin) = {
+            let (want_full, ack_tick, ack_token, margin) = {
                 let Some(peer) = self.peers.get(&peer_id) else {
                     continue; // disconnected while an earlier peer's frame was going out
                 };
                 (
                     peer.want_full,
                     u32::try_from(peer.newest_input_tick.max(0)).unwrap_or(u32::MAX),
+                    // What this peer must quote back to have its ack of this frame believed.
+                    peer.frame_token(current).unwrap_or(0),
                     peer.margin_last,
                 )
             };
@@ -3019,6 +3158,7 @@ impl OrbitNet {
                 tick: u32::try_from(current).unwrap_or(u32::MAX),
                 ack_tick,
                 ack_bits: 0,
+                ack_token,
                 margin_ticks: margin,
                 flags: 0,
                 entity_count: sent.len() as u32,
@@ -3559,6 +3699,12 @@ impl OrbitNet {
             peer.auth = Some(SessionAuth::new(hello.session_key));
             peer.budget = ReceiveBudget::new();
         }
+        // The secret this connection's frame tokens are minted from. `get_or_insert_with`, not an
+        // assignment: a hello is retried, and re-minting would strand every token the client already
+        // holds. See `PeerState::token_salt` for why a rekey does not rotate it either.
+        if peer.token_salt.is_none() {
+            peer.token_salt = Some(Self::mint_session_key());
+        }
         peer.synced = true;
         peer.want_full = true;
         peer.newest_input_tick = -1;
@@ -3634,6 +3780,7 @@ impl OrbitNet {
         // round-trip sample in milliseconds while it is still true.
         let tick_ms = self.effective_rate().dt() * 1000.0;
         let mut nacked = false;
+        let unproven_ack;
         {
             let Some(peer) = self.peers.get_mut(&sender) else {
                 return; // No handshake, no input.
@@ -3642,41 +3789,26 @@ impl OrbitNet {
                 peer.want_full = true;
                 nacked = true;
             }
-            // Consume the ack window: every snapshot frame the client confirms receiving
-            // promotes the entity ticks it carried to `acked_base` — the only ticks a masked
-            // delta may reference, because the client provably holds those rows.
-            let ack = u64::from(header.ack_tick);
-            if ack > 0 {
-                // Raise `newest_ack` and measure the round trip, but ONLY when the ack has
-                // actually advanced -- see `note_ack` for why an unadvanced one must not be
-                // measured. `note_ack` uses `saturating_sub` because an ack can name a frame the
-                // accumulator has not reached: ticks are published before the send phase runs, and
-                // a peer's clock leads.
-                peer.note_ack(ack, current, tick_ms);
-                let newest_ack = peer.newest_ack;
-                let mut promoted: Vec<(u64, u64)> = Vec::new();
-                peer.sent_log.retain(|(frame, entities)| {
-                    let confirmed = *frame == ack
-                        || (*frame < ack
-                            && ack - *frame <= 32
-                            && (header.ack_bits >> (ack - *frame - 1)) & 1 == 1);
-                    if confirmed {
-                        promoted.extend_from_slice(entities);
-                        return false;
-                    }
-                    // Older than the ack window can reach: it will never be confirmed.
-                    frame.saturating_add(32) >= newest_ack
-                });
-                for (id, tick) in promoted {
-                    let entry = peer.acked_base.entry(id).or_insert(0);
-                    *entry = (*entry).max(tick);
-                }
-            }
+            // Consume the ack window: every snapshot frame the client PROVES it received promotes
+            // the entity ticks that frame carried to `acked_base` — the only ticks a masked delta
+            // may reference, because the client provably holds those rows. An ack that carries the
+            // wrong frame token proves nothing and is refused whole; see `PeerState::consume_ack`.
+            let outcome = peer.consume_ack(
+                u64::from(header.ack_tick),
+                header.ack_token,
+                header.ack_bits,
+                current,
+                tick_ms,
+            );
+            unproven_ack = outcome == AckOutcome::Unproven;
         }
         // The acceptance bar for turning AOI on: a re-entering entity must get its full block
         // WITHOUT a want_full storm, and this is the number that says whether it did.
         if nacked {
             self.acc_want_full_nacks += 1;
+        }
+        if unproven_ack {
+            self.acc_unproven_acks += 1;
         }
 
         // What this peer may spend of the receive path this tick. Every block below costs a handle
@@ -3802,6 +3934,9 @@ impl OrbitNet {
                 (self.snapshot_ack_bits << shift) | (1u32 << (shift - 1))
             };
             self.newest_snapshot_tick = frame_tick;
+            // The proof rides with the tick it proves. An older frame arriving out of order sets its
+            // ack BIT below but not this, because the ack the server checks names the newest.
+            self.snapshot_ack_token = header.ack_token;
         } else if frame_tick < self.newest_snapshot_tick {
             let behind = self.newest_snapshot_tick - frame_tick;
             if (1..=32).contains(&behind) {
@@ -4100,8 +4235,8 @@ mod tests {
     use super::{
         admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
         full_block_due, hold_on_drop, owned_rows_into, owned_rows_of, resolve_observer,
-        seat_observer, session_directions, EntityRow, OrbitNet, PeerAnchor, PeerObserver,
-        PeerState, ResumeTable, RxOutcome, SeatId, SeatIndex, StateIntegration,
+        seat_observer, session_directions, AckOutcome, EntityRow, OrbitNet, PeerAnchor,
+        PeerObserver, PeerState, ResumeTable, RxOutcome, SeatId, SeatIndex, StateIntegration,
         FULL_STATE_INTERVAL, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER, RTT_SAMPLE_MAX_MS,
         RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
@@ -4110,6 +4245,7 @@ mod tests {
         SeatScratch, MEMBERSHIP_GLOBAL,
     };
     use orbitnet_core::priority::Band;
+    use orbitnet_core::KEY_LEN;
 
     // ------------------------------------------------------------------
     // Membership: how a gathered row reaches the filter, and where a peer's own world comes from.
@@ -5023,15 +5159,16 @@ mod tests {
     #[test]
     fn a_deliberately_lagged_ack_still_inflates_the_estimate() {
         // KNOWN RESIDUAL, pinned here so nobody re-derives the stronger claim this code has already
-        // attracted twice. `note_ack` refuses an ack that does not ADVANCE, which closes the free
-        // version of the attack -- a peer that says nothing new gets no sample at all. It does NOT
-        // tie the reported ack to the highest frame the peer actually received, and it accepts any
-        // advance however small. A client that advances at full rate while holding a constant lag
-        // is therefore measured at that lag, and reads identically to a genuinely slow peer.
+        // attracted twice. Two rules close the cheap versions of the attack: `note_ack` refuses an
+        // ack that does not ADVANCE, so a peer that says nothing new gets no sample at all, and
+        // `consume_ack` refuses an ack whose frame token the peer could not be holding, so a peer
+        // cannot name a frame that never reached it. Neither ties the ack to the HIGHEST frame the
+        // peer received. A client that advances at full rate while holding a constant lag quotes a
+        // real token every time, is measured at that lag, and reads identically to a slow peer.
         //
-        // There is no server-side cross-check available: the ping/pong clock is client-initiated
-        // and `integrate_pong` runs only on clients, so the server has no independent figure. The
-        // containment is the millisecond ceiling in `NetLagComp`, not anything here.
+        // No wire field closes this one. `current - ack` is the whole round trip whatever lead the
+        // client runs at, so the server has no second quantity to derive an independent figure from.
+        // The containment is the millisecond ceiling in `NetLagComp`, not anything here.
         let mut peer = peer_with(&[3, 3, 3]);
         let honest = peer.rtt_ms().unwrap();
         for i in 0..(RTT_WINDOW as u64 * 2) {
@@ -5067,6 +5204,125 @@ mod tests {
             "held to the first (smallest) claimed lag, not the largest: {} ms",
             peer.rtt_ms().unwrap()
         );
+    }
+
+    // A peer holding a server-minted secret, as one does from its handshake onward.
+    fn peer_with_salt(salt: u8) -> PeerState {
+        PeerState {
+            token_salt: Some([salt; KEY_LEN]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_frame_token_is_specific_to_the_frame_and_to_the_peer() {
+        // What makes a token proof of receipt rather than arithmetic: a client knows every tick number
+        // and it knows the session key it minted, so a token derived from those would be computable for
+        // a frame that never arrived. Both axes have to separate.
+        let peer = peer_with_salt(0x5a);
+        assert_ne!(
+            peer.frame_token(100),
+            peer.frame_token(101),
+            "two frames of one session share a token"
+        );
+        assert_ne!(
+            peer.frame_token(100),
+            peer_with_salt(0x5b).frame_token(100),
+            "two peers share a token for the same tick"
+        );
+    }
+
+    #[test]
+    fn a_peer_with_no_salt_can_prove_nothing() {
+        // A peer that has not handshaken has been sent no frame, so there is nothing it could prove
+        // and no value that may pass for a proof -- including the `0` an empty header carries.
+        let peer = PeerState::default();
+        assert_eq!(peer.frame_token(10), None);
+        assert!(!peer.ack_is_proven(10, 0));
+    }
+
+    #[test]
+    fn an_ack_quoting_its_frames_token_is_consumed() {
+        let mut peer = peer_with_salt(0x11);
+        peer.sent_log.push_back((10, vec![(7, 10)]));
+        let token = peer.frame_token(10).unwrap();
+        assert_eq!(
+            peer.consume_ack(10, token, 0, 13, TICK_MS),
+            AckOutcome::Consumed
+        );
+        assert_eq!(peer.newest_ack, 10);
+        assert!((peer.rtt_ms().unwrap() - 3.0 * TICK_MS as f32).abs() < 0.1);
+        assert_eq!(peer.acked_base.get(&7), Some(&10));
+    }
+
+    #[test]
+    fn an_ack_the_peer_cannot_prove_buys_nothing() {
+        // THE ATTACK THIS CLOSES. An ack is a claim about what arrived, and `newest_ack`, the
+        // round-trip sample and the `acked_base` promotion are all granted on the strength of it. A
+        // peer that names a frame it never received cannot produce the token for it, and gets none of
+        // the three -- the sent log still holds the frame, awaiting an ack that is real.
+        let mut peer = peer_with_salt(0x11);
+        peer.sent_log.push_back((10, vec![(7, 10)]));
+        let forged = peer.frame_token(10).unwrap() ^ 1;
+        assert_eq!(
+            peer.consume_ack(10, forged, 0, 13, TICK_MS),
+            AckOutcome::Unproven
+        );
+        assert_eq!(peer.newest_ack, 0);
+        assert_eq!(
+            peer.rtt_ms(),
+            None,
+            "an unproven claim is not a measurement"
+        );
+        assert!(peer.acked_base.is_empty());
+        assert_eq!(peer.sent_log.len(), 1);
+    }
+
+    #[test]
+    fn a_token_from_another_frame_does_not_prove_this_one() {
+        // The replay shape, and the one an under-reporting peer would reach for first: it genuinely
+        // holds the token of every frame that reached it, so refusing a token is not enough -- the
+        // token has to be refused FOR THE TICK BEING CLAIMED.
+        let mut peer = peer_with_salt(0x22);
+        let held = peer.frame_token(40).unwrap();
+        assert_eq!(
+            peer.consume_ack(41, held, 0, 45, TICK_MS),
+            AckOutcome::Unproven
+        );
+        assert_eq!(
+            peer.consume_ack(40, held, 0, 45, TICK_MS),
+            AckOutcome::Consumed
+        );
+    }
+
+    #[test]
+    fn a_peer_that_has_received_nothing_yet_is_not_refused() {
+        // `ack_tick` 0 is every peer between its handshake and its first snapshot. It claims nothing,
+        // so there is nothing to prove and nothing to count as a refusal.
+        let mut peer = peer_with_salt(0x33);
+        assert_eq!(peer.consume_ack(0, 0, 0, 9, TICK_MS), AckOutcome::Empty);
+        assert_eq!(peer.rtt_ms(), None);
+    }
+
+    #[test]
+    fn the_ack_bits_ride_on_the_proven_tick() {
+        // The bits name 32 frames older than `ack` and prove nothing themselves. They are consumed
+        // because the tick they hang off was proven, and refused with it when it was not.
+        let mut peer = peer_with_salt(0x44);
+        peer.sent_log.push_back((8, vec![(1, 8)]));
+        peer.sent_log.push_back((10, vec![(2, 10)]));
+        let token = peer.frame_token(10).unwrap();
+        assert_eq!(
+            peer.consume_ack(10, token ^ 0xff, 0b10, 12, TICK_MS),
+            AckOutcome::Unproven
+        );
+        assert!(peer.acked_base.is_empty(), "the bits came in on a lie");
+        assert_eq!(
+            peer.consume_ack(10, token, 0b10, 12, TICK_MS),
+            AckOutcome::Consumed
+        );
+        assert_eq!(peer.acked_base.get(&1), Some(&8));
+        assert_eq!(peer.acked_base.get(&2), Some(&10));
     }
 
     #[test]
