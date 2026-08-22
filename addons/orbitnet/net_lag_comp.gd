@@ -69,6 +69,10 @@ static var per_shooter: bool = true
 ## The shooter's VIEW LAG of what they are shooting at, in NET TICKS: how far behind the server's present the
 ## remote bodies on their screen are drawn.
 ##
+## The pooled fallback, used by a shot that cannot name its shooter: an AI's round, a diagnostic re-deriving a
+## depth, or a peer whose first accounting window has not closed yet. A shot that can name its shooter is built
+## from [method observed_interp_for], which is per peer.
+##
 ## **IT IS MEASURED, NOT ASSUMED.** The tempting constant is 1.0, on the argument that every remote body renders
 ## by interpolating between the last two RECEIVED poses and is therefore drawn exactly one net tick behind. The
 ## first half is true; the second does not follow, because a row does not arrive every tick. A peer's snapshot
@@ -80,9 +84,10 @@ static var per_shooter: bool = true
 ## at. That is arithmetic rather than a feel judgement.
 ##
 ## The send path publishes the figure, and **what is read is the POOLED value across every band**, not the near
-## band's. It is refreshed once per server tick from the scalar accessor [method Net.interarrival_all_ticks] (see
-## [method refresh_observed_interp]) rather than read per shot, because a nineteen-key dictionary per pellet per
-## tick is the kind of cost this file's header exists to warn about.
+## band's. It is refreshed once per server tick -- the per-peer figure from [method Net.interarrival_ticks] into
+## [method refresh_observed_interp_for], the pooled one from [method Net.interarrival_all_ticks] into
+## [method refresh_observed_interp] -- rather than read per shot, because a nineteen-key dictionary per pellet
+## per tick is the kind of cost this file's header exists to warn about.
 ##
 ## **THE POOLED FIGURE IS THE HONEST ONE FOR THIS CONSUMER.** This term is applied to EVERY shot at EVERY range,
 ## and the code that applies it does not know which band its target sits in. Feeding it the near figure would
@@ -117,10 +122,59 @@ static func refresh_observed_interp(interarrival: float) -> void:
 		return
 	observed_interp_ticks = clampf(interarrival, INTERP_TICKS, MAX_INTERP_TICKS)
 
-## Put the measurement back to the floor. Called when a session ends: this is a `static var`, so it outlives the
-## session whose send path it describes, and the next session must start from the floor rather than inherit it.
+## The same measurement, per peer: how far behind the server's present the remote bodies on one peer's screen
+## are drawn, in net ticks.
+##
+## Send cadence is a per-peer quantity by construction. The byte budget is charged per peer per frame and the
+## send path rebuilds its candidate list per peer, so a peer with a small interest set gets its rows every tick
+## while a peer in a dense part of the world waits several. The round-trip term this is added to
+## ([method Net.peer_rtt_ms]) is already per peer, and pooling only this half granted a peer served every tick a
+## window measured partly from peers served every eighth: over-rewound above the pool mean, under-rewound below
+## it, up to the [constant MAX_INTERP_TICKS] ceiling. Under-rewind is the direction that costs a shooter a hit
+## they saw land.
+##
+## A peer with no entry falls back to [member observed_interp_ticks] rather than to [constant INTERP_TICKS]. A fresh
+## joiner has no cadence of its own yet, and the session's pooled mean is a better estimate of the one it is
+## about to have than the one-tick floor -- which would hand it the shallowest window in the session at the
+## moment its link is least settled.
+##
+## Read through [method observed_interp_for] rather than directly; the fallback lives there.
+static var _peer_interp_ticks: Dictionary[int, float] = {}
+
+## Re-read the send path's measured inter-arrival for ONE peer. SERVER ONLY, once per net tick per synced peer,
+## from [method Net.interarrival_ticks].
+##
+## A zero, negative or NaN figure drops this peer's entry rather than pinning it to the floor. Those are the
+## answers for a peer whose window admitted nothing and for a peer the backend does not know, and neither is a
+## measurement of a one-tick cadence. Dropping returns that peer to the pooled fallback, which is what a peer
+## with nothing measured about it should get.
+static func refresh_observed_interp_for(peer: int, interarrival: float) -> void:
+	if is_nan(interarrival) or interarrival <= 0.0:
+		_peer_interp_ticks.erase(peer)
+		return
+	_peer_interp_ticks[peer] = clampf(interarrival, INTERP_TICKS, MAX_INTERP_TICKS)
+
+## The interpolation term for one shooter, in net ticks: that peer's own measured cadence, or
+## [member observed_interp_ticks] when nothing has been measured about it yet.
+static func observed_interp_for(peer: int) -> float:
+	return _peer_interp_ticks.get(peer, observed_interp_ticks)
+
+## Drop one peer's measurement. A consuming game wires this to [signal Net.peer_dropped]; the store is not
+## reached from the facade, for the same reason the hittable snapshot is not -- this file stays decoupled from
+## how a session enumerates players.
+##
+## The store is keyed by peer id and peer ids are reused across a session's lifetime, so an entry left behind by
+## a departed peer is the cadence a LATER peer would be rewound by. Nothing else clears it: the per-tick refresh
+## only visits peers that are still connected.
+static func forget_peer_interp(peer: int) -> void:
+	_peer_interp_ticks.erase(peer)
+
+## Put every measurement back to the floor and forget every peer. Called when a session ends: these are
+## `static var`s, so they outlive the session whose send path they describe, and the next session must start
+## from the floor rather than inherit it.
 static func reset_observed_interp() -> void:
 	observed_interp_ticks = INTERP_TICKS
+	_peer_interp_ticks.clear()
 
 ## How many ticks of rewind `ms` is worth at `tick_hz`, clamped in MS first and then bounded by what the ring can
 ## actually hold. Pure -- the whole policy, unit-testable without a session.
@@ -147,6 +201,10 @@ static func rewind_ticks_for(ms: float, tick_hz: float, ring_size: int = _RING_S
 ## playtest measures, and why the error hides there. `rtt/2` is BELOW the flat window it replaces for every
 ## shooter under about 67 ms, so adopting it ships as a regression for exactly the population it was meant to
 ## help.
+##
+## A NEGATIVE `interp_ticks` means "no per-peer figure supplied", and falls back to the pooled
+## [member observed_interp_ticks]. A caller that can name its shooter passes
+## [method observed_interp_for] instead, or calls [method rewind_ticks_for_peer_shot], which does.
 ##
 ## A NEGATIVE `rtt_ms` means "no estimate", which is not the same as zero and must not be treated as it: the
 ## caller falls back to [member delay_ms] rather than handing a fresh joiner the shallowest window in the session
@@ -195,6 +253,18 @@ static func rewind_ticks_for_shot(is_authority_shooter: bool, rtt_ms: float, tic
 	if per_shooter and is_authority_shooter:
 		return 0
 	return rewind_ticks_for_shooter(rtt_ms, tick_hz, interp_ticks)
+
+## The rewind depth in ticks for one shot fired by a named peer: [method rewind_ticks_for_shot] with both terms
+## resolved for that peer.
+##
+## The call a weapon authority should make. Both halves of the window are per peer -- the round trip from
+## [method Net.peer_rtt_ms], the interpolation term from [method observed_interp_for] -- and this is the one
+## place that says so, so a shot site cannot pair one peer's round trip with the session's pooled cadence.
+## `rtt_ms` is still a parameter rather than read here, because [NetLagComp] does not name [Net] and must not
+## start.
+static func rewind_ticks_for_peer_shot(is_authority_shooter: bool, peer: int, rtt_ms: float,
+		tick_hz: float) -> int:
+	return rewind_ticks_for_shot(is_authority_shooter, rtt_ms, tick_hz, observed_interp_for(peer))
 
 ## The rewind depth in ticks for the CURRENT session's FALLBACK window, derived from [member delay_ms] at the
 ## tick rate the loop is actually running at. [method Net.effective_tickrate] and not [method Net.tickrate]: the

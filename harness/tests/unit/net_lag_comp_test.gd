@@ -340,6 +340,121 @@ func test_the_interpolation_term_is_the_send_paths_measured_inter_arrival() -> v
 	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, 60.0), 1000.0 / 60.0, 1e-4,
 		"a shooter on a perfect link still gets the interpolation term -- their screen is a tick behind regardless")
 
+func test_the_interpolation_term_is_scoped_to_the_peer_that_fired() -> void:
+	# The defect: the round-trip half of the window was per peer and the interpolation half was one
+	# process-wide figure pooled across every peer. Send cadence is per peer by construction -- the byte budget
+	# is charged per peer per frame and the candidate list is rebuilt per peer -- so a shooter whose own rows
+	# arrive every tick was granted a window measured partly from peers whose rows arrive every eighth.
+	#
+	# Two shooters on identical links, differing only in what the send path measured about each: the depths
+	# must differ, and each must be the one its own cadence earns.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp(4.0)          # the session's pooled mean
+	NetLagComp.refresh_observed_interp_for(2, 1.0)   # served every tick
+	NetLagComp.refresh_observed_interp_for(3, 8.0)   # served every eighth
+	assert_almost_eq(NetLagComp.observed_interp_for(2), 1.0, 1e-4, "peer 2 is charged its own cadence")
+	assert_almost_eq(NetLagComp.observed_interp_for(3), 8.0, 1e-4, "peer 3 is charged its own")
+	var fast: int = NetLagComp.rewind_ticks_for_peer_shot(false, 2, 100.0, 60.0)
+	var slow: int = NetLagComp.rewind_ticks_for_peer_shot(false, 3, 100.0, 60.0)
+	assert_true(slow > fast,
+		"the same link at two cadences is two windows, not one pooled window applied to both")
+	assert_eq(fast, NetLagComp.rewind_ticks_for_shooter(100.0, 60.0, 1.0),
+		"and each is exactly the depth that peer's own measurement earns")
+	assert_eq(slow, NetLagComp.rewind_ticks_for_shooter(100.0, 60.0, 8.0), "...on both sides of the pool mean")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_a_peer_with_no_measurement_falls_back_to_the_pooled_figure() -> void:
+	# NOT to the one-tick floor. A fresh joiner has no cadence of its own yet, and the session's pooled mean is
+	# a better estimate of the one it is about to have -- the floor would hand it the shallowest window in the
+	# session at the moment its link is least settled.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp(3.4)
+	assert_almost_eq(NetLagComp.observed_interp_for(7), 3.4, 1e-4,
+		"an unmeasured peer takes the pooled mean, not the floor")
+	assert_eq(NetLagComp.rewind_ticks_for_peer_shot(false, 7, 100.0, 60.0),
+		NetLagComp.rewind_ticks_for_shooter(100.0, 60.0), "...which is the window the pooled figure produced")
+	# And with nothing measured at all, the pooled figure is itself the floor.
+	NetLagComp.reset_observed_interp()
+	assert_almost_eq(NetLagComp.observed_interp_for(7), NetLagComp.INTERP_TICKS, 1e-4,
+		"no measurement anywhere leaves the floor in place rather than inventing a number")
+	NetLagComp.observed_interp_ticks = saved
+
+func test_a_peers_measurement_is_clamped_like_the_pooled_one() -> void:
+	# The same floor and ceiling, for the same reasons: a body cannot render fresher than the tick it arrived
+	# on, and a send path so starved that a row arrives every twentieth tick is broken in a way a deeper rewind
+	# does not fix.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(4, 0.25)
+	assert_almost_eq(NetLagComp.observed_interp_for(4), NetLagComp.INTERP_TICKS, 1e-4,
+		"a sub-tick measurement cannot buy a window shallower than one tick")
+	NetLagComp.refresh_observed_interp_for(4, 50.0)
+	assert_almost_eq(NetLagComp.observed_interp_for(4), NetLagComp.MAX_INTERP_TICKS, 1e-4,
+		"a pathological measurement clamps rather than turning the rewind into a time machine")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_an_absent_measurement_drops_the_peer_rather_than_pinning_it() -> void:
+	# The backend answers 0.0 for a peer whose window admitted nothing and for a peer it does not know, and
+	# neither is a measurement of a one-tick cadence. Pinning the floor there would make an idle window read as
+	# the fastest possible link; dropping the entry returns the peer to the pooled fallback.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp(5.0)
+	NetLagComp.refresh_observed_interp_for(9, 2.0)
+	for absent: float in [0.0, -1.0, NAN]:
+		NetLagComp.refresh_observed_interp_for(9, 2.0)
+		NetLagComp.refresh_observed_interp_for(9, absent)
+		assert_almost_eq(NetLagComp.observed_interp_for(9), 5.0, 1e-4,
+			"an absent figure returns the peer to the pooled fallback, not to the floor")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_a_departed_peers_measurement_does_not_outlive_it() -> void:
+	# Peer ids are reused within a session's lifetime and the per-tick refresh only visits peers that are still
+	# connected, so an entry left behind by a departed peer is the cadence a LATER peer would be rewound by.
+	# The session-scoped reset covers the same hazard across sessions: these are `static var`s.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp(4.0)
+	NetLagComp.refresh_observed_interp_for(5, 8.0)
+	NetLagComp.forget_peer_interp(5)
+	assert_almost_eq(NetLagComp.observed_interp_for(5), 4.0, 1e-4,
+		"the id is back to the pooled fallback the moment its peer is gone")
+	NetLagComp.refresh_observed_interp_for(5, 8.0)
+	NetLagComp.reset_observed_interp()
+	assert_almost_eq(NetLagComp.observed_interp_for(5), NetLagComp.INTERP_TICKS, 1e-4,
+		"and a session teardown clears every peer, not only the pooled scalar")
+	NetLagComp.observed_interp_ticks = saved
+
+func test_the_peer_aware_shot_answers_to_the_same_policy_switches() -> void:
+	# It is `rewind_ticks_for_shot` with both terms resolved for one peer, so it must inherit the whole policy:
+	# the authority's own shot takes no rewind, and `per_shooter` off restores the flat window for everyone --
+	# including a peer with a deep measured cadence, which is what would otherwise survive the switch.
+	var was: bool = NetLagComp.per_shooter
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(6, 8.0)
+	NetLagComp.per_shooter = true
+	for hz: float in [30.0, 60.0, 120.0]:
+		assert_eq(NetLagComp.rewind_ticks_for_peer_shot(true, 6, 0.0, hz), 0,
+			"the authority's own shot takes no rewind at %d Hz, whatever was measured about it" % int(hz))
+		assert_eq(NetLagComp.rewind_ticks_for_peer_shot(false, 6, 100.0, hz),
+			NetLagComp.rewind_ticks_for_shot(false, 100.0, hz, 8.0),
+			"a remote shot is the shot policy with that peer's own term at %d Hz" % int(hz))
+	NetLagComp.per_shooter = false
+	for hz: float in [30.0, 60.0, 120.0]:
+		assert_eq(NetLagComp.rewind_ticks_for_peer_shot(false, 6, 100.0, hz), NetLagComp.rewind_ticks(int(hz)),
+			"per_shooter off: the flat window at %d Hz, measured cadence and all" % int(hz))
+		assert_eq(NetLagComp.rewind_ticks_for_peer_shot(true, 6, 0.0, hz), NetLagComp.rewind_ticks(int(hz)),
+			"per_shooter off: the authority gets it too at %d Hz" % int(hz))
+	NetLagComp.per_shooter = was
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
 func test_the_interpolation_term_is_a_duration_at_every_tick_rate() -> void:
 	# INTERP_TICKS is a constant in TICKS and the term it produces is a DURATION, so it has to shrink as the rate
 	# rises. A remote body renders one tick behind whatever a tick currently is.

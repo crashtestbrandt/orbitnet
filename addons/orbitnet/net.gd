@@ -768,11 +768,15 @@ func perf_metrics() -> Dictionary[String, float]:
 ## The POOLED mean ticks between admissions across every band -- the one figure from
 ## [method bandwidth_metrics] that is read EVERY NET TICK on the authority rather than at human rates.
 ##
-## It is the interpolation term in every shot's rewind depth, refreshed once per tick by the server's own
-## per-tick hook instead of once per pellet. Reading it through the dictionary allocated a nineteen-key
-## `Dictionary` in the backend, boxed every value, and rebuilt a typed copy here, per tick, forever -- on the
-## very send path this accounting exists to make cheaper. Everything else in that dictionary stays where it
-## is.
+## A scalar rather than a dictionary key because it is read at tick rates: through
+## [method bandwidth_metrics] it allocated a nineteen-key `Dictionary` in the backend, boxed every value, and
+## rebuilt a typed copy here, per tick, forever -- on the very send path this accounting exists to make
+## cheaper. Everything else in that dictionary stays where it is.
+##
+## This is the figure for a consumer that cannot name a peer. A shot can name its shooter, and the
+## interpolation term in its rewind depth comes from [method interarrival_ticks] instead -- send cadence is a
+## per-peer quantity, and pairing a pooled cadence with a per-peer round trip is the asymmetry that accessor
+## exists to remove.
 ##
 ## FAILS OPEN at 0.0, which [NetLagComp.refresh_observed_interp] reads as "no measurement yet" and answers with
 ## the floor. That matters for the same reason [method NetStateHandle.last_known_state]'s guard does: the
@@ -792,6 +796,38 @@ func interarrival_all_ticks() -> float:
 ## the question that separates a stale binary from an unpublished window.
 func has_interarrival_scalar() -> bool:
 	return _mode != Mode.OFFLINE and _backend_has(&"interarrival_all")
+
+## The mean ticks between admissions for the rows sent to one peer, pooled across every band.
+##
+## The per-peer form of [method interarrival_all_ticks], and the one [NetLagComp] builds a shot's
+## interpolation term from. Send cadence is a per-peer quantity: the byte budget is charged per peer per frame
+## and the candidate list is rebuilt per peer, so a peer with a small interest set gets its rows every tick
+## while a peer in a dense part of the world waits several. The round-trip term beside it
+## ([method peer_rtt_ms]) is already per peer, and a pooled interpolation term grants a peer served every tick
+## a window measured partly from peers served every eighth.
+##
+## Answers 0.0 for an unknown peer, for a peer whose window admitted nothing, and before the first window is
+## published -- the same "no measurement" answer the pooled scalar gives, which
+## [method NetLagComp.refresh_observed_interp_for] reads as "leave the fallback in place".
+##
+## Falls back to the pooled scalar against a backend that predates this accessor, rather than to 0.0. The
+## committed cdylib is a bot's and can be a commit behind these sources, and answering 0.0 there would drop
+## every shooter in the session to the one-tick floor -- a deeper regression than the pooled figure this
+## replaces. Ask [method has_peer_interarrival] to tell the two apart.
+func interarrival_ticks(peer: int) -> float:
+	if _mode == Mode.OFFLINE:
+		return 0.0
+	if not _backend_has(&"interarrival_ticks"):
+		return interarrival_all_ticks()
+	return _orbit.interarrival_ticks(peer)
+
+## Whether the LOADED cdylib carries the per-peer accessor above, as a fact separate from what it answers.
+##
+## The same question [method has_interarrival_scalar] asks, for the same reason: the accessor degrades to a
+## figure indistinguishable from a real per-peer one, so no reading of its result can say whether the
+## measurement is per peer or pooled. A probe asserting that the per-peer split is live has to ask this.
+func has_peer_interarrival() -> bool:
+	return _mode != Mode.OFFLINE and _backend_has(&"interarrival_ticks")
 
 # WHETHER THE LOADED CDYLIB CARRIES A METHOD, ANSWERED ONCE. Several accessors on this facade have to tolerate a
 # binary older than these sources (the committed one is a bot's and lands in its own commit), and they did it with
