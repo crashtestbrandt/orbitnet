@@ -509,6 +509,29 @@ fn classify_rx(outcome: StateIntegration, block_was_full: bool) -> RxOutcome {
 }
 
 impl PeerState {
+    /// Start or stop withholding one entity from this peer. The whole of what
+    /// [`OrbitNet::set_entity_hidden`] does, as a method a test can call without a `SceneTree`.
+    ///
+    /// [`PeerInterest::set_hidden`] carries the filter half — the refusal, and dropping the entity
+    /// from the set in this call rather than at the next update. What is here is the other half:
+    /// **starting a veto clears the same three per-entity entries a leave clears**. It is a leave —
+    /// it just happened between updates, so no `leaves` list will ever name it, and the clearing
+    /// cannot be left to the loop that reads one. Without it a later retraction encodes a delta
+    /// against a base the peer dropped while it was withheld; the peer NACKs, and a NACK is per-peer
+    /// and all-entity, so one re-admitted body costs a full-state burst for everything that peer
+    /// holds.
+    ///
+    /// Retracting clears nothing, because nothing was sent while the veto was in force: the entries
+    /// cleared at the start are still empty, which is what makes the re-admission a full block.
+    fn set_entity_hidden(&mut self, id: u64, hidden: bool) {
+        self.interest.set_hidden(id, hidden);
+        if hidden {
+            self.last_sent.remove(&id);
+            self.last_full.remove(&id);
+            self.acked_base.remove(&id);
+        }
+    }
+
     /// Consume an arriving acknowledgement: raise `newest_ack`, and take a round-trip sample IF the
     /// ack advanced. Returns whether it did.
     ///
@@ -1210,6 +1233,48 @@ impl OrbitNet {
                 PeerAnchor::Inferred => MEMBERSHIP_GLOBAL,
                 _ => state.anchor_membership,
             }) as i64
+    }
+
+    /// Withhold one entity from one peer, or stop withholding it.
+    ///
+    /// SERVER-SIDE ONLY, and the third interest axis. Distance and membership are both properties of
+    /// the *entity* — one position, one world, read the same by every peer — so neither can express
+    /// "not this peer". This can, including the exception a membership id cannot: a class of entities
+    /// scoped by a declared key, minus one.
+    ///
+    /// `entity_id` is the token `get_entity_id()` returns on either synchronizer, and `0` is ignored
+    /// — that is what an unresolved synchronizer reports, and vetoing "no entity" is not a state
+    /// worth holding. May be called before the peer completes its handshake; the veto is held until
+    /// it does.
+    ///
+    /// **The veto beats everything the filter would otherwise say**, `always` included, and it
+    /// refuses at the candidate rather than at the cap, so a withheld entity occupies no slot in
+    /// `aoi_max_entities`. See [`PeerState::set_entity_hidden`] for the delta bookkeeping it clears
+    /// and [`PeerInterest::set_hidden`] for the filter rule itself.
+    ///
+    /// **THE CLIENT-SIDE CONTRACT, STATED PLAINLY: a veto stops the rows and nothing else.** No
+    /// despawn is sent, the receiving client's node is not removed, and the entity manifest still
+    /// names the id — ids are session-global whatever any one peer receives. What the client sees is
+    /// `get_last_known_state()` ceasing to advance, exactly as it does for a distance cull, and what
+    /// to do about an entity that stopped updating is the consuming project's decision.
+    #[func]
+    fn set_entity_hidden(&mut self, peer: i32, entity_id: i64, hidden: bool) {
+        if entity_id == 0 {
+            return;
+        }
+        self.peers
+            .entry(peer)
+            .or_default()
+            .set_entity_hidden(entity_id as u64, hidden);
+    }
+
+    /// Whether `entity_id` is currently withheld from `peer`. `false` for an unknown peer, and for
+    /// entity id `0`, which [`Self::set_entity_hidden`] refuses to record.
+    #[func]
+    fn is_entity_hidden(&self, peer: i32, entity_id: i64) -> bool {
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| state.interest.is_hidden(entity_id as u64))
     }
 
     /// Remote-resim lever: when true, un-exempt display-only entities so this client predicts
@@ -2754,6 +2819,13 @@ impl OrbitNet {
     /// it made one, the body it drives when it did not — and then filtered on membership first and
     /// distance second, which is [`candidate_for_row`] plus `update_linear_into`.
     ///
+    /// **The shared candidate list carries no per-peer facts and does not have to.** A visibility
+    /// veto ([`OrbitNet::set_entity_hidden`]) is held on the peer's own `PeerInterest` and applied
+    /// inside the filter, so it costs this loop nothing and cannot be forgotten by a caller that
+    /// builds candidates some other way. A vetoed entity is absent from `interest`, so the cull
+    /// figure below — `rows.len() - interest.len()` — already counts it, on every tick the veto
+    /// holds.
+    ///
     /// The leave half is the correctness requirement here. Re-entry is already *safe* — a
     /// delta against a base the peer dropped is rejected and raises `WANT_FULL` — but `want_full` is
     /// a per-peer, **all-entity** flag, so one re-entering body would cost a round trip plus a
@@ -3486,8 +3558,8 @@ mod tests {
         StateIntegration, FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
     use orbitnet_core::interest::{
-        AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatScratch,
-        MEMBERSHIP_GLOBAL,
+        AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatObserver,
+        SeatScratch, MEMBERSHIP_GLOBAL,
     };
     use orbitnet_core::priority::Band;
 
@@ -3959,6 +4031,91 @@ mod tests {
         OrbitNet::collect_observers(&rows, &mut observers);
         assert_eq!(observers.len(), 1);
         assert_eq!(observers[0].0, seat_of(42, 1));
+    }
+
+    // ------------------------------------------------------------------
+    // The visibility veto: what the send path clears when one starts.
+    // ------------------------------------------------------------------
+
+    /// One peer holding an entity on a single seat: in interest, sent, sent full, and with an acked
+    /// delta base.
+    fn peer_holding(id: u64) -> PeerState {
+        let mut peer = PeerState::default();
+        let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
+        peer.interest.update_linear_into(
+            &AoiConfig::default(),
+            &[SeatObserver {
+                center: [0.0; 3],
+                membership: MEMBERSHIP_GLOBAL,
+            }],
+            &[InterestCandidate::anchored(id, [1.0, 0.0, 0.0])],
+            &mut scratch,
+            &mut leaves,
+        );
+        peer.last_sent.insert(id, 400);
+        peer.last_full.insert(id, 390);
+        peer.acked_base.insert(id, 395);
+        peer
+    }
+
+    /// A veto is a leave that happens between updates, so no `leaves` list can name it and the same
+    /// three entries have to be cleared right here. Left in place, the re-admission encodes a delta
+    /// against a base the peer dropped while it was withheld.
+    #[test]
+    fn starting_a_veto_clears_the_same_bookkeeping_a_leave_clears() {
+        let mut peer = peer_holding(7);
+        assert!(peer.interest.contains(7));
+
+        peer.set_entity_hidden(7, true);
+        assert!(peer.interest.is_hidden(7), "the veto is recorded");
+        assert!(
+            !peer.interest.contains(7),
+            "and it left the set in this call"
+        );
+        assert!(!peer.last_sent.contains_key(&7));
+        assert!(!peer.last_full.contains_key(&7));
+        assert!(!peer.acked_base.contains_key(&7));
+    }
+
+    /// The veto covers ONE entity. Everything else this peer holds keeps its delta chain, which is
+    /// the difference between a veto and the per-peer, all-entity `want_full`.
+    #[test]
+    fn a_veto_leaves_every_other_entity_of_that_peer_untouched() {
+        let mut peer = peer_holding(7);
+        peer.last_sent.insert(8, 401);
+        peer.last_full.insert(8, 391);
+        peer.acked_base.insert(8, 396);
+
+        peer.set_entity_hidden(7, true);
+        assert_eq!(peer.last_sent.get(&8), Some(&401));
+        assert_eq!(peer.last_full.get(&8), Some(&391));
+        assert_eq!(peer.acked_base.get(&8), Some(&396));
+        assert!(!peer.interest.is_hidden(8));
+    }
+
+    /// Retracting clears nothing, because nothing was sent while the veto held. The entries stay
+    /// empty, which is exactly what makes the re-admission a full block rather than a delta.
+    #[test]
+    fn retracting_a_veto_leaves_the_bookkeeping_empty() {
+        let mut peer = peer_holding(7);
+        peer.set_entity_hidden(7, true);
+        peer.set_entity_hidden(7, false);
+        assert!(!peer.interest.is_hidden(7));
+        assert!(peer.last_sent.is_empty(), "still nothing to delta against");
+        assert!(peer.last_full.is_empty());
+        assert!(peer.acked_base.is_empty());
+    }
+
+    /// A vetoed entity is absent from the set, so the cull figure the send path derives per peer —
+    /// `rows.len() - interest.len()` — counts it on every tick the veto holds, with no separate
+    /// accounting to keep in step.
+    #[test]
+    fn a_vetoed_entity_counts_as_culled_by_the_derived_figure() {
+        let rows = 3usize;
+        let mut peer = peer_holding(7);
+        assert_eq!(rows - peer.interest.len(), 2);
+        peer.set_entity_hidden(7, true);
+        assert_eq!(rows - peer.interest.len(), 3);
     }
 
     // ------------------------------------------------------------------

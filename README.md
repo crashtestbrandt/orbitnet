@@ -121,8 +121,6 @@ for a tick and what the server said about it, reported beside the wire quantizat
 
 Known and filed, not hidden:
 
-- **No per-peer visibility veto.** Interest culling stops an entity's rows; it never withholds the entity, so a
-  game needing fog of war can be maphacked.
 - **A peer that declares nothing still has its centre and world inferred.** `Net.set_peer_anchor()` and
   `Net.set_peer_anchor_entity()` state both outright; without one they are read off the lowest-id rollback
   entity each of that peer's **seats** drives, so a seat driving more than one body is centred and placed by
@@ -131,7 +129,8 @@ Known and filed, not hidden:
   filter runs, so adding one to a connection already in session re-indexes that connection's interest sets for
   one tick: the sets are recomputed against the wrong seat's prior members, then correct themselves on the next
   update. Split-screen players seated at join are unaffected.
-- **Nothing despawns.** A culled entity freezes at its last received pose rather than leaving the scene.
+- **Nothing despawns.** A culled entity — or one `Net.set_entity_hidden()` withholds — freezes at its last
+  received pose rather than leaving the scene. The rows stop; the node stays.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
 - **`@half` silently no-ops on invalid pairings** instead of warning.
 - **The retained interest grid is unused.** It now matches the linear path rule for rule — leaves, always-set,

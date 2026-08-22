@@ -106,14 +106,18 @@ Net.perf_summary()   -> String
 - **`rb_nodes`** — how many nodes the loop called `_rollback_tick` on. A quick check that your rollback
   entity count is what you think it is.
 
-### Interest: two axes, distance and membership
+### Interest: three axes, distance, membership and the veto
 
-A peer replicates an entity when **both** filters admit it. They are independent and are declared separately.
+A peer replicates an entity when **every** filter admits it. They are independent and are declared separately.
 
 | axis | rollback lane | state lane |
 |---|---|---|
 | **Distance** — within `aoi_radius` of the peer's centre | always on; the anchor is the body's first `Vector3` **State** property, so register position first | opt in with `NetStateHandle.set_anchor(entry)`, naming a `Vector3` explicitly |
 | **Membership** — in the same world as the peer | opt in with `NetRollbackHandle.set_membership(entry)`, naming an `int` | opt in with `NetStateHandle.set_membership(entry)`, naming an `int` |
+| **Veto** — not withheld from this peer | `Net.set_entity_hidden(peer, entity_id, true)`, server-side | same call, same ids |
+
+The first two are properties of the **entity** — one position, one world, read the same way by every peer. The
+veto is the only per-(peer, entity) fact in the filter, and the only one that can name an exception.
 
 **The seat's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
 authority is that peer, which declares that seat, and which resolved an anchor — unless the peer declares them,
@@ -146,7 +150,7 @@ single transport peer. Each is a **seat**, and the second player's surroundings 
 | Declaring a seat | `NetRollbackHandle.set_seat(index)`, **on the server**. Every body starts at `0`. |
 | What a seat gets | Its own interest anchor, its own centre, its own world, its own hysteresis band and its own nearest-N cap. |
 | What the connection gets | The **union** of its seats' sets, with the **nearest** seat's distance kept per entity — which is the band the send rota scores it in. |
-| What stays per connection | The delta base, the ack window, `want_full` and the byte budget. Those are properties of a datagram, and a datagram is per connection. |
+| What stays per connection | The delta base, the ack window, `want_full`, the byte budget and the **veto**. Those are properties of a datagram, and a datagram is per connection. |
 
 - **A seat with no body yet culls nothing of its own.** Culling is decided per seat, so a seat whose body has
   not spawned does not inherit another seat's centre and have its surroundings culled around a position it is
@@ -164,6 +168,8 @@ single transport peer. Each is a **seat**, and the second player's surroundings 
   payload and validates it against the seats the server assigned to that sender.
 - **Nothing on the wire carries a seat.** Interest runs where state authority is, so a seat is a server-side
   declaration; the anti-forgery check on received input is per entity and is unchanged.
+- **`Net.set_entity_hidden()` withholds from the whole connection.** A veto refuses a row in a datagram every
+  seat shares, so it is applied to each of them — including a seat that joins later — rather than to the union.
 
 ```gdscript
 # A player body: its world is also the OWNING PEER's world.
@@ -207,6 +213,38 @@ Net.set_peer_anchor(peer_id, Vector3(0.0, 120.0, 0.0), 2)
 
 # ...or following one unit around, wherever it goes.
 Net.set_peer_anchor_entity(peer_id, body.entity_id(), 2)
+```
+
+#### Withholding one entity from one peer
+
+Server-side only, and no-ops OFFLINE. A membership scopes a whole class of entities by a declared key; the veto
+covers one peer and one entity, which is how an exception inside a world gets said at all.
+
+| | |
+|---|---|
+| `set_entity_hidden(peer, entity_id, hidden)` | Withhold `entity_id` from `peer`, or stop withholding it. `entity_id` comes from `entity_id()` on a handle; `0` is ignored. |
+| `is_entity_hidden(peer, entity_id)` | Whether it is currently withheld. |
+
+- **The veto beats every other answer the filter would give**, an always-relevant channel with no anchor
+  included, and it refuses at the candidate rather than at the cap — a withheld entity occupies no slot in
+  `set_aoi_max_entities()`.
+- **Starting one drops the entity from that peer's interest in the same call** and clears its delta
+  bookkeeping, so a later retraction sends a full block rather than a delta against a base the peer dropped.
+  Retracting re-admits the entity as a newcomer, through `aoi_radius` like any other.
+- **A veto stops the rows and nothing else.** No despawn is sent, the client's node is not removed, and the
+  entity id stays session-global. The client sees `get_last_known_state()` stop advancing — the same thing a
+  distance cull looks like — and what an entity that stopped updating means is your game's decision.
+- **It survives that entity's despawn**, because it is keyed on the id and ids are node-path-derived: a body
+  respawning under its old name reclaims its old id, and dropping the veto with the body would hand the peer
+  that entity on the tick it came back.
+- **It may precede the peer's handshake**, and it is dropped when that peer disconnects.
+
+```gdscript
+# One unit inside a shared world that this one peer must never receive.
+Net.set_entity_hidden(peer_id, spy.entity_id(), true)
+
+# ...and back, once it is theirs to see. The next block it gets is a full one.
+Net.set_entity_hidden(peer_id, spy.entity_id(), false)
 ```
 
 ---
