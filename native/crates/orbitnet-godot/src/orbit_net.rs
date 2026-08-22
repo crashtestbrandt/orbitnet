@@ -687,6 +687,23 @@ impl PeerState {
 
     /// Whether `token` is the value this peer could only be holding because the frame at `ack` reached
     /// it. `false` for a peer with no salt, which is a peer that has been sent no frame to prove.
+    ///
+    /// **A bare comparison, deliberately**, where [`orbitnet_core::auth`] folds its MAC comparison to a
+    /// single test. Two reasons, and the first alone would not be enough:
+    ///
+    /// 1. It compares two `u32`s, which is one machine comparison. The leak that folding closes is a
+    ///    walk that returns at the first differing BYTE, turning 2^64 guesses into 8 × 256.
+    /// 2. **A correct guess is worth less than no guess at all.** The only ack a peer cannot already
+    ///    prove is one for a frame it does not hold — a HIGHER ack than it earned — and [`note_ack`]
+    ///    measures `current - ack`, so a higher ack reports a SHORTER round trip and shrinks that peer's
+    ///    own rewind window. It also promotes an `acked_base` for a row the peer does not hold, so the
+    ///    next masked delta against that row is undecodable and the peer NACKs itself into full blocks.
+    ///    The profitable direction is a LOWER ack, and there the peer quotes a token it genuinely holds.
+    ///
+    /// A forged MAC buys entry to the session, which is why that one is folded. This buys a self-inflicted
+    /// `want_full` storm.
+    ///
+    /// [`note_ack`]: PeerState::note_ack
     fn ack_is_proven(&self, ack: u64, token: u32) -> bool {
         self.frame_token(ack) == Some(token)
     }
