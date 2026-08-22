@@ -8,7 +8,7 @@ just check           # everything a PR must pass
 ```
 
 `check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → cargo gates → lint →
-unit suites → the two-peer RTS probe.
+unit suites → the server-shape probe → the two-peer RTS probe.
 
 ## Layout, and where to edit
 
@@ -75,12 +75,22 @@ all pure, all unit tests.
 Logic on a `Node` is usually *still* unit-testable via `.new()` without calling `_ready()`, and static methods
 need no instance at all. Do not reach for a probe just because a class extends `Node`.
 
-**Genuinely needs a live scene, physics or network?** → a probe under `tools/instr/`. But a probe gates PRs
-**only** if it guards a fundamental netcode regression: rollback determinism, prediction and reconciliation,
+**Genuinely needs a live scene, physics or network?** → a probe: a driver script under `tools/`, plus its
+instrumentation inside the project it drives (`tools/instr/` in a demo, a scene of its own in `harness/`). But
+a probe gates PRs **only** if it guards a fundamental netcode regression: rollback determinism, prediction and reconciliation,
 two-peer sync, dedicated-server boot, the facade, or the transport factory.
 
-Exactly one probe gates PRs today: `tools/rts-probe.sh`. **Keep it that way.** If a probe's assertions are
-pure math, port them to a unit test and delete the redundant block.
+Two probes gate PRs today, and each reaches one item on that list that nothing else can:
+
+| Probe | What it guards |
+| --- | --- |
+| `tools/rts-probe.sh` | two-peer sync: identical worlds, orders replicated, a forged order refused |
+| `tools/server-shape-probe.sh` | both **server shapes** end to end -- a joining client's own state channel delivers rows against a dedicated server and against a listen server alike |
+
+**A third needs a line on that list that neither already covers.** If a probe's assertions are pure math, port
+them to a unit test and delete the redundant block. And a probe that can only ever pass is not coverage: the
+shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL) for
+exactly that reason.
 
 An empty run is a failure, not a pass — the runner exits non-zero on no suites or no `test_*` methods.
 
