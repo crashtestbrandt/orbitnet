@@ -1098,8 +1098,14 @@ impl OrbitRollbackSynchronizer {
     }
 
     /// Encode this entity's input block (newest rows, redundancy-armored) as standalone bytes.
+    ///
+    /// `slot` is the wire name the server bound this entity to, which the caller reads out of the
+    /// session's slot table. The synchronizer does not hold it: the id is derived locally from the
+    /// node path, the slot is not, and keeping the two apart is what stops a client from inventing
+    /// one.
     pub(crate) fn encode_input_block_bytes(
         &self,
+        slot: u16,
         frame_tick: u64,
         redundancy: usize,
     ) -> Option<Vec<u8>> {
@@ -1109,7 +1115,7 @@ impl OrbitRollbackSynchronizer {
         orbitnet_core::codec::encode_input_block(
             &mut writer,
             self.input_schema.props(),
-            self.entity_id,
+            slot,
             frame_tick,
             newest,
             &row_refs,
@@ -1183,6 +1189,7 @@ impl OrbitRollbackSynchronizer {
         &mut self,
         writer: &mut Writer,
         scratch: &mut Vec<bool>,
+        slot: u16,
         frame_tick: u64,
         reference_tick: Option<u64>,
     ) -> Option<(u64, bool)> {
@@ -1202,7 +1209,7 @@ impl OrbitRollbackSynchronizer {
                 writer,
                 scratch,
                 self.state_schema.props(),
-                self.entity_id,
+                slot,
                 frame_tick,
                 tick,
                 Some((ref_tick, &base)),
@@ -1213,7 +1220,7 @@ impl OrbitRollbackSynchronizer {
                 writer,
                 scratch,
                 self.state_schema.props(),
-                self.entity_id,
+                slot,
                 frame_tick,
                 tick,
                 None,
@@ -1727,9 +1734,10 @@ impl OrbitStateSynchronizer {
         self.entity_id as i64
     }
 
-    /// Hash of the resolved schema.
+    /// Hash of the resolved schema. Peers must agree on this exactly; the entity manifest states
+    /// it, which is why the singleton reads it as well as GDScript.
     #[func]
-    fn schema_hash(&self) -> i64 {
+    pub fn schema_hash(&self) -> i64 {
         i64::from(self.schema.hash())
     }
 
@@ -1936,6 +1944,7 @@ impl OrbitStateSynchronizer {
         &mut self,
         writer: &mut Writer,
         scratch: &mut Vec<bool>,
+        slot: u16,
         frame_tick: u64,
         reference_tick: Option<u64>,
     ) -> Option<(u64, bool)> {
@@ -1948,7 +1957,7 @@ impl OrbitStateSynchronizer {
                 writer,
                 scratch,
                 self.schema.props(),
-                self.entity_id,
+                slot,
                 frame_tick,
                 tick,
                 Some((ref_tick, &base)),
@@ -1959,7 +1968,7 @@ impl OrbitStateSynchronizer {
                 writer,
                 scratch,
                 self.schema.props(),
-                self.entity_id,
+                slot,
                 frame_tick,
                 tick,
                 None,

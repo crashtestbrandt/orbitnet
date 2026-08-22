@@ -102,10 +102,16 @@ bare `float` hp cannot be narrowed at all, but as a normalized third component i
 ### Where 96 comes from
 
 - One UDP frame per peer per tick, **~1200-byte payload budget**.
-- 20 B of properties + per-entity header ≈ **26 B/unit**.
-- 1200 / 26 ≈ **46 units refreshed per peer per tick**.
+- 20 B of properties + a **5 B per-entity header** = **25 B/unit**. The header is 2 B of wire slot, a
+  1 B frame-tick delta, a 1 B body length and a 1 B flags byte.
+- 1200 / 25 = **48 units refreshed per peer per tick**.
 - Entities are served **stalest-first**, so exceeding that does not drop anyone — it ages everyone.
-- 2 seats × 48 = **96 units**: a full refresh every ~2 net ticks, i.e. ~100 ms worst-case age at 20 Hz.
+- 2 seats × 48 = **96 units**: a full refresh every 2 net ticks, i.e. ~100 ms worst-case age at 20 Hz.
+
+**This page read ≈26 B/unit and ≈46 units, and neither was ever measured.** The header was 12.5 B until the
+entity's 64-bit id came off the wire in favour of a 16-bit session slot — a hash spread across the whole
+64-bit range, so its varint cost 9.5 B on average. The real figures before that change were 32.5 B/unit and
+≈37 units per peer per tick. See [protocol.md](protocol.md#entity-slots).
 
 A deliberate, comfortable 2× over the single-tick budget — enough that the round-robin is real rather than
 hypothetical, not so much that the demo looks broken. Raise `UNITS_PER_SEAT` and the refresh interval climbs
@@ -139,9 +145,13 @@ The one place determinism *is* required is **node naming** — agreement about n
 
 ## Entity ids: the failure that is silent
 
-OrbitNet derives an entity id as FNV-1a of the synchronizer root's **node path**. That is a good design — no
-id-assignment handshake, no per-entity RPC routing, a reconnecting client re-derives the same ids — and it
-has exactly one requirement: **every peer must build the same node paths.**
+OrbitNet derives an entity id as FNV-1a of the synchronizer root's **node path**, and both peers derive it
+independently — no per-entity RPC routing, and a reconnecting client re-derives the same ids. It has exactly
+one requirement: **every peer must build the same node paths.**
+
+(The id is no longer what rides in each block; that is a 16-bit session slot the server assigns and the
+entity manifest distributes. The id is still what a client resolves that slot to, so path agreement is
+exactly as load-bearing as it was — see [protocol.md](protocol.md#entity-slots).)
 
 Godot's automatic naming does not do that. `add_child(Node3D.new())` produces `@Node3D@27`, and that number
 is a per-process allocation counter: it depends on how many nodes the process has ever created, which depends

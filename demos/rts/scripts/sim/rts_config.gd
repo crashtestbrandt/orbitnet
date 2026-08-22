@@ -6,11 +6,16 @@ class_name RtsConfig
 ## derivation is the whole reason this demo is the size it is:
 ##
 ##   * One UDP frame per peer per net tick, with a ~1200-byte payload budget.
-##   * A state-lane unit costs 20 bytes of properties (see UnitBody) plus its per-entity header, call it
-##     ~26 bytes on the wire.
-##   * 1200 / 26 ~= 46 units refreshed per peer per tick.
+##   * A state-lane unit costs 20 bytes of properties (see UnitBody) plus a 5-byte per-entity header:
+##     2 for the entity's wire slot, 1 frame-tick delta, 1 body length, 1 flags. 25 bytes on the wire.
+##   * 1200 / 25 = 48 units refreshed per peer per tick.
 ##   * Entities are served STALEST-FIRST, so exceeding that does not drop anyone -- it raises everyone's
-##     staleness. 96 units at 20 Hz means a full refresh every ~2 net ticks, i.e. ~100 ms worst-case age.
+##     staleness. 96 units at 20 Hz means a full refresh every 2 net ticks, i.e. ~100 ms worst-case age.
+##
+## The header was 12.5 bytes until the entity's 64-bit id came off the wire in favour of a 16-bit session
+## slot: the id was a hash spread across the whole 64-bit range, so its varint cost 9.5 bytes on average.
+## The figure here read ~26 bytes and ~46 units, which was never the measured header -- the real numbers
+## before that change were 32.5 bytes and ~37 units.
 ##
 ## That is a deliberate, comfortable 2x over the single-tick budget: enough that the round-robin is real and
 ## visible in the HUD's staleness readout, not so much that the demo looks broken. Push UNITS_PER_SEAT up and

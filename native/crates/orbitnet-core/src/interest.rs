@@ -2597,6 +2597,37 @@ mod tests {
         );
     }
 
+    /// The send rota phases on the 64-bit entity id, not the dense wire slot — but the wire change
+    /// that introduced slots put a sequential alternative in reach, so the property is checked
+    /// against sequential values too rather than assumed.
+    ///
+    /// Dense indices are in fact the *better* spreader: hashed ids land in phase buckets
+    /// binomially, so some ticks carry more entities than others, while `0..n` fills every bucket
+    /// to within one. What keeps the rota on the id is stability, not spread — a slot is released
+    /// and reissued, and an entity that changed slots would jump mid-interval.
+    #[test]
+    fn send_phase_spreads_dense_sequential_indices() {
+        let interval = 8u64;
+        let base = 4_096u64;
+        for index in 0..64u64 {
+            let fires = (base..base + interval)
+                .filter(|&tick| send_phase(index, tick, interval))
+                .count();
+            assert_eq!(
+                fires, 1,
+                "index {index} fired {fires} times in one interval"
+            );
+        }
+        // Every phase bucket carries the same share: 64 sequential indices over 8 ticks is 8 each,
+        // with no tick starved and none doubled up.
+        for tick in base..base + interval {
+            let due = (0..64u64)
+                .filter(|&index| send_phase(index, tick, interval))
+                .count();
+            assert_eq!(due, 8, "tick {tick} carried {due} of 64 sequential indices");
+        }
+    }
+
     #[test]
     fn send_phase_guards_degenerate_intervals_and_extreme_ticks() {
         // Interval 0 must not panic on the modulo; 0 and 1 both mean "every tick".

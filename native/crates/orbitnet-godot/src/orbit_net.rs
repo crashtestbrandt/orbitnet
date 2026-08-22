@@ -41,6 +41,7 @@ use orbitnet_core::interest::{
     MEMBERSHIP_GLOBAL,
 };
 use orbitnet_core::priority::{self, Band};
+use orbitnet_core::slots::SlotTable;
 use orbitnet_core::{
     AoiConfig, AuthError, ClockEstimator, CoupledSlew, Direction, LeadTracker, ReceiveBudget,
     ResimPlanner, SessionAuth, TickAccumulator, TickRate, KEY_LEN,
@@ -980,6 +981,20 @@ pub struct OrbitNet {
     /// hundredfold multiplier `input_owner_hint` exists to avoid, on an answer that changes when a peer
     /// connects and at no other time.
     live_peers: std::collections::HashSet<i32>,
+    /// The session's map between entity ids and the dense `u16` slots the wire carries.
+    ///
+    /// **The server allocates; a client only holds what the manifest told it.** One field for both
+    /// roles because both answer the same two questions — what does this slot name, and what slot
+    /// names this entity — and the send and receive paths run on either side of a host.
+    slots: SlotTable,
+    /// Server: an entity registered or unregistered, so the slot table needs a pass.
+    ///
+    /// Stays raised while any registered entity is still without a slot, which is how a slot refused
+    /// during its predecessor's reuse quarantine gets retried instead of stranding the entity.
+    slots_dirty: bool,
+    /// Server: the slot table has been reported exhausted once already. The condition persists for
+    /// as long as the session stays at the cap, and a per-tick per-entity error would bury the log.
+    slots_exhausted_warned: bool,
     manifest_dirty: bool,
     /// Client: schema fingerprints announced by the server, checked as entities register.
     expected_schemas: HashMap<u64, (u32, u32)>,
@@ -1152,6 +1167,9 @@ impl INode for OrbitNet {
             session_auth: None,
             resume: ResumeTable::default(),
             live_peers: std::collections::HashSet::new(),
+            slots: SlotTable::new(),
+            slots_dirty: false,
+            slots_exhausted_warned: false,
             manifest_dirty: false,
             expected_schemas: HashMap::new(),
             newest_snapshot_tick: 0,
@@ -1390,6 +1408,11 @@ impl OrbitNet {
         self.lead.clear();
         self.lead_bias_ticks = 0.0;
         self.expected_schemas.clear();
+        // Slots name entities within ONE session. Carrying the table into the next one would let a
+        // stale slot resolve to a stranger, and a server would hand out indices it no longer owns.
+        self.slots.clear();
+        self.slots_dirty = true;
+        self.slots_exhausted_warned = false;
         self.stretch_now = 1.0;
         // The window describes a session that has ended; carrying its rates into the next one would make the
         // first second of every session read as the last second of the previous.
@@ -2064,6 +2087,7 @@ impl OrbitNet {
                         }
                         self.rollback_entities.insert(id, sync);
                         self.manifest_dirty = true;
+                        self.slots_dirty = true;
                     }
                 }
                 PendingOp::RegisterState(id, sync) => {
@@ -2077,6 +2101,7 @@ impl OrbitNet {
                         }
                         self.state_entities.insert(id, sync);
                         self.manifest_dirty = true;
+                        self.slots_dirty = true;
                     }
                 }
                 PendingOp::Unregister(id, who) => {
@@ -2109,6 +2134,12 @@ impl OrbitNet {
                         peer.acked_base.remove(&id);
                         peer.interest.remove(id);
                     }
+                    // The wire slot goes the same way, and for the same reason — but it is released
+                    // by `reconcile_slots` rather than here, because "is this id still registered"
+                    // is the question that decides it and the branches above may have left the id
+                    // in place. A respawn whose Register drained ahead of the corpse's Unregister
+                    // keeps its slot; nothing else does.
+                    self.slots_dirty = true;
                 }
             }
         }
@@ -2116,6 +2147,53 @@ impl OrbitNet {
         // it was freed without exiting the tree cleanly).
         self.rollback_entities.retain(|_, s| s.is_instance_valid());
         self.state_entities.retain(|_, s| s.is_instance_valid());
+    }
+
+    /// SERVER: bring the wire slot table back into agreement with the two entity registries.
+    ///
+    /// One reconciliation pass rather than a release beside every removal, because the registries
+    /// lose entries three different ways — an `Unregister` op, a respawn that supersedes its
+    /// predecessor, and the `is_instance_valid` sweep that catches a node freed without leaving the
+    /// tree cleanly — and only the first of those has a call site to hang a release on.
+    ///
+    /// Runs when a registration changed, and whenever the table and the registries disagree on size
+    /// — the size check is what catches the silent sweep, which raises no flag of its own.
+    /// [`SlotTable::reconcile`] holds the algorithm and the reuse rules; this decides when to run it
+    /// and what to do with what it reports.
+    fn reconcile_slots(&mut self, current: u64) {
+        let registered_count = self.rollback_entities.len() + self.state_entities.len();
+        if !self.slots_dirty && self.slots.len() == registered_count {
+            return;
+        }
+        let registered: std::collections::BTreeSet<u64> = self
+            .rollback_entities
+            .keys()
+            .chain(self.state_entities.keys())
+            .copied()
+            .collect();
+        let outcome = self.slots.reconcile(&registered, current);
+        if outcome.released > 0 || outcome.named > 0 {
+            self.manifest_dirty = true;
+        }
+        // Raised while any entity is still without a slot, which keeps this pass running next tick.
+        // A quarantined slot is a refusal that expires on its own; stranding the entity instead
+        // would stop replicating it for the rest of the session.
+        self.slots_dirty = outcome.unnamed > 0;
+        match outcome.exhausted {
+            Some(id) if !self.slots_exhausted_warned => {
+                self.slots_exhausted_warned = true;
+                godot_error!(
+                    "OrbitNet: every one of the {} entity slots this session can name on the wire \
+                     is in use, so entity {:#018x} and any further one cannot be replicated. \
+                     Unregister entities, or split the world across sessions.",
+                    orbitnet_core::slots::MAX_SLOTS,
+                    id
+                );
+            }
+            // The condition lifted: a later exhaustion is worth reporting again.
+            None => self.slots_exhausted_warned = false,
+            Some(_) => {}
+        }
     }
 
     fn check_expected_schema(&self, id: u64, sync: &Gd<OrbitRollbackSynchronizer>) {
@@ -2861,6 +2939,8 @@ impl OrbitNet {
         match self.mode {
             MODE_CLIENT => self.send_client_input(current),
             MODE_SERVER | MODE_HOST => {
+                // Before the manifest, because the manifest is what publishes the table.
+                self.reconcile_slots(current);
                 self.send_manifest_if_dirty();
                 self.send_snapshots(current);
             }
@@ -2904,7 +2984,14 @@ impl OrbitNet {
             if !bound.owns_input() {
                 continue;
             }
-            if let Some(bytes) = bound.encode_input_block_bytes(current, INPUT_REDUNDANCY) {
+            // A client cannot derive a slot; the server assigns it and the manifest carries it. A
+            // body whose binding has not arrived yet sends nothing this tick — the block would name
+            // an entity the server could not resolve, and input rides `INPUT_REDUNDANCY` ticks of
+            // history, so the first block after the binding lands re-sends what these ticks held.
+            let Some(slot) = self.slots.slot_of(bound.entity_id()) else {
+                continue;
+            };
+            if let Some(bytes) = bound.encode_input_block_bytes(slot, current, INPUT_REDUNDANCY) {
                 blocks.push(bytes);
             }
         }
@@ -2941,25 +3028,53 @@ impl OrbitNet {
         self.send_to(SERVER_PEER, writer.as_slice(), TransferMode::UNRELIABLE);
     }
 
+    /// SERVER: publish the whole slot table, with each entity's schema fingerprints, to every
+    /// synced peer.
+    ///
+    /// **Both lanes, and a complete snapshot every time.** It carried rollback entities only while
+    /// it was purely a schema check — a state-lane entity has no input schema to disagree about —
+    /// but it is now also the only channel that says what a wire slot names, and state-lane blocks
+    /// carry slots too. Sending the whole table rather than a diff is what makes a receiver's copy
+    /// self-repairing: rebuilding from each frame drops every binding that has gone away, with no
+    /// removal record to lose.
+    ///
+    /// **An empty table is sent, not skipped.** A session whose last entity unregistered has to
+    /// tell its peers so; returning early there left every client holding bindings for entities
+    /// that no longer exist.
     fn send_manifest_if_dirty(&mut self) {
         if !self.manifest_dirty {
             return;
         }
         self.manifest_dirty = false;
         let mut entries: Vec<ManifestEntry> = Vec::new();
-        for (&id, sync) in &self.rollback_entities {
-            if !sync.is_instance_valid() {
-                continue;
+        for (slot, id) in self.slots.bindings() {
+            if let Some(sync) = self.rollback_entities.get(&id) {
+                if !sync.is_instance_valid() {
+                    continue;
+                }
+                let bound = sync.bind();
+                entries.push(ManifestEntry {
+                    slot,
+                    id,
+                    state_hash: bound.schema_hash() as u32,
+                    input_hash: bound.input_schema_hash() as u32,
+                });
+            } else if let Some(sync) = self.state_entities.get(&id) {
+                if !sync.is_instance_valid() {
+                    continue;
+                }
+                let bound = sync.bind();
+                entries.push(ManifestEntry {
+                    slot,
+                    id,
+                    state_hash: bound.schema_hash() as u32,
+                    // A state-lane entity has no input schema, so `0` is the declared absence
+                    // rather than a hash. Nothing compares it: `check_expected_schema` runs against
+                    // rollback synchronizers only, and a state entity's id can never reach one —
+                    // the two lanes salt the node path differently (`S|` against `R|`).
+                    input_hash: 0,
+                });
             }
-            let bound = sync.bind();
-            entries.push(ManifestEntry {
-                id,
-                state_hash: bound.schema_hash() as u32,
-                input_hash: bound.input_schema_hash() as u32,
-            });
-        }
-        if entries.is_empty() {
-            return;
         }
         let bytes = encode_manifest(&entries);
         let peers: Vec<i32> = self
@@ -3190,7 +3305,21 @@ impl OrbitNet {
                     break;
                 }
                 let id = candidate.id;
+                // The wire name for this entity. Missing only while `reconcile_slots` is holding
+                // the entity back — a slot still inside its predecessor's reuse quarantine — which
+                // is a delay this entity's next tick resolves, so it counts as deferred.
+                let Some(slot) = self.slots.slot_of(id) else {
+                    self.acc_blocks_deferred += 1;
+                    continue;
+                };
                 // Rate tiering is a deliberate hold-back, so it counts as culled, not deferred.
+                // **It phases on the 64-bit id, not the wire slot**, and so does `full_block_due`
+                // below. Either value spreads a set of entities across an interval — dense
+                // sequential slots spread more evenly than hashes do, which
+                // `send_phase_spreads_dense_sequential_indices` pins — but only the id is STABLE.
+                // A slot is released and reissued, so an entity that took a different slot would
+                // jump its tier phase and its keyframe phase with it, restarting the interval it
+                // was part-way through.
                 if tiering
                     && !orbitnet_core::interest::send_phase(id, current, band.tiered_interval())
                 {
@@ -3230,6 +3359,7 @@ impl OrbitNet {
                     let tick = sync.bind_mut().encode_block(
                         &mut body,
                         &mut self.mask_scratch,
+                        slot,
                         current,
                         reference,
                     );
@@ -3241,6 +3371,7 @@ impl OrbitNet {
                     let tick = sync.bind_mut().encode_block(
                         &mut body,
                         &mut self.mask_scratch,
+                        slot,
                         current,
                         reference,
                     );
@@ -3728,7 +3859,13 @@ impl OrbitNet {
                 if self.mode == MODE_CLIENT && sender == SERVER_PEER {
                     let _ = reader.u8();
                     if let Ok(entries) = decode_manifest(&mut reader) {
+                        // The manifest is a COMPLETE table, so the local copy is rebuilt rather
+                        // than merged. That is what retires the binding of an entity the server has
+                        // unregistered: a merge would keep naming it, and a slot reissued to a
+                        // different entity would then be resolved to the wrong one.
+                        self.slots.clear();
                         for entry in entries {
+                            self.slots.bind(entry.slot, entry.id);
                             self.expected_schemas
                                 .insert(entry.id, (entry.state_hash, entry.input_hash));
                             if let Some(sync) = self.rollback_entities.get(&entry.id) {
@@ -3989,10 +4126,15 @@ impl OrbitNet {
             }
             // The packet may name a body that died since the last drain_pending — a client keeps
             // sending input for its avatar until the despawn reaches it, a full round trip after the
-            // server freed the body. Resolve the handle through live_handle so the corpse's stale
-            // registry entry is skipped rather than cloned (which panics) — this is the exact line
-            // the shipped crash logs pointed at.
-            let Some(mut sync) = self.rollback_entities.get(&meta.id).and_then(live_handle) else {
+            // server freed the body. Two ways that shows up now: the slot has already been released
+            // (so it names nothing), or it still names the corpse. Resolve the handle through
+            // live_handle so the corpse's stale registry entry is skipped rather than cloned (which
+            // panics) — this is the exact line the shipped crash logs pointed at.
+            let Some(entity) = self.slots.id_of(meta.slot) else {
+                let _ = skip_input_block_body(reader, &meta);
+                continue;
+            };
+            let Some(mut sync) = self.rollback_entities.get(&entity).and_then(live_handle) else {
                 let _ = skip_input_block_body(reader, &meta);
                 continue;
             };
@@ -4101,7 +4243,11 @@ impl OrbitNet {
             let Ok(meta) = decode_state_block_meta(reader, frame_tick) else {
                 return;
             };
-            if let Some(mut sync) = self.rollback_entities.get(&meta.id).and_then(live_handle) {
+            // A slot with no binding is the ordinary in-flight case — the manifest that binds it
+            // rides the reliable channel and an unreliable snapshot can overtake it — so it falls
+            // through to the skip below, exactly as an unknown entity id used to.
+            let entity = self.slots.id_of(meta.slot).unwrap_or(0);
+            if let Some(mut sync) = self.rollback_entities.get(&entity).and_then(live_handle) {
                 if !meta.state_lane {
                     let result = {
                         let mut bound = sync.bind_mut();
@@ -4110,7 +4256,7 @@ impl OrbitNet {
                     match result {
                         Ok(StateIntegration::Mispredict(tick)) => {
                             self.dbg_rx_applied += 1;
-                            self.planner.mark(meta.id, tick);
+                            self.planner.mark(entity, tick);
                         }
                         Ok(outcome) => self.note_integration(outcome, meta.full),
                         Err(_) => return,
@@ -4118,7 +4264,7 @@ impl OrbitNet {
                     continue;
                 }
             }
-            if let Some(mut sync) = self.state_entities.get(&meta.id).and_then(live_handle) {
+            if let Some(mut sync) = self.state_entities.get(&entity).and_then(live_handle) {
                 if meta.state_lane {
                     let result = {
                         let mut bound = sync.bind_mut();
@@ -4135,8 +4281,9 @@ impl OrbitNet {
             self.dbg_rx_skipped += 1;
             if self.debug_wire && self.dbg_rx_skipped % 120 == 1 {
                 godot_print!(
-                    "[orbitnet] rx skip unknown entity {:#018x} lane={} tick={}",
-                    meta.id,
+                    "[orbitnet] rx skip unknown slot {} (entity {:#018x}) lane={} tick={}",
+                    meta.slot,
+                    entity,
                     meta.state_lane,
                     meta.tick
                 );

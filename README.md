@@ -158,6 +158,13 @@ Known and filed, not hidden:
   acknowledge a frame that never reached it. It can still acknowledge a frame **older** than the newest it
   holds, which reads as a slow link and is believed. That buys a deeper per-shooter rewind, bounded by
   `NetLagComp.max_delay_ms` — 250 ms by default, the deepest rewind the game will grant anyone.
+- **A session can name 65,536 entities on the wire, and the manifest restates all of them.** A block carries
+  a 16-bit slot instead of the 64-bit entity id, which is where a third of a full block used to go
+  ([docs/protocol.md](docs/protocol.md#entity-slots)). Past the cap the server refuses to replicate the
+  entity and says so, rather than wrapping an index onto a live one. The slot table is distributed by the
+  entity manifest as a whole table each time it changes, so a session with tens of thousands of entities
+  churning steadily spends real reliable bandwidth restating bindings that did not move. A delta-encoded
+  manifest is the fix if that ever bites.
 - **Input values are not validated.** The backend checks who wrote a row, not what is in it: a row that
   decodes at the right stride is stored as-is. Clamping and plausibility are the game's job inside
   `_rollback_tick`. The full split is in
