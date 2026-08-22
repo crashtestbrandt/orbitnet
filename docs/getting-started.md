@@ -67,6 +67,20 @@ already assigned. Registering earlier does nothing, quietly.
 On teardown: `Net.set_mode(Net.Mode.OFFLINE)` and, if you decoupled, `Net.set_net_tick_coupled()`. The decouple
 is process-wide; leaking it is how "only on the second game" bugs start.
 
+**Seat players on `Net.peer_joined`, not on `multiplayer.peer_connected`.** The transport signal fires when
+the socket comes up, which is before the OrbitNet handshake — so the peer's session identity is not known yet,
+and identity is the only thing that tells a reconnecting player from a newcomer. Key your roster on
+`session_id`, not on the peer id:
+
+```gdscript
+Net.peer_joined.connect(_on_peer_joined)          # (peer, session_id, resumed_from)
+Net.peer_dropped.connect(_on_peer_dropped)        # (peer, session_id, held)
+Net.peer_session_expired.connect(_on_expired)     # (session_id, peer) — release the seat here
+```
+
+A dropped peer's session is held open for 30 s by default and its body is held on the neutral input row —
+see [api.md](api.md#session-identity-and-reconnection).
+
 ## 4. A replicated body
 
 The server owns its **state**; the owning client authors its **input** and predicts locally.

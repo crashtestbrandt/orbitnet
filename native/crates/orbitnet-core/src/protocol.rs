@@ -14,7 +14,13 @@
 ///
 /// Peers must agree on **major** exactly. This is bumped whenever the frame layout changes in a way
 /// an older peer would misread. Major 2: quantized wire encodings (`QuantKind`).
-pub const PROTOCOL_VERSION: u32 = 0x0002_0000;
+///
+/// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
+/// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
+/// documented absent-value behaviour, a newer peer reads it when it is there. Minor 2.1: the handshake's
+/// trailing `session_id`, absent meaning "no session identity" — see `Handshake::decode`. Anything that
+/// shifts an existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
+pub const PROTOCOL_VERSION: u32 = 0x0002_0100;
 
 /// Extract the major component of a protocol version.
 #[must_use]

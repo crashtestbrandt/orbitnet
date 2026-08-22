@@ -51,6 +51,78 @@ local player.
 |---|---|
 | `pre_tick(tick: int)` | Once per net tick, **before** the backend records that tick's input. Populate your replicated input frame here so it is captured and sent. Never fires OFFLINE. |
 | `post_tick()` | Once per tick loop **after** the rollback/resim finished — every body's state is now the authoritative present-tick value. Capture render poses here under the decouple. |
+| `peer_joined(peer, session_id, resumed_from)` | **Server-side.** A peer finished the handshake. `resumed_from` is the peer id it held before it dropped, or 0 for a newcomer. **Seat players here**, not on the transport's `peer_connected`. Fires once per peer, however many times its handshake is retried. |
+| `peer_dropped(peer, session_id, held)` | **Server-side.** A peer's connection is gone. `held` is whether its session is being kept open for the grace window — false for no identity, for a grace of 0, and for a ghost whose identity a returning player already took back (such a drop reports `session_id` 0). |
+| `peer_session_expired(session_id, peer)` | **Server-side.** A held session's window closed unclaimed. The release point — the addon does not act on it. |
+
+### Session identity and reconnection
+
+A multiplayer peer id names a **connection** and is reassigned on every reconnect, so a roster keyed on one
+hands a returning player whichever place happens to be free — somebody else's army, somebody else's body. A
+**session identity** names the player and survives the drop. The client mints one, the handshake carries it,
+and the server matches a rejoiner against the sessions it is holding open.
+
+*(This is a different axis from [seats](#seats-several-owned-bodies-on-one-connection). A seat says which of a
+connection's owned bodies one body is; a session identity says which player a connection belongs to.)*
+
+**The identity is asserted by the client and verified by nobody.** It is adequate for giving a player their
+own entity back and inadequate for anything that must not be forged — account identity, entitlement, ban
+evasion. Those need an authenticated layer above it, and `set_session_id()` is where its verified id goes.
+
+| | |
+|---|---|
+| `session_id() -> int` | This peer's identity. Minted randomly at boot, so a game that does nothing is already resumable within a process. |
+| `set_session_id(id: int) -> void` | Override it. **Before the join handshake.** Pass a stored value to survive a process restart; 0 claims no identity and is always seated as a newcomer. |
+| `peer_session_id(peer: int) -> int` | Server-side: the identity `peer` presented. **Key your roster on this.** 0 for an unknown peer and one that claimed none. |
+| `is_session_held(session_id: int) -> bool` | Server-side: whether a dropped session is still reclaimable. |
+| `reconnect_grace() -> float` / `set_reconnect_grace(s: float) -> void` | Seconds a dropped peer's session is held open. Wall-clock, server-side, 30 s by default. 0 disables resume — a drop is forgotten in the same frame and `peer_dropped` reports `held = false`. |
+
+**The gap policy, stated.** From the tick its owner leaves, an entity's input is written as the **neutral
+(all-zero) row** on the server and its tick is marked authoritative. Two consequences, and each replaces
+something the default got wrong:
+
+- It acts on **no** intent rather than repeating the departed player's last one. Without this the last input
+  row is re-applied on every tick the history ring can still reach — a body walking into a wall keeps walking
+  into it — and past the ring the input node simply keeps whatever values were last written to it.
+- Its state **keeps broadcasting**. Without this the entity's frontier freezes at the last tick a received
+  input backed, while the server goes on simulating it — so every other peer holds it still and then watches
+  it jump the moment its owner returns.
+
+Sizing the window costs something in both directions: nobody else can be given the entity, and it keeps
+replicating, for the whole of it. Too short and a player who dropped on a loading screen returns to a stranger
+in their body; too long and a full session refuses newcomers while it waits for players who left for good.
+
+**A returning player does not wait for the transport to notice the old connection.** A killed client is not
+declared dead until its keepalive times out — measured here at anywhere from 45 s to never — so the handshake
+takes the identity back from whatever connection still claims it and reports that peer as `resumed_from`. The
+superseded connection is not closed, only stripped: its later `peer_dropped` reports `session_id` 0 and holds
+nothing.
+
+**So `resumed_from` names a connection that may still be up, and acting on it hands the new claimant that
+peer's body.** For a relaunched client that is the whole point. For a *forged* token it is identical from the
+server's side, and the original keeps its socket, receives no error, and stops driving its own entity. The
+alternative — resuming only a drop the server observed — refuses every genuinely fast reconnect for as long
+as the transport takes to notice, which is why it is not the default. **The conservative rule, if you want
+it:** honour `resumed_from` only for a session you already saw `peer_dropped` report with `held = true`.
+
+```gdscript
+func _ready() -> void:
+    Net.set_reconnect_grace(30.0)
+    Net.peer_joined.connect(_on_peer_joined)
+    Net.peer_session_expired.connect(_on_session_expired)
+
+func _on_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
+    # assign() reclaims the slot this session already owns, whatever peer id it arrives under.
+    var slot: int = roster.assign(peer, session_id)
+    if slot < 0:
+        multiplayer.multiplayer_peer.disconnect_peer(peer)   # full
+        return
+    _broadcast_roster()   # re-points the body's input authority on every peer
+
+func _on_session_expired(session_id: int, _peer: int) -> void:
+    roster.release_session(session_id)
+    _broadcast_roster()   # that slot's body goes back to the server: set_input_authority(1)
+```
 
 ### The three lanes
 
@@ -261,6 +333,7 @@ Net.set_entity_hidden(peer_id, spy.entity_id(), false)
 | `entity_id() -> int` | This body's stable replication id, for `Net.set_peer_anchor_entity()`. An opaque token — routinely negative, never compared or ordered. 0 when inert or unresolved. |
 | `process_settings() -> void` | Re-resolve after the property set changes. |
 | `process_authority() -> void` | Re-evaluate prediction after an authority change. Call on **every** peer when ownership moves. |
+| `set_input_authority(peer: int) -> void` | Point this body's **input** at `peer` and re-resolve everything that reads the answer, in one call. `1` hands it back to the server, which is what an unclaimed body means. The **connection** axis, not the seat one — `set_seat()` is unaffected. **Local — call it on every peer**; nothing here replicates. Writing the node's authority without the re-resolve leaves this peer predicting the wrong body and the send path anchoring the wrong peer's radius, and nothing errors when it happens. |
 | `is_predicting() -> bool` | Whether the owner is currently mispredicting — the reconciliation gate. |
 | `get_last_known_state() -> int` | Tick of the latest authoritative state received. −1 when inert. |
 | `memo_set(tick, key, value)` / `memo_get(tick, key, fallback)` | The per-tick memo ring. Record on the `is_fresh` pass; every replayed pass reads the same value back, so a resim resolves against what the fresh pass saw. Trimmed with rollback history. |

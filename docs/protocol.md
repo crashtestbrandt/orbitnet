@@ -19,7 +19,26 @@ last N ticks for redundancy, so a single lost packet costs nothing.
 
 **Control frames** — reliable: handshake, entity schema, entity binding, reject.
 
+**Handshake** — magic, protocol version, schema hash, tick rate, then a **session id**:
+
+```
+magic | protocol version (u32) | schema hash (u32) | tickrate (u16) | session id (u64, optional)
+```
+
+The session id is what makes a reconnecting player recognisable: a peer id names the connection and is
+reassigned every time, this names the player and is resent verbatim on every join. It is **asserted by the
+client and verified by nobody** — adequate for giving a player their own entity back, inadequate for anything
+that must not be forged. `0` means "no identity"; see [api.md](api.md#session-identity-and-reconnection).
+
+It is an **optional trailing field**: a handshake that stops after the tick rate decodes as `session_id = 0`
+rather than as a truncation error. That is what keeps a peer built before the field from being dropped in
+silence — `handle_hello` answers a decode failure by returning, so the joiner would see no rejection at all.
+
 **Versioning.** `PROTOCOL_VERSION` packs `(major << 16) | (minor << 8) | patch`; **major must match exactly**.
+**Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
+optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
+documented absent value. Minor 2.1 is the handshake's session id. Anything that shifts an existing field's
+offset is a major bump, because there the older peer decodes garbage.
 The schema hash is FNV-1a over `(name, kind, role)` in **declaration order** — deliberately order-sensitive,
 because two peers registering the same properties in different orders would otherwise silently misapply state,
 which is miserable to diagnose. A mismatch produces an operator-readable message naming both versions or both

@@ -120,6 +120,39 @@ func process_authority() -> void:
 	if _sync != null:
 		_sync.process_authority()
 
+## Point this body's INPUT at `peer`, and re-resolve everything that reads the answer. The one call a roster
+## makes when this body changes hands -- a player joining, leaving, or reconnecting. `1` hands the input back
+## to the server, which is what an unclaimed body means.
+##
+## THIS IS THE CONNECTION, NOT THE SEAT. `peer` is a transport peer id: it says WHICH CONNECTION authors this
+## body's input. [method set_seat] is the other axis and is unaffected -- it says which of that connection's
+## owned bodies this one is, for interest. Re-pointing a body at another connection leaves its seat index
+## alone, which is right: the body is the same body, driven by somebody else.
+##
+## THE TWO HALVES HAVE TO HAPPEN TOGETHER, and doing them by hand is where this goes wrong. Writing the node's
+## multiplayer authority alone changes who the backend accepts input frames FROM, but leaves the cached owner
+## naming the previous peer -- so this peer keeps predicting (or keeps refusing to predict) the wrong body, and
+## the send path anchors the wrong peer's interest radius. That is why it is one call.
+##
+## IT IS LOCAL AND MUST BE CALLED ON EVERY PEER. Multiplayer authority is a property of a node on the peer that
+## holds it; nothing here replicates. A peer that missed the call disagrees about who owns the body, and on the
+## server that disagreement is what starts rejecting the new owner's input.
+##
+## No-op OFFLINE. Against a backend that predates the call it falls back to the same two steps from here, so a
+## checkout pairing new GDScript with an older binary re-points the body rather than silently not.
+func set_input_authority(peer: int) -> void:
+	if _sync == null:
+		return
+	if _sync.has_method(&"set_input_authority"):
+		_sync.set_input_authority(peer)
+		return
+	# The fallback resolves the input node the way Net.register_rollback_body() set it. `get` answers a
+	# Variant, so it is ASSIGNED to a typed local rather than cast (the GDScript rule for wire-ish values).
+	var input_node: Node = _sync.get(&"input_authority_node")
+	if input_node != null:
+		input_node.set_multiplayer_authority(peer)
+	_sync.process_authority()
+
 ## Whether the owner is currently mis-predicting (the reconciliation gate). False when inert.
 func is_predicting() -> bool:
 	return _sync != null and _sync.is_predicting()

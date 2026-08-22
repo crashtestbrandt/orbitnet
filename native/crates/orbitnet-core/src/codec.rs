@@ -205,6 +205,11 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_le_bytes());
     }
 
+    /// Write a little-endian `u64`.
+    pub fn u64(&mut self, value: u64) {
+        self.buf.extend_from_slice(&value.to_le_bytes());
+    }
+
     /// Write a little-endian `u16`.
     pub fn u16(&mut self, value: u16) {
         self.buf.extend_from_slice(&value.to_le_bytes());
@@ -314,6 +319,14 @@ impl<'a> Reader<'a> {
     pub fn u32(&mut self) -> Result<u32, CodecError> {
         let bytes = self.take(4)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Read a little-endian `u64`.
+    pub fn u64(&mut self) -> Result<u64, CodecError> {
+        let bytes = self.take(8)?;
+        let mut array = [0u8; 8];
+        array.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(array))
     }
 
     /// Read a little-endian `f32`.
@@ -472,31 +485,59 @@ pub struct Handshake {
     pub schema_hash: u32,
     /// The sender's tick rate in hertz.
     pub tickrate: u16,
+    /// The sender's **session identity**, or `0` for "no identity — seat me as a newcomer".
+    ///
+    /// A transport peer id names a CONNECTION and is reassigned on every reconnect, so it cannot answer
+    /// "is this the player who was here a moment ago". This can: a client mints one token and resends it
+    /// verbatim on every join, so the server matches a rejoiner to the session it dropped.
+    ///
+    /// **It is asserted by the client and verified by nobody.** Anything that must not be forgeable —
+    /// account identity, entitlement, ban evasion — belongs in an authenticated layer above this field. What
+    /// it is adequate for is the thing it exists for: a player whose link dropped getting their own entity
+    /// back instead of a stranger's.
+    pub session_id: u64,
 }
 
 impl Handshake {
-    /// Build a handshake for this build, given the local schema hash and tick rate.
+    /// Build a handshake for this build, given the local schema hash and tick rate. Carries no session
+    /// identity; see [`Handshake::with_session`].
     #[must_use]
     pub fn local(schema_hash: u32, tickrate: u16) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             schema_hash,
             tickrate,
+            session_id: 0,
         }
+    }
+
+    /// The same handshake, carrying a session identity.
+    #[must_use]
+    pub fn with_session(mut self, session_id: u64) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     /// Encode, including the leading magic.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(14);
+        let mut writer = Writer::with_capacity(22);
         writer.bytes(&MAGIC);
         writer.u32(self.protocol_version);
         writer.u32(self.schema_hash);
         writer.u16(self.tickrate);
+        writer.u64(self.session_id);
         writer.into_inner()
     }
 
     /// Decode, validating the magic.
+    ///
+    /// **The session id is an OPTIONAL TRAILING FIELD.** A handshake that stops after the tick rate decodes
+    /// with `session_id: 0` rather than as a truncation error, which is what keeps a peer built before the
+    /// field from being dropped in silence: it still handshakes, [`Handshake::check_compatibility`] still
+    /// reports any real version or schema mismatch with a readable message, and the only thing it loses is
+    /// the ability to resume. That is also why the field was added under a MINOR protocol bump — see
+    /// `PROTOCOL_VERSION`.
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(buf);
         if reader.bytes(MAGIC.len())? != MAGIC {
@@ -506,6 +547,7 @@ impl Handshake {
             protocol_version: reader.u32()?,
             schema_hash: reader.u32()?,
             tickrate: reader.u16()?,
+            session_id: reader.u64().unwrap_or(0),
         })
     }
 
@@ -1173,6 +1215,43 @@ mod tests {
         let decoded = Handshake::decode(&hello.encode()).unwrap();
         assert_eq!(decoded, hello);
         assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn handshake_carries_a_session_identity_verbatim() {
+        let hello = Handshake::local(0xabcd_1234, 60).with_session(0xdead_beef_c0de_1234);
+        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        assert_eq!(decoded.session_id, 0xdead_beef_c0de_1234);
+        assert_eq!(decoded, hello);
+    }
+
+    /// The whole point of the trailing field: a peer built before it still joins, and simply never resumes.
+    /// Decoding its shorter handshake as a truncation error would drop it in silence — `handle_hello`
+    /// answers a decode failure by returning, so the joiner would see no rejection message at all.
+    #[test]
+    fn a_handshake_without_a_session_id_decodes_as_no_identity() {
+        let full = Handshake::local(0x1234, 60).with_session(7);
+        let bytes = full.encode();
+        let short = &bytes[..bytes.len() - 8];
+        let decoded = Handshake::decode(short).unwrap();
+        assert_eq!(
+            decoded.session_id, 0,
+            "an absent trailing field is no identity"
+        );
+        assert_eq!(
+            decoded.tickrate, 60,
+            "and the fields before it still decode"
+        );
+        assert!(decoded.check_compatibility(&full).is_ok());
+    }
+
+    /// The identity is not part of the agreement check: two peers with different sessions are compatible,
+    /// which is what lets every client mint its own.
+    #[test]
+    fn a_differing_session_identity_is_not_an_incompatibility() {
+        let ours = Handshake::local(0x1234, 60).with_session(1);
+        let theirs = Handshake::local(0x1234, 60).with_session(2);
+        assert!(ours.check_compatibility(&theirs).is_ok());
     }
 
     #[test]

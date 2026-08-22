@@ -396,6 +396,15 @@ enum PeerAnchor {
 struct PeerState {
     /// Whether the handshake completed (server side: Hello received and answered).
     synced: bool,
+    /// The identity this peer's handshake carried, or `0` for a peer that claimed none.
+    ///
+    /// Kept beside the transport peer id rather than replacing it, because the two answer different
+    /// questions: the peer id says where to send bytes and is reassigned on every reconnect, this says who
+    /// is on the other end and survives one. Only the second can recognise a rejoiner.
+    ///
+    /// Per CONNECTION, not per seat: a session identity says which player is on the far end of one socket,
+    /// and every seat behind that socket belongs to the same player.
+    session_id: u64,
     /// Where this peer observes from, declared by the game. See [`PeerAnchor`].
     anchor: PeerAnchor,
     /// The last position [`PeerAnchor::Entity`] resolved to, and the answer once it no longer can.
@@ -455,6 +464,96 @@ struct PeerState {
     /// whole window at whatever rate happens to be running when somebody asks — the same mistake
     /// the tick-stamping cleanup removed from the rewind window itself.
     rtt_samples: std::collections::VecDeque<f32>,
+}
+
+/// One dropped session the server is holding open for its player to come back to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldSession {
+    /// The transport peer id the session was last connected under.
+    ///
+    /// Reported to the game so it can name what it is releasing; never matched against, because a rejoiner
+    /// arrives under a NEW id and matching on this one is precisely the thing that does not work.
+    peer: i32,
+    /// Wall-clock millisecond stamp past which the session is forgotten.
+    expires_at_ms: u64,
+}
+
+/// The dropped sessions a server is holding, keyed by the identity their handshake carried.
+///
+/// **What is held is the identity and nothing else.** None of the departed peer's send bookkeeping is
+/// retained — `last_sent`, `acked_base`, the sent log — and retaining it would be wrong: a rejoiner is a new
+/// transport connection whose client-side delta bases are gone, so it is handshaked as a newcomer and asks
+/// for full blocks. The one thing that cannot be rebuilt from the connection is who the player was, and that
+/// is what this table is.
+///
+/// A plain struct with no Godot types, so the whole expiry rule is unit-testable without a `SceneTree`.
+#[derive(Default)]
+struct ResumeTable {
+    held: HashMap<u64, HeldSession>,
+}
+
+impl ResumeTable {
+    /// Hold `session_id` open until `expires_at_ms`. Identity `0` is refused — that is what a peer claiming
+    /// no identity sends, and holding one slot for "everybody anonymous" would hand the next anonymous
+    /// joiner the last one's seat.
+    ///
+    /// Re-holding an id already present overwrites it: the newer drop is the one whose window should run.
+    fn hold(&mut self, session_id: u64, peer: i32, expires_at_ms: u64) -> bool {
+        if session_id == 0 {
+            return false;
+        }
+        self.held.insert(
+            session_id,
+            HeldSession {
+                peer,
+                expires_at_ms,
+            },
+        );
+        true
+    }
+
+    /// Take `session_id` out of the table, answering the peer id it was last connected under.
+    ///
+    /// `None` for an unheld id, which is every first-time joiner and every peer that claimed no identity.
+    /// Claiming REMOVES: a session is resumed once, by the connection that arrived first, and a second
+    /// claimant with the same token is a newcomer rather than a second resume of one player's place.
+    fn claim(&mut self, session_id: u64) -> Option<i32> {
+        if session_id == 0 {
+            return None;
+        }
+        self.held.remove(&session_id).map(|held| held.peer)
+    }
+
+    /// Remove and return every session whose window closed at or before `now_ms`, as `(session, peer)`.
+    ///
+    /// Ordered by session id so a game that logs the release reads the same order on every run — the table
+    /// is a `HashMap`, whose iteration order is not.
+    fn expire(&mut self, now_ms: u64) -> Vec<(u64, i32)> {
+        if self.held.is_empty() {
+            return Vec::new();
+        }
+        let mut due: Vec<(u64, i32)> = self
+            .held
+            .iter()
+            .filter(|(_, held)| held.expires_at_ms <= now_ms)
+            .map(|(&id, held)| (id, held.peer))
+            .collect();
+        due.sort_unstable();
+        for (id, _) in &due {
+            self.held.remove(id);
+        }
+        due
+    }
+
+    /// Whether `session_id` is currently being held open.
+    fn holds(&self, session_id: u64) -> bool {
+        session_id != 0 && self.held.contains_key(&session_id)
+    }
+
+    /// Forget every held session (session teardown).
+    fn clear(&mut self) {
+        self.held.clear();
+    }
 }
 
 /// How many unacked snapshot frames a peer's sent log retains before the oldest expire.
@@ -679,6 +778,22 @@ pub struct OrbitNet {
     #[export]
     rate_tiering: bool,
 
+    /// Seconds a dropped peer's session is held open for it to come back to. `0` disables resume.
+    ///
+    /// Server-side. It is a WALL-CLOCK window, not a tick count: a player alt-tabs, a router
+    /// renegotiates, a phone changes network — none of those are measured in simulation ticks, and a
+    /// window denominated in ticks would be a different policy at every rate.
+    ///
+    /// **Sizing it is a game decision with a real cost on both sides.** The entity is held for the whole
+    /// window: nobody else can be given it, it keeps replicating, and it acts on no input (see
+    /// `OrbitRollbackSynchronizer::mark_orphaned_authoritative`). Too short and a player who dropped on a
+    /// loading screen comes back to a stranger in their body; too long and a full session refuses newcomers
+    /// while it waits for players who left for good. 30 s is the default because it clears the ordinary
+    /// causes — a renegotiated route, an application switch — without holding a competitive place through a
+    /// whole engagement.
+    #[export]
+    reconnect_grace: f64,
+
     mode: i64,
     running: bool,
     synced: bool,
@@ -713,6 +828,17 @@ pub struct OrbitNet {
     rollback_entities: BTreeMap<u64, Gd<OrbitRollbackSynchronizer>>,
     state_entities: BTreeMap<u64, Gd<OrbitStateSynchronizer>>,
     peers: HashMap<i32, PeerState>,
+    /// This peer's own session identity, sent in its handshake. `0` claims none.
+    session_id: u64,
+    /// Server: the sessions of dropped peers, held open until their grace window closes.
+    resume: ResumeTable,
+    /// Server: the transport peer ids connected as of this frame, plus our own.
+    ///
+    /// Refreshed once per frame and read once per rollback entity per tick to decide which entities have
+    /// lost their input author. The alternative — asking the engine per entity per tick — is the same
+    /// hundredfold multiplier `input_owner_hint` exists to avoid, on an answer that changes when a peer
+    /// connects and at no other time.
+    live_peers: std::collections::HashSet<i32>,
     manifest_dirty: bool,
     /// Client: schema fingerprints announced by the server, checked as entities register.
     expected_schemas: HashMap<u64, (u32, u32)>,
@@ -828,6 +954,7 @@ impl INode for OrbitNet {
             aoi_band_radius: 0.0,
             aoi_max_entities: 0,
             rate_tiering: false,
+            reconnect_grace: 30.0,
             mode: MODE_OFFLINE,
             running: false,
             synced: false,
@@ -848,6 +975,9 @@ impl INode for OrbitNet {
             rollback_entities: BTreeMap::new(),
             state_entities: BTreeMap::new(),
             peers: HashMap::new(),
+            session_id: 0,
+            resume: ResumeTable::default(),
+            live_peers: std::collections::HashSet::new(),
             manifest_dirty: false,
             expected_schemas: HashMap::new(),
             newest_snapshot_tick: 0,
@@ -967,6 +1097,41 @@ impl OrbitNet {
     #[signal]
     fn after_rollback_loop();
 
+    /// Server: a peer completed the handshake. `resumed_from` is the transport peer id it held before it
+    /// dropped, or `0` for a first-time joiner.
+    ///
+    /// **This, not the transport's `peer_connected`, is where a game seats a player.** `peer_connected`
+    /// fires when the socket comes up, which is before the handshake, so no identity is known yet and there
+    /// is nothing to match a rejoiner against.
+    ///
+    /// **`resumed_from` NAMES A CONNECTION THAT MAY STILL BE UP.** It is whichever connection last claimed
+    /// this identity, whether the server saw it drop or not — the second case is a relaunched client that
+    /// beat its own keepalive timeout, and it is also what a forged token looks like. Honouring it hands the
+    /// new claimant that peer's body, so a game that wants the conservative rule honours it only for a
+    /// session it already saw [`Self::peer_dropped`] report as `held`. See `handle_hello`.
+    #[signal]
+    fn peer_joined(peer: i64, session_id: i64, resumed_from: i64);
+
+    /// Server: a peer's transport connection is gone. `held` is whether its session is being kept open for
+    /// the grace window — `false` means it is already forgotten and the game should release its seat now.
+    ///
+    /// `held` is false for a peer that claimed no identity, with the grace window at `0`, and — the case
+    /// worth knowing about — for a GHOST whose identity a returning player already took back, which is what
+    /// a relaunched client that beat its own keepalive timeout leaves behind. Such a drop reports
+    /// `session_id` `0`. See [`hold_on_drop`].
+    #[signal]
+    fn peer_dropped(peer: i64, session_id: i64, held: bool);
+
+    /// Server: a held session's grace window closed with nobody claiming it. `peer` is the transport id it
+    /// was last connected under, for logging.
+    ///
+    /// **This is the release point, and the addon does not act on it.** The entity is still there, still
+    /// replicating, still owned by a peer id that no longer exists. What to do about that — free the body,
+    /// hand its input back to the server with `set_input_authority(1)`, open the seat to the next joiner —
+    /// is the game's decision, exactly as it is for an entity a cull stopped sending.
+    #[signal]
+    fn peer_session_expired(session_id: i64, peer: i64);
+
     // ------------------------------------------------------------------
     // Session control (facade API)
     // ------------------------------------------------------------------
@@ -1026,6 +1191,10 @@ impl OrbitNet {
         self.synced = false;
         self.hello_pending = false;
         self.peers.clear();
+        // A held session describes a player who can come back to THIS session. There is no session to come
+        // back to now, and carrying the table into the next one would resume a stranger.
+        self.resume.clear();
+        self.live_peers.clear();
         self.planner.clear();
         self.clock.clear();
         self.lead.clear();
@@ -1147,6 +1316,46 @@ impl OrbitNet {
             Some(ms) => f64::from(ms),
             None => -1.0,
         }
+    }
+
+    /// Set this peer's session identity — the token its handshake carries.
+    ///
+    /// CLIENT-SIDE, and the whole of what a client contributes to being resumable. Set it before the join
+    /// handshake goes out; a change afterwards reaches the server only on the next join, which is the right
+    /// moment for it anyway.
+    ///
+    /// The token is opaque and it is never interpreted here: the server compares it for equality against the
+    /// sessions it is holding and does nothing else with it. `0` claims no identity, and a peer claiming
+    /// none is always seated as a newcomer.
+    #[func]
+    fn set_session_id(&mut self, id: i64) {
+        self.session_id = id as u64;
+    }
+
+    /// This peer's session identity, as last set. `0` when none was.
+    #[func]
+    fn session_id(&self) -> i64 {
+        self.session_id as i64
+    }
+
+    /// The session identity `peer` claimed in its handshake. `0` for an unknown peer and for one that
+    /// claimed none.
+    ///
+    /// SERVER-SIDE. This is the key a game's roster should be built on, not the peer id: a peer id names the
+    /// connection and is reassigned on every reconnect.
+    #[func]
+    fn peer_session_id(&self, peer: i32) -> i64 {
+        self.peers
+            .get(&peer)
+            .map_or(0, |state| state.session_id as i64)
+    }
+
+    /// Whether a dropped session is currently being held open for `session_id` to reclaim.
+    ///
+    /// SERVER-SIDE. `false` once the window closes, once it is claimed, and for identity `0`.
+    #[func]
+    fn is_session_held(&self, session_id: i64) -> bool {
+        self.resume.holds(session_id as u64)
     }
 
     /// Declare where one peer observes from, and which world it observes in.
@@ -1423,9 +1632,26 @@ impl OrbitNet {
         let _ = id;
     }
 
+    /// Drop the peer's entry, and hold its session open if it had one.
+    ///
+    /// The peer entry itself is never retained. Everything on it describes a CONNECTION — what that socket
+    /// was last sent, which rows it acked, how long its round trip was — and none of it is true of the new
+    /// socket a rejoiner arrives on. What survives is the identity, in [`Self::resume`].
     #[func]
     fn _on_peer_disconnected(&mut self, id: i64) {
-        self.peers.remove(&(id as i32));
+        let peer = id as i32;
+        let session_id = self.peers.remove(&peer).map_or(0, |state| state.session_id);
+        let server = self.mode == MODE_SERVER || self.mode == MODE_HOST;
+        let grace_ms = (self.reconnect_grace.max(0.0) * 1000.0) as u64;
+        let held = hold_on_drop(session_id, grace_ms, server)
+            && self
+                .resume
+                .hold(session_id, peer, Self::now_ms().saturating_add(grace_ms));
+        if server {
+            self.signals()
+                .peer_dropped()
+                .emit(id, session_id as i64, held);
+        }
     }
 
     #[func]
@@ -1520,7 +1746,8 @@ impl OrbitNet {
         if peer.get_connection_status() != ConnectionStatus::CONNECTED {
             return;
         }
-        let hello = Handshake::local(0, self.tickrate.clamp(1, 240) as u16);
+        let hello =
+            Handshake::local(0, self.tickrate.clamp(1, 240) as u16).with_session(self.session_id);
         self.send_to(SERVER_PEER, &hello.encode(), TransferMode::RELIABLE);
     }
 
@@ -1802,6 +2029,10 @@ impl OrbitNet {
             return;
         }
 
+        // Who is connected, asked once for the whole frame. Read per entity per tick below to decide which
+        // entities have lost their input author.
+        self.refresh_live_peers();
+
         // Batch boundary: land buffered authoritative rows before anything reads state.
         self.apply_pending_rows();
 
@@ -1843,13 +2074,30 @@ impl OrbitNet {
         }
     }
 
+    /// Per tick, decide what each rollback entity's input confidence is before anything simulates it, and
+    /// plan the entities this peer will run.
+    ///
+    /// Two server fallbacks live here, and they are the same statement about two different absences. An
+    /// entity with NO input bindings has no author by construction; an entity whose input owner has left has
+    /// lost the one it had. In both cases the server is what is authoring the body, so its tick is
+    /// authoritative — and the second case additionally has to say what that authorship IS, which is the
+    /// neutral row. See `OrbitRollbackSynchronizer::mark_orphaned_authoritative`.
+    ///
+    /// The owner is read from the CACHED hint rather than live, and that is deliberate: the hint is what the
+    /// game last declared through `set_input_authority`, so an owner it still names after the peer left is
+    /// exactly the orphan this looks for. The moment the game re-points the body — at a rejoin, or at a
+    /// release — the hint moves with it and the fallback stops applying, in the same call.
     fn mark_forward_ticks(&mut self, tick: u64) {
+        let server = self.mode == MODE_SERVER || self.mode == MODE_HOST;
         for (&id, sync) in &self.rollback_entities {
             let Some(mut sync) = live_handle(sync) else {
                 continue;
             };
             let mut bound = sync.bind_mut();
             bound.mark_inputless_authoritative(tick);
+            if server && !self.live_peers.contains(&bound.input_owner_hint()) {
+                bound.mark_orphaned_authoritative(tick);
+            }
             if bound.simulates() || bound.predicts_remotely() {
                 self.planner.mark(id, tick);
             }
@@ -2047,7 +2295,48 @@ impl OrbitNet {
         }
     }
 
+    /// Monotonic wall clock in milliseconds, for the resume windows.
+    ///
+    /// Wall clock rather than accumulated tick time, because a grace window measures how long a PLAYER has
+    /// been away and that is not a simulation quantity: it must keep running while the loop stretches,
+    /// catches up, or discards a backlog after a hitch.
+    fn now_ms() -> u64 {
+        Time::singleton().get_ticks_msec()
+    }
+
+    /// Refresh [`Self::live_peers`] from the transport, once per frame.
+    ///
+    /// Server-side only, because [`Self::mark_forward_ticks`] is the only reader and it asks only on the
+    /// authority. A client would pay an engine call and an allocation every frame for a set nothing reads.
+    fn refresh_live_peers(&mut self) {
+        if self.mode != MODE_SERVER && self.mode != MODE_HOST {
+            return;
+        }
+        let mut live = std::collections::HashSet::new();
+        if let Some(api) = self.base().get_multiplayer() {
+            live.insert(api.clone().get_unique_id());
+            for id in api.get_peers().as_slice() {
+                live.insert(*id);
+            }
+        }
+        self.live_peers = live;
+    }
+
+    /// Release every held session whose window closed, telling the game about each.
+    fn expire_held_sessions(&mut self) {
+        if self.mode != MODE_SERVER && self.mode != MODE_HOST {
+            return;
+        }
+        let due = self.resume.expire(Self::now_ms());
+        for (session_id, peer) in due {
+            self.signals()
+                .peer_session_expired()
+                .emit(session_id as i64, i64::from(peer));
+        }
+    }
+
     fn run_net_upkeep(&mut self, delta: f64) {
+        self.expire_held_sessions();
         if self.mode == MODE_CLIENT && self.running {
             self.ping_timer += delta;
             if self.ping_timer >= PING_INTERVAL {
@@ -3067,10 +3356,49 @@ impl OrbitNet {
             godot_error!("OrbitNet: rejecting peer {sender}: {err}");
             return;
         }
+        // **Take the identity off any peer that still claims it.** One player cannot be connected twice
+        // under one identity, so an entry that still claims it is a GHOST — a connection the transport has
+        // not declared dead yet, which on ENet's defaults takes the better part of a minute. Without this
+        // the ghost's disconnect arrives last and holds an identity the returning player is already using,
+        // and closing that window releases the seat of somebody who is playing.
+        //
+        // **NOTHING HERE CHECKS THAT THE SUPERSEDED PEER IS DEAD, AND THE CONSEQUENCE IS A LIVE TAKEOVER,
+        // NOT A FORFEITED FUTURE RESUME.** The match is on the token alone. A peer presenting a token that a
+        // CONNECTED, PLAYING peer holds is reported through `peer_joined` as an ordinary resume of that
+        // peer, and a roster that honours `resumed_from` — including the reference one in the RTS demo —
+        // hands the returning claimant that player's body on the spot: the original keeps its connection,
+        // receives no error, and simply stops driving its own entity. The superseded connection is not
+        // closed; only its claim to the identity is taken.
+        //
+        // That is accepted rather than overlooked, because the alternative costs the case this exists for.
+        // Sourcing a resume only from `ResumeTable::claim` — a drop the server actually observed — refuses
+        // a genuinely returning player for as long as the transport takes to notice the old socket is gone,
+        // which was measured here at anywhere from 45 s to never. Refusing every real fast reconnect to
+        // close a hole that needs 63 guessed bits is the wrong trade. It is a hole, it is stated as one in
+        // `README.md`, and a game that wants the conservative rule can have it without a backend change:
+        // honour `resumed_from` only for a session it already saw `peer_dropped` report as `held`.
+        let mut superseded = 0;
+        if hello.session_id != 0 {
+            for (&id, state) in self.peers.iter_mut() {
+                if id != sender && state.session_id == hello.session_id {
+                    state.session_id = 0;
+                    superseded = id;
+                }
+            }
+        }
+        // Claimed BEFORE the peer entry is touched, and claiming REMOVES: the identity is spent here, so a
+        // later connection carrying the same token resumes nothing. A held session wins over a superseded
+        // ghost when somehow both exist — the held one is the drop the server actually saw.
+        let resumed_from = self.resume.claim(hello.session_id).unwrap_or(superseded);
         let peer = self.peers.entry(sender).or_default();
+        // A hello is RETRIED until the welcome lands, so this runs again for a peer already synced. The
+        // welcome has to go out again — that is what the retry is for — but the game must hear about the join
+        // exactly once, or a roster answers a lost packet by re-seating somebody who never left.
+        let first_hello = !peer.synced;
         peer.synced = true;
         peer.want_full = true;
         peer.newest_input_tick = -1;
+        peer.session_id = hello.session_id;
 
         let welcome = Welcome {
             protocol_version: orbitnet_core::PROTOCOL_VERSION,
@@ -3079,6 +3407,15 @@ impl OrbitNet {
         };
         self.send_to(sender, &welcome.encode(), TransferMode::RELIABLE);
         self.manifest_dirty = true;
+        // Last, and after every field this call sets: the game answers this signal by seating the player,
+        // which re-enters this node through the facade.
+        if first_hello {
+            self.signals().peer_joined().emit(
+                i64::from(sender),
+                hello.session_id as i64,
+                i64::from(resumed_from),
+            );
+        }
     }
 
     fn integrate_welcome(&mut self, welcome: &Welcome) {
@@ -3526,6 +3863,18 @@ fn owned_rows_of(owned: &[(SeatId, u32)], peer_id: i32) -> &[(SeatId, u32)] {
     &owned[start..end]
 }
 
+/// Whether a dropped peer's session should be held open for it to come back to.
+///
+/// - Not a server: only the authority holds sessions.
+/// - No grace window configured: resume is switched off.
+/// - **No identity**, which covers two different peers. One never sent a token. The other is a GHOST whose
+///   token was taken from it by the returning player's handshake — see `handle_hello` — and its late
+///   disconnect must not re-open a window on an identity somebody is currently playing under.
+#[must_use]
+fn hold_on_drop(session_id: u64, grace_ms: u64, server: bool) -> bool {
+    server && grace_ms > 0 && session_id != 0
+}
+
 /// Whether this entity's next block for this peer must be a full row. A free function so the rule
 /// the send loop runs is the rule a test can call.
 ///
@@ -3554,9 +3903,10 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 mod tests {
     use super::{
         admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
-        full_block_due, owned_rows_into, owned_rows_of, resolve_observer, seat_observer, EntityRow,
-        OrbitNet, PeerAnchor, PeerObserver, PeerState, RxOutcome, SeatId, SeatIndex,
-        StateIntegration, FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
+        full_block_due, hold_on_drop, owned_rows_into, owned_rows_of, resolve_observer,
+        seat_observer, EntityRow, OrbitNet, PeerAnchor, PeerObserver, PeerState, ResumeTable,
+        RxOutcome, SeatId, SeatIndex, StateIntegration, FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS,
+        RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
     use orbitnet_core::interest::{
         AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatObserver,
@@ -4546,5 +4896,106 @@ mod tests {
         // would wrap to ~1.8e19 ticks and, uncapped, hand the peer the deepest window there is.
         let peer = peer_with(&[0]);
         assert_eq!(peer.rtt_ms().unwrap(), 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // Resume: which dropped sessions a rejoiner may claim, and for how long.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_rejoiner_claims_the_session_it_dropped_and_learns_its_old_peer_id() {
+        let mut table = ResumeTable::default();
+        assert!(table.hold(0xabcd, 7, 1_000));
+        assert!(table.holds(0xabcd));
+        assert_eq!(table.claim(0xabcd), Some(7));
+        assert!(!table.holds(0xabcd), "claiming spends the session");
+    }
+
+    /// A peer that claimed no identity has nothing to resume, and `0` must not become a slot every
+    /// anonymous joiner in turn inherits.
+    #[test]
+    fn identity_zero_is_never_held_and_never_claimed() {
+        let mut table = ResumeTable::default();
+        assert!(!table.hold(0, 7, 1_000));
+        assert!(!table.holds(0));
+        assert_eq!(table.claim(0), None);
+    }
+
+    /// Resuming is once. A second connection carrying a token the first already spent is a newcomer, or
+    /// two live peers would be seated on one entity.
+    #[test]
+    fn a_second_claimant_of_one_token_is_a_newcomer() {
+        let mut table = ResumeTable::default();
+        table.hold(9, 3, 1_000);
+        assert_eq!(table.claim(9), Some(3));
+        assert_eq!(table.claim(9), None);
+    }
+
+    #[test]
+    fn an_unheld_token_is_a_newcomer() {
+        let mut table = ResumeTable::default();
+        table.hold(1, 4, 1_000);
+        assert_eq!(table.claim(2), None);
+        assert!(table.holds(1), "and the held session is untouched");
+    }
+
+    /// The window is inclusive at its deadline, and a session past it is gone from the table as well as
+    /// reported — a release the game hears about twice would open the seat twice.
+    #[test]
+    fn a_session_expires_at_its_deadline_and_is_reported_once() {
+        let mut table = ResumeTable::default();
+        table.hold(5, 2, 1_000);
+        assert!(table.expire(999).is_empty(), "not due yet");
+        assert_eq!(table.expire(1_000), vec![(5, 2)]);
+        assert!(table.expire(2_000).is_empty(), "and not reported again");
+        assert!(!table.holds(5));
+    }
+
+    /// Expiries are reported in session order rather than `HashMap` order, so a game that logs or acts on
+    /// the batch behaves the same on every run.
+    #[test]
+    fn several_expiries_are_reported_in_a_stable_order() {
+        let mut table = ResumeTable::default();
+        table.hold(30, 3, 100);
+        table.hold(10, 1, 100);
+        table.hold(20, 2, 100);
+        assert_eq!(table.expire(100), vec![(10, 1), (20, 2), (30, 3)]);
+    }
+
+    /// A player who drops, rejoins, and drops again gets a window measured from the SECOND drop.
+    #[test]
+    fn re_holding_a_session_restarts_its_window() {
+        let mut table = ResumeTable::default();
+        table.hold(8, 2, 1_000);
+        table.hold(8, 5, 4_000);
+        assert!(table.expire(1_000).is_empty(), "the first deadline is gone");
+        assert_eq!(
+            table.expire(4_000),
+            vec![(8, 5)],
+            "and the newer peer id is what is reported"
+        );
+    }
+
+    #[test]
+    fn a_drop_is_not_held_without_a_server_a_window_or_an_identity() {
+        assert!(
+            hold_on_drop(0xabcd, 30_000, true),
+            "the ordinary drop holds"
+        );
+        assert!(!hold_on_drop(0xabcd, 30_000, false), "not a server");
+        assert!(!hold_on_drop(0xabcd, 0, true), "resume switched off");
+        // Also the GHOST case: a stale connection whose token was taken by the returning player's
+        // handshake carries identity 0 by the time its disconnect lands, so it re-opens no window.
+        assert!(!hold_on_drop(0, 30_000, true), "no identity");
+    }
+
+    #[test]
+    fn teardown_forgets_every_held_session() {
+        let mut table = ResumeTable::default();
+        table.hold(1, 1, 1_000);
+        table.hold(2, 2, 1_000);
+        table.clear();
+        assert!(table.expire(u64::MAX).is_empty());
+        assert!(!table.holds(1));
     }
 }
