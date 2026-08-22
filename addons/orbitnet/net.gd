@@ -56,6 +56,46 @@ signal pre_tick(tick: int)
 ## captures each physics frame. Fires once per frame that ran >= 1 net tick; inert OFFLINE.
 signal post_tick()
 
+## SERVER-SIDE: a peer finished the OrbitNet handshake. `resumed_from` is the peer id it held before it
+## dropped, or 0 for a first-time joiner. `session_id` is the identity its handshake carried (0 = none).
+##
+## ADMIT PLAYERS HERE, not on the transport's `peer_connected`. That signal fires when the socket comes up,
+## which is before the handshake -- so no identity is known yet and a rejoiner cannot be matched to the place
+## it left. Never fires OFFLINE or on a client.
+##
+## Fires ONCE per peer, however many times its handshake is retried.
+##
+## `resumed_from` NAMES A CONNECTION THAT MAY STILL BE UP, and that matters because acting on it hands the new
+## claimant that peer's body. It is whichever connection last claimed this identity, whether or not the server
+## saw it drop: a relaunched client routinely beats its own keepalive timeout, so the connection it replaces is
+## still in the peer list. A forged token looks identical, and the consequence is the same -- the original
+## keeps its socket, gets no error, and stops driving its own entity.
+##
+## THE CONSERVATIVE RULE, IF YOU WANT IT: honour `resumed_from` only for a session you already saw
+## [signal peer_dropped] report with `held = true`. That costs a returning player their body until the
+## transport notices the old socket is gone, which can take tens of seconds, which is why it is not the
+## default. See [method session_id] for what the identity is and is not worth.
+signal peer_joined(peer: int, session_id: int, resumed_from: int)
+
+## SERVER-SIDE: a peer's transport connection is gone. `held` is whether its session is being kept open for
+## [method reconnect_grace] seconds -- false means it is already forgotten and its place should be released now.
+##
+## `held` is false for a peer that claimed no identity, with the grace window at 0, and -- the case worth
+## knowing about -- for a GHOST connection whose identity a returning player already took back. A transport
+## does not notice a killed client until its keepalive times out, which on ENet's defaults is the better part
+## of a minute, so a player who relaunches quickly is admitted first and the dead connection's drop arrives
+## afterwards. That drop reports `session_id` 0, and whatever it held has already moved to the new peer id.
+signal peer_dropped(peer: int, session_id: int, held: bool)
+
+## SERVER-SIDE: a held session's grace window closed with nobody claiming it. `peer` is the id it was last
+## connected under, for logging.
+##
+## THIS IS THE RELEASE POINT AND THE ADDON DOES NOT ACT ON IT. The entity is still in the scene, still
+## replicating, and still pointed at a peer id that no longer exists. Free the body, or hand its input back to
+## the server with [method NetRollbackHandle.set_input_authority] and open the place to the next joiner -- the
+## same shape of decision as an entity a cull stopped sending.
+signal peer_session_expired(session_id: int, peer: int)
+
 func _init() -> void:
 	# _init, not _ready: the unit-test runner (--script SceneTree mode) calls into the facade before the
 	# tree delivers _ready, and the OFFLINE contract must hold there too. Children attached here enter the
@@ -84,6 +124,17 @@ func _init() -> void:
 	# fire while the tick loop runs (networked), so OFFLINE these connections are inert.
 	_orbit.before_tick.connect(_on_backend_before_tick)
 	_orbit.after_rollback_loop.connect(_on_backend_after_rollback_loop)
+	# The session-lifecycle signals reach the facade the same way, but by NAME and behind a has_signal probe:
+	# they are newer than the committed binary, and `_orbit.peer_joined.connect(...)` against a binary that
+	# lacks them is a script error at autoload time -- on every project load. Same tolerance rule as the
+	# `_backend_*` accessors below, applied to signals.
+	if _orbit.has_signal(&"peer_joined"):
+		_orbit.connect(&"peer_joined", _on_backend_peer_joined)
+		_orbit.connect(&"peer_dropped", _on_backend_peer_dropped)
+		_orbit.connect(&"peer_session_expired", _on_backend_peer_session_expired)
+	# One identity per process, minted before anything can join. A consumer that wants a session to survive a
+	# RESTART overwrites it with a stored value -- see set_session_id().
+	set_session_id(_mint_session_id())
 
 func _on_backend_before_tick(_delta: float, tick: int) -> void:
 	pre_tick.emit(tick)
@@ -91,6 +142,15 @@ func _on_backend_before_tick(_delta: float, tick: int) -> void:
 func _on_backend_after_rollback_loop() -> void:
 	if _mode != Mode.OFFLINE:
 		post_tick.emit()
+
+func _on_backend_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
+	peer_joined.emit(peer, session_id, resumed_from)
+
+func _on_backend_peer_dropped(peer: int, session_id: int, held: bool) -> void:
+	peer_dropped.emit(peer, session_id, held)
+
+func _on_backend_peer_session_expired(session_id: int, peer: int) -> void:
+	peer_session_expired.emit(session_id, peer)
 
 ## Install the NATIVE crash handler, appending reports to `<dir>/crash-native.log`. Returns false if it was
 ## already installed (or the path did not fit). `dir` must be an absolute, already-created directory.
@@ -307,6 +367,84 @@ func tickrate() -> int:
 ## cvar round-trips. Under sync_to_physics this does not change the live tick (see tickrate()).
 func set_tickrate(rate: int) -> void:
 	_orbit.tickrate = clampi(rate, 1, 240)
+
+# --- session identity and resume ------------------------------------------------------------------
+## This peer's SESSION IDENTITY -- the token its join handshake carries, and the only thing that survives a
+## reconnect.
+##
+## A multiplayer peer id names a CONNECTION. The transport reassigns it on every reconnect, so a server holding
+## one cannot answer "is this the player who was here a moment ago", and every roster keyed on it hands a
+## rejoining player whichever place happens to be free -- somebody else's army, somebody else's body. This
+## answers it: one token, minted once, resent verbatim on every join.
+##
+## The facade mints a random one at boot, so a game that does nothing is already resumable within a process.
+##
+## IT IS ASSERTED BY THE CLIENT AND VERIFIED BY NOBODY. A peer can send any token it likes, including one it
+## watched somebody else use. It is adequate for the thing it exists for -- a player whose link dropped getting
+## their own entity back -- and inadequate for anything that must not be forged. Account identity, entitlement
+## and ban evasion need an authenticated layer above this, and this call is where its verified id would be
+## written.
+func session_id() -> int:
+	if not _backend_has(&"session_id"):
+		return 0
+	return _orbit.session_id()
+
+## Set this peer's session identity. CLIENT-SIDE, and it must be set BEFORE the join handshake goes out; a
+## change afterwards reaches the server on the next join.
+##
+## Pass a value the game stored to make a session survive a PROCESS RESTART -- a crash, an alt-F4, a
+## reinstalled route. `0` claims no identity, which is always seated as a newcomer.
+func set_session_id(id: int) -> void:
+	if not _backend_has(&"set_session_id"):
+		return
+	_orbit.set_session_id(id)
+
+## The session identity `peer` claimed in its handshake, or 0 for an unknown peer and one that claimed none.
+## SERVER-SIDE. KEY YOUR ROSTER ON THIS, not on the peer id.
+func peer_session_id(peer: int) -> int:
+	if _mode == Mode.OFFLINE or not _backend_has(&"peer_session_id"):
+		return 0
+	return _orbit.peer_session_id(peer)
+
+## Whether a dropped session is currently being held open for `session_id` to reclaim. SERVER-SIDE; false once
+## the window closes, once it is claimed, and for identity 0.
+func is_session_held(session_id: int) -> bool:
+	if _mode == Mode.OFFLINE or not _backend_has(&"is_session_held"):
+		return false
+	return _orbit.is_session_held(session_id)
+
+## Seconds a dropped peer's session is held open for it to come back to. 0 disables resume entirely: a peer
+## that drops is forgotten in the same frame and [signal peer_dropped] reports `held = false`.
+##
+## SERVER-SIDE, and WALL-CLOCK -- a player alt-tabs, a router renegotiates, a phone changes network, and none
+## of those are measured in simulation ticks.
+##
+## SIZING IT COSTS SOMETHING IN BOTH DIRECTIONS. The entity is held for the whole window: nobody else can be
+## given it, it keeps replicating, and it acts on no input at all (see
+## [method NetRollbackHandle.set_input_authority] for the release, and the gap policy below). Too short and a
+## player who dropped on a loading screen comes back to a stranger in their body; too long and a full session
+## refuses newcomers while it waits for players who left for good. The 30 s default clears the ordinary causes
+## without holding a competitive place through a whole engagement.
+##
+## THE GAP POLICY, STATED: from the tick its owner leaves, an entity's input is written as the NEUTRAL (all
+## zero) row on the server and its tick is marked authoritative. It therefore acts on no intent rather than
+## repeating the departed player's last one, and its state keeps broadcasting -- so other peers see it come to
+## rest where it was, instead of freezing at one tick and then jumping when its owner returns.
+func reconnect_grace() -> float:
+	return _backend_float(&"reconnect_grace", 0.0)
+
+func set_reconnect_grace(seconds: float) -> void:
+	_orbit.set(&"reconnect_grace", maxf(0.0, seconds))
+
+## Mint a session identity: 63 random bits, positive so it prints legibly and round-trips through anything
+## that treats an id as a plain integer.
+##
+## Godot seeds the global RNG randomly at startup, so this differs between processes without the game having
+## to seed anything. It is not a secret and does not need to be one -- see [method session_id].
+static func _mint_session_id() -> int:
+	var high: int = randi() & 0x7fffffff
+	var low: int = randi() & 0xffffffff
+	return maxi(1, (high << 32) | low)
 
 # --- resim-depth knobs + perf diagnostics ---------------------------------------------------
 # input_delay shrinks the unconfirmed window directly (input is stamped into the future); display_offset

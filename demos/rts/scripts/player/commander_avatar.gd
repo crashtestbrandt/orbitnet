@@ -97,8 +97,7 @@ func set_owner_peer(peer: int) -> void:
 	owner_peer = peer
 	if Net.is_offline() or _handle == null:
 		return
-	input.set_multiplayer_authority(peer if peer > 0 else 1)
-	_handle.process_authority()
+	_handle.set_input_authority(peer if peer > 0 else 1)
 
 ## Write this frame's desired cursor. Called only on the peer that OWNS this commander; on anyone else the
 ## input node is not writable and the backend would ignore it anyway.

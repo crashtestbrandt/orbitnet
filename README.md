@@ -136,8 +136,13 @@ Known and filed, not hidden:
 - **The retained interest grid is unused.** It now matches the linear path rule for rule — leaves, always-set,
   worlds — but it measures slower at the arena sizes a session runs at today, so the linear scan is what ships.
   It overtakes the scan past about ±600 m of occupancy. The measured tables are in `interest.rs`'s header.
-- **No reconnection and no packet authentication.** A dropped client loses its entity, and the wire carries
-  nothing beyond a per-entity authority check.
+- **A session identity is client-asserted and unauthenticated.** `Net.session_id()` is what a rejoiner
+  presents to reclaim its entity, and a peer can present any value it likes, including one it watched someone
+  else use. **A presented identity beats a live connection holding it**, because a relaunched client routinely
+  arrives before the transport reports its old socket as gone — so a forged one takes a playing player's body,
+  and that player keeps its connection with no error. Anything that must not be forged needs an authenticated
+  layer above it; a game that will not accept the takeover honours `resumed_from` only after a `peer_dropped`
+  it saw as `held`. Beyond this the wire carries nothing but a per-entity authority check.
 
 ## Licence
 

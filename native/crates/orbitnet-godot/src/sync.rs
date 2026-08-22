@@ -443,6 +443,28 @@ impl OrbitRollbackSynchronizer {
         self.input_local = owner == local_peer;
     }
 
+    /// Point this entity's input at `peer`, and re-resolve everything that reads the answer.
+    ///
+    /// The two halves have to happen together and one of them is easy to forget. Writing the authority alone
+    /// changes what [`Self::input_owner_peer`] answers — the anti-forgery check on a received input block —
+    /// but leaves `input_local` and [`Self::input_owner_hint`] naming the previous owner, so this peer keeps
+    /// predicting (or keeps refusing to predict) the wrong body and the send path anchors the wrong peer's
+    /// interest radius. That is why this exists as one call rather than as a note in a doc comment.
+    ///
+    /// **It is local, and it must be called on EVERY peer.** Multiplayer authority is a property of a node
+    /// on the peer that holds it; nothing here replicates. A peer that missed the call disagrees about who
+    /// owns the body, and on the server that disagreement is what starts rejecting the new owner's input.
+    ///
+    /// `peer` is a transport peer id. `1` hands the input back to the server, which is what a game does when
+    /// a seat empties.
+    #[func]
+    fn set_input_authority(&mut self, peer: i64) {
+        if let Some(mut node) = self.resolved_input_root() {
+            node.set_multiplayer_authority(peer as i32);
+        }
+        self.process_authority();
+    }
+
     /// Whether the most recent simulated tick ran on non-authoritative (predicted or
     /// extrapolated) input.
     #[func]
@@ -1180,6 +1202,40 @@ impl OrbitRollbackSynchronizer {
         if self.input_bindings.is_empty() && self.owns_state() {
             self.ledger.set_confidence(tick, Confidence::Authoritative);
         }
+    }
+
+    /// **The gap policy: an entity whose input owner is no longer connected is held on the NEUTRAL input
+    /// row, and its state frontier keeps advancing.** Server-side, called once per tick for as long as the
+    /// owner is away; [`OrbitNet::mark_forward_ticks`] decides when that is.
+    ///
+    /// Both halves are corrections, and each fixes something the default did wrong.
+    ///
+    /// **The neutral row replaces a carry-forward.** [`Self::restore_tick`] applies the closest input row at
+    /// or before the tick, so with nobody sending, the departed player's last row was re-applied on every
+    /// tick the ring could still reach — a body that walks into a wall keeps walking into it — and past the
+    /// ring, nothing was written at all and the input node simply kept the last values anyone had put there.
+    /// An all-zero row is written at the tick instead, so the body acts on no intent rather than on stale
+    /// intent. Zero is the neutral value because it is the one the codec defines: an input schema's row is
+    /// zero before anything fills it, which is the row every peer already agrees on.
+    ///
+    /// **Marking the tick authoritative unfreezes the broadcast.** [`Self::record_tick`] raises
+    /// `latest_auth_sim_tick` only on an authoritative tick and [`Self::encode_block`] sends the row at that
+    /// tick, so an orphan whose input never arrives kept simulating on the server while every other peer
+    /// held it at the last tick a received row backed — and the moment its owner came back, the broadcast
+    /// jumped forward in one step. The server IS the author now, so the tick is authoritative and says so.
+    ///
+    /// An entity with no input bindings is untouched: [`Self::mark_inputless_authoritative`] already covers
+    /// it, and it has no owner to lose.
+    pub(crate) fn mark_orphaned_authoritative(&mut self, tick: u64) {
+        if self.input_bindings.is_empty() || !self.owns_state() {
+            return;
+        }
+        // A fresh zero row rather than `scratch_input`: that buffer is the local-capture path's, and it
+        // holds a real captured row. One small allocation per orphaned entity per tick is the right trade
+        // for not sharing a buffer between "what this peer authored" and "what nobody authored".
+        let neutral = vec![0u8; self.input_schema.row_stride()];
+        self.input_history.write_row(tick, &neutral);
+        self.ledger.set_confidence(tick, Confidence::Authoritative);
     }
 
     /// Reset all runtime state (session teardown).

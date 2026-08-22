@@ -214,6 +214,44 @@ replicate, so AOI can cull exactly one thing — the other player's cursor. Show
 distinction better than a slider that appears to do something. Making AOI work on the state lane is
 [a filed gap](../README.md#limits), not a demo bug.
 
+## Reconnection: the seat is the player's, not the connection's
+
+One seat per connection is a bijection at any instant, and still not enough: a peer id is reassigned every
+time a player dials back in, so the seat a returning player gets is whichever happens to be free. `SeatRoster`
+therefore **owns** a seat by the session identity the handshake carried (`Net.peer_session_id`) and merely
+*binds* a peer to it. Three rules:
+
+| Event | What the demo does |
+|---|---|
+| `Net.peer_joined` | `roster.assign(peer, session_id)` — a session that owns a seat reclaims it whatever peer id it arrives under; anyone else takes the lowest free seat. **This, not `multiplayer.peer_connected`**, because the transport signal fires before any identity is known. |
+| `Net.peer_dropped` with `held` | Nothing. The roster keeps naming the departed peer, so the seat reads as taken and the commander keeps its input authority pointed at an id that is no longer connected. |
+| `Net.peer_session_expired` | `roster.release_session()` and rebroadcast — the seat opens and its commander goes back to the server. |
+
+**Doing nothing on the drop is the interesting part.** It is what puts the commander in the backend's gap
+policy: the body is held on the neutral input row with its state still broadcasting, so it comes to rest
+where it was instead of freezing at one tick and jumping when its owner returns. Releasing the seat on the
+drop would open it to the next arrival while its owner is still inside the grace window.
+
+**A restarted process is a different player unless it says otherwise.** `Net` mints one identity per
+process, so a client that rejoins from the same process resumes for free; a client that was killed and
+relaunched has a new identity and is seated as a newcomer. The demo's `--session=N` flag pins one so the
+restart case can be watched at all — a real game persists the value instead.
+
+```sh
+just rts-host                                                  # the host takes seat 0
+godot --path demos/rts -- --join=127.0.0.1 --session=424242    # seat 1; kill it, then run the line again
+```
+
+Relaunch **at once** and the host prints `peer N resumed seat 1 (was peer M)`. There is no `holding` line
+first, and that is the interesting part: ENet does not declare a killed client dead until its keepalive
+times out, so the returning player's handshake arrives while the server still believes the old connection is
+up. The handshake takes the identity back from it and names it as `resumed_from`; the ghost's own drop lands
+whenever the transport gets round to it, carrying no identity and holding nothing.
+
+**Close** the client instead of killing it — a clean ENet disconnect is reported at once — and stay away,
+and the sequence is the one the grace window is for: `peer N dropped -- holding seat 1 for 30s`, then 30 s
+later `seat released -- peer N did not return`, and the next joiner takes seat 1.
+
 ## The rest, briefly
 
 - **Movement is a pure function.** `UnitSteering.step()` over a plane and an AABB list — no
@@ -234,7 +272,7 @@ distinction better than a slider that appears to do something. Making AOI work o
 ## Deliberately omitted
 
 - **No version handshake.** Two incompatible peers connect and misbehave rather than being refused.
-- **No join browser, invites, or reconnection with seat retention.**
+- **No join browser or invites.**
 - **No InputMap** — raw key constants, so there is no project-settings dependency to break across Godot
   versions. A real game should use one.
 - **No fog of war.** It would be presentation-only and maphack-vulnerable: closing it needs a per-peer

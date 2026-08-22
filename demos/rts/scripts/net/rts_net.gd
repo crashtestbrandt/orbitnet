@@ -26,10 +26,22 @@ class_name RtsNet
 ## what lets rule 1 hold for a CLIENT too -- the alternative, blocking the world build on a welcome packet,
 ## re-opens exactly the window rule 1 closes.
 ##
+##   4. PLAYERS ARE SEATED ON Net.peer_joined, NOT ON multiplayer.peer_connected. The transport signal fires
+##      when the socket comes up, which is before the OrbitNet handshake -- so the peer's SESSION IDENTITY is
+##      not known yet, and identity is the only thing that can tell a reconnecting player from a newcomer.
+##      Seating on the transport signal is what makes a rejoiner land in whatever seat happens to be free.
+##
+## RECONNECTION, AND WHAT THE SEAT DOES WHILE NOBODY IS IN IT. A dropped peer's seat is HELD: the roster keeps
+## naming that peer, the commander keeps its input authority pointed at it, and the backend holds the body on
+## the neutral input row with its state still broadcasting (Net.set_reconnect_grace). Nothing is re-pointed on
+## the drop. When the player comes back, Net.peer_joined carries the identity that reclaims the seat and the
+## roster broadcast re-points the commander at the new peer id. When the window closes instead,
+## Net.peer_session_expired frees the seat and the commander goes back to the server.
+##
 ## Deliberately omitted, and listed as known gaps rather than hidden: a build/protocol version handshake (two
-## incompatible peers will connect and misbehave rather than being refused with a reason), a join browser,
-## invites, and reconnection with seat retention. Each is real work in a shipping session layer and none of it
-## teaches anything about the replication lanes.
+## incompatible peers will connect and misbehave rather than being refused with a reason), a join browser, and
+## invites. Each is real work in a shipping session layer and none of it teaches anything about the
+## replication lanes.
 
 signal session_state_changed(state: State)
 signal local_seat_changed(seat: int)
@@ -54,6 +66,14 @@ func _ready() -> void:
 	# here rather than per-session keeps the wiring in one place; it is inert OFFLINE (no loop runs).
 	if not Net.pre_tick.is_connected(_on_pre_tick):
 		Net.pre_tick.connect(_on_pre_tick)
+	# The session-lifecycle signals, connected once for the same reason: they are inert until a session is
+	# hosted, and only ever fire on the authority.
+	if not Net.peer_joined.is_connected(_on_net_peer_joined):
+		Net.peer_joined.connect(_on_net_peer_joined)
+	if not Net.peer_dropped.is_connected(_on_net_peer_dropped):
+		Net.peer_dropped.connect(_on_net_peer_dropped)
+	if not Net.peer_session_expired.is_connected(_on_net_session_expired):
+		Net.peer_session_expired.connect(_on_net_session_expired)
 
 func state() -> State:
 	return _state
@@ -152,11 +172,10 @@ func _on_pre_tick(_tick: int) -> void:
 		world.net_step()
 
 # --- peer lifecycle ------------------------------------------------------------------------------
+## The CLIENT-side transport signals only. The server's join and leave both come from Net (RULE 4): the
+## transport's peer_connected fires before any identity is known, and its peer_disconnected cannot say whether
+## the session is being held open.
 func _connect_peer_signals() -> void:
-	if not multiplayer.peer_connected.is_connected(_on_peer_connected):
-		multiplayer.peer_connected.connect(_on_peer_connected)
-	if not multiplayer.peer_disconnected.is_connected(_on_peer_disconnected):
-		multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 	if not multiplayer.connected_to_server.is_connected(_on_connected_to_server):
 		multiplayer.connected_to_server.connect(_on_connected_to_server)
 	if not multiplayer.connection_failed.is_connected(_on_connection_failed):
@@ -164,24 +183,62 @@ func _connect_peer_signals() -> void:
 	if not multiplayer.server_disconnected.is_connected(_on_server_disconnected):
 		multiplayer.server_disconnected.connect(_on_server_disconnected)
 
-func _on_peer_connected(peer: int) -> void:
+## The seat assignment, on the OrbitNet handshake rather than the transport connect -- see RULE 4. `resumed_from`
+## is the peer id this player held before it dropped, or 0 for a newcomer.
+##
+## THIS DEMO TAKES THE PERMISSIVE RULE, DELIBERATELY. A session reclaims its seat on presentation of the
+## identity alone, which is what makes a fast reconnect work at all -- the transport can take tens of seconds
+## to report the old socket as gone, and until it does, a returning player would otherwise be refused as
+## "every seat is taken". The price is that a forged identity takes a live player's seat rather than merely
+## losing a future resume: the original keeps its connection and its commander simply stops answering it. That
+## is stated as a limit in `README.md`. A game that wants the conservative rule honours `resumed_from` only for
+## a session it already saw `Net.peer_dropped` report with `held = true`.
+func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	if not Net.is_server():
 		return
-	var seat: int = roster.assign(peer)
+	var seat: int = roster.assign(peer, session_id)
 	if seat < 0:
 		# Every seat taken. Refusing here is the honest answer; silently admitting a seatless spectator would
 		# let them connect, receive the whole world, and have every order rejected with no explanation.
 		print("RTS: refusing peer %d -- every seat is taken" % peer)
 		multiplayer.multiplayer_peer.disconnect_peer(peer)
 		return
-	print("RTS: peer %d seated at %d" % [peer, seat])
+	if resumed_from > 0:
+		print("RTS: peer %d resumed seat %d (was peer %d)" % [peer, seat, resumed_from])
+	else:
+		print("RTS: peer %d seated at %d" % [peer, seat])
+	# Re-points the commander at the new peer id on every peer, which is what makes the seat playable again.
 	_broadcast_roster()
 
-func _on_peer_disconnected(peer: int) -> void:
+## A peer's connection is gone. `held` is whether the backend is keeping its session open.
+##
+## A HELD SEAT IS NOT TOUCHED. The roster keeps naming the departed peer, so the seat stays taken and the
+## commander keeps its input authority pointed at an id that is no longer connected -- which is exactly the
+## state the backend's gap policy covers: the body is held on the neutral input row and keeps broadcasting, so
+## every other peer sees it come to rest rather than freeze. Releasing here instead would open the seat to the
+## next arrival while its owner is still inside the grace window.
+func _on_net_peer_dropped(peer: int, session_id: int, held: bool) -> void:
 	if not Net.is_server():
 		return
+	var seat: int = roster.seat_of_peer(peer)
+	if held and seat >= 0:
+		print("RTS: peer %d dropped -- holding seat %d for %.0fs" % [peer, seat, Net.reconnect_grace()])
+		return
+	# Not held, or holding nothing. Three ways to get here: the peer claimed no identity, it was refused
+	# before it was ever seated, or it is a GHOST whose identity a returning player already took back -- the
+	# connection a killed client leaves behind until its keepalive times out. release() is a no-op in that
+	# last case, because assign() moved the seat to the new peer id when the player arrived.
 	roster.release(peer)
-	print("RTS: peer %d left" % peer)
+	print("RTS: peer %d left (session %d, seat %d, not held)" % [peer, session_id, seat])
+	_broadcast_roster()
+
+## The grace window closed with nobody claiming the session: the player is not coming back. Free the seat, and
+## let the roster broadcast hand the commander back to the server (owner 0 resolves to peer 1).
+func _on_net_session_expired(session_id: int, peer: int) -> void:
+	if not Net.is_server():
+		return
+	roster.release_session(session_id)
+	print("RTS: seat released -- peer %d did not return" % peer)
 	_broadcast_roster()
 
 func _on_connected_to_server() -> void:
