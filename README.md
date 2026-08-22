@@ -123,8 +123,12 @@ Known and filed, not hidden:
 
 - **A peer that declares nothing still has its centre and world inferred.** `Net.set_peer_anchor()` and
   `Net.set_peer_anchor_entity()` state both outright; without one they are read off the lowest-id rollback
-  entity that peer drives, so a peer driving more than one is centred and placed by whichever that is, and a
-  peer driving none has neither and sees everything.
+  entity each of that peer's **seats** drives, so a seat driving more than one body is centred and placed by
+  whichever that is, and a peer driving none has neither and sees everything.
+- **A seat cannot arrive or leave mid-session cleanly.** Seats are declared per body and are read where the
+  filter runs, so adding one to a connection already in session re-indexes that connection's interest sets for
+  one tick: the sets are recomputed against the wrong seat's prior members, then correct themselves on the next
+  update. Split-screen players seated at join are unaffected.
 - **Nothing despawns.** A culled entity — or one `Net.set_entity_hidden()` withholds — freezes at its last
   received pose rather than leaving the scene. The rows stop; the node stays.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.

@@ -407,18 +407,24 @@ func set_aoi_max_entities(count: int) -> void:
 ## Declare where one peer OBSERVES from, and which world it observes in. SERVER-SIDE ONLY; no-op OFFLINE or
 ## against a backend that predates the call.
 ##
-## Undeclared, a peer is centred on -- and put in the world of -- the lowest-id rollback body its input drives.
-## That answers what a peer CONTROLS, and interest management asks what it OBSERVES. The two agree in a game with
-## one world and one avatar per player, and disagree in every other one: a spectator drives nothing, a commander
-## watches ground its body is not standing on, and a peer with a body in each of two worlds observes exactly one.
+## Undeclared, each SEAT on a peer is centred on -- and put in the world of -- the lowest-id rollback body that
+## seat drives. That answers what a seat CONTROLS, and interest management asks what it OBSERVES. The two agree
+## in a game with one world and one avatar per player, and disagree in every other one: a spectator drives
+## nothing, a commander watches ground its body is not standing on, and a peer with a body in each of two worlds
+## observes exactly one.
 ##
 ## `membership` is the same id [method NetRollbackHandle.set_membership] declares on an entity, and 0 is every
 ## world. Declaring it here makes a peer's world a FACT RATHER THAN A PICK: the inferred path reads it off
-## whichever of the peer's bodies sorts lowest by hash, so a peer driving two bodies in different worlds has no
+## whichever of the seat's bodies sorts lowest by hash, so a seat driving two bodies in different worlds has no
 ## defined world without this call.
 ##
 ## A DECLARATION REPLACES INFERENCE OUTRIGHT, on both axes at once -- the driven body is consulted for neither
 ## until [method clear_peer_anchor]. May be called before the peer finishes its handshake.
+##
+## IT ALSO COLLAPSES A SPLIT-SCREEN CONNECTION TO ONE VIEWPOINT. This declares where a CONNECTION observes from,
+## and a connection with several seats has stated one answer for all of them. That is the same precedence that
+## stops a declared centre from falling back to an avatar's. A game that wants a centre per seat declares
+## nothing here and lets each seat's own body anchor it -- see [method NetRollbackHandle.set_seat].
 func set_peer_anchor(peer: int, position: Vector3, membership: int = 0) -> void:
 	if _mode == Mode.OFFLINE or not _backend_has(&"set_peer_anchor"):
 		return
@@ -441,9 +447,10 @@ func set_peer_anchor_entity(peer: int, entity_id: int, membership: int = 0) -> v
 		return
 	_orbit.set_peer_anchor_entity(peer, entity_id, membership)
 
-## Retract a peer's anchor declaration AND its world, together. The peer returns to the inferred pair: centred on
-## the lowest-id body its input drives, in that body's world. Retracting one axis without the other would leave a
-## peer declared into a world it has no declared position in, or positioned in a world it is no longer in.
+## Retract a peer's anchor declaration AND its world, together. The peer returns to the inferred pair, one per
+## seat: each centred on the lowest-id body that seat drives, in that body's world. Retracting one axis without
+## the other would leave a peer declared into a world it has no declared position in, or positioned in a world it
+## is no longer in.
 func clear_peer_anchor(peer: int) -> void:
 	if _mode == Mode.OFFLINE or not _backend_has(&"clear_peer_anchor"):
 		return

@@ -125,10 +125,21 @@ The veto stops the rows and nothing else. That is the client-side contract a dis
 inherits the same limit — nothing despawns, so the withheld entity's node stays where it was. Ids stay
 session-global either way: the entity manifest goes to every synced peer whatever any one of them receives.
 
-**A peer's centre and its world both come from one body**: the lowest-id entity whose *input* authority is that
-peer and which resolved an anchor. A peer with no such body has neither, and the backend correctly falls back
-to "everything is in interest" — every world, at every distance. This is the limitation most likely to surprise
-you — see [api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
+**A seat's centre and its world both come from one body**: the lowest-id entity whose *input* authority is that
+peer, which declares that seat, and which resolved an anchor. A seat with no such body has neither, and the
+backend correctly falls back to "everything is in interest" — every world, at every distance. This is the
+limitation most likely to surprise you — see
+[api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
+
+**A connection may hold several seats, and the filter runs once per seat.** A seat is one owned, predicted body
+behind one transport peer; local split-screen is two or more, and the sentence above is per seat: the anchor is
+the lowest-id entity whose input authority is that peer AND which declares that seat. Relevancy is a property of
+a viewpoint, so each seat gets its own centre, world, hysteresis band and cap — while the delta base, the ack
+window, the veto and the byte budget stay per connection, because those are properties of a datagram. What the
+datagram carries is the **union** of the connection's seats, holding the **nearest** seat's distance per entity,
+and an entity leaves only when every seat has let go of it. Every body is on seat `0` until
+`NetRollbackHandle.set_seat()` says otherwise, which is one seat per connection and is what every connection had
+before seats existed.
 
 **That inference is a fallback, and `Net.set_peer_anchor()` replaces it.** What a peer observes is a different
 question from what its input drives — a spectator drives nothing, and a peer with a body in each of two worlds

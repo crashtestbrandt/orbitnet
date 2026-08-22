@@ -22,6 +22,12 @@ lane, including a puck nobody authors. Between them the two demos cover both hal
 | **State** | every unit | 96 |
 | **Command** | every order | one channel per *seat* |
 
+**Seat** here is the backend's word for the same thing: one owned, predicted body behind a connection. This
+demo's roster is a bijection — one seat per peer, which is `NetRollbackHandle.set_seat()` left at its default
+of `0` — so "seat" and "connection" name the same thing throughout it. They stop naming the same thing under
+local split-screen, where one connection holds several seats; see
+[api.md](api.md#seats-several-owned-bodies-on-one-connection).
+
 ### Why exactly one rollback entity per player
 
 The rollback lane exists for input arriving **every tick** that can be **predicted from the last one**. An RTS

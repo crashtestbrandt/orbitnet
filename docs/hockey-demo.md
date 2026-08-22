@@ -174,6 +174,10 @@ tick forever, including offline, where nothing is corrected.
 - **Drop-in and drop-out are the same mechanism.** A peer connecting takes a seat, a peer leaving releases it,
   and the whole seat table is rebroadcast either way over a reliable RPC — which is what re-points each
   `MalletInput`'s multiplayer authority on every peer.
+- **One seat per peer, which is the backend's default.** The backend seats a *body*, not a connection, and
+  `NetRollbackHandle.set_seat()` lets one connection drive several — local split-screen. This demo declares
+  none, so every mallet is on seat `0` and "seat" and "connection" name the same thing throughout it. See
+  [api.md](api.md#seats-several-owned-bodies-on-one-connection).
 - **Mallets do not collide with each other.** Team-mates may overlap, and the renderer fades the nearer one
   instead of pushing it away. Pushing would put a rule in the simulation to solve a drawing problem, and every
   peer would then have to predict it.

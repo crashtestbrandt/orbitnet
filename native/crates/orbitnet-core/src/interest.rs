@@ -15,6 +15,16 @@
 //! cluster spread horizontally, so vertical binning would only fragment cells — but queries still
 //! measure true 3D euclidean distance, so a body far overhead is correctly out of range.
 //!
+//! ## Seats
+//!
+//! A [`PeerInterest`] is one **seat's** set: one viewpoint, with one centre and one world. A
+//! connection may carry several — local split-screen is two or more locally-owned bodies behind a
+//! single transport peer — and [`ConnectionInterest`] is the level above: one `PeerInterest` per
+//! seat, unioned into the set the datagram carries, with the nearest seat's distance kept per
+//! member. Relevancy is a property of a viewpoint; a delta base, a byte budget and the veto below
+//! are properties of a datagram. A connection with one seat is filtered exactly as it was before
+//! seats existed.
+//!
 //! [`PeerInterest`] layers hysteresis on top: an entity *enters* a peer's set inside
 //! `enter_radius` but only *leaves* past `enter_radius * exit_factor`. Inside the band between the
 //! two radii, current members stay and newcomers are refused, so a body drifting along the
@@ -56,6 +66,10 @@
 //! **A veto stops the rows and nothing else.** It is the same client-side contract a distance cull
 //! has: the entity's updates stop arriving and its node is never removed, so the consuming project
 //! decides what an entity that stopped updating means.
+//!
+//! **A veto is per CONNECTION, not per seat.** What it refuses is a row in a datagram, and a
+//! datagram is shared by every seat on the connection, so [`ConnectionInterest::set_hidden`] mirrors
+//! it onto each of them — including a seat that appears later — rather than filtering the union.
 //!
 //! ## Grid or scan
 //!
@@ -754,15 +768,7 @@ impl PeerInterest {
     /// interest-set sizes this exists to serve is worse than the filter it replaced.
     fn commit(&mut self, scratch: &mut [(BodyId, f32)], leaves: &mut Vec<BodyId>) {
         scratch.sort_unstable_by_key(|&(id, _)| id);
-        let mut fresh = scratch.iter().peekable();
-        for &id in self.members.keys() {
-            while fresh.peek().is_some_and(|&&(candidate, _)| candidate < id) {
-                fresh.next();
-            }
-            if fresh.peek().is_none_or(|&&(candidate, _)| candidate != id) {
-                leaves.push(id);
-            }
-        }
+        push_leaves(&self.members, scratch, leaves);
         self.members.clear();
         for &(id, dist_sq) in scratch.iter() {
             self.members
@@ -847,6 +853,254 @@ impl PeerInterest {
     }
 
     /// How many entities are vetoed for this peer.
+    #[must_use]
+    pub fn hidden_len(&self) -> usize {
+        self.hidden.len()
+    }
+}
+
+/// Push every id `old` holds that `fresh` does not onto `leaves`.
+///
+/// `fresh` must be sorted ascending by id, and `old` already is, so the diff is one linear merge.
+/// Shared by [`PeerInterest::commit`] and [`ConnectionInterest::update_linear_into`], so a seat's
+/// leave rule and a connection's are one rule applied to two sets rather than two copies of it.
+fn push_leaves(old: &BTreeMap<BodyId, f32>, fresh: &[(BodyId, f32)], leaves: &mut Vec<BodyId>) {
+    let mut fresh = fresh.iter().peekable();
+    for &id in old.keys() {
+        while fresh.peek().is_some_and(|&&(candidate, _)| candidate < id) {
+            fresh.next();
+        }
+        if fresh.peek().is_none_or(|&&(candidate, _)| candidate != id) {
+            leaves.push(id);
+        }
+    }
+}
+
+/// Where one **seat** observes from, and which world it observes in.
+///
+/// A seat is one owned viewpoint on a connection. Local split-screen puts two or more behind a
+/// single transport peer, each with its own body, its own centre and its own world; a connection
+/// with one seat — every connection in a game without split-screen — is the one-element case and is
+/// filtered exactly as it was before seats existed.
+///
+/// The two fields fail independently, and [`ConnectionInterest::update_linear_into`] relies on it. A
+/// non-finite `center` means "this seat has no position to be culled by" and admits everything its
+/// world allows, while `membership` still refuses another world. A seat whose body has not spawned
+/// yet therefore keeps its own set open, rather than inheriting the centre of a seat it is nowhere
+/// near.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeatObserver {
+    /// The centre this seat's radius is measured from. Non-finite means no distance filter for
+    /// this seat.
+    pub center: [f32; 3],
+    /// The world this seat is in, or [`MEMBERSHIP_GLOBAL`] for every world.
+    pub membership: MembershipId,
+}
+
+/// Caller-owned working storage for [`ConnectionInterest::update_linear_into`].
+///
+/// One per caller, reused across ticks and connections, so a warm update allocates nothing. It
+/// holds the buffers the per-seat pass needs — the distance scratch each seat's own update clears,
+/// the per-seat leave list a connection does not publish, and the merged union — rather than taking
+/// three more `&mut Vec` parameters.
+#[derive(Debug, Default, Clone)]
+pub struct SeatScratch {
+    dist: Vec<(BodyId, f32)>,
+    leaves: Vec<BodyId>,
+    merged: Vec<(BodyId, f32)>,
+}
+
+/// One CONNECTION's interest: a hysteretic set per seat, unioned into the set the datagram carries.
+///
+/// **The two levels exist because the two questions have different answers.** Relevancy is a
+/// property of a seat — a viewpoint, with its own centre and its own world — while a delta base, an
+/// ack window and a byte budget are properties of the datagram, and a datagram is per connection.
+/// So each seat gets its own [`PeerInterest`] with its own hysteresis, and what the send path reads
+/// is their union.
+///
+/// The rules that follow from that, each of them a test in this module:
+///
+/// * **Membership is the union.** An entity one seat can see is carried on the connection, whatever
+///   the other seats say.
+/// * **A leave is a leave from the UNION.** Clearing `last_sent` / `acked_base` when an entity
+///   leaves one seat's set would break the delta chain of a body another seat is still watching —
+///   a full-state burst for a body that never went anywhere.
+/// * **The stored distance is the NEAREST seat's.** The send rota reads it back as a band, so a
+///   body in the second seat's face must not be scored at its distance from the first.
+/// * **The cap is per seat.** `AoiConfig::max_entities` bounds what one viewpoint needs; a second
+///   viewpoint needs its own N, and the datagram is bounded by the byte budget rather than by this.
+/// * **Seats are positional.** `seats[i]` in the slice handed to the update is the same seat next
+///   tick, because that index is what carries its hysteresis. A shorter slice truncates the tail,
+///   and everything only the dropped seats held leaves the union on that tick.
+///
+/// * **The veto is per connection**, and it is the one thing here that is not decided per seat. A
+///   withheld entity is one this datagram may not carry, so [`Self::set_hidden`] is mirrored onto
+///   every seat — including one that joins later — rather than applied to the union. Applying it to
+///   the union alone would leave the entity occupying a seat's `max_entities` population, which is
+///   exactly what [`PeerInterest::set_hidden`] refuses at the candidate to avoid.
+///
+/// A connection with exactly one seat is [`PeerInterest`] exactly — same members, same distances,
+/// same leaves — which `one_seat_matches_a_bare_peer_interest` asserts.
+#[derive(Debug, Default, Clone)]
+pub struct ConnectionInterest {
+    /// One hysteretic set per seat, positional and parallel to the observer slice.
+    seats: Vec<PeerInterest>,
+    /// The union, holding the nearest seat's distance squared per member.
+    members: BTreeMap<BodyId, f32>,
+    /// The connection's standing vetoes, held here as well as on every seat so a seat added later
+    /// inherits them. See [`Self::set_hidden`].
+    hidden: HashSet<BodyId>,
+}
+
+impl ConnectionInterest {
+    /// A connection with no seats and an empty union.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Recompute every seat's set from `candidates`, union them, and report what left the union.
+    ///
+    /// Each seat is filtered by [`PeerInterest::update_linear_into`] against its own centre and its
+    /// own world, so every rule that path documents — hysteresis, the always-set, the membership
+    /// refusal, the nearest-N cap, the non-finite-centre fail-open — holds per seat here.
+    ///
+    /// `candidates` is the CONNECTION's list, not the seat's: a body the connection drives is
+    /// `always` to every seat on it, because the datagram that would carry it is shared. Nothing
+    /// here is per seat except where it is observed from.
+    ///
+    /// `leaves` is cleared on entry and receives the union's leaves in ascending id order.
+    pub fn update_linear_into(
+        &mut self,
+        cfg: &AoiConfig,
+        seats: &[SeatObserver],
+        candidates: &[InterestCandidate],
+        scratch: &mut SeatScratch,
+        leaves: &mut Vec<BodyId>,
+    ) {
+        leaves.clear();
+        // Grows for a new seat and TRUNCATES for a departed one, which is the whole of the
+        // seat-count rule: everything only the dropped seats held falls out of the union below and
+        // is reported as a leave.
+        let held = self.seats.len();
+        self.seats.resize_with(seats.len(), PeerInterest::new);
+        // A seat that just appeared starts with no vetoes of its own, and a veto is the
+        // CONNECTION's — so it inherits the standing declarations before it filters anything. Miss
+        // this and adding a seat hands that connection every entity it was being withheld from.
+        for seat in &mut self.seats[held.min(seats.len())..] {
+            for &id in &self.hidden {
+                seat.set_hidden(id, true);
+            }
+        }
+
+        scratch.merged.clear();
+        for (set, observer) in self.seats.iter_mut().zip(seats) {
+            set.update_linear_into(
+                cfg,
+                observer.center,
+                observer.membership,
+                candidates,
+                &mut scratch.dist,
+                &mut scratch.leaves,
+            );
+            scratch.merged.extend(set.iter_with_distance());
+        }
+
+        // Ascending by id, then by distance, so the first entry for an id is the nearest seat's and
+        // `dedup_by_key` — which keeps the FIRST of a run — is the whole of the nearest-seat rule.
+        // Every distance here is finite and non-negative: `PeerInterest` normalises the
+        // always-relevant `NEG_INFINITY` to `0.0` before storing it.
+        scratch
+            .merged
+            .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+        scratch.merged.dedup_by_key(|&mut (id, _)| id);
+
+        push_leaves(&self.members, &scratch.merged, leaves);
+        self.members.clear();
+        self.members.extend(scratch.merged.iter().copied());
+    }
+
+    /// How many seats this connection currently holds.
+    #[must_use]
+    pub fn seat_count(&self) -> usize {
+        self.seats.len()
+    }
+
+    /// Whether any seat on this connection holds `id`.
+    #[must_use]
+    pub fn contains(&self, id: BodyId) -> bool {
+        self.members.contains_key(&id)
+    }
+
+    /// The distance squared the NEAREST seat recorded for `id` at the last update (`0.0` for
+    /// always-relevant entities, which have no meaningful distance).
+    #[must_use]
+    pub fn dist_sq(&self, id: BodyId) -> Option<f32> {
+        self.members.get(&id).copied()
+    }
+
+    /// The union with its per-member distance squared, in ascending id order.
+    pub fn iter_with_distance(&self) -> impl Iterator<Item = (BodyId, f32)> + '_ {
+        self.members.iter().map(|(&id, &dist_sq)| (id, dist_sq))
+    }
+
+    /// The union's ids in ascending order — the deterministic wire order.
+    pub fn iter(&self) -> impl Iterator<Item = BodyId> + '_ {
+        self.members.keys().copied()
+    }
+
+    /// How many entities the union holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    /// Whether the union holds nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// Drop `id` from the union **and from every seat** — for despawns, which must not wait for the
+    /// next update to fall out of the filter. Missing one seat would let a freed id re-enter the
+    /// union on the next update without passing the filter again.
+    pub fn remove(&mut self, id: BodyId) {
+        self.members.remove(&id);
+        for seat in &mut self.seats {
+            seat.remove(id);
+        }
+    }
+
+    /// Start or stop withholding `id` from this CONNECTION. [`PeerInterest::set_hidden`] carries
+    /// every rule; this is where the declaration is held and how it reaches each seat.
+    ///
+    /// **A veto is per connection and is applied per seat.** What it refuses is a row in a datagram,
+    /// and the datagram is shared — so there is no coherent meaning to withholding an entity from
+    /// one seat of a connection while another seat's set carries it onto the same wire. Mirroring it
+    /// onto every seat is also what keeps a withheld entity out of each seat's `max_entities`
+    /// population, which vetoing the union alone would lose.
+    ///
+    /// It is held here as well because seats come and go: a seat that appears later inherits the
+    /// standing set at its first update, and a seat that leaves takes only its own copy with it.
+    pub fn set_hidden(&mut self, id: BodyId, hidden: bool) {
+        if hidden {
+            self.hidden.insert(id);
+            self.members.remove(&id);
+        } else {
+            self.hidden.remove(&id);
+        }
+        for seat in &mut self.seats {
+            seat.set_hidden(id, hidden);
+        }
+    }
+
+    /// Whether `id` is vetoed for this connection. See [`Self::set_hidden`].
+    #[must_use]
+    pub fn is_hidden(&self, id: BodyId) -> bool {
+        !self.hidden.is_empty() && self.hidden.contains(&id)
+    }
+
+    /// How many entities are vetoed for this connection.
     #[must_use]
     pub fn hidden_len(&self) -> usize {
         self.hidden.len()
@@ -2357,5 +2611,350 @@ mod tests {
             .filter(|&tick| send_phase(u64::MAX, tick, interval))
             .count();
         assert_eq!(fires, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Seats: one hysteretic set per viewpoint, unioned per connection
+    // ------------------------------------------------------------------
+
+    /// A seat observing from `center`, in every world.
+    fn seat_at(center: [f32; 3]) -> SeatObserver {
+        SeatObserver {
+            center,
+            membership: MEMBERSHIP_GLOBAL,
+        }
+    }
+
+    /// A seat observing from `center`, in `membership`.
+    fn seat_in(center: [f32; 3], membership: MembershipId) -> SeatObserver {
+        SeatObserver { center, membership }
+    }
+
+    /// One connection update, returning the union's leaves.
+    fn update_connection(
+        connection: &mut ConnectionInterest,
+        cfg: &AoiConfig,
+        seats: &[SeatObserver],
+        candidates: &[InterestCandidate],
+    ) -> Vec<BodyId> {
+        let mut scratch = SeatScratch::default();
+        let mut leaves = Vec::new();
+        connection.update_linear_into(cfg, seats, candidates, &mut scratch, &mut leaves);
+        leaves
+    }
+
+    #[test]
+    fn one_seat_matches_a_bare_peer_interest() {
+        // The compatibility claim the whole two-level structure rests on: a connection with one
+        // seat is the shape every connection had before seats existed. Walked over moving bodies
+        // and a moving centre, so hysteresis, the cap and the leave diff are all exercised.
+        let cfg = cfg(32.0, 100.0, 1.25, 3);
+        let mut state = 0x0BAD_5EA7u32;
+        let mut connection = ConnectionInterest::new();
+        let mut reference = PeerInterest::new();
+        let (mut scratch, mut ref_scratch) = (SeatScratch::default(), Vec::new());
+        let (mut leaves, mut ref_leaves) = (Vec::new(), Vec::new());
+
+        for step in 0..64u32 {
+            let candidates: Vec<InterestCandidate> = (0..24u64)
+                .map(|id| {
+                    let pos = [lcg_coord(&mut state), 0.0, lcg_coord(&mut state)];
+                    if id % 8 == 0 {
+                        InterestCandidate::always(id)
+                    } else {
+                        InterestCandidate::anchored(id, pos)
+                    }
+                })
+                .collect();
+            let center = [f32::from(step as u16) - 32.0, 0.0, 12.0];
+
+            connection.update_linear_into(
+                &cfg,
+                &[seat_at(center)],
+                &candidates,
+                &mut scratch,
+                &mut leaves,
+            );
+            reference.update_linear_into(
+                &cfg,
+                center,
+                MEMBERSHIP_GLOBAL,
+                &candidates,
+                &mut ref_scratch,
+                &mut ref_leaves,
+            );
+
+            assert_eq!(
+                connection.iter_with_distance().collect::<Vec<_>>(),
+                reference.iter_with_distance().collect::<Vec<_>>(),
+                "members diverged at step {step}"
+            );
+            assert_eq!(leaves, ref_leaves, "leaves diverged at step {step}");
+        }
+    }
+
+    #[test]
+    fn membership_is_the_union_of_the_seats() {
+        // Two seats 1000 m apart, each with a body beside it. Neither is inside the other's
+        // radius, and the connection carries both — which is the whole feature: the datagram is
+        // shared, so what any seat can see rides on it.
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [0.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [1000.0, 0.0, 0.0]),
+            InterestCandidate::anchored(3, [500.0, 0.0, 0.0]),
+        ];
+        let mut connection = ConnectionInterest::new();
+        update_connection(
+            &mut connection,
+            &cfg,
+            &[seat_at([0.0; 3]), seat_at([1000.0, 0.0, 0.0])],
+            &candidates,
+        );
+
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(connection.seat_count(), 2);
+        // The body between them is out of range of both, and a union of two refusals is a refusal.
+        assert!(!connection.contains(3));
+    }
+
+    #[test]
+    fn the_stored_distance_is_the_nearest_seats() {
+        // The send rota reads this back as a band. A body in the second seat's face scored at its
+        // distance from the first is the second player's world updating at long-range rates.
+        let cfg = cfg(32.0, 400.0, 1.25, 0);
+        let candidates = [InterestCandidate::anchored(1, [300.0, 0.0, 0.0])];
+        let mut connection = ConnectionInterest::new();
+        update_connection(
+            &mut connection,
+            &cfg,
+            &[seat_at([0.0; 3]), seat_at([310.0, 0.0, 0.0])],
+            &candidates,
+        );
+        assert_eq!(connection.dist_sq(1), Some(100.0));
+
+        // Order of the seats does not decide it — the nearest does.
+        let mut reversed = ConnectionInterest::new();
+        update_connection(
+            &mut reversed,
+            &cfg,
+            &[seat_at([310.0, 0.0, 0.0]), seat_at([0.0; 3])],
+            &candidates,
+        );
+        assert_eq!(reversed.dist_sq(1), Some(100.0));
+    }
+
+    #[test]
+    fn a_leave_fires_only_when_every_seat_lets_go() {
+        // The correctness requirement. `last_sent` / `acked_base` are cleared from this list, so a
+        // leave reported while another seat still watches the body breaks a live delta chain.
+        let cfg = cfg(32.0, 100.0, 1.0, 0);
+        let mut connection = ConnectionInterest::new();
+        let near = [InterestCandidate::anchored(1, [0.0, 0.0, 0.0])];
+        let seats = [seat_at([0.0; 3]), seat_at([50.0, 0.0, 0.0])];
+        assert!(update_connection(&mut connection, &cfg, &seats, &near).is_empty());
+        assert!(connection.contains(1));
+
+        // Out of the first seat's radius, still inside the second's: no leave.
+        let seats = [seat_at([500.0, 0.0, 0.0]), seat_at([50.0, 0.0, 0.0])];
+        assert!(update_connection(&mut connection, &cfg, &seats, &near).is_empty());
+        assert!(connection.contains(1));
+
+        // Out of both: one leave, once.
+        let seats = [seat_at([500.0, 0.0, 0.0]), seat_at([600.0, 0.0, 0.0])];
+        assert_eq!(update_connection(&mut connection, &cfg, &seats, &near), [1]);
+        assert!(!connection.contains(1));
+    }
+
+    #[test]
+    fn a_seat_with_no_centre_keeps_its_own_set_relevant() {
+        // The failure this replaces: culling switched on and off per CONNECTION, so a seat whose
+        // body had not spawned yet inherited the other seat's centre and had its surroundings
+        // culled around a position it was nowhere near.
+        let cfg = cfg(32.0, 10.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [0.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [900.0, 0.0, 0.0]),
+        ];
+        let mut connection = ConnectionInterest::new();
+        update_connection(
+            &mut connection,
+            &cfg,
+            &[seat_at([0.0; 3]), seat_at([f32::NAN; 3])],
+            &candidates,
+        );
+        // The located seat culls to its radius; the unlocated one measures nothing and refuses
+        // nothing, so the far body rides on the connection.
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_seat_is_filtered_in_its_own_world() {
+        // Membership is per seat, and the union crosses worlds: a connection with a body in each
+        // of two worlds carries both. The distance test cannot separate them — both worlds are
+        // rebased on the same origin here, which is the case membership exists for.
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored_in(1, [0.0, 0.0, 0.0], 7),
+            InterestCandidate::anchored_in(2, [0.0, 0.0, 0.0], 9),
+            InterestCandidate::anchored_in(3, [0.0, 0.0, 0.0], 11),
+        ];
+        let mut connection = ConnectionInterest::new();
+        update_connection(
+            &mut connection,
+            &cfg,
+            &[seat_in([0.0; 3], 7), seat_in([0.0; 3], 9)],
+            &candidates,
+        );
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn the_cap_is_per_seat() {
+        // `max_entities` bounds what one viewpoint needs. A second viewpoint needs its own N, so
+        // the union may hold up to N per seat; the datagram is bounded by the byte budget instead.
+        let cfg = cfg(32.0, 1000.0, 1.25, 2);
+        let candidates: Vec<InterestCandidate> = (0..8u64)
+            .map(|id| InterestCandidate::anchored(id, [id as f32 * 10.0, 0.0, 0.0]))
+            .collect();
+        let mut connection = ConnectionInterest::new();
+        update_connection(
+            &mut connection,
+            &cfg,
+            &[seat_at([0.0; 3]), seat_at([70.0, 0.0, 0.0])],
+            &candidates,
+        );
+        // Nearest two of the first seat (0, 1) and of the second (7, 6).
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![0, 1, 6, 7]);
+    }
+
+    #[test]
+    fn hysteresis_is_per_seat() {
+        // A body retained by the seat that already held it, inside the exit band, is NOT admitted
+        // to a seat it is equally far from and was never a member of. Two sets, two answers, and
+        // the union takes the retaining seat's distance.
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let mut connection = ConnectionInterest::new();
+        let near = [InterestCandidate::anchored(1, [0.0, 0.0, 0.0])];
+        update_connection(
+            &mut connection,
+            &cfg,
+            &[seat_at([0.0; 3]), seat_at([110.0, 0.0, 0.0])],
+            &near,
+        );
+        assert_eq!(connection.dist_sq(1), Some(0.0));
+
+        // Now 110 m from the first seat — past `enter_radius`, inside `enter * exit_factor`, and a
+        // member, so it stays — and 110 m from the second, which never held it and refuses it.
+        let seats = [seat_at([110.0, 0.0, 0.0]), seat_at([-110.0, 0.0, 0.0])];
+        assert!(update_connection(&mut connection, &cfg, &seats, &near).is_empty());
+        assert_eq!(connection.dist_sq(1), Some(110.0 * 110.0));
+    }
+
+    #[test]
+    fn dropping_a_seat_leaves_what_only_it_held() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [0.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [1000.0, 0.0, 0.0]),
+        ];
+        let mut connection = ConnectionInterest::new();
+        let seats = [seat_at([0.0; 3]), seat_at([1000.0, 0.0, 0.0])];
+        update_connection(&mut connection, &cfg, &seats, &candidates);
+        assert_eq!(connection.len(), 2);
+
+        // The second seat goes away. Its body leaves the union, and the first seat's set — and its
+        // hysteresis — is untouched, because seats are positional.
+        assert_eq!(
+            update_connection(&mut connection, &cfg, &seats[..1], &candidates),
+            [2]
+        );
+        assert_eq!(connection.seat_count(), 1);
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn remove_drops_the_id_from_every_seat() {
+        // A despawn must not survive in a seat's set: it would re-enter the union on the next
+        // update without ever passing the filter again.
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [InterestCandidate::anchored(1, [0.0, 0.0, 0.0])];
+        let mut connection = ConnectionInterest::new();
+        let seats = [seat_at([0.0; 3]), seat_at([10.0, 0.0, 0.0])];
+        update_connection(&mut connection, &cfg, &seats, &candidates);
+        connection.remove(1);
+        assert!(connection.is_empty());
+
+        // Nothing to re-admit it: the same update over an empty candidate list keeps it gone, and
+        // reports no leave, because the union no longer held it.
+        assert!(update_connection(&mut connection, &cfg, &seats, &[]).is_empty());
+        assert!(!connection.contains(1));
+    }
+
+    /// A veto refuses a row in a datagram, and the datagram is shared — so it holds whichever seat
+    /// would otherwise have admitted the entity, and it beats `always` there as it does on one set.
+    #[test]
+    fn a_veto_holds_across_every_seat_on_the_connection() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [
+            InterestCandidate::anchored(1, [0.0, 0.0, 0.0]),
+            InterestCandidate::always(2),
+        ];
+        let mut connection = ConnectionInterest::new();
+        let seats = [seat_at([0.0; 3]), seat_at([10.0, 0.0, 0.0])];
+        update_connection(&mut connection, &cfg, &seats, &candidates);
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1, 2]);
+
+        connection.set_hidden(1, true);
+        connection.set_hidden(2, true);
+        assert!(connection.is_hidden(1));
+        assert_eq!(connection.hidden_len(), 2);
+        assert!(
+            connection.is_empty(),
+            "both left the union in the call, not at the next update"
+        );
+        // And neither seat re-admits them, the always-relevant one included.
+        assert!(update_connection(&mut connection, &cfg, &seats, &candidates).is_empty());
+        assert!(connection.is_empty());
+
+        // Retracting re-admits through `enter_radius` like any newcomer.
+        connection.set_hidden(1, false);
+        update_connection(&mut connection, &cfg, &seats, &candidates);
+        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// **A seat that appears later inherits the connection's standing vetoes.** It starts with an
+    /// empty set of its own, and without this the tick a split-screen player joins is the tick that
+    /// connection is handed every entity it was being withheld from.
+    #[test]
+    fn a_seat_added_later_inherits_the_connections_vetoes() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [InterestCandidate::anchored(1, [0.0, 0.0, 0.0])];
+        let mut connection = ConnectionInterest::new();
+        update_connection(&mut connection, &cfg, &[seat_at([0.0; 3])], &candidates);
+        connection.set_hidden(1, true);
+        assert!(connection.is_empty());
+
+        let two = [seat_at([0.0; 3]), seat_at([5.0, 0.0, 0.0])];
+        update_connection(&mut connection, &cfg, &two, &candidates);
+        assert_eq!(connection.seat_count(), 2);
+        assert!(
+            connection.is_empty(),
+            "the new seat was withheld the entity too"
+        );
+    }
+
+    #[test]
+    fn a_connection_with_no_seats_holds_nothing() {
+        // A connection whose seats have not been resolved yet is not a connection that sees
+        // everything: the send path gives an unlocatable connection ONE seat with a non-finite
+        // centre, which is the fail-open. An empty slice is the different statement that there is
+        // no viewpoint at all, and it must not quietly become the first one.
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let candidates = [InterestCandidate::always(1)];
+        let mut connection = ConnectionInterest::new();
+        update_connection(&mut connection, &cfg, &[], &candidates);
+        assert!(connection.is_empty());
+        assert_eq!(connection.seat_count(), 0);
     }
 }

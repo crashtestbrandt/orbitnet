@@ -27,6 +27,7 @@ use orbitnet_core::{
 };
 
 use crate::binding::{self, PropBinding};
+use crate::orbit_net::SeatIndex;
 
 /// `relevancy`: this channel is replicated to every peer in every world, whatever the interest
 /// radius says and whatever `membership_property` names.
@@ -211,6 +212,30 @@ pub struct OrbitRollbackSynchronizer {
     #[export]
     priority: i32,
 
+    /// Which **seat** on the owning connection drives this body — `0` unless the game says
+    /// otherwise.
+    ///
+    /// A seat is one owned viewpoint behind one transport peer. Local split-screen over a network
+    /// session is two or more locally-owned, locally-predicted bodies on a single connection, and
+    /// each needs its own interest anchor: the second player's surroundings are not the first
+    /// player's. The owning peer is read off `input_authority_node`; this is the other half of the
+    /// answer, and `(input owner, seat)` is what the interest pass keys an anchor on.
+    ///
+    /// **Server-side, and it replicates nothing.** Interest is computed only where state authority
+    /// is, so this is read only there — the server assigns seats and declares them on its own copy
+    /// of the scene. A client may leave every body at `0`; nothing on the wire carries a seat, and
+    /// the anti-forgery check on received input is per entity and unchanged.
+    ///
+    /// **A label, not a slot index.** Two bodies with the same input owner and the same value here
+    /// share one anchor — lowest entity id wins, as before — and every distinct value on one
+    /// connection is one more interest set to maintain. The numbers need not be contiguous, and
+    /// their order decides nothing but the order the sets are held in.
+    ///
+    /// Every body left at the default `0` is one seat per connection, which is what every
+    /// connection had before seats existed.
+    #[export]
+    seat: i32,
+
     /// The world this body belongs to, as a `"NodePath:property"` entry naming an **int**, resolved
     /// against `root`.
     ///
@@ -299,6 +324,7 @@ impl INode for OrbitRollbackSynchronizer {
             enable_prediction: true,
             exempt: false,
             priority: 1,
+            seat: 0,
             membership_property: GString::new(),
             entity_id: 0,
             state_schema: SchemaBuilder::new(),
@@ -760,6 +786,16 @@ impl OrbitRollbackSynchronizer {
     pub(crate) fn send_priority(&self) -> u32 {
         self.priority
             .clamp(1, orbitnet_core::priority::PRIORITY_MAX as i32) as u32
+    }
+
+    /// The declared seat, clamped into the range the interest pass keys an anchor on.
+    ///
+    /// A negative value is a game writing its own "unset" into an `int` export, and it reads as
+    /// seat `0` — the same fail-onto-the-default direction the rest of these declarations take.
+    /// The cost of getting it wrong is one connection's two viewpoints sharing an anchor, which is
+    /// the behaviour that predates seats, not a body deleted from somebody's world.
+    pub(crate) fn seat_hint(&self) -> SeatIndex {
+        self.seat.clamp(0, i32::from(SeatIndex::MAX)) as SeatIndex
     }
 
     /// Whether this peer simulates the entity in the rollback loop.
