@@ -1853,11 +1853,36 @@ impl OrbitNet {
     /// Lives on this node purely because the extension is the only first-party binary loaded by a
     /// RELEASE export template — Godot's own crash handler is `DEBUG_ENABLED`-only, so a shipped
     /// build otherwise dies with no backtrace and no `NOTIFICATION_CRASH`. `dir` is resolved and
-    /// created by the caller (`CrashLogger`, which already owns `user://logs`), so nothing in the
-    /// signal path has to touch Godot. Idempotent; returns false if already installed.
+    /// created by the caller, which already owns its own log directory, so nothing in the signal
+    /// path has to touch Godot. Idempotent; returns false if already installed.
     #[func]
     fn install_crash_handler(&self, dir: GString) -> bool {
         crate::crash::install(&dir.to_string())
+    }
+
+    /// Where a Windows fail-fast would leave a dump, read back from Windows Error Reporting.
+    ///
+    /// [`Self::install_crash_handler`]'s Windows filter never runs for `__fastfail` — what the CRT
+    /// raises on detected heap corruption — because a fail-fast bypasses every in-process handler by
+    /// design. WER's out-of-process `LocalDumps` collector is the only thing that sees it, and
+    /// OrbitNet never writes those keys: they are HKLM-only, need administrator privileges, and set
+    /// policy for every application on the machine. So this READS what the machine is already
+    /// configured to do, and a caller's crash report can name the folder or say nothing collects.
+    ///
+    /// Keys: `supported` (false off Windows), `configured`, `scope` (`none`/`global`/`image`),
+    /// `folder`, `dump_type`, `dump_count`, `image`. See `docs/crash-capture.md`.
+    #[func]
+    fn crash_dump_config(&self) -> VarDictionary {
+        let dumps = crate::crash::local_dumps();
+        vdict! {
+            "supported" => dumps.supported,
+            "configured" => dumps.configured,
+            "scope" => &GString::from(dumps.scope),
+            "folder" => &GString::from(dumps.folder.as_str()),
+            "dump_type" => dumps.dump_type,
+            "dump_count" => dumps.dump_count,
+            "image" => &GString::from(dumps.image.as_str()),
+        }
     }
 
     /// The protocol major version. Peers must agree on this exactly.
