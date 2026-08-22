@@ -1015,6 +1015,10 @@ pub struct OrbitNet {
     // --- Send-path accounting. Raw counters accumulate on the hot path; `m_bw` is what
     // `metrics()` reads, republished once a window because `metrics()` is `&self`. ---
     m_bw: BandwidthMetrics,
+    /// Mean ticks between admissions for one peer's rows, pooled across every band, republished
+    /// once a window from `acc_peer_band`. Rebuilt rather than updated, so a peer that left during
+    /// the window is absent from the next one instead of frozen at its last figure.
+    m_peer_interarrival: HashMap<i32, f64>,
     bw_timer: f64,
     acc_tx_bytes: u64,
     acc_tx_datagrams: u64,
@@ -1034,6 +1038,22 @@ pub struct OrbitNet {
     acc_interest_members: u64,
     acc_band_sends: [u64; 3],
     acc_band_members: [u64; 3],
+    /// `(sends, members)` per peer over the window: the same two counts as `acc_band_sends` and
+    /// `acc_band_members`, split by peer and pooled across the three bands.
+    ///
+    /// Send cadence is a per-peer quantity. The byte budget is charged per peer per frame and the
+    /// candidate list is rebuilt per peer, so a peer with a small interest set gets its rows every
+    /// tick while a peer in a dense part of the world waits several. Pooling the counts across peers
+    /// publishes one figure that describes no peer in the session, and the lag-compensation rewind
+    /// then charges every shooter the pool mean for a view lag only their own cadence earns.
+    ///
+    /// Pooled across bands rather than split by them. The consumer is the interpolation term in a
+    /// shot's rewind depth, which is applied at every range and cannot see which band its target sits
+    /// in. The per-band split stays global, where it answers whether the far band is genuinely far.
+    ///
+    /// Accumulated into per-peer locals on the hot path and folded in once per peer per tick. A hash
+    /// lookup per candidate row is the cost this accounting exists to avoid.
+    acc_peer_band: HashMap<i32, (u64, u64)>,
     win_peer_bytes: HashMap<i32, u64>,
     win_starve_ticks_max: u64,
     win_unsent_backlog_max: u64,
@@ -1146,6 +1166,7 @@ impl INode for OrbitNet {
             m_net_ms: 0.0,
             m_rb_nodes: 0.0,
             m_bw: BandwidthMetrics::default(),
+            m_peer_interarrival: HashMap::new(),
             bw_timer: 0.0,
             acc_tx_bytes: 0,
             acc_tx_datagrams: 0,
@@ -1165,6 +1186,7 @@ impl INode for OrbitNet {
             acc_interest_members: 0,
             acc_band_sends: [0; 3],
             acc_band_members: [0; 3],
+            acc_peer_band: HashMap::new(),
             win_peer_bytes: HashMap::new(),
             win_starve_ticks_max: 0,
             win_unsent_backlog_max: 0,
@@ -1371,6 +1393,7 @@ impl OrbitNet {
         // The window describes a session that has ended; carrying its rates into the next one would make the
         // first second of every session read as the last second of the previous.
         self.m_bw = BandwidthMetrics::default();
+        self.m_peer_interarrival.clear();
         self.bw_timer = 0.0;
         self.reset_bandwidth_counters();
         for sync in self.rollback_entities.values() {
@@ -1699,11 +1722,14 @@ impl OrbitNet {
     /// `tx_datagrams_s` is published so the sum can be checked rather than trusted.
     /// Just the near-band inter-arrival, without building [`Self::bandwidth_metrics`]'s dictionary.
     ///
-    /// This one figure is read **every net tick on the authority** (it is the interpolation term
-    /// in every shot's rewind depth, refreshed once per tick rather than once per shot). Going through
-    /// the full dictionary to get it allocated a nineteen-key `VarDictionary` and boxed every value,
-    /// per tick, forever — on the hot path of the loop this epic exists to make cheaper. Everything
-    /// else in that dictionary is read by a probe or a HUD at human rates and can keep paying for it.
+    /// A scalar rather than a dictionary key because it is read at tick rates: going through
+    /// [`Self::bandwidth_metrics`] to get it allocated a nineteen-key `VarDictionary` and boxed every
+    /// value, per tick, forever — on the hot path of the loop this epic exists to make cheaper.
+    /// Everything else in that dictionary is read by a probe or a HUD at human rates and can keep
+    /// paying for it.
+    ///
+    /// This is the figure for a consumer that cannot name a peer. The interpolation term in a shot's
+    /// rewind depth can name one, and reads [`Self::interarrival_ticks`] instead.
     #[func]
     fn interarrival_all(&self) -> f64 {
         self.m_bw.interarrival_all
@@ -1712,6 +1738,22 @@ impl OrbitNet {
     #[func]
     fn interarrival_near(&self) -> f64 {
         self.m_bw.interarrival_near
+    }
+
+    /// Mean ticks between admissions for the rows sent to one peer, pooled across every band.
+    ///
+    /// The per-peer form of [`Self::interarrival_all`], and the one the lag-compensation rewind
+    /// wants. That rewind's interpolation term is the shooter's own view lag, and the round-trip
+    /// term beside it ([`Self::peer_rtt_ms`]) is already per peer; a pooled interpolation term grants
+    /// a peer served every tick a window measured partly from peers served every eighth.
+    ///
+    /// Answers 0.0 for an unknown peer, for a peer whose window admitted nothing, and before the
+    /// first window has been published. That is the same "no measurement" answer
+    /// [`Self::interarrival_all`] gives, and the caller's rule for it is unchanged: leave the
+    /// fallback in place rather than invent a number.
+    #[func]
+    fn interarrival_ticks(&self, peer: i32) -> f64 {
+        self.m_peer_interarrival.get(&peer).copied().unwrap_or(0.0)
     }
 
     #[func]
@@ -2674,6 +2716,13 @@ impl OrbitNet {
             interest_entities: self.acc_interest_members as f64
                 / self.acc_interest_peer_ticks.max(1) as f64,
         };
+        // Cleared and refilled rather than updated in place: a peer that disconnected during the
+        // window has no entry in the accumulator, and must not keep answering with the figure it
+        // last earned.
+        self.m_peer_interarrival.clear();
+        for (&peer, &(sends, members)) in &self.acc_peer_band {
+            self.m_peer_interarrival.insert(peer, band(sends, members));
+        }
         self.reset_bandwidth_counters();
     }
 
@@ -2698,6 +2747,7 @@ impl OrbitNet {
         self.acc_interest_members = 0;
         self.acc_band_sends = [0; 3];
         self.acc_band_members = [0; 3];
+        self.acc_peer_band.clear();
         self.win_peer_bytes.clear();
         self.win_starve_ticks_max = 0;
         self.win_unsent_backlog_max = 0;
@@ -2958,6 +3008,10 @@ impl OrbitNet {
             order.clear();
             let mut starve_max = 0u64;
             let mut unsent = 0u64;
+            // This peer's own share of the two band counters, folded into `acc_peer_band` once the
+            // frame is built. The band arrays beside them stay global.
+            let mut peer_members = 0u64;
+            let mut peer_sends = 0u64;
             {
                 let Some(peer) = self.peers.get(&peer_id) else {
                     continue;
@@ -2999,6 +3053,7 @@ impl OrbitNet {
                     };
                     let weight = priority::weight_for(band, row.priority, row.owner == peer_id);
                     self.acc_band_members[band.index()] += 1;
+                    peer_members += 1;
                     order.push((
                         priority::Candidate {
                             id,
@@ -3127,6 +3182,7 @@ impl OrbitNet {
                                 sent_full.push((id, tick));
                             }
                             self.acc_band_sends[band.index()] += 1;
+                            peer_sends += 1;
                             self.acc_blocks_deferred += (order.len() - index - 1) as u64;
                             break;
                         }
@@ -3147,8 +3203,16 @@ impl OrbitNet {
                         sent_full.push((id, tick));
                     }
                     self.acc_band_sends[band.index()] += 1;
+                    peer_sends += 1;
                 }
             }
+
+            // Folded in before the empty-frame `continue` below. A tick that offered this peer
+            // candidates and admitted none of them is part of that peer's cadence, and dropping it
+            // would bias the figure towards the peers that got served.
+            let acc = self.acc_peer_band.entry(peer_id).or_insert((0, 0));
+            acc.0 += peer_sends;
+            acc.1 += peer_members;
 
             if sent.is_empty() {
                 continue;
