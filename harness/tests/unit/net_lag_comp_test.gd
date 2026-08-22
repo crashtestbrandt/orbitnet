@@ -560,3 +560,358 @@ func test_no_shooter_can_ask_for_more_history_than_the_ring_retains() -> void:
 		assert_true(deepest < NetLagComp.retain_ticks(hz),
 			"at %d Hz the deepest window (%d ticks) stays inside the ring's residency (%d)" % [
 				hz, deepest, NetLagComp.retain_ticks(hz)])
+
+# --- the per-TARGET rewind depth: one cast, three depths -----------------------------------------------
+# The window is the shooter's view lag of WHAT THEY ARE SHOOTING AT, and the interpolation half of that is how
+# stale the target's last received row is. That is a property of the TARGET's distance, because the send path
+# admits rows by priority and bands priority by distance -- so one depth for a whole cast errs long for a
+# contested body and short for one across the map. These pin the banding rule, how the band evidence composes
+# with the per-peer figure, and that the resolve path reconstructs each target at its own band's tick.
+#
+# `band_scale_m` and the three band figures are process-wide statics on a RefCounted class and `just test` is
+# ONE Godot process, so every case that writes them restores them.
+
+func test_the_band_edges_are_the_send_paths_own() -> void:
+	# scale/3 and 2*scale/3 against the distance from the SHOOTER to the target, which is the test
+	# `priority.rs` bands a row by -- duplicated in GDScript because `band_of` has no binding, so the two must
+	# agree on every edge or a target is rewound by a band it was never sent in.
+	var origin: Vector3 = Vector3.ZERO
+	assert_eq(NetLagComp.band_for(origin, Vector3(29.0, 0.0, 0.0), 90.0), NetLagComp.Band.NEAR,
+		"inside scale/3 is the near band")
+	assert_eq(NetLagComp.band_for(origin, Vector3(30.0, 0.0, 0.0), 90.0), NetLagComp.Band.NEAR,
+		"the near edge itself is still near -- the comparison is <=, as it is in the backend")
+	assert_eq(NetLagComp.band_for(origin, Vector3(31.0, 0.0, 0.0), 90.0), NetLagComp.Band.MID,
+		"past scale/3 is the mid band")
+	assert_eq(NetLagComp.band_for(origin, Vector3(60.0, 0.0, 0.0), 90.0), NetLagComp.Band.MID,
+		"the mid edge itself is still mid")
+	assert_eq(NetLagComp.band_for(origin, Vector3(61.0, 0.0, 0.0), 90.0), NetLagComp.Band.FAR,
+		"past 2*scale/3 is the far band")
+	# The shooter is not the world origin, so the distance is between the two positions and not a magnitude.
+	assert_eq(NetLagComp.band_for(Vector3(100.0, 0.0, 0.0), Vector3(120.0, 0.0, 0.0), 90.0),
+		NetLagComp.Band.NEAR, "the distance is shooter-to-target, never the target's distance from the origin")
+
+func test_an_unconfigured_band_scale_bands_nothing() -> void:
+	# `aoi_band_radius` defaults to 0 and the backend reports the near band for every row at a non-positive
+	# scale, so an unconfigured session has no band evidence about anything. Reporting NEAR here is what routes
+	# such a session back to the pooled figure -- the near FIGURE applied to the whole world is the error this
+	# split exists to remove, and turning the split on by default would have been exactly that.
+	for scale: float in [0.0, -90.0, NAN, INF]:
+		assert_eq(NetLagComp.band_for(Vector3.ZERO, Vector3(5000.0, 0.0, 0.0), scale), NetLagComp.Band.NEAR,
+			"a scale of %f bands every target near" % scale)
+
+func test_the_band_term_is_the_peers_own_cadence_scaled_by_its_bands_staleness() -> void:
+	# The two measurements are different MARGINS of the same table: one peer's cadence pooled across bands, and
+	# one band's cadence pooled across peers. Neither alone is the cell -- this peer's rows for this band -- and
+	# the backend does not publish that cell, because a per-peer-per-band accumulator is a hash lookup per
+	# candidate row on the send path. The product of the margins over the pooled total is what they support.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(11, 3.0)
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 90.0)   # near fresher than pooled, far staler
+	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.NEAR), 2.0, 1e-4,
+		"a near target: the peer's 3.0 scaled by 2/3")
+	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.MID), 4.0, 1e-4,
+		"a mid target: scaled by 4/3")
+	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.FAR), 6.0, 1e-4,
+		"a far target: scaled by 6/3 -- three depths from one shooter, which is the whole point")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_no_band_evidence_leaves_every_target_on_the_pooled_figure() -> void:
+	# Three ways for the evidence not to be there, and each must land on exactly what the flat call gives --
+	# not on the near figure, and not on the floor.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(12, 3.0)
+	var flat: float = NetLagComp.observed_interp_for(12)
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 0.0)   # measured, but no band scale configured
+	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
+		assert_almost_eq(NetLagComp.observed_interp_for_band(12, band), flat, 1e-4,
+			"an unconfigured band scale leaves band %d on the pooled figure" % band)
+	NetLagComp.refresh_band_interp(2.0, 0.0, 0.0, 3.0, 90.0)   # only the near band published anything
+	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.MID), flat, 1e-4,
+		"a band that published no measurement stays on the pooled figure")
+	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.FAR), flat, 1e-4,
+		"...both of them")
+	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.NEAR), 2.0, 1e-4,
+		"...while the band that did publish one is still scaled by it")
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 0.0, 90.0)   # nothing pooled to divide by
+	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
+		assert_almost_eq(NetLagComp.observed_interp_for_band(12, band), flat, 1e-4,
+			"no pooled measurement is no ratio, so band %d takes the pooled fallback" % band)
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_a_degenerate_band_measurement_is_no_measurement() -> void:
+	# NaN, infinity and a non-positive figure are all the backend saying it has nothing, and none of them may
+	# reach a ratio: a NaN numerator poisons the window and an infinite one turns it into the ceiling.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(13, 3.0)
+	var flat: float = NetLagComp.observed_interp_for(13)
+	for junk: float in [NAN, INF, -INF, -1.0, 0.0]:
+		NetLagComp.refresh_band_interp(junk, junk, junk, 3.0, 90.0)
+		assert_almost_eq(NetLagComp.observed_interp_for_band(13, NetLagComp.Band.FAR), flat, 1e-4,
+			"a band figure of %f is no measurement, not a window built from it" % junk)
+		NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, junk, 90.0)
+		assert_almost_eq(NetLagComp.observed_interp_for_band(13, NetLagComp.Band.FAR), flat, 1e-4,
+			"...and neither is a pooled denominator of %f" % junk)
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_the_band_term_takes_the_same_floor_and_ceiling_as_every_other() -> void:
+	# The band figures are raw so the ratio is undistorted, which means the product can be anything -- a far
+	# band drawn from a handful of sends is an arbitrary multiple of the pooled one. The clamp is applied ONCE,
+	# to the product, and is the same floor and ceiling the flat term takes.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(14, 8.0)
+	NetLagComp.refresh_band_interp(1.0, 1.0, 40.0, 2.0, 90.0)   # a far band 20x the pooled figure
+	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.FAR),
+		NetLagComp.MAX_INTERP_TICKS, 1e-4,
+		"a pathological band ratio clamps rather than turning the rewind into a time machine")
+	NetLagComp.refresh_observed_interp_for(14, 1.0)
+	NetLagComp.refresh_band_interp(0.1, 1.0, 1.0, 10.0, 90.0)   # a near band a hundredth of the pooled figure
+	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.NEAR),
+		NetLagComp.INTERP_TICKS, 1e-4,
+		"and a fresh band cannot buy a window shallower than the tick a body arrived on")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_a_session_teardown_forgets_the_bands_and_the_scale() -> void:
+	# These are `static var`s and outlive the session whose send path they describe. A scale left behind would
+	# band the next session's targets against a world of a different size.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.refresh_observed_interp_for(15, 3.0)
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 90.0)
+	NetLagComp.reset_observed_interp()
+	assert_almost_eq(NetLagComp.band_scale_m, 0.0, 1e-6, "the band scale is gone")
+	assert_almost_eq(NetLagComp.band_interp_scale(NetLagComp.Band.FAR), 1.0, 1e-6,
+		"and every band is back to the pooled figure rather than the previous session's ratio")
+	NetLagComp.observed_interp_ticks = saved
+
+func test_two_peers_at_two_ranges_are_four_windows() -> void:
+	# The composition, as depths rather than terms: the per-peer split and the per-band split are independent
+	# axes, and collapsing either one is the defect each was written to remove.
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(21, 1.0)   # served every tick
+	NetLagComp.refresh_observed_interp_for(22, 4.0)   # served every fourth
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 90.0)
+	var fast_near: int = NetLagComp.rewind_ticks_for_peer_shot_band(false, 21, 100.0, 60.0, NetLagComp.Band.NEAR)
+	var fast_far: int = NetLagComp.rewind_ticks_for_peer_shot_band(false, 21, 100.0, 60.0, NetLagComp.Band.FAR)
+	var slow_near: int = NetLagComp.rewind_ticks_for_peer_shot_band(false, 22, 100.0, 60.0, NetLagComp.Band.NEAR)
+	var slow_far: int = NetLagComp.rewind_ticks_for_peer_shot_band(false, 22, 100.0, 60.0, NetLagComp.Band.FAR)
+	assert_true(fast_near < fast_far, "one shooter's far target is rewound deeper than their near one")
+	assert_true(slow_near < slow_far, "...for both shooters")
+	assert_true(fast_far < slow_far, "and the slower peer is still rewound deeper at the same range")
+	assert_eq(fast_far, NetLagComp.rewind_ticks_for_shot(false, 100.0, 60.0,
+		NetLagComp.observed_interp_for_band(21, NetLagComp.Band.FAR)),
+		"each depth is exactly the shot policy with that peer's own band term")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_the_band_depth_answers_to_the_same_policy_switches() -> void:
+	# `per_shooter` off must restore the flat window EXACTLY -- a band ratio surviving the switch is what would
+	# otherwise make the A/B this knob exists for a three-way comparison -- and the authority's own shots must
+	# still take no rewind at all, at every range.
+	var was: bool = NetLagComp.per_shooter
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(23, 4.0)
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 90.0)
+	NetLagComp.per_shooter = true
+	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
+		assert_eq(NetLagComp.rewind_ticks_for_peer_shot_band(true, 23, 0.0, 60.0, band), 0,
+			"the authority's own shot takes no rewind at band %d, whatever that band measured" % band)
+	NetLagComp.per_shooter = false
+	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
+		assert_eq(NetLagComp.rewind_ticks_for_peer_shot_band(false, 23, 100.0, 60.0, band),
+			NetLagComp.rewind_ticks(60), "per_shooter off: the flat window at band %d, band ratio and all" % band)
+	NetLagComp.per_shooter = was
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_the_band_tick_array_is_the_present_tick_less_each_bands_depth() -> void:
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	NetLagComp.refresh_observed_interp_for(24, 3.0)
+	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 90.0)
+	var ticks: PackedInt64Array = NetLagComp.rewind_band_ticks(500, false, 24, 100.0, 60.0)
+	assert_eq(ticks.size(), 3, "three ticks, one per band, indexed by the Band enum")
+	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
+		assert_eq(int(ticks[band]), 500 - NetLagComp.rewind_ticks_for_peer_shot_band(false, 24, 100.0, 60.0, band),
+			"band %d is the present tick less its own depth" % band)
+	assert_true(ticks[NetLagComp.Band.FAR] < ticks[NetLagComp.Band.NEAR],
+		"the far band reaches further back, which is the ordering the split exists to produce")
+	# A session too young to hold the depth leaves the tick NEGATIVE rather than clamped to 0: `resolve_hit`
+	# answers an unrecorded tick by resolving that target at the shot's base depth, while a clamp to 0 would
+	# point it at whatever tick 0 happens to hold.
+	var young: PackedInt64Array = NetLagComp.rewind_band_ticks(1, false, 24, 100.0, 60.0)
+	assert_true(young[NetLagComp.Band.FAR] < 0, "a depth the session cannot reach stays negative, not clamped")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+# --- the resolve path: each target reconstructed at its OWN band's tick ---------------------------------
+# One shooter at the world origin, three targets laid out so exactly one ray reaches each, and a ring whose
+# recorded poses encode the tick they were recorded at: every body sits one metre further out per tick into the
+# past, so the resolved entry distance names the slot the resolver read. `space` is null throughout, which
+# NetRay.cast answers with a miss, so the analytic capsule half is what the assertions read.
+#
+#   near target   x = 10 + (19 - tick), y = 0     10.0 m from the shooter -- inside scale/3 (30)
+#   mid target    x = 45 + (19 - tick), y = -10   46.1 m from the shooter -- between 30 and 60
+#   far target    x = 80 + (19 - tick), y = 10    83.6 m from the shooter -- past 2*scale/3 (60)
+#
+# The rays are cast from the target's own Y so each reaches one body and the broad phase rejects the other two.
+# THEY DO NOT START AT THE SHOOTER, which is the point: a round's segment start walks toward its target over the
+# time of flight, and banding by it would rewind a pellet to a different depth on every tick of its own flight.
+const _BAND_SCALE: float = 90.0        # edges at 30 and 60
+const _SHOOTER: Vector3 = Vector3.ZERO
+const _BASE_TICK: int = 18             # the shot's flat depth, and the fallback for any band the ring lacks
+const _PRESENT_TICK: int = 20
+
+func _band_row(tick: int) -> Array[NetLagComp.Sample]:
+	var age: float = float(19 - tick)
+	var out: Array[NetLagComp.Sample] = []
+	out.push_back(_sample_at(_band_bodies[0], Transform3D(Basis.IDENTITY,
+		Vector3(10.0 + age, 0.0, 0.0)), 0.5, 2.0))
+	out.push_back(_sample_at(_band_bodies[1], Transform3D(Basis.IDENTITY,
+		Vector3(45.0 + age, -10.0, 0.0)), 0.5, 2.0))
+	out.push_back(_sample_at(_band_bodies[2], Transform3D(Basis.IDENTITY,
+		Vector3(80.0 + age, 10.0, 0.0)), 0.5, 2.0))
+	return out
+
+var _band_bodies: Array[Node3D] = []
+
+func _band_ring() -> NetLagComp:
+	_band_bodies = [Node3D.new(), Node3D.new(), Node3D.new()]
+	var lc: NetLagComp = NetLagComp.new()
+	for tick: int in [16, 17, 18, 19]:
+		lc.hittable_provider = func() -> Array[NetLagComp.Sample]: return _band_row(tick)
+		lc.record(tick)
+	return lc
+
+func _free_band_bodies() -> void:
+	for body: Node3D in _band_bodies:
+		body.free()
+	_band_bodies = []
+
+# The ray that reaches one band's target, from that target's own Y so the other two are culled.
+func _band_ray(lc: NetLagComp, y: float, band_ticks: PackedInt64Array) -> NetRay.Hit:
+	return lc.resolve_hit(null, Vector3(0.0, y, 0.0), Vector3(1.0, 0.0, 0.0), 200.0, [], 0xFFFFFFFF,
+		_BASE_TICK, _PRESENT_TICK, _HITBOX_LAYER, band_ticks, _SHOOTER)
+
+func test_one_cast_resolves_three_targets_at_three_ticks() -> void:
+	# The headline: a contested body a few metres away and one across the map are not the same age, so they are
+	# not rewound by the same amount. Near reads tick 19, mid tick 17, far tick 16 -- and the entry distance
+	# names which, because each body sits one metre further out per tick into the past.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = _BAND_SCALE
+	var lc: NetLagComp = _band_ring()
+	var ticks: PackedInt64Array = PackedInt64Array([19, 17, 16])
+	assert_almost_eq(_band_ray(lc, 0.0, ticks).distance, 9.5, 1e-4,
+		"the near target is reconstructed at tick 19 (x = 10, entry 9.5)")
+	assert_almost_eq(_band_ray(lc, -10.0, ticks).distance, 46.5, 1e-4,
+		"the mid target at tick 17 (x = 47, entry 46.5)")
+	assert_almost_eq(_band_ray(lc, 10.0, ticks).distance, 82.5, 1e-4,
+		"the far target at tick 16 (x = 83, entry 82.5) -- three depths in one cast")
+	_free_band_bodies()
+	NetLagComp.band_scale_m = was_scale
+
+func test_no_band_ticks_restores_the_single_slot_rewind_exactly() -> void:
+	# The default, and every caller that predates the split: one tick for the whole cast. The band scale is
+	# left configured on purpose -- an empty array, not an unbanded session, is what turns the refinement off.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = _BAND_SCALE
+	var lc: NetLagComp = _band_ring()
+	var flat: PackedInt64Array = PackedInt64Array()
+	assert_almost_eq(_band_ray(lc, 0.0, flat).distance, 10.5, 1e-4, "near at the base tick 18 (x = 11)")
+	assert_almost_eq(_band_ray(lc, -10.0, flat).distance, 45.5, 1e-4, "mid at the base tick 18 (x = 46)")
+	assert_almost_eq(_band_ray(lc, 10.0, flat).distance, 80.5, 1e-4, "far at the base tick 18 (x = 81)")
+	_free_band_bodies()
+	NetLagComp.band_scale_m = was_scale
+
+func test_an_unconfigured_band_scale_puts_every_target_on_the_near_tick() -> void:
+	# With no scale the banding rule reports NEAR for everything, so every target takes band_ticks[NEAR]. That
+	# is not a policy accident: `rewind_band_ticks` derives all three from the pooled figure when there is no
+	# band evidence, so the three ticks are equal and this is the flat window.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = 0.0
+	var lc: NetLagComp = _band_ring()
+	var ticks: PackedInt64Array = PackedInt64Array([19, 17, 16])
+	assert_almost_eq(_band_ray(lc, 10.0, ticks).distance, 79.5, 1e-4,
+		"a target 80 m out is banded NEAR without a scale, and takes the near tick 19 (x = 80)")
+	_free_band_bodies()
+	NetLagComp.band_scale_m = was_scale
+
+func test_a_band_tick_the_ring_never_recorded_falls_back_to_the_base_depth() -> void:
+	# Never to nothing. A session too young to hold a band's depth, or a depth past the ring's residency, must
+	# resolve that target at the shot's base tick -- which the dispatch guard has already proved is recorded.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = _BAND_SCALE
+	var lc: NetLagComp = _band_ring()
+	for missing: int in [5, -3]:
+		var ticks: PackedInt64Array = PackedInt64Array([19, 17, missing])
+		assert_almost_eq(_band_ray(lc, 10.0, ticks).distance, 80.5, 1e-4,
+			"an unrecorded far tick (%d) resolves the far target at the base tick 18, not at no tick" % missing)
+	_free_band_bodies()
+	NetLagComp.band_scale_m = was_scale
+
+func test_a_target_whose_counterpart_cannot_be_identified_keeps_the_base_depth() -> void:
+	# The counterpart lookup is an INDEX PROBE, not a search: slot N's entry i and slot M's entry i are the same
+	# collider whenever the hittable set did not change between them. The identity compare is what makes that
+	# guess safe -- on the ticks after a spawn or a death it fails, and the target takes the base depth for a few
+	# ticks rather than being resolved against a DIFFERENT BODY's pose, which is the failure worth having a
+	# compare for.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = _BAND_SCALE
+	var lc: NetLagComp = _band_ring()
+	var stranger: Node3D = Node3D.new()
+	var reordered: Array[NetLagComp.Sample] = _band_row(16)
+	reordered[2].collider = stranger   # tick 16's far entry now names a body that was not there at tick 18
+	lc.hittable_provider = func() -> Array[NetLagComp.Sample]: return reordered
+	lc.record(16)
+	var hit: NetRay.Hit = _band_ray(lc, 10.0, PackedInt64Array([19, 17, 16]))
+	assert_almost_eq(hit.distance, 80.5, 1e-4,
+		"the far target keeps the base tick 18 (x = 81) rather than taking a stranger's pose")
+	assert_true(hit.collider == _band_bodies[2], "and it is still the target that was struck")
+	stranger.free()
+	_free_band_bodies()
+	NetLagComp.band_scale_m = was_scale
+
+func test_a_shorter_band_slot_never_indexes_past_its_end() -> void:
+	# A tick recorded while fewer bodies were hittable has a shorter sample list, so the index probe would read
+	# past its end. It must answer "no counterpart" rather than trip an out-of-bounds read on the resolve path.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = _BAND_SCALE
+	var lc: NetLagComp = _band_ring()
+	var short_row: Array[NetLagComp.Sample] = [_band_row(16)[0]]
+	lc.hittable_provider = func() -> Array[NetLagComp.Sample]: return short_row
+	lc.record(16)
+	assert_almost_eq(_band_ray(lc, 10.0, PackedInt64Array([19, 17, 16])).distance, 80.5, 1e-4,
+		"the far target falls back to the base tick rather than reading past the shorter slot")
+	_free_band_bodies()
+	NetLagComp.band_scale_m = was_scale
+
+func test_every_target_is_banded_once_so_none_can_be_dropped() -> void:
+	# The failure the swap-not-a-pass shape exists to prevent. A pass per band reads each band's slot and
+	# rejects the samples that do not belong to it -- so a body straddling a band edge, which reads NEAR in the
+	# slot the near pass walks and MID in the slot the mid pass walks, is rejected by BOTH and silently stops
+	# being hittable. Here the mid target sits one metre inside the near edge at the near tick and one metre
+	# outside it at the mid tick; it must still resolve.
+	var was_scale: float = NetLagComp.band_scale_m
+	NetLagComp.band_scale_m = _BAND_SCALE
+	var straddler: Node3D = Node3D.new()
+	var lc: NetLagComp = NetLagComp.new()
+	# x = 29 at tick 19 (near, 29 < 30) and x = 31 at tick 17 (mid, 31 > 30): the two sides of the edge.
+	for tick: int in [17, 19]:
+		var x: float = 29.0 if tick == 19 else 31.0
+		lc.hittable_provider = func() -> Array[NetLagComp.Sample]: return [
+			_sample_at(straddler, Transform3D(Basis.IDENTITY, Vector3(x, 0.0, 0.0)), 0.5, 2.0)] as Array[NetLagComp.Sample]
+		lc.record(tick)
+	var hit: NetRay.Hit = lc.resolve_hit(null, Vector3.ZERO, Vector3(1.0, 0.0, 0.0), 200.0, [], 0xFFFFFFFF,
+		19, _PRESENT_TICK, _HITBOX_LAYER, PackedInt64Array([19, 17, 17]), _SHOOTER)
+	assert_true(hit.valid, "a target straddling a band edge between two slots is still resolved, never dropped")
+	assert_true(hit.collider == straddler, "and it is the straddler that was struck")
+	straddler.free()
+	NetLagComp.band_scale_m = was_scale
