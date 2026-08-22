@@ -1737,14 +1737,8 @@ impl OrbitNet {
         }
     }
 
-    /// Send-path accounting, windowed to per-second figures once a second.
-    ///
-    /// Deliberately a **separate** dictionary from [`Self::metrics`]: `bench_metrics.gd` and the
-    /// perf probe read that one's exact shape, and widening a dictionary two harnesses index into
-    /// is how a measurement change becomes a gate failure. Byte figures are OrbitNet **payload**;
-    /// `tx_wire_bytes_s` is the same traffic with [`WIRE_OVERHEAD_BYTES`] per datagram added, and
-    /// `tx_datagrams_s` is published so the sum can be checked rather than trusted.
-    /// Just the near-band inter-arrival, without building [`Self::bandwidth_metrics`]'s dictionary.
+    /// The POOLED mean ticks between admissions across every band, without building
+    /// [`Self::bandwidth_metrics`]'s dictionary.
     ///
     /// A scalar rather than a dictionary key because it is read at tick rates: going through
     /// [`Self::bandwidth_metrics`] to get it allocated a nineteen-key `VarDictionary` and boxed every
@@ -1759,9 +1753,32 @@ impl OrbitNet {
         self.m_bw.interarrival_all
     }
 
+    /// Mean ticks between admissions for the rows in one distance band, as three scalars.
+    ///
+    /// Scalars rather than [`Self::bandwidth_metrics`] keys for the reason
+    /// [`Self::interarrival_all`] is one: the lag-compensation rewind reads all three every net
+    /// tick on the authority, to derive a rewind depth per TARGET rather than one depth per shot.
+    /// A row's band is its distance from the peer's interest anchor, so a contested target and a
+    /// body across the map are not the same age, and a rewind that applies the pooled figure to
+    /// both errs long on the near one and short on the far one.
+    ///
+    /// Each answers 0.0 before the first window is published and for a band that admitted nothing
+    /// — including every band but `near` in a session with no `aoi_band_radius` configured, where
+    /// `priority::band_of` reports [`priority::Band::Near`] for every row. The caller's rule for
+    /// 0.0 is unchanged: leave the fallback in place rather than invent a number.
     #[func]
     fn interarrival_near(&self) -> f64 {
         self.m_bw.interarrival_near
+    }
+
+    #[func]
+    fn interarrival_mid(&self) -> f64 {
+        self.m_bw.interarrival_mid
+    }
+
+    #[func]
+    fn interarrival_far(&self) -> f64 {
+        self.m_bw.interarrival_far
     }
 
     /// Mean ticks between admissions for the rows sent to one peer, pooled across every band.
@@ -1780,6 +1797,13 @@ impl OrbitNet {
         self.m_peer_interarrival.get(&peer).copied().unwrap_or(0.0)
     }
 
+    /// Send-path accounting, windowed to per-second figures once a second.
+    ///
+    /// Deliberately a **separate** dictionary from [`Self::metrics`]: `bench_metrics.gd` and the
+    /// perf probe read that one's exact shape, and widening a dictionary two harnesses index into
+    /// is how a measurement change becomes a gate failure. Byte figures are OrbitNet **payload**;
+    /// `tx_wire_bytes_s` is the same traffic with [`WIRE_OVERHEAD_BYTES`] per datagram added, and
+    /// `tx_datagrams_s` is published so the sum can be checked rather than trusted.
     #[func]
     fn bandwidth_metrics(&self) -> VarDictionary {
         let bw = &self.m_bw;

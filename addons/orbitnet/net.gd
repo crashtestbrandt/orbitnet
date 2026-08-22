@@ -829,6 +829,46 @@ func interarrival_ticks(peer: int) -> float:
 func has_peer_interarrival() -> bool:
 	return _mode != Mode.OFFLINE and _backend_has(&"interarrival_ticks")
 
+## The mean ticks between admissions for the rows in ONE distance band -- near, mid and far, the three
+## [method bandwidth_metrics] keys as scalars.
+##
+## Scalars for the reason [method interarrival_all_ticks] is one: [NetLagComp] reads all three EVERY NET TICK
+## on the authority, to derive a rewind depth per TARGET rather than one depth per shot. The send path bands a
+## row by its distance from the peer's interest anchor, so a contested target and a body across the map are
+## not the same age; a rewind applying the pooled figure to both errs long on the near one and short on the
+## far one.
+##
+## Each answers 0.0 before the first window is published and for a band that admitted nothing -- which is
+## every band but near in a session with no [method aoi_band_radius] configured, where the backend bands every
+## row near. [method NetLagComp.refresh_band_interp] reads 0.0 as "no measurement" and leaves that band on the
+## pooled figure.
+##
+## FAILS OPEN at 0.0 against a backend older than these sources, the same tolerance
+## [method interarrival_all_ticks] carries and for the same reason: the committed cdylib is a bot's and can be
+## a commit behind. Ask [method has_band_interarrival] to tell a stale binary from an unpublished window.
+func interarrival_near_ticks() -> float:
+	if _mode == Mode.OFFLINE or not _backend_has(&"interarrival_near"):
+		return 0.0
+	return _orbit.interarrival_near()
+
+func interarrival_mid_ticks() -> float:
+	if _mode == Mode.OFFLINE or not _backend_has(&"interarrival_mid"):
+		return 0.0
+	return _orbit.interarrival_mid()
+
+func interarrival_far_ticks() -> float:
+	if _mode == Mode.OFFLINE or not _backend_has(&"interarrival_far"):
+		return 0.0
+	return _orbit.interarrival_far()
+
+## Whether the LOADED cdylib carries the three band accessors above, as a fact separate from what they answer.
+##
+## `interarrival_near` predates the pair beside it, so this asks for the two that do not: a binary carrying
+## only the near scalar answers 0.0 for mid and far, which is indistinguishable from a session that has no
+## band scale configured. A probe asserting the per-target rewind is live has to ask this.
+func has_band_interarrival() -> bool:
+	return _mode != Mode.OFFLINE and _backend_has(&"interarrival_mid") and _backend_has(&"interarrival_far")
+
 # WHETHER THE LOADED CDYLIB CARRIES A METHOD, ANSWERED ONCE. Several accessors on this facade have to tolerate a
 # binary older than these sources (the committed one is a bot's and lands in its own commit), and they did it with
 # `has_method` -- a ClassDB lookup with a StringName argument, on paths this epic identifies as per-tick and
