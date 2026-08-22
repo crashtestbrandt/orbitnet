@@ -5,6 +5,12 @@
 //! [`crate::protocol::SchemaBuilder::hash`] exists to catch a disagreement before it decodes into
 //! garbage.
 //!
+//! **A block names its entity by a dense 16-bit session slot, not by the 64-bit entity id.** The id
+//! is an FNV-1a hash spread across the whole 64-bit range, so writing it as a varint cost 9.5 bytes
+//! on average — a third of a full block and nearly half of a delta. [`crate::slots`] states what
+//! replaced it and what distributing a slot table costs; [`encode_manifest`] is the channel that
+//! distributes it.
+//!
 //! The decoder is the one piece of this crate that reads bytes chosen by a remote peer, so it is
 //! written to be total: every read is bounds-checked and returns [`CodecError`] rather than
 //! panicking or indexing out of range. A netcode decoder that panics on a malformed packet is a
@@ -617,13 +623,14 @@ impl Handshake {
 
 /// One entity's slice of a [`FrameKind::ServerSnapshot`] frame — the metadata half.
 ///
-/// Blocks are length-prefixed so a peer that does not (yet) know an entity id — its spawn may
-/// still be in flight on the reliable spawner channel — can skip the block cleanly instead of
-/// losing the rest of the packet.
+/// Blocks are length-prefixed so a peer that does not (yet) know a slot — the entity's spawn may
+/// still be in flight on the reliable spawner channel, or the manifest binding the slot may not
+/// have landed — can skip the block cleanly instead of losing the rest of the packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateBlockMeta {
-    /// Stable entity id (the FNV-1a hash of the synchronizer root's node path).
-    pub id: u64,
+    /// The entity's dense session slot. Resolve it to a 64-bit entity id through the receiver's
+    /// [`crate::slots::SlotTable`]; a slot this peer holds no binding for is skipped.
+    pub slot: u16,
     /// The tick this block's state describes. Per-entity, at or before the frame tick: an entity
     /// whose latest simulation used predicted input broadcasts its newest *authoritative* tick.
     pub tick: u64,
@@ -655,19 +662,23 @@ const STATE_BLOCK_LANE: u8 = 1 << 1;
 /// repairs a broken delta chain as well as a requested one, so the keyframe clock has to see it.
 /// Inferring fullness at the call site makes the clock miss those, and the miss is invisible: the
 /// block is correct either way, only the bookkeeping is wrong.
+///
+/// `slot` is the entity's dense session index, not its 64-bit id. It is written **fixed-width**
+/// rather than as a varint: a `u16` varint costs 1 byte below 128 and 3 above it, so a session with
+/// more than 128 entities would pay MORE than the flat 2 bytes for most of its blocks.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_state_block(
     writer: &mut Writer,
     scratch: &mut Vec<bool>,
     props: &[PropSchema],
-    id: u64,
+    slot: u16,
     frame_tick: u64,
     entity_tick: u64,
     reference: Option<(u64, &[u8])>,
     row: &[u8],
     state_lane: bool,
 ) -> bool {
-    writer.varint(id);
+    writer.u16(slot);
 
     let mut body = Writer::new();
     let mut flags = 0u8;
@@ -703,13 +714,13 @@ pub fn encode_state_block(
 
 /// Read a state block's metadata, leaving the reader at its mask/payload.
 ///
-/// The caller either resolves `meta.id` to a local entity and calls [`decode_state_block_into`],
-/// or calls [`skip_state_block_body`] to hop over an unknown entity.
+/// The caller either resolves `meta.slot` to a local entity and calls [`decode_state_block_into`],
+/// or calls [`skip_state_block_body`] to hop over an entity it cannot name.
 pub fn decode_state_block_meta(
     reader: &mut Reader<'_>,
     frame_tick: u64,
 ) -> Result<StateBlockMeta, CodecError> {
-    let id = reader.varint()?;
+    let slot = reader.u16()?;
     let tick_delta = reader.varint()?;
     let tick = frame_tick.saturating_sub(tick_delta);
     let body_len = usize::try_from(reader.varint()?).map_err(|_| CodecError::VarintOverflow)?;
@@ -733,7 +744,7 @@ pub fn decode_state_block_meta(
         return Err(CodecError::UnexpectedEof);
     };
     Ok(StateBlockMeta {
-        id,
+        slot,
         tick,
         full,
         state_lane,
@@ -800,8 +811,9 @@ pub fn decode_state_block_into(
 /// rows are small and redundancy is the loss armor: a lost packet's ticks arrive in the next one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputBlockMeta {
-    /// Stable entity id.
-    pub id: u64,
+    /// The entity's dense session slot, resolved through the receiver's
+    /// [`crate::slots::SlotTable`]. A slot the server holds no binding for is skipped.
+    pub slot: u16,
     /// The newest input tick carried.
     pub newest_tick: u64,
     /// How many consecutive rows follow (newest first, ticks descending by one).
@@ -811,15 +823,19 @@ pub struct InputBlockMeta {
 }
 
 /// Append one entity input block: the newest `rows.len()` ticks, newest first.
+///
+/// `slot` is the entity's dense session index. A client learns it from the entity manifest, so a
+/// body whose slot has not arrived yet sends no input block at all rather than one the server would
+/// have to guess at.
 pub fn encode_input_block(
     writer: &mut Writer,
     props: &[PropSchema],
-    id: u64,
+    slot: u16,
     frame_tick: u64,
     newest_tick: u64,
     rows: &[&[u8]],
 ) {
-    writer.varint(id);
+    writer.u16(slot);
     // Zigzag: an input stamp normally LEADS the frame tick (input delay / adaptive lead), so the
     // delta genuinely takes both signs.
     writer.zigzag(frame_tick as i64 - newest_tick as i64);
@@ -837,7 +853,7 @@ pub fn decode_input_block_meta(
     reader: &mut Reader<'_>,
     frame_tick: u64,
 ) -> Result<InputBlockMeta, CodecError> {
-    let id = reader.varint()?;
+    let slot = reader.u16()?;
     let tick_delta = reader.zigzag()?;
     // Saturating on both sides: the delta comes off the wire and must not overflow either way.
     let newest_tick = if tick_delta >= 0 {
@@ -851,7 +867,7 @@ pub fn decode_input_block_meta(
     }
     let count = u32::from(reader.u8()?);
     Ok(InputBlockMeta {
-        id,
+        slot,
         newest_tick,
         count,
         body_len: body_len - 1,
@@ -984,24 +1000,41 @@ impl Pong {
     }
 }
 
-/// One entity's schema fingerprint inside a [`FrameKind::EntityManifest`] frame.
+/// One entity's row in a [`FrameKind::EntityManifest`] frame: its slot binding and its schema
+/// fingerprints.
+///
+/// **The manifest carries the whole slot table, both lanes, every time.** It covered the rollback
+/// lane only while it was purely a schema check, because a state-lane entity has no input schema to
+/// disagree about. It is now also the only channel that tells a client what a wire slot names, and
+/// state-lane blocks carry slots too, so it has to name every replicated entity.
+///
+/// It is a **complete snapshot rather than a diff**, which is what makes a receiver's table
+/// self-repairing: rebuilding from each manifest drops the binding of every entity that has
+/// unregistered since the last one, with no removal record to lose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestEntry {
-    /// Stable entity id.
+    /// The dense session slot this entity's blocks are named by on the wire.
+    pub slot: u16,
+    /// Stable entity id (the FNV-1a hash of the synchronizer root's node path).
     pub id: u64,
     /// Hash of the entity's state schema.
     pub state_hash: u32,
-    /// Hash of the entity's input schema.
+    /// Hash of the entity's input schema. `0` for a state-lane entity, which has no input schema.
     pub input_hash: u32,
 }
 
 /// Encode an entity manifest frame.
 #[must_use]
 pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
-    let mut writer = Writer::with_capacity(4 + entries.len() * 12);
+    let mut writer = Writer::with_capacity(4 + entries.len() * 14);
     writer.u8(FrameKind::EntityManifest.tag());
     writer.varint(entries.len() as u64);
     for entry in entries {
+        writer.u16(entry.slot);
+        // The full 64-bit id, still a varint. This is the one frame that has to carry it — a
+        // receiver derives the same id from the same node path and needs the pairing to find its
+        // own entity — and it rides the reliable channel only when the registry changes, so its
+        // ~9.5 bytes are spent once per entity per change rather than once per entity per tick.
         writer.varint(entry.id);
         writer.u32(entry.state_hash);
         writer.u32(entry.input_hash);
@@ -1012,11 +1045,12 @@ pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
 /// Decode an entity manifest's payload after the kind tag has been consumed.
 pub fn decode_manifest(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, CodecError> {
     let count = reader.varint()?;
-    // Each entry is at least 10 bytes; a hostile count cannot make us over-allocate.
+    // Each entry is at least 11 bytes; a hostile count cannot make us over-allocate.
     let cap = usize::try_from(count.min(4096)).unwrap_or(0);
     let mut entries = Vec::with_capacity(cap);
     for _ in 0..count {
         entries.push(ManifestEntry {
+            slot: reader.u16()?,
             id: reader.varint()?,
             state_hash: reader.u32()?,
             input_hash: reader.u32()?,
@@ -1392,7 +1426,7 @@ mod tests {
 
         let mut reader = Reader::new(&bytes);
         let meta = decode_state_block_meta(&mut reader, 100).unwrap();
-        assert_eq!(meta.id, 42);
+        assert_eq!(meta.slot, 42);
         assert_eq!(meta.tick, 98);
         assert!(meta.full);
         assert!(!meta.state_lane);
@@ -1506,7 +1540,7 @@ mod tests {
         assert!(!applied, "no base row should mean no application");
 
         let second = decode_state_block_meta(&mut reader, 50).unwrap();
-        assert_eq!(second.id, 8);
+        assert_eq!(second.slot, 8);
         assert_eq!(second.tick, 49);
     }
 
@@ -1542,10 +1576,10 @@ mod tests {
 
         let mut reader = Reader::new(&bytes);
         let meta = decode_state_block_meta(&mut reader, 10).unwrap();
-        assert_eq!(meta.id, 999);
+        assert_eq!(meta.slot, 999);
         skip_state_block_body(&mut reader, &meta).unwrap();
         let second = decode_state_block_meta(&mut reader, 10).unwrap();
-        assert_eq!(second.id, 5);
+        assert_eq!(second.slot, 5);
     }
 
     #[test]
@@ -1599,7 +1633,7 @@ mod tests {
 
         let mut reader = Reader::new(&bytes);
         let meta = decode_input_block_meta(&mut reader, 120).unwrap();
-        assert_eq!(meta.id, 11);
+        assert_eq!(meta.slot, 11);
         assert_eq!(
             meta.newest_tick, 123,
             "an input stamp may lead the frame tick"
@@ -1663,18 +1697,132 @@ mod tests {
         assert_eq!(Pong::decode(&mut reader).unwrap(), pong);
     }
 
+    /// The demo's own state entity: 20 bytes of wire payload across three properties.
+    fn demo_state_schema() -> SchemaBuilder {
+        use crate::protocol::QuantKind;
+        let mut builder = SchemaBuilder::new();
+        builder.push_quantized("position", PropKind::Vec3, PropRole::State, QuantKind::Half);
+        builder.push_quantized("net_aux", PropKind::Vec3, PropRole::State, QuantKind::Half);
+        builder.push("net_meta", PropKind::I64, PropRole::State);
+        builder
+    }
+
+    /// The measurement the slot exists for, pinned so a framing change cannot quietly undo it.
+    ///
+    /// A full block of the demo's state entity is **25 bytes**: 2 slot + 1 frame-tick delta + 1
+    /// body length + 1 flags + 20 payload. The 64-bit id it replaced was an FNV-1a hash spread
+    /// across the whole range, so its varint cost 9 or 10 bytes — a 32.5-byte block, of which 29%
+    /// was the identifier.
+    #[test]
+    fn a_full_block_of_the_demo_entity_is_twenty_five_bytes() {
+        let schema = demo_state_schema();
+        assert_eq!(crate::quant::wire_row_stride(schema.props()), 20);
+        let row = vec![0u8; schema.row_stride()];
+        let mut writer = Writer::new();
+        let mut scratch = Vec::new();
+        let full = encode_state_block(
+            &mut writer,
+            &mut scratch,
+            schema.props(),
+            0,
+            100,
+            100,
+            None,
+            &row,
+            true,
+        );
+        assert!(full);
+        assert_eq!(writer.len(), 25);
+    }
+
+    /// Every slot costs the same two bytes, so the budget arithmetic holds at any session size.
+    ///
+    /// This is the reason the slot is written fixed-width rather than as a varint: a `u16` varint
+    /// is 1 byte below 128 and 3 bytes above it, so past 128 entities most blocks would pay MORE
+    /// than the flat 2.
+    #[test]
+    fn block_size_does_not_move_with_the_slot() {
+        let schema = demo_state_schema();
+        let row = vec![0u8; schema.row_stride()];
+        let mut sizes = Vec::new();
+        for slot in [0u16, 1, 127, 128, 1_000, u16::MAX] {
+            let mut writer = Writer::new();
+            let mut scratch = Vec::new();
+            encode_state_block(
+                &mut writer,
+                &mut scratch,
+                schema.props(),
+                slot,
+                100,
+                100,
+                None,
+                &row,
+                true,
+            );
+            let bytes = writer.into_inner();
+            let meta = decode_state_block_meta(&mut Reader::new(&bytes), 100).unwrap();
+            assert_eq!(
+                meta.slot, slot,
+                "slot {slot} did not survive the round trip"
+            );
+            sizes.push(bytes.len());
+        }
+        assert!(
+            sizes.windows(2).all(|pair| pair[0] == pair[1]),
+            "block size moved with the slot: {sizes:?}"
+        );
+    }
+
+    /// A delta carrying one changed 6-byte property is 13 bytes: 2 slot + 1 frame-tick delta +
+    /// 1 body length + 1 flags + 1 reference-tick delta + 1 mask + 6 payload. The id it replaced
+    /// made that 20.5 bytes, 46% of it identifier.
+    #[test]
+    fn a_one_property_delta_of_the_demo_entity_is_thirteen_bytes() {
+        let schema = demo_state_schema();
+        let base = vec![0u8; schema.row_stride()];
+        let mut row = base.clone();
+        // Move `net_aux` only — the second property, one 6-byte half-precision Vec3 on the wire.
+        let aux = &schema.props()[1];
+        row[aux.offset..aux.offset + aux.kind.stride()].fill(0x11);
+        let mut writer = Writer::new();
+        let mut scratch = Vec::new();
+        let full = encode_state_block(
+            &mut writer,
+            &mut scratch,
+            schema.props(),
+            9,
+            100,
+            100,
+            Some((99, &base)),
+            &row,
+            true,
+        );
+        assert!(!full);
+        assert_eq!(writer.len(), 13);
+    }
+
     #[test]
     fn manifest_round_trips() {
         let entries = vec![
             ManifestEntry {
+                slot: 0,
                 id: 1,
                 state_hash: 0xaaaa_bbbb,
                 input_hash: 0xcccc_dddd,
             },
             ManifestEntry {
+                slot: u16::MAX,
                 id: u64::MAX,
                 state_hash: 0,
                 input_hash: 1,
+            },
+            // A state-lane entity: a slot binding and a state hash, no input schema to disagree
+            // about.
+            ManifestEntry {
+                slot: 7,
+                id: 0x0f0f_0f0f_0f0f_0f0f,
+                state_hash: 0x1234_5678,
+                input_hash: 0,
             },
         ];
         let bytes = encode_manifest(&entries);

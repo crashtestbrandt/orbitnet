@@ -11,12 +11,15 @@ Little-endian.
 
 ```
 frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | 32-bit ack token | input-arrival margin byte
-then per entity:  { entity id | flags | changed-property bitmask | packed payload }
+then per entity:  { slot (u16) | frame-tick delta | body length | flags | changed-property bitmask | packed payload }
 then the trailer: { sequence (u32) | MAC tag (u64) }
 ```
 
 No property names, no type tags — the schema is positional and agreed in advance. Client input carries the
 last N ticks for redundancy, so a single lost packet costs nothing.
+
+**A block names its entity by a 16-bit session slot, not by the 64-bit entity id.** See
+[entity slots](#entity-slots) for what that costs and what it saves.
 
 **Control frames** — reliable: handshake, welcome, entity manifest. All but the handshake carry the same
 12-byte trailer.
@@ -44,6 +47,7 @@ operator-readable version mismatch. An all-zero key is then refused with a messa
 | 2 | Quantized wire encodings. |
 | 3 | Per-datagram authentication, and the handshake's session key. |
 | 4 | The hot-frame header carries an **ack token**. |
+| 5 | Blocks name entities by a **16-bit session slot**; the entity manifest distributes the slot table for both lanes. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -51,7 +55,8 @@ documented absent value. Anything that shifts an existing field's offset is a ma
 older peer decodes garbage.
 
 Schema agreement is **per entity, not per session**: the server states each replicated entity's state and
-input hash in its `EntityManifest` frame, and a client whose locally built schema hashes differently is told
+input hash in its `EntityManifest` frame — `0` for the input hash of a state-lane entity, which has no input
+schema — and a client whose locally built schema hashes differently is told
 so by name. The hash is FNV-1a over `(name, kind, role)` in **declaration order** — deliberately
 order-sensitive, because two peers registering the same properties in different orders would otherwise
 silently misapply state, which is miserable to diagnose. The handshake carried a session-wide schema hash
@@ -61,6 +66,73 @@ until major 3; there is no such thing to hash, both call sites passed `0`, and t
 bounds-checked and returns an error rather than panicking — a decoder that panics on a malformed packet is a
 remote denial of service. `#![forbid(unsafe_code)]` means a bounds bug cannot become memory unsafety either.
 Tests sweep truncated and pseudo-random buffers.
+
+## Entity slots
+
+A block used to open with the entity id: 64 bits of FNV-1a over the synchronizer root's node path, written
+as a varint. Hash output is spread across the whole 64-bit range, so that varint cost **9.5 bytes on
+average** — measured over 6000 plausible node paths under both lane salts, which is also the theoretical
+mean for a value uniform over 2<sup>64</sup>.
+
+Against the RTS demo's own state entity — 20 B of properties — that was **29% of a full block and 46% of a
+delta**:
+
+| | Full block | Delta, one changed 6 B property |
+|---|---|---|
+| id, as a varint | 9.5 B | 9.5 B |
+| **slot, fixed** | **2 B** | **2 B** |
+| other framing | 3 B | 5 B |
+| payload | 20 B | 6 B |
+| block, before | 32.5 B | 20.5 B |
+| **block, now** | **25 B** | **13 B** |
+
+At the default 1200 B budget that is 37 full blocks per frame before and **48 after** — 30% more entities
+refreshed at the same budget. Across 100 peers at 30 Hz it saves 764 kB/s (6.1 Mbit/s) of server egress.
+
+**Fixed width, not a varint.** A `u16` varint costs 1 byte below 128 and 3 above it, so past 128 entities
+most blocks would pay more than the flat 2.
+
+### What a slot costs
+
+The id needed no distribution: every peer derived the same value from the same node path, which is why a
+reconnecting client re-derives its ids with no handshake. A slot is **assigned by the server**, so it has to
+be distributed and held.
+
+- **The entity manifest carries it**, reliably, as `(slot, id, state hash, input hash)` per entity. That
+  frame covered the rollback lane only while it was purely a schema check; it now names **both lanes**,
+  because state-lane blocks carry slots too.
+- **It is a complete table, sent whole**, including when it is empty. A receiver rebuilds its copy from each
+  frame rather than merging, which is what retires the binding of an entity that has unregistered — there is
+  no removal record to lose.
+- **A block whose slot has no binding is skipped**, exactly as a block for an unknown entity id was. Blocks
+  stay length-prefixed for that reason. An unreliable snapshot can overtake the reliable manifest that binds
+  its slot; the block is lost, the next one lands.
+- **A client sends no input block for a body whose slot has not arrived.** Input rides `INPUT_REDUNDANCY`
+  ticks of history, so the first block after the binding lands re-sends what those ticks held.
+
+### Reissuing a freed slot
+
+Ids are reused — a body respawning under its old node name reclaims the same id — and slots are reused too.
+Reuse is the one way a slot can be *wrong* rather than merely unknown: a snapshot naming slot `N` can
+overtake the manifest that rebound `N` from entity A to entity B, and the receiver would apply B's row to A.
+
+- **A freed slot is quarantined for 256 ticks before it may name a different entity** — ~4.3 s at 60 Hz,
+  ~12.8 s at 20 Hz, far longer than the reliable retransmit it has to outlast.
+- **The oldest expired slot is reissued first**, so churn spends the whole free list instead of cycling one
+  slot.
+- **Reuse is preferred over minting**, which holds the index space near the session's peak concurrency
+  rather than letting it climb with every spawn. Not exactly at the peak: a slot freed inside the quarantine
+  window is unavailable to the next caller, so a fast-churning session does mint past it.
+
+### The cap is declared and refused
+
+16 bits caps a session at **65,536 concurrent entities**. Past that the server refuses to name the entity
+and says so once, rather than wrapping an index — a wrapped index would alias two live entities onto one
+wire name. A refusal while every free slot is still cooling is transient and retried on the next tick.
+
+**Rate tiering still phases on the 64-bit id**, not the slot. Dense sequential indices spread across an
+interval *more* evenly than hashes do, so the choice is about stability: a slot is released and reissued,
+and an entity that took a different one would jump its tier phase and its keyframe phase mid-interval.
 
 ## Datagram authentication
 
@@ -120,6 +192,7 @@ The backend checks the wire. It does not check your game.
 | An ack for a frame the peer cannot prove it received | The frame token; see above. The rest of that frame's input blocks are still processed. |
 | Anything from a peer that has not handshaken | Including pings. |
 | A peer speaking a different protocol major | Rejected at the handshake with a readable message. |
+| A block naming a slot with no binding | The spawn or the manifest is still in flight. Skipped cleanly; the rest of the frame decodes. |
 | An input block for an entity the sender does not own | The live `get_multiplayer_authority()` check on the input node. |
 | An input block stamped too far into the future | Past `INPUT_FUTURE_HORIZON_TICKS` ahead of the server. |
 | An input row of the wrong wire stride, or for a tick history has rotated past | |
@@ -247,6 +320,12 @@ derive from the node path, so a body respawning under its old name reclaims the 
 replacement's `Register` can drain ahead of the corpse's `Unregister`. Removing by bare id there would
 unregister the live body. Per-peer delta bookkeeping is cleared either way — it describes the departed body,
 and a fresh body must not be delta-encoded against it.
+
+The **wire slot** is released by a reconciliation pass rather than beside that removal, because the
+registries lose entries three ways — an `Unregister` op, a respawn that supersedes its predecessor, and the
+`is_instance_valid` sweep for a node freed without leaving the tree cleanly — and only the first has a call
+site to hang a release on. The pass runs when a registration changed, or when the table and the registries
+disagree on size, which is what catches the silent sweep.
 
 `tools/orbitnet-smoke.sh` gates all of this by freeing a registered body in each window. Note that such a panic
 is *recovered* — the process keeps running with a corrupted frame — so it can only be caught by reading the
