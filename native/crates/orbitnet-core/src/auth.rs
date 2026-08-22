@@ -258,12 +258,16 @@ impl ReplayWindow {
         }
         if seq > self.newest {
             let shift = seq - self.newest;
-            self.bitmap = if shift >= 64 {
-                0
-            } else {
-                // The old newest becomes bit `shift - 1` of the new map.
-                (self.bitmap << shift) | (1u64 << (shift - 1))
-            };
+            // Every recorded bit moves up by `shift`, and the old newest lands at bit `shift - 1`.
+            // Both are `checked_shl` rather than a width test, because the two have DIFFERENT
+            // boundaries: a jump of exactly [`REPLAY_WINDOW`] shifts every recorded bit out but puts
+            // the old newest on the last bit the window still covers, and the read path below accepts
+            // `behind == REPLAY_WINDOW`. Clearing the map wholesale there loses that one bit, and the
+            // datagram it recorded is accepted a second time.
+            self.bitmap = self.bitmap.checked_shl(shift).unwrap_or(0);
+            if let Some(bit) = 1u64.checked_shl(shift - 1) {
+                self.bitmap |= bit;
+            }
             self.newest = seq;
             return true;
         }
@@ -662,6 +666,23 @@ mod tests {
         // Everything before the jump is now further back than the window reaches.
         assert!(!window.accept(10));
         assert!(window.accept(999));
+    }
+
+    /// The jump-width sweep, because the interesting widths are the ones next to each other: a jump of
+    /// exactly [`REPLAY_WINDOW`] shifts every recorded bit out of the map but leaves the pre-jump
+    /// newest on the LAST bit the window still covers, and one wider genuinely outruns it. Refusing the
+    /// pre-jump sequence is what both must do, for different reasons.
+    #[test]
+    fn a_forward_jump_never_forgets_a_sequence_it_still_covers() {
+        for shift in 1..=(REPLAY_WINDOW + 2) {
+            let mut window = ReplayWindow::new();
+            assert!(window.accept(1000));
+            assert!(window.accept(1000 + shift), "shift {shift}");
+            assert!(
+                !window.accept(1000),
+                "shift {shift}: the pre-jump newest replayed"
+            );
+        }
     }
 
     #[test]
