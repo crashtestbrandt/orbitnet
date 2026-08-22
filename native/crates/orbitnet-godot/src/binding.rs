@@ -616,14 +616,30 @@ pub fn capture_row_from_hook(
 /// Decode `row` into the hook's array and stage the call that hands it to the game.
 ///
 /// The decode happens here, with the synchronizer bound; the call happens after every `bind` is
-/// dropped. `None` when the hook's node has been freed.
+/// dropped.
+///
+/// `None` means the hook cannot run — a freed node, or an array the game resized — and the caller
+/// answers it with the per-property walk, so the row lands either way. The wrong-length case is
+/// reported once and then keeps falling back, the same contract [`capture_row_from_hook`] enforces
+/// on the other direction: silently resizing the array back would leave a game that broke the
+/// contract with no signal that it had.
 pub fn stage_restore_from_row(
     hook: &mut BulkHook,
     bindings: &[PropBinding],
     row: &[u8],
 ) -> Option<HookCall> {
     if hook.values.len() != hook.slots.len() {
-        hook.values.resize(hook.slots.len(), &Variant::nil());
+        if !hook.warned {
+            hook.warned = true;
+            godot_error!(
+                "{}: bulk restore hook's array is {} values for {} properties — this lane falls \
+                 back to the per-property walk. Do not resize the array it is handed.",
+                hook.label,
+                hook.values.len(),
+                hook.slots.len()
+            );
+        }
+        return None;
     }
     for (slot, &index) in hook.slots.iter().enumerate() {
         let binding = &bindings[index];

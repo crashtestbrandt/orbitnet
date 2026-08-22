@@ -217,7 +217,8 @@ func set_bulk_capture(method: String) -> void:
 		_sync.set(&"bulk_capture_method", method)
 
 ## Declare the game method that RESTORES a whole lane's values in one call. Same signature and same shape as
-## [method set_bulk_capture]; read the slots and write them onto your own fields.
+## [method set_bulk_capture]; read the slots and write them onto your own fields, and do not resize the array --
+## a wrong-length one drops the lane back to the walk and reports it once, exactly as on the capture side.
 ##
 ## THE RESTORE ORDER IS NOT THE CAPTURE ORDER. Cosmetic entries are captured and replicated but never restored,
 ## so they are absent here and present there. Read [method bulk_restore_order], not the capture order, and a

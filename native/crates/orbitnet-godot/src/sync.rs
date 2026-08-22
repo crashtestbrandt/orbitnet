@@ -303,7 +303,8 @@ pub struct OrbitRollbackSynchronizer {
     ///
     /// Signature: `func <name>(lane: int, values: Array) -> void`, lanes as above. Read the slots
     /// in the order [`Self::bulk_restore_order`] publishes and write them onto the game's own
-    /// fields; do not resize the array.
+    /// fields. Do not resize the array: a wrong-length one drops the lane back to the walk and
+    /// reports it once, the same answer the capture side gives.
     ///
     /// **The restore order is not the capture order.** `Cosmetic` entries are captured and
     /// replicated but never restored, so they are absent here and present there. A lane that
@@ -1367,27 +1368,26 @@ impl OrbitRollbackSynchronizer {
     /// dropped. A lane without one walks its properties as before.
     pub(crate) fn restore_tick(&mut self, tick: u64, out: &mut Vec<binding::HookCall>) {
         if let Some(row) = self.state_history.row(tick) {
-            match self.state_restore_hook.as_mut() {
-                Some(hook) => {
-                    if let Some(call) =
-                        binding::stage_restore_from_row(hook, &self.state_bindings, row)
-                    {
-                        out.push(call);
-                    }
-                }
+            let staged = match self.state_restore_hook.as_mut() {
+                Some(hook) => binding::stage_restore_from_row(hook, &self.state_bindings, row),
+                None => None,
+            };
+            match staged {
+                Some(call) => out.push(call),
+                // No hook, or a hook that cannot run this tick. Either way the row still has to
+                // land, so the walk is the answer rather than a lane that silently stops
+                // restoring.
                 None => binding::apply_row(&self.state_bindings, row, true),
             }
         }
         if !self.input_bindings.is_empty() {
             if let Some((input_tick, row)) = self.input_history.closest_at_or_before(tick) {
-                match self.input_restore_hook.as_mut() {
-                    Some(hook) => {
-                        if let Some(call) =
-                            binding::stage_restore_from_row(hook, &self.input_bindings, row)
-                        {
-                            out.push(call);
-                        }
-                    }
+                let staged = match self.input_restore_hook.as_mut() {
+                    Some(hook) => binding::stage_restore_from_row(hook, &self.input_bindings, row),
+                    None => None,
+                };
+                match staged {
+                    Some(call) => out.push(call),
                     None => binding::apply_row(&self.input_bindings, row, true),
                 }
                 if input_tick != tick {
