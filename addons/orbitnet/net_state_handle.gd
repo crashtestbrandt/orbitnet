@@ -150,6 +150,19 @@ func last_known_state() -> int:
 		return Net.current_tick()
 	return _sync.get_last_known_state()
 
+## Whether [method last_known_state] reports a MEASURED tick rather than its fail-open fallback.
+##
+## False means the loaded cdylib has no `get_last_known_state`, so `last_known_state()` is answering
+## `Net.current_tick()` -- a value that rises on every peer whether or not a single row ever arrived. False is
+## also what an inert handle reports, because there is nothing to measure.
+##
+## Published because the fallback is INVISIBLE in the reading. A staleness rule wants the fail-open and does not
+## care; anything that treats the reading as evidence -- a probe asserting that rows reach a client, a HUD
+## claiming a body is live, a bug report quoting a tick -- is measuring the fallback the moment this is false,
+## and cannot tell from the number alone. Check it once at bind time and say which branch the reading came from.
+func reports_last_known_state() -> bool:
+	return _reports_last_state
+
 ## Re-read the synchronizer's configuration after its state set changes.
 func process_settings() -> void:
 	if _sync != null:
