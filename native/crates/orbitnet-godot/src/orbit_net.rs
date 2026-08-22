@@ -1737,14 +1737,8 @@ impl OrbitNet {
         }
     }
 
-    /// Send-path accounting, windowed to per-second figures once a second.
-    ///
-    /// Deliberately a **separate** dictionary from [`Self::metrics`]: `bench_metrics.gd` and the
-    /// perf probe read that one's exact shape, and widening a dictionary two harnesses index into
-    /// is how a measurement change becomes a gate failure. Byte figures are OrbitNet **payload**;
-    /// `tx_wire_bytes_s` is the same traffic with [`WIRE_OVERHEAD_BYTES`] per datagram added, and
-    /// `tx_datagrams_s` is published so the sum can be checked rather than trusted.
-    /// Just the near-band inter-arrival, without building [`Self::bandwidth_metrics`]'s dictionary.
+    /// The POOLED mean ticks between admissions across every band, without building
+    /// [`Self::bandwidth_metrics`]'s dictionary.
     ///
     /// A scalar rather than a dictionary key because it is read at tick rates: going through
     /// [`Self::bandwidth_metrics`] to get it allocated a nineteen-key `VarDictionary` and boxed every
@@ -1803,6 +1797,13 @@ impl OrbitNet {
         self.m_peer_interarrival.get(&peer).copied().unwrap_or(0.0)
     }
 
+    /// Send-path accounting, windowed to per-second figures once a second.
+    ///
+    /// Deliberately a **separate** dictionary from [`Self::metrics`]: `bench_metrics.gd` and the
+    /// perf probe read that one's exact shape, and widening a dictionary two harnesses index into
+    /// is how a measurement change becomes a gate failure. Byte figures are OrbitNet **payload**;
+    /// `tx_wire_bytes_s` is the same traffic with [`WIRE_OVERHEAD_BYTES`] per datagram added, and
+    /// `tx_datagrams_s` is published so the sum can be checked rather than trusted.
     #[func]
     fn bandwidth_metrics(&self) -> VarDictionary {
         let bw = &self.m_bw;
