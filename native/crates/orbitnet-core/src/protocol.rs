@@ -5,22 +5,32 @@
 //! schema order — which is most of why they are small, and all of why a schema disagreement is
 //! catastrophic rather than merely wrong.
 //!
-//! So the schema is hashed and the hash is exchanged during the handshake. A mismatch is reported
-//! as a mismatch instead of decoded into garbage. This is a deliberate departure from the GDScript
-//! backend, which silently misapplied state when two peers registered properties in different
-//! orders.
+//! So the schema is hashed, and the server states the hash of every replicated entity in its
+//! `EntityManifest` frame. A client whose locally built schema for that entity hashes differently is
+//! told so by name, instead of decoding the bytes into garbage. This is a deliberate departure from
+//! the GDScript backend, which silently misapplied state when two peers registered properties in
+//! different orders.
+//!
+//! **Per entity, not per session.** The handshake carried a session-wide schema hash until protocol
+//! major 3 and both production call sites passed `0`, because there is no such thing to hash: peers
+//! legitimately have different entities registered at any moment, and the client's set is empty when
+//! it handshakes. The field compared `0` against `0` between honest builds and was removed.
 
 /// Wire protocol version, as `(major << 16) | (minor << 8) | patch`.
 ///
 /// Peers must agree on **major** exactly. This is bumped whenever the frame layout changes in a way
-/// an older peer would misread. Major 2: quantized wire encodings (`QuantKind`).
+/// an older peer would misread.
+///
+/// | Major | What changed |
+/// | --- | --- |
+/// | 2 | Quantized wire encodings (`QuantKind`). |
+/// | 3 | Every datagram but the handshake carries a sequence number and a MAC (`crate::auth`); the handshake carries the session key and no longer carries a session-wide schema hash. |
 ///
 /// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
 /// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
-/// documented absent-value behaviour, a newer peer reads it when it is there. Minor 2.1: the handshake's
-/// trailing `session_id`, absent meaning "no session identity" — see `Handshake::decode`. Anything that
-/// shifts an existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
-pub const PROTOCOL_VERSION: u32 = 0x0002_0100;
+/// documented absent-value behaviour, a newer peer reads it when it is there. Anything that shifts an
+/// existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
+pub const PROTOCOL_VERSION: u32 = 0x0003_0000;
 
 /// Extract the major component of a protocol version.
 #[must_use]
@@ -299,8 +309,8 @@ mod tests {
 
     #[test]
     fn protocol_major_is_extracted() {
-        assert_eq!(protocol_major(PROTOCOL_VERSION), 2);
-        assert_eq!(protocol_major(0x0003_0201), 3);
+        assert_eq!(protocol_major(PROTOCOL_VERSION), 3);
+        assert_eq!(protocol_major(0x0004_0201), 4);
     }
 
     #[test]

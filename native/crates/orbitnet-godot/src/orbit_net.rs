@@ -25,9 +25,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use godot::classes::multiplayer_peer::TransferMode;
-use godot::classes::{Engine, MultiplayerApi, Node, SceneMultiplayer, Time};
+use godot::classes::{
+    Crypto, Engine, MultiplayerApi, Node, RandomNumberGenerator, SceneMultiplayer, Time,
+};
 use godot::prelude::*;
 
+use orbitnet_core::auth::TRAILER_LEN;
 use orbitnet_core::codec::{
     decode_input_block_meta, decode_manifest, decode_state_block_meta, encode_manifest,
     input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
@@ -39,7 +42,8 @@ use orbitnet_core::interest::{
 };
 use orbitnet_core::priority::{self, Band};
 use orbitnet_core::{
-    AoiConfig, ClockEstimator, CoupledSlew, LeadTracker, ResimPlanner, TickAccumulator, TickRate,
+    AoiConfig, AuthError, ClockEstimator, CoupledSlew, Direction, LeadTracker, ReceiveBudget,
+    ResimPlanner, SessionAuth, TickAccumulator, TickRate, KEY_LEN,
 };
 
 use crate::sync::{OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration};
@@ -424,6 +428,13 @@ struct PeerState {
     /// — "this peer is at this point, in this world" — and a centre without the world it is measured
     /// in is precisely the pairing the inferred path takes from one row to keep consistent.
     anchor_membership: MembershipId,
+    /// The key and replay window for this connection's datagrams, seated by its handshake.
+    ///
+    /// `None` until the handshake lands, and that is the gate: [`OrbitNet::open_datagram`] drops
+    /// everything from a peer that has none, so a peer that never handshook cannot even draw a pong.
+    auth: Option<SessionAuth>,
+    /// What this peer has spent of the server's receive path in the current tick.
+    budget: ReceiveBudget,
     /// Per-entity newest tick sent — drives send priority.
     last_sent: HashMap<u64, u64>,
     /// Per-entity newest tick sent as a full block. Drives the keyframe interval.
@@ -830,6 +841,12 @@ pub struct OrbitNet {
     peers: HashMap<i32, PeerState>,
     /// This peer's own session identity, sent in its handshake. `0` claims none.
     session_id: u64,
+    /// Client: the key this session's datagrams are authenticated with, and the window that refuses a
+    /// replayed one from the server. Minted fresh in [`OrbitNet::start`] and carried in the handshake.
+    ///
+    /// The server holds no session key of its own — a session's key is the client's, and the server
+    /// keeps one [`SessionAuth`] per connected peer on [`PeerState`].
+    session_auth: Option<SessionAuth>,
     /// Server: the sessions of dropped peers, held open until their grace window closes.
     resume: ResumeTable,
     /// Server: the transport peer ids connected as of this frame, plus our own.
@@ -927,6 +944,12 @@ pub struct OrbitNet {
     dbg_rx_rejected: u64,
     dbg_rx_skipped: u64,
     dbg_rx_kinds: [u64; 8],
+    /// Datagrams refused by [`OrbitNet::open_datagram`]: forged, replayed, or from a peer with no
+    /// handshake. Counted always; printed under `ORBITNET_DEBUG`.
+    dbg_rx_unauth: u64,
+    /// Whether this session has already warned that it is refusing datagrams. One warning per
+    /// session: under an actual flood the log is the second thing to fall over.
+    auth_warned: bool,
     dbg_input_novel: u64,
     dbg_resim_spans: u64,
     dbg_resim_ticks_total: u64,
@@ -976,6 +999,7 @@ impl INode for OrbitNet {
             state_entities: BTreeMap::new(),
             peers: HashMap::new(),
             session_id: 0,
+            session_auth: None,
             resume: ResumeTable::default(),
             live_peers: std::collections::HashSet::new(),
             manifest_dirty: false,
@@ -1032,6 +1056,8 @@ impl INode for OrbitNet {
             dbg_rx_rejected: 0,
             dbg_rx_skipped: 0,
             dbg_rx_kinds: [0; 8],
+            dbg_rx_unauth: 0,
+            auth_warned: false,
             dbg_input_novel: 0,
             dbg_resim_spans: 0,
             dbg_resim_ticks_total: 0,
@@ -1172,9 +1198,14 @@ impl OrbitNet {
         self.want_full = false;
         self.ping_timer = 0.0;
 
+        self.auth_warned = false;
         if self.mode == MODE_CLIENT {
             self.synced = false;
             self.running = false;
+            // A FRESH key per session, never the previous one. Restarting the sequence numbers under
+            // a key an observer already saw would make every datagram captured from the last session
+            // replayable into this one.
+            self.session_auth = Some(SessionAuth::new(Self::mint_session_key()));
             self.send_hello();
         } else {
             // Server, host, and the sessionless smoke path are their own ground truth.
@@ -1191,6 +1222,10 @@ impl OrbitNet {
         self.synced = false;
         self.hello_pending = false;
         self.peers.clear();
+        // The key describes a session that has ended, and its sequence numbers are spent. The next
+        // session mints its own.
+        self.session_auth = None;
+        self.auth_warned = false;
         // A held session describes a player who can come back to THIS session. There is no session to come
         // back to now, and carrying the table into the next one would resume a stranger.
         self.resume.clear();
@@ -1704,12 +1739,46 @@ impl OrbitNet {
             .unwrap_or(false)
     }
 
-    /// Hand one datagram to the transport, and account for it.
+    /// Authenticate one datagram and hand it to the transport.
+    ///
+    /// **Everything but the handshake goes through here, and a datagram this cannot authenticate is
+    /// not sent.** The fail-safe direction is deliberate: a frame added later is sealed by default,
+    /// and only [`OrbitNet::send_hello`] — which is what carries the key — opts out by calling
+    /// [`OrbitNet::send_raw`].
+    ///
+    /// The sealed datagram is [`TRAILER_LEN`] bytes longer than the payload. That rides above
+    /// `MAX_FRAME_PAYLOAD` the same way the frame header does.
+    fn send_to(&mut self, peer: i32, bytes: &[u8], mode: TransferMode) {
+        let Some((direction, _)) = session_directions(self.mode) else {
+            return;
+        };
+        let mut sealed = Vec::with_capacity(bytes.len() + TRAILER_LEN);
+        sealed.extend_from_slice(bytes);
+        let auth = match direction {
+            Direction::ToServer => self.session_auth.as_mut(),
+            Direction::ToClient => self
+                .peers
+                .get_mut(&peer)
+                .and_then(|state| state.auth.as_mut()),
+        };
+        // No key means no session — a server peer that has not handshaken, or a client that has not
+        // started. Nothing that reaches here is worth sending in the clear.
+        let Some(auth) = auth else {
+            return;
+        };
+        if auth.seal(direction, &mut sealed).is_none() {
+            return;
+        }
+        self.send_raw(peer, &sealed, mode);
+    }
+
+    /// Hand one datagram to the transport unauthenticated, and account for it.
     ///
     /// Every byte OrbitNet puts on the wire goes through here — snapshots, input frames, manifests,
     /// pings and the handshake alike — which is what makes `tx_bytes_s` a number about the session
-    /// rather than about the snapshot loop.
-    fn send_to(&mut self, peer: i32, bytes: &[u8], mode: TransferMode) {
+    /// rather than about the snapshot loop. Only the handshake calls it directly; see
+    /// [`OrbitNet::send_to`].
+    fn send_raw(&mut self, peer: i32, bytes: &[u8], mode: TransferMode) {
         let Some(mut scene) = self.scene_multiplayer() else {
             return;
         };
@@ -1746,9 +1815,38 @@ impl OrbitNet {
         if peer.get_connection_status() != ConnectionStatus::CONNECTED {
             return;
         }
-        let hello =
-            Handshake::local(0, self.tickrate.clamp(1, 240) as u16).with_session(self.session_id);
-        self.send_to(SERVER_PEER, &hello.encode(), TransferMode::RELIABLE);
+        // The one datagram sent unauthenticated, because it is what carries the key everything else
+        // is authenticated with. `start()` mints it; this covers the transport connecting first.
+        let key = self
+            .session_auth
+            .get_or_insert_with(|| SessionAuth::new(Self::mint_session_key()))
+            .key();
+        let hello = Handshake::local(self.tickrate.clamp(1, 240) as u16)
+            .with_session(self.session_id)
+            .with_key(key);
+        self.send_raw(SERVER_PEER, &hello.encode(), TransferMode::RELIABLE);
+    }
+
+    /// 16 random bytes for this session's key.
+    ///
+    /// `Crypto` is Godot's platform CSPRNG. `RandomNumberGenerator` is the fallback for a build
+    /// without the mbedtls module, and it is **not** cryptographic: an attacker who can predict its
+    /// stream can forge this session's datagrams. It is stated here rather than substituted silently,
+    /// and the shipped export templates all carry `Crypto`.
+    fn mint_session_key() -> [u8; KEY_LEN] {
+        let mut key = [0u8; KEY_LEN];
+        let random = Crypto::new_gd().generate_random_bytes(KEY_LEN as i32);
+        let bytes = random.as_slice();
+        if bytes.len() >= KEY_LEN {
+            key.copy_from_slice(&bytes[..KEY_LEN]);
+            return key;
+        }
+        let mut rng = RandomNumberGenerator::new_gd();
+        rng.randomize();
+        for chunk in key.chunks_mut(4) {
+            chunk.copy_from_slice(&rng.randi().to_le_bytes());
+        }
+        key
     }
 
     /// Retry the handshake until the welcome lands. Reliable transport should make the first
@@ -2370,6 +2468,9 @@ impl OrbitNet {
                     self.dbg_rx_skipped,
                     self.dbg_rx_kinds
                 );
+                if self.dbg_rx_unauth > 0 {
+                    godot_print!("[orbitnet]   rx_unauthenticated={}", self.dbg_rx_unauth);
+                }
                 godot_print!(
                     "[orbitnet]   input_novel={} resim_spans={} resim_ticks={} fresh={}",
                     self.dbg_input_novel,
@@ -2387,6 +2488,7 @@ impl OrbitNet {
                 self.dbg_rx_applied = 0;
                 self.dbg_rx_rejected = 0;
                 self.dbg_rx_skipped = 0;
+                self.dbg_rx_unauth = 0;
             }
         }
     }
@@ -3278,8 +3380,14 @@ impl OrbitNet {
             self.handle_hello(sender, bytes);
             return;
         }
-        let mut reader = Reader::new(bytes);
-        let Ok(kind) = FrameKind::from_tag(bytes[0]) else {
+        let Some(payload) = self.open_datagram(sender, bytes) else {
+            return;
+        };
+        if payload.is_empty() {
+            return;
+        }
+        let mut reader = Reader::new(payload);
+        let Ok(kind) = FrameKind::from_tag(payload[0]) else {
             return;
         };
         match kind {
@@ -3344,6 +3452,50 @@ impl OrbitNet {
         }
     }
 
+    /// Verify a datagram against its session's key and replay window, answering the payload.
+    ///
+    /// **Nothing below this line decodes a byte a peer chose until this returns.** `None` means the
+    /// datagram was forged, replayed, or sent by a peer with no handshake — including the ping a
+    /// server used to answer for any connected sender, which is now refused with the rest.
+    fn open_datagram<'a>(&mut self, sender: i32, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        // A peer authenticates with the direction it EXPECTS TO RECEIVE. That is what makes a
+        // reflected datagram fail: the direction is mixed into the MAC and never sent.
+        let (_, direction) = session_directions(self.mode)?;
+        let auth = match direction {
+            Direction::ToClient => self.session_auth.as_mut(),
+            Direction::ToServer => self
+                .peers
+                .get_mut(&sender)
+                .and_then(|state| state.auth.as_mut()),
+        };
+        let opened = auth.map(|auth| auth.open(direction, bytes));
+        match opened {
+            Some(Ok(payload)) => Some(payload),
+            Some(Err(AuthError::Truncated | AuthError::BadTag | AuthError::Replayed)) | None => {
+                self.note_unauthenticated(sender);
+                None
+            }
+        }
+    }
+
+    /// Count a refused datagram, and say so once per session.
+    ///
+    /// Once, because the log is the second thing to fall over under a flood. The count is what a
+    /// `ORBITNET_DEBUG` run prints every second, and it is the number that says whether a session is
+    /// being probed or merely misconfigured.
+    fn note_unauthenticated(&mut self, sender: i32) {
+        self.dbg_rx_unauth += 1;
+        if self.auth_warned {
+            return;
+        }
+        self.auth_warned = true;
+        godot_warn!(
+            "OrbitNet: refusing an unauthenticated datagram from peer {sender} — forged, replayed, \
+             or sent before the handshake. Further refusals this session are silent; run with \
+             ORBITNET_DEBUG to count them."
+        );
+    }
+
     fn handle_hello(&mut self, sender: i32, bytes: &[u8]) {
         if self.mode != MODE_SERVER && self.mode != MODE_HOST {
             return;
@@ -3351,7 +3503,7 @@ impl OrbitNet {
         let Ok(hello) = Handshake::decode(bytes) else {
             return;
         };
-        let ours = Handshake::local(0, self.effective_rate().hz() as u16);
+        let ours = Handshake::local(self.effective_rate().hz() as u16);
         if let Err(err) = ours.check_compatibility(&hello) {
             godot_error!("OrbitNet: rejecting peer {sender}: {err}");
             return;
@@ -3395,6 +3547,18 @@ impl OrbitNet {
         // welcome has to go out again — that is what the retry is for — but the game must hear about the join
         // exactly once, or a roster answers a lost packet by re-seating somebody who never left.
         let first_hello = !peer.synced;
+        // Seat the session key. A hello is retried, so the usual case is the SAME key arriving again
+        // — and the window must SURVIVE that, because resetting it on every hello would let anything
+        // captured from this peer be replayed by sending one copy of its own handshake first.
+        //
+        // A hello carrying a DIFFERENT key is a peer that restarted its session on a live connection,
+        // and it gets a fresh window and a fresh budget. That a hello can rekey a connection at all is
+        // the same trust the transport's sender id already carries: nothing but the connection says
+        // who sent it.
+        if peer.auth.is_none_or(|auth| auth.key() != hello.session_key) {
+            peer.auth = Some(SessionAuth::new(hello.session_key));
+            peer.budget = ReceiveBudget::new();
+        }
         peer.synced = true;
         peer.want_full = true;
         peer.newest_input_tick = -1;
@@ -3515,9 +3679,20 @@ impl OrbitNet {
             self.acc_want_full_nacks += 1;
         }
 
+        // What this peer may spend of the receive path this tick. Every block below costs a handle
+        // resolve and a live authority call, so without a bound a peer could spend the server's tick
+        // having blocks it does not own correctly refused. See `orbitnet_core::auth::ReceiveBudget`.
+        let mut budget = self
+            .peers
+            .get(&sender)
+            .map_or_else(ReceiveBudget::new, |peer| peer.budget);
+        budget.open(current);
         for _ in 0..header.entity_count {
+            if !budget.admit() {
+                break;
+            }
             let Ok(meta) = decode_input_block_meta(reader, u64::from(header.tick)) else {
-                return;
+                break;
             };
             // Bound accepted input to the near future: the history ring only rejects the PAST, so
             // a hostile newest_tick near u64::MAX would rotate the ring's frontier out of reach
@@ -3547,6 +3722,9 @@ impl OrbitNet {
             if owner != sender {
                 drop(bound);
                 let _ = skip_input_block_body(reader, &meta);
+                if !budget.note_foreign() {
+                    break;
+                }
                 continue;
             }
             let wire_stride = bound.input_wire_stride();
@@ -3584,6 +3762,7 @@ impl OrbitNet {
         }
 
         if let Some(peer) = self.peers.get_mut(&sender) {
+            peer.budget = budget;
             let newest = i64::from(header.tick);
             peer.newest_input_tick = peer.newest_input_tick.max(newest);
             let margin = newest - i64::try_from(current).unwrap_or(i64::MAX);
@@ -3863,6 +4042,23 @@ fn owned_rows_of(owned: &[(SeatId, u32)], peer_id: i32) -> &[(SeatId, u32)] {
     &owned[start..end]
 }
 
+/// The direction this role SENDS in, and the direction it EXPECTS TO RECEIVE.
+///
+/// A free function so the one rule that must not be inverted is the rule a test can call. Getting it
+/// backwards would authenticate every datagram in the direction it did not travel, and the whole
+/// session would refuse itself — which is loud, but it is also exactly what the direction byte exists
+/// to make impossible for an attacker, so it is stated once and checked once.
+///
+/// `None` OFFLINE: there is no session and nothing to authenticate.
+#[must_use]
+fn session_directions(mode: i64) -> Option<(Direction, Direction)> {
+    match mode {
+        MODE_CLIENT => Some((Direction::ToServer, Direction::ToClient)),
+        MODE_SERVER | MODE_HOST => Some((Direction::ToClient, Direction::ToServer)),
+        _ => None,
+    }
+}
+
 /// Whether a dropped peer's session should be held open for it to come back to.
 ///
 /// - Not a server: only the authority holds sessions.
@@ -3904,8 +4100,9 @@ mod tests {
     use super::{
         admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
         full_block_due, hold_on_drop, owned_rows_into, owned_rows_of, resolve_observer,
-        seat_observer, EntityRow, OrbitNet, PeerAnchor, PeerObserver, PeerState, ResumeTable,
-        RxOutcome, SeatId, SeatIndex, StateIntegration, FULL_STATE_INTERVAL, RTT_SAMPLE_MAX_MS,
+        seat_observer, session_directions, EntityRow, OrbitNet, PeerAnchor, PeerObserver,
+        PeerState, ResumeTable, RxOutcome, SeatId, SeatIndex, StateIntegration,
+        FULL_STATE_INTERVAL, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER, RTT_SAMPLE_MAX_MS,
         RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
     use orbitnet_core::interest::{
@@ -4997,5 +5194,22 @@ mod tests {
         table.clear();
         assert!(table.expire(u64::MAX).is_empty());
         assert!(!table.holds(1));
+    }
+
+    #[test]
+    fn a_role_receives_in_the_direction_it_does_not_send() {
+        // The property the direction byte rests on: each role's send and receive directions are
+        // opposites, and the two roles are mirror images. An inversion here refuses every datagram.
+        let (client_tx, client_rx) = session_directions(MODE_CLIENT).unwrap();
+        let (server_tx, server_rx) = session_directions(MODE_SERVER).unwrap();
+        assert_ne!(client_tx, client_rx);
+        assert_ne!(server_tx, server_rx);
+        assert_eq!(client_tx, server_rx);
+        assert_eq!(server_tx, client_rx);
+        assert_eq!(
+            session_directions(MODE_HOST),
+            session_directions(MODE_SERVER)
+        );
+        assert_eq!(session_directions(MODE_OFFLINE), None);
     }
 }

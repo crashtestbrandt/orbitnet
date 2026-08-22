@@ -12,17 +12,19 @@ Little-endian.
 ```
 frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | input-arrival margin byte
 then per entity:  { entity id | flags | changed-property bitmask | packed payload }
+then the trailer: { sequence (u32) | MAC tag (u64) }
 ```
 
 No property names, no type tags — the schema is positional and agreed in advance. Client input carries the
 last N ticks for redundancy, so a single lost packet costs nothing.
 
-**Control frames** — reliable: handshake, entity schema, entity binding, reject.
+**Control frames** — reliable: handshake, welcome, entity manifest. All but the handshake carry the same
+12-byte trailer.
 
-**Handshake** — magic, protocol version, schema hash, tick rate, then a **session id**:
+**Handshake** — magic, protocol version, tick rate, a **session id**, then the **session key**:
 
 ```
-magic | protocol version (u32) | schema hash (u32) | tickrate (u16) | session id (u64, optional)
+magic | protocol version (u32) | tickrate (u16) | session id (u64) | session key (16 bytes)
 ```
 
 The session id is what makes a reconnecting player recognisable: a peer id names the connection and is
@@ -30,24 +32,77 @@ reassigned every time, this names the player and is resent verbatim on every joi
 client and verified by nobody** — adequate for giving a player their own entity back, inadequate for anything
 that must not be forged. `0` means "no identity"; see [api.md](api.md#session-identity-and-reconnection).
 
-It is an **optional trailing field**: a handshake that stops after the tick rate decodes as `session_id = 0`
-rather than as a truncation error. That is what keeps a peer built before the field from being dropped in
-silence — `handle_hello` answers a decode failure by returning, so the joiner would see no rejection at all.
+Everything after the protocol version decodes **best-effort**, to a zero tick rate, no session id and an
+all-zero key. `handle_hello` answers a decode error by returning, so a peer whose handshake is short would
+otherwise be dropped in silence; decoding it far enough to reach the compatibility check is what produces the
+operator-readable version mismatch. An all-zero key is then refused with a message of its own.
 
 **Versioning.** `PROTOCOL_VERSION` packs `(major << 16) | (minor << 8) | patch`; **major must match exactly**.
+
+| Major | What changed |
+| --- | --- |
+| 2 | Quantized wire encodings. |
+| 3 | Per-datagram authentication, and the handshake's session key. |
+
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
-documented absent value. Minor 2.1 is the handshake's session id. Anything that shifts an existing field's
-offset is a major bump, because there the older peer decodes garbage.
-The schema hash is FNV-1a over `(name, kind, role)` in **declaration order** — deliberately order-sensitive,
-because two peers registering the same properties in different orders would otherwise silently misapply state,
-which is miserable to diagnose. A mismatch produces an operator-readable message naming both versions or both
-hashes, never a desync.
+documented absent value. Anything that shifts an existing field's offset is a major bump, because there the
+older peer decodes garbage.
+
+Schema agreement is **per entity, not per session**: the server states each replicated entity's state and
+input hash in its `EntityManifest` frame, and a client whose locally built schema hashes differently is told
+so by name. The hash is FNV-1a over `(name, kind, role)` in **declaration order** — deliberately
+order-sensitive, because two peers registering the same properties in different orders would otherwise
+silently misapply state, which is miserable to diagnose. The handshake carried a session-wide schema hash
+until major 3; there is no such thing to hash, both call sites passed `0`, and the field was removed.
 
 **Robustness.** The decoder is the one component parsing bytes chosen by a remote peer, so every read is
 bounds-checked and returns an error rather than panicking — a decoder that panics on a malformed packet is a
 remote denial of service. `#![forbid(unsafe_code)]` means a bounds bug cannot become memory unsafety either.
 Tests sweep truncated and pseudo-random buffers.
+
+## Datagram authentication
+
+Every datagram but the handshake carries a **32-bit sequence number and a 64-bit MAC tag**, and is dropped
+before a single field is decoded unless both check out.
+
+- **The key** is 16 bytes, minted by the client from Godot's `Crypto`, one per session, and carried in the
+  handshake. The server keeps one per connected peer; a peer that has not handshaken has none, and everything
+  it sends is refused — including the ping a server used to answer for any connected sender.
+- **The MAC** is SipHash-2-4 over the payload, the sequence number, and a **direction byte that is not
+  transmitted**. Each side authenticates with the direction it expects to receive, so a datagram reflected
+  back at its sender fails the tag check.
+- **The replay window** is a 64-entry sliding bitmap, the same construction IPsec uses. A sequence number is
+  accepted once; a repeat, or one more than 64 behind the newest accepted, is refused. A datagram whose tag
+  fails does not advance the window, so a forger cannot burn sequence numbers the real peer has yet to send.
+- **Sequence numbers are refused rather than wrapped.** 32 bits at 60 Hz is 2.2 years of one session.
+- **The key crosses the wire in the clear**, so this authenticates a datagram's membership in a session, not
+  a peer's identity. An attacker who cannot read the session's traffic cannot forge a datagram at all,
+  whatever sender id it puts on one, and one connected peer cannot forge another's. **An on-path observer
+  who can read the handshake can do everything the client can** — closing that needs a key exchange. Recorded
+  as a limit in the [README](../README.md#limits).
+
+## What the receive path refuses, and what it does not
+
+The backend checks the wire. It does not check your game.
+
+| Refused by the backend | |
+| --- | --- |
+| A datagram whose MAC does not verify | Forged, corrupted, or reflected. |
+| A datagram replaying a sequence number | Or one further back than the replay window reaches. |
+| Anything from a peer that has not handshaken | Including pings. |
+| A peer speaking a different protocol major | Rejected at the handshake with a readable message. |
+| An input block for an entity the sender does not own | The live `get_multiplayer_authority()` check on the input node. |
+| An input block stamped too far into the future | Past `INPUT_FUTURE_HORIZON_TICKS` ahead of the server. |
+| An input row of the wrong wire stride, or for a tick history has rotated past | |
+| More than 64 input blocks from one peer in one tick | The per-peer receive budget. The rest of that frame is abandoned, and so is the rest of a frame that names more than 8 entities the sender does not own. |
+
+| **Not** checked by the backend — yours | |
+| --- | --- |
+| **Input values** | A row that decodes at the correct stride is written into input history as-is. Range, rate and plausibility are your job, inside `_rollback_tick`. A client is free to send a movement axis of 10<sup>9</sup>. |
+| **Command payloads** | `NetCommand` resolves the sender; the *handler* decides whether that sender may do that thing. See [api.md](api.md#netcommand). |
+| **Session identity** | Client-asserted, verified by nobody. |
+| **Account identity, entitlement, bans** | An authenticated layer above this, whose verified id goes into `set_session_id()`. |
 
 ## The clock
 

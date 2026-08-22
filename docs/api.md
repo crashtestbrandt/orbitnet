@@ -141,12 +141,19 @@ func make_rollback(root: Node) -> NetRollbackHandle     # bare handle; you regis
 
 - `root`'s authority is the **server** — it owns every body's state.
 - `input_node`'s authority is the **owning client** — each client authors only its own input, and the backend
-  validates the sender against that authority. That is the anti-forgery check.
+  validates the sender against that authority. That is the anti-forgery check on **who** wrote a row.
+  **Nothing checks what is in it** — see [protocol.md](protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
 - Splitting them **requires input on its own node**, because authority is a per-node property.
 - `predict` is true on the owning client *and* on the server, false on a client watching someone else's body.
 
 `root` then implements `_rollback_tick(delta: float, tick: int, is_fresh: bool)`, called on every peer that
 predicts it. See [protocol.md](protocol.md#is_fresh) for what `is_fresh` guarantees.
+
+**Validate your input values there.** The backend authenticates every datagram and refuses a row written for
+an entity the sender does not own, but a row that decodes at the right stride is stored as-is: a client can
+send any value its input schema can express. Clamp axes, bound rates, and reject impossible states inside
+`_rollback_tick`, on the server. The full split is
+[in protocol.md](protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
 
 ### Resim-depth and diagnostics knobs
 
