@@ -142,7 +142,16 @@ Known and filed, not hidden:
   arrives before the transport reports its old socket as gone — so a forged one takes a playing player's body,
   and that player keeps its connection with no error. Anything that must not be forged needs an authenticated
   layer above it; a game that will not accept the takeover honours `resumed_from` only after a `peer_dropped`
-  it saw as `held`. Beyond this the wire carries nothing but a per-entity authority check.
+  it saw as `held`.
+- **The session key crosses the wire in the clear.** Every datagram but the handshake carries a MAC and a
+  replay sequence, and the handshake carries the key they are checked with. So an attacker who cannot read
+  the session's traffic cannot forge a datagram, and one connected peer cannot forge another's — but **an
+  on-path observer who reads the handshake can do everything the client can.** Closing that needs a key
+  exchange, and therefore an asymmetric primitive `orbitnet-core` has no dependency for.
+- **Input values are not validated.** The backend checks who wrote a row, not what is in it: a row that
+  decodes at the right stride is stored as-is. Clamping and plausibility are the game's job inside
+  `_rollback_tick`. The full split is in
+  [docs/protocol.md](docs/protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
 
 ## Licence
 

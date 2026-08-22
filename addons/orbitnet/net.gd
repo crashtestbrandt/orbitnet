@@ -937,6 +937,12 @@ func make_interpolator(root: Node) -> NetInterpolatorHandle:
 ## non-owning client (apply state only). Splitting state vs input authority requires input to live on its OWN
 ## node -- hence `input_node`, a child whose authority differs from the body's.
 ##
+## WHAT THE BACKEND DOES NOT CHECK: the VALUES in a received input row. Each datagram is authenticated
+## against the sender's session key and each row is refused unless the sender holds the input node's
+## authority, but a row that decodes at the right stride is stored as-is -- a client can send any value its
+## input schema can express. Clamp axes, bound rates and reject impossible states in `_rollback_tick`, on the
+## server. docs/protocol.md states the full split.
+##
 ## There is no "one synchronizer type per body on every peer" constraint: replication routes by an entity id
 ## DERIVED from the root's node path rather than by RPC node paths -- but the
 ## property SETS must still be identical on every peer (the wire schema is positional; the backend hashes it

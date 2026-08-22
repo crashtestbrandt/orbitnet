@@ -13,6 +13,7 @@
 
 use core::fmt;
 
+use crate::auth::KEY_LEN;
 use crate::columnar::changed_mask;
 use crate::protocol::{protocol_major, PropSchema, PROTOCOL_VERSION};
 
@@ -23,6 +24,9 @@ pub const MAGIC: [u8; 4] = *b"OBNW";
 ///
 /// Frames are never fragmented: when a tick's content exceeds this, low-priority entities are
 /// deferred to a later tick instead. That is what stops a crowded fight from stalling a server.
+///
+/// The frame header and the [`crate::auth::TRAILER_LEN`] authentication trailer both ride ABOVE this
+/// ceiling, so a full datagram is this plus both. The headroom under a 1500-byte path MTU covers it.
 pub const MAX_FRAME_PAYLOAD: usize = 1200;
 
 /// Something went wrong reading or validating a frame.
@@ -43,13 +47,9 @@ pub enum CodecError {
         /// This peer's version.
         ours: u32,
     },
-    /// The peer's replicated property schema does not match ours.
-    SchemaMismatch {
-        /// The remote peer's schema hash.
-        theirs: u32,
-        /// This peer's schema hash.
-        ours: u32,
-    },
+    /// The peer's handshake carried no session key, so nothing it sends afterwards can be
+    /// authenticated. An older build, or a truncated handshake.
+    MissingSessionKey,
 }
 
 impl fmt::Display for CodecError {
@@ -66,11 +66,10 @@ impl fmt::Display for CodecError {
                 version_string(*theirs),
                 version_string(*ours)
             ),
-            CodecError::SchemaMismatch { theirs, ours } => write!(
+            CodecError::MissingSessionKey => write!(
                 f,
-                "OrbitNet schema mismatch: peer's replicated property set hashes to {theirs:#010x}, \
-                 ours to {ours:#010x}. The peers registered different properties, or registered \
-                 them in a different order."
+                "OrbitNet handshake carried no session key, so no datagram from this peer can be \
+                 authenticated. The peer is an older build, or its handshake was truncated."
             ),
         }
     }
@@ -477,12 +476,14 @@ impl FrameHeader {
 }
 
 /// The reliable frame a joining peer sends, and the reply it gets.
+///
+/// **It is the one datagram OrbitNet does not authenticate, because it is what establishes the key
+/// everything else is authenticated with.** [`crate::auth`] states exactly what that buys and what it
+/// does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handshake {
     /// The sender's packed protocol version.
     pub protocol_version: u32,
-    /// The sender's replicated property schema hash.
-    pub schema_hash: u32,
     /// The sender's tick rate in hertz.
     pub tickrate: u16,
     /// The sender's **session identity**, or `0` for "no identity — seat me as a newcomer".
@@ -496,18 +497,24 @@ pub struct Handshake {
     /// it is adequate for is the thing it exists for: a player whose link dropped getting their own entity
     /// back instead of a stranger's.
     pub session_id: u64,
+    /// The key every other datagram of this session is authenticated with.
+    ///
+    /// Minted by the client, one per session, and **carried in the clear** — so it authenticates a
+    /// datagram's membership in a session rather than a peer's identity. All zeroes is refused by
+    /// [`Handshake::check_compatibility`]: it is what a peer that sent no key at all decodes to.
+    pub session_key: [u8; KEY_LEN],
 }
 
 impl Handshake {
-    /// Build a handshake for this build, given the local schema hash and tick rate. Carries no session
-    /// identity; see [`Handshake::with_session`].
+    /// Build a handshake for this build at `tickrate`. Carries no session identity and no key; see
+    /// [`Handshake::with_session`] and [`Handshake::with_key`].
     #[must_use]
-    pub fn local(schema_hash: u32, tickrate: u16) -> Self {
+    pub fn local(tickrate: u16) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            schema_hash,
             tickrate,
             session_id: 0,
+            session_key: [0; KEY_LEN],
         }
     }
 
@@ -518,44 +525,63 @@ impl Handshake {
         self
     }
 
+    /// The same handshake, carrying the session key.
+    #[must_use]
+    pub fn with_key(mut self, session_key: [u8; KEY_LEN]) -> Self {
+        self.session_key = session_key;
+        self
+    }
+
     /// Encode, including the leading magic.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(22);
+        let mut writer = Writer::with_capacity(MAGIC.len() + 14 + KEY_LEN);
         writer.bytes(&MAGIC);
         writer.u32(self.protocol_version);
-        writer.u32(self.schema_hash);
         writer.u16(self.tickrate);
         writer.u64(self.session_id);
+        writer.bytes(&self.session_key);
         writer.into_inner()
     }
 
     /// Decode, validating the magic.
     ///
-    /// **The session id is an OPTIONAL TRAILING FIELD.** A handshake that stops after the tick rate decodes
-    /// with `session_id: 0` rather than as a truncation error, which is what keeps a peer built before the
-    /// field from being dropped in silence: it still handshakes, [`Handshake::check_compatibility`] still
-    /// reports any real version or schema mismatch with a readable message, and the only thing it loses is
-    /// the ability to resume. That is also why the field was added under a MINOR protocol bump — see
-    /// `PROTOCOL_VERSION`.
+    /// **Everything after the protocol version decodes best-effort**, to a zero tick rate, no session
+    /// identity and an all-zero key. That is not laxity: `handle_hello` answers a decode error by
+    /// returning, so a peer whose handshake is short — an older build, a truncated frame — would be
+    /// dropped in silence with no rejection message at all. Decoding it far enough to reach
+    /// [`Handshake::check_compatibility`] is what produces the operator-readable version mismatch, and
+    /// the same check refuses the all-zero key a short handshake leaves behind.
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(buf);
         if reader.bytes(MAGIC.len())? != MAGIC {
             return Err(CodecError::BadMagic);
         }
+        let protocol_version = reader.u32()?;
+        let tickrate = reader.u16().unwrap_or(0);
+        let session_id = reader.u64().unwrap_or(0);
+        let mut session_key = [0u8; KEY_LEN];
+        if let Ok(bytes) = reader.bytes(KEY_LEN) {
+            session_key.copy_from_slice(bytes);
+        }
         Ok(Self {
-            protocol_version: reader.u32()?,
-            schema_hash: reader.u32()?,
-            tickrate: reader.u16()?,
-            session_id: reader.u64().unwrap_or(0),
+            protocol_version,
+            tickrate,
+            session_id,
+            session_key,
         })
     }
 
     /// Check a remote handshake against ours.
     ///
-    /// Protocol major must match exactly and the schema hash must match. A differing tick rate is
-    /// deliberately *not* an error here — it is a policy decision for the caller, since some games
-    /// legitimately let peers run at different rates.
+    /// Protocol major must match exactly and the remote must carry a session key. A differing tick rate
+    /// is deliberately *not* an error here — it is a policy decision for the caller, since some games
+    /// legitimately let peers run at different rates. Nor is a differing session identity: every client
+    /// mints its own.
+    ///
+    /// **The key is checked on `remote` only.** The local handshake in this call is a version reference
+    /// built by [`Handshake::local`], and the server never mints a key of its own — the client's is the
+    /// session's.
     pub fn check_compatibility(&self, remote: &Handshake) -> Result<(), CodecError> {
         if protocol_major(remote.protocol_version) != protocol_major(self.protocol_version) {
             return Err(CodecError::ProtocolMismatch {
@@ -563,11 +589,8 @@ impl Handshake {
                 ours: self.protocol_version,
             });
         }
-        if remote.schema_hash != self.schema_hash {
-            return Err(CodecError::SchemaMismatch {
-                theirs: remote.schema_hash,
-                ours: self.schema_hash,
-            });
+        if remote.session_key == [0u8; KEY_LEN] {
+            return Err(CodecError::MissingSessionKey);
         }
         Ok(())
     }
@@ -1209,81 +1232,89 @@ mod tests {
         );
     }
 
+    const TEST_KEY: [u8; KEY_LEN] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x01,
+    ];
+
     #[test]
     fn handshake_round_trips() {
-        let hello = Handshake::local(0xabcd_1234, 60);
+        let hello = Handshake::local(60).with_key(TEST_KEY);
         let decoded = Handshake::decode(&hello.encode()).unwrap();
         assert_eq!(decoded, hello);
         assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(decoded.session_key, TEST_KEY);
     }
 
     #[test]
     fn handshake_carries_a_session_identity_verbatim() {
-        let hello = Handshake::local(0xabcd_1234, 60).with_session(0xdead_beef_c0de_1234);
+        let hello = Handshake::local(60)
+            .with_session(0xdead_beef_c0de_1234)
+            .with_key(TEST_KEY);
         let decoded = Handshake::decode(&hello.encode()).unwrap();
         assert_eq!(decoded.session_id, 0xdead_beef_c0de_1234);
         assert_eq!(decoded, hello);
     }
 
-    /// The whole point of the trailing field: a peer built before it still joins, and simply never resumes.
-    /// Decoding its shorter handshake as a truncation error would drop it in silence — `handle_hello`
-    /// answers a decode failure by returning, so the joiner would see no rejection message at all.
+    /// A short handshake must reach `check_compatibility` rather than fail to decode: `handle_hello`
+    /// answers a decode error by returning, so the joiner would see no rejection message at all. This is
+    /// the shape an older build's handshake arrives in.
     #[test]
-    fn a_handshake_without_a_session_id_decodes_as_no_identity() {
-        let full = Handshake::local(0x1234, 60).with_session(7);
+    fn a_truncated_handshake_decodes_far_enough_to_be_rejected_readably() {
+        let full = Handshake::local(60).with_session(7).with_key(TEST_KEY);
         let bytes = full.encode();
-        let short = &bytes[..bytes.len() - 8];
-        let decoded = Handshake::decode(short).unwrap();
-        assert_eq!(
-            decoded.session_id, 0,
-            "an absent trailing field is no identity"
-        );
-        assert_eq!(
-            decoded.tickrate, 60,
-            "and the fields before it still decode"
-        );
-        assert!(decoded.check_compatibility(&full).is_ok());
+        for keep in 8..bytes.len() {
+            let decoded = Handshake::decode(&bytes[..keep]).unwrap();
+            assert_eq!(decoded.protocol_version, PROTOCOL_VERSION, "keep {keep}");
+            let err = Handshake::local(60)
+                .check_compatibility(&decoded)
+                .unwrap_err();
+            assert_eq!(err, CodecError::MissingSessionKey, "keep {keep}");
+            assert!(err.to_string().contains("session key"), "{err}");
+        }
     }
 
     /// The identity is not part of the agreement check: two peers with different sessions are compatible,
     /// which is what lets every client mint its own.
     #[test]
     fn a_differing_session_identity_is_not_an_incompatibility() {
-        let ours = Handshake::local(0x1234, 60).with_session(1);
-        let theirs = Handshake::local(0x1234, 60).with_session(2);
+        let ours = Handshake::local(60).with_session(1).with_key(TEST_KEY);
+        let theirs = Handshake::local(60).with_session(2).with_key(TEST_KEY);
         assert!(ours.check_compatibility(&theirs).is_ok());
     }
 
     #[test]
     fn handshake_rejects_bad_magic() {
-        let mut bytes = Handshake::local(1, 60).encode();
+        let mut bytes = Handshake::local(60).with_key(TEST_KEY).encode();
         bytes[0] = b'X';
         assert_eq!(Handshake::decode(&bytes), Err(CodecError::BadMagic));
     }
 
     #[test]
     fn handshake_accepts_a_matching_peer() {
-        let ours = Handshake::local(0x1234, 60);
-        let theirs = Handshake::local(0x1234, 60);
+        let ours = Handshake::local(60);
+        let theirs = Handshake::local(60).with_key(TEST_KEY);
         assert!(ours.check_compatibility(&theirs).is_ok());
     }
 
     #[test]
     fn handshake_tolerates_a_differing_patch_version() {
-        let ours = Handshake::local(0x1234, 60);
+        let ours = Handshake::local(60);
         let theirs = Handshake {
             protocol_version: PROTOCOL_VERSION + 1, // patch bump
-            ..ours
+            ..Handshake::local(60).with_key(TEST_KEY)
         };
         assert!(ours.check_compatibility(&theirs).is_ok());
     }
 
+    /// Version skew is reported BEFORE the missing key, so a peer one major behind — which by
+    /// definition sends no key this build can read — is told the thing it can act on.
     #[test]
     fn handshake_rejects_a_major_version_gap() {
-        let ours = Handshake::local(0x1234, 60);
+        let ours = Handshake::local(60);
         let theirs = Handshake {
             protocol_version: crate::PROTOCOL_VERSION + 0x0001_0000,
-            ..ours
+            ..Handshake::local(60)
         };
         let err = ours.check_compatibility(&theirs).unwrap_err();
         assert!(matches!(err, CodecError::ProtocolMismatch { .. }));
@@ -1296,18 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn handshake_rejects_a_schema_gap() {
-        let ours = Handshake::local(0x1111, 60);
-        let theirs = Handshake::local(0x2222, 60);
-        let err = ours.check_compatibility(&theirs).unwrap_err();
-        assert!(matches!(err, CodecError::SchemaMismatch { .. }));
-        assert!(err.to_string().contains("0x00002222"), "{err}");
-    }
-
-    #[test]
     fn differing_tickrate_is_not_a_handshake_error() {
-        let ours = Handshake::local(0x1234, 60);
-        let theirs = Handshake::local(0x1234, 30);
+        let ours = Handshake::local(60).with_key(TEST_KEY);
+        let theirs = Handshake::local(30).with_key(TEST_KEY);
         assert!(ours.check_compatibility(&theirs).is_ok());
     }
 

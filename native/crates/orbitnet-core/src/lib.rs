@@ -15,6 +15,8 @@
 //!   `memcmp` changed-masks, masked merges. No `Variant`, no per-tick allocation.
 //! * [`protocol`] — property schema description and the schema hash peers agree on.
 //! * [`codec`] — the wire encoding: varints, frame headers, handshake, entity blocks.
+//! * [`auth`] — what the receive path refuses: the per-datagram MAC, the replay window, and the
+//!   per-peer input budget.
 //! * [`freshness`] — the #67 fix: per-(entity, tick) input confidence, so `is_fresh` keys on
 //!   input *novelty* rather than tick visitation, plus the tick-indexed memo ring.
 //! * [`interest`] — AOI: the uniform grid, per-seat interest sets with hysteresis, and the
@@ -25,6 +27,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod clock;
 pub mod codec;
 pub mod columnar;
@@ -37,6 +40,7 @@ pub mod protocol;
 pub mod quant;
 pub mod tick;
 
+pub use auth::{AuthError, Direction, ReceiveBudget, ReplayWindow, SessionAuth, KEY_LEN};
 pub use clock::ClockEstimator;
 pub use codec::{CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
 pub use columnar::ColumnarHistory;
