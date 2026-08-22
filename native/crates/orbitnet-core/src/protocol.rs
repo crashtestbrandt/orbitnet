@@ -266,6 +266,21 @@ impl SchemaBuilder {
             .collect()
     }
 
+    /// Indices of the properties the rollback loop restores before a replayed tick.
+    ///
+    /// The twin of [`Self::resim_triggering`], and the order a bulk **restore** hook marshals in.
+    /// `Cosmetic` is captured and replicated but never written back, so it is absent here while
+    /// being present in the capture order — the two lists differ on exactly that.
+    #[must_use]
+    pub fn restored(&self) -> Vec<usize> {
+        self.props
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.role.is_restored())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// FNV-1a hash over `(name, kind, role)` in declaration order.
     ///
     /// FNV-1a rather than something stronger because this is an agreement check between cooperating
@@ -365,6 +380,24 @@ mod tests {
         let schema = sample();
         // net_rcs_lin is cosmetic, so index 3 must not be a resim trigger.
         assert_eq!(schema.resim_triggering(), vec![0, 1, 2]);
+    }
+
+    /// The capture order and the restore order differ on exactly the cosmetics: a bulk hook is
+    /// handed every property to fill, and only the restored subset to read back.
+    #[test]
+    fn cosmetic_props_are_captured_but_never_restored() {
+        let schema = sample();
+        assert_eq!(schema.restored(), vec![0, 1, 2]);
+        assert_eq!(schema.len(), 4, "and the fourth is still captured");
+    }
+
+    #[test]
+    fn input_props_are_restored_even_though_they_never_trigger_resim() {
+        let mut schema = SchemaBuilder::new();
+        schema.push("net_pos", PropKind::Vec3, PropRole::State);
+        schema.push("nin_move", PropKind::Vec2, PropRole::Input);
+        assert_eq!(schema.restored(), vec![0, 1]);
+        assert_eq!(schema.resim_triggering(), vec![0]);
     }
 
     #[test]

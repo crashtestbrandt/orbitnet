@@ -46,7 +46,8 @@ use orbitnet_core::{
     ResimPlanner, SessionAuth, TickAccumulator, TickRate, KEY_LEN,
 };
 
-use crate::sync::{OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration};
+use crate::binding;
+use crate::sync::{self, OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration};
 
 /// Network role, mirroring the facade's `Net.Mode`.
 const MODE_OFFLINE: i64 = 0;
@@ -2334,9 +2335,27 @@ impl OrbitNet {
         self.signals().after_rollback_loop().emit();
     }
 
+    /// Capture every locally-authored input row for `tick`.
+    ///
+    /// Two passes rather than one, because a bulk input hook is game code and has to run with the
+    /// binds dropped. The staging pass is NOT gated on a session-wide flag the way phase 3's is:
+    /// it runs once per tick rather than once per replayed tick, and what it costs an entity with
+    /// no hook is one native `bind` — set beside the `Object::get` per input property the second
+    /// pass makes on that same entity, which is a script-boundary crossing.
     fn capture_inputs(&mut self, tick: u64) {
         let delay = self.input_delay.max(0) as u64;
         let stamp = tick + delay;
+        let mut hook_batch: Vec<binding::HookCall> = Vec::new();
+        for sync in self.rollback_entities.values() {
+            let Some(mut sync) = live_handle(sync) else {
+                continue;
+            };
+            let mut bound = sync.bind_mut();
+            if bound.owns_input() {
+                bound.stage_capture(sync::LANE_INPUT, &mut hook_batch);
+            }
+        }
+        self.run_hooks(&mut hook_batch);
         for sync in self.rollback_entities.values() {
             let Some(mut sync) = live_handle(sync) else {
                 continue;
@@ -2393,6 +2412,31 @@ impl OrbitNet {
         }
     }
 
+    /// Run a batch of staged bulk marshalling hooks with every `bind` on this node surrendered.
+    ///
+    /// **The surrender is required, not a precaution.** A bulk hook is game code, and game code
+    /// called from inside the loop legally calls back into the facade — `current_tick()`,
+    /// `rollback_tick()`, a memo read. Phase 2 has always run `_rollback_tick` under this guard;
+    /// capture and restore are the same mechanism applied to marshalling, so they take it too.
+    /// Calling one while the synchronizer or this node is bound is a borrow panic, not a wrong
+    /// answer.
+    ///
+    /// The batch is drained and handed back empty, so one `Vec` carries a whole frame's calls.
+    fn run_hooks(&mut self, batch: &mut Vec<binding::HookCall>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut calls = std::mem::take(batch);
+        {
+            let _guard = self.base_mut();
+            for call in &mut calls {
+                call.invoke();
+            }
+        }
+        calls.clear();
+        *batch = calls;
+    }
+
     fn run_rollback(&mut self, current: u64, dt: f64) {
         let started = Instant::now();
         let limit = self.history_limit.max(2) as u64;
@@ -2424,18 +2468,26 @@ impl OrbitNet {
         self.dbg_resim_spans += plan.len() as u64;
         self.dbg_resim_ticks_total += current.saturating_sub(from);
         let mut ranges: Vec<(u64, u64, u64, Gd<OrbitRollbackSynchronizer>)> = Vec::new();
+        // Whether ANY entity in this frame's plan captures through a bulk hook. Answered once here,
+        // where the entities are already being walked, so phase 3's staging pass is skipped
+        // outright in a session that declares none — the default, which must not pay for the
+        // feature.
+        let mut any_capture_hook = false;
         for entry in &plan {
             if let Some(sync) = self
                 .rollback_entities
                 .get(&entry.body)
                 .and_then(live_handle)
             {
+                any_capture_hook |= sync.bind().has_capture_hook(sync::LANE_STATE);
                 ranges.push((entry.body, entry.range.from, entry.range.to, sync));
             }
         }
 
         let mut rb_nodes = 0u64;
         let mut call_batch: Vec<(Gd<Node>, bool)> = Vec::new();
+        // Staged bulk marshalling calls, reused across every phase and every tick of this frame.
+        let mut hook_batch: Vec<binding::HookCall> = Vec::new();
         // THREE NUMBERS WHERE THERE WAS ONE. The loop already ran these as three passes; what
         // changed is that they are now timed separately. `m_rollback_ms` wrapped restore + game code + record in
         // a single figure, so the documented "capture lands within 2-3x of the old backend" was an assertion
@@ -2459,7 +2511,10 @@ impl OrbitNet {
         for tick in from..current {
             self.rollback_tick_now = Some(tick);
 
-            // Phase 1 — restore state + input for every entity replaying this tick.
+            // Phase 1 — restore state + input for every entity replaying this tick. A lane with a
+            // bulk restore hook decodes its row into the hook's array here and stages the call;
+            // every lane without one walks its properties, as before. The staged calls run after,
+            // with the binds dropped.
             let phase_started = Instant::now();
             for (_, range_from, range_to, sync) in &ranges {
                 if tick < *range_from || tick >= *range_to {
@@ -2468,8 +2523,9 @@ impl OrbitNet {
                 let Some(mut sync) = live_handle(sync) else {
                     continue;
                 };
-                sync.bind_mut().restore_tick(tick);
+                sync.bind_mut().restore_tick(tick, &mut hook_batch);
             }
+            self.run_hooks(&mut hook_batch);
 
             restore_ns += phase_started.elapsed().as_nanos();
 
@@ -2517,8 +2573,23 @@ impl OrbitNet {
 
             sim_ns += phase_started.elapsed().as_nanos();
 
-            // Phase 3 — record the resulting state as tick + 1.
+            // Phase 3 — record the resulting state as tick + 1. Entities with a bulk capture hook
+            // run it first, binds dropped, filling their preallocated arrays; the encode into the
+            // row then happens bound, in record_tick, whichever way the values arrived.
             let phase_started = Instant::now();
+            if any_capture_hook {
+                for (_, range_from, range_to, sync) in &ranges {
+                    if tick < *range_from || tick >= *range_to {
+                        continue;
+                    }
+                    let Some(mut sync) = live_handle(sync) else {
+                        continue;
+                    };
+                    sync.bind_mut()
+                        .stage_capture(sync::LANE_STATE, &mut hook_batch);
+                }
+                self.run_hooks(&mut hook_batch);
+            }
             for (_, range_from, range_to, sync) in &ranges {
                 if tick < *range_from || tick >= *range_to {
                     continue;
@@ -2539,8 +2610,9 @@ impl OrbitNet {
                 let Some(mut sync) = live_handle(sync) else {
                     continue;
                 };
-                sync.bind_mut().restore_tick(display_tick);
+                sync.bind_mut().restore_tick(display_tick, &mut hook_batch);
             }
+            self.run_hooks(&mut hook_batch);
         }
 
         self.m_resim_ticks = (current - from) as f64;
@@ -2554,10 +2626,25 @@ impl OrbitNet {
         self.m_record_ms = record_ns as f64 / 1_000_000.0;
     }
 
+    /// Capture the state lane's frontier row for every channel this peer's state owns.
+    ///
+    /// Two passes for the same reason [`Self::capture_inputs`] takes two, and ungated for the same
+    /// reason.
     fn capture_state_lane(&mut self, tick: u64) {
         if self.mode != MODE_SERVER && self.mode != MODE_HOST {
             return;
         }
+        let mut hook_batch: Vec<binding::HookCall> = Vec::new();
+        for sync in self.state_entities.values() {
+            let Some(mut sync) = live_handle(sync) else {
+                continue;
+            };
+            let mut bound = sync.bind_mut();
+            if bound.owns_state() {
+                bound.stage_capture(&mut hook_batch);
+            }
+        }
+        self.run_hooks(&mut hook_batch);
         for sync in self.state_entities.values() {
             let Some(mut sync) = live_handle(sync) else {
                 continue;

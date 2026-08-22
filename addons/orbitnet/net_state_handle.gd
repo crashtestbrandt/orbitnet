@@ -6,6 +6,10 @@ class_name NetStateHandle
 ##
 ## OFFLINE / no synchronizer: _sync is null and every method no-ops.
 
+## Bulk-hook lane: this channel's only lane. Named so the same game method can serve a rollback body's lanes
+## too -- see [constant NetRollbackHandle.LANE_STATE].
+const LANE_STATE: int = 0
+
 var _sync: Node = null   # the backend state synchronizer node (created + owned by orbitnet/net.gd), or null OFFLINE
 # Whether the loaded cdylib can answer last_known_state(). Resolved ONCE: the answer cannot change within a
 # process, and the question was being asked once per replicated body per render frame -- a ClassDB method-bind
@@ -158,3 +162,38 @@ func entity_id() -> int:
 	if _sync == null or not _sync.has_method(&"get_entity_id"):
 		return 0
 	return _sync.get_entity_id()
+
+## Declare the game method that CAPTURES this channel's whole row in one call, replacing the per-property walk.
+##
+## Signature: `func <method>(lane: int, values: Array) -> void`, declared on the channel's ROOT, with `lane`
+## always [constant LANE_STATE]. Fill every slot of `values` in the order [method bulk_capture_order] publishes;
+## the array is preallocated and reused, so a slot left alone keeps last tick's value, and resizing it drops the
+## channel back to the walk with an error.
+##
+## What it buys: the authority captures every channel whose state it owns, once per tick, at one `Object.get`
+## per property. A fat channel is 41 of them. This makes it one call.
+##
+## NO RESTORE HOOK ON THIS LANE, and none is needed: applying a row here is the receive path, which runs once
+## per received block rather than once per replayed tick, so there is no replay multiplier to divide.
+##
+## Call BEFORE process_settings(); the hook resolves with the property list.
+func set_bulk_capture(method: String) -> void:
+	if _sync != null:
+		_sync.set(&"bulk_capture_method", method)
+
+## The declared entries the bulk capture hook marshals, in the order its array carries them. Empty when the
+## channel has no hook, when the handle is inert, or on a backend too old to answer.
+func bulk_capture_order() -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"bulk_capture_order"):
+		return PackedStringArray()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant.
+	var order: PackedStringArray = _sync.bulk_capture_order(LANE_STATE)
+	return order
+
+## Whether this channel captures through a bulk hook rather than the per-property walk. Check it after
+## process_settings() when a hook seems to do nothing: a method name that does not resolve leaves the channel
+## on the walk.
+func uses_bulk_capture() -> bool:
+	if _sync == null or not _sync.has_method(&"uses_bulk_capture"):
+		return false
+	return _sync.uses_bulk_capture(LANE_STATE)

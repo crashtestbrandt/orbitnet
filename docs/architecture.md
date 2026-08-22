@@ -53,8 +53,24 @@ happens after, in leverage order:
 3. **Columnar packed history.** A per-entity `Vec<u8>` of `history_limit × stride`, indexed `tick % capacity`,
    in schema order. No `Dictionary`, no `Variant`, no per-tick allocation — and the changed mask falls out of a
    `memcmp` on fixed-stride slices during capture.
-4. **Quantization** — a *bandwidth* lever, not a CPU one. See
+4. **One crossing per lane, optionally.** A synchronizer that declares a bulk hook is handed a preallocated
+   `Array` and fills or reads it in a single `Object::call`, so the count drops from `S` per lane per tick to
+   `1`. Opt-in per synchronizer; a lane that declares none keeps the walk, byte for byte. See
+   [api.md](api.md#bulk-marshalling-one-crossing-per-lane-per-tick).
+5. **Quantization** — a *bandwidth* lever, not a CPU one. See
    [api.md](api.md#wire-quantization-and-the-scalar-reality).
+
+**The rollback loop is what makes this leverage worth having.** Restore, simulate and record run per replayed
+tick per entity, so a body with `S` state props replaying `D` ticks pays `S × D` reads and up to `S × D` writes
+in one frame — the same walk the state lane pays once. `restore_ms` / `sim_ms` / `record_ms` report the three
+phases apart, and `resim_force` fixes `D`, so the effect of a change here is measured rather than asserted.
+
+Two paths keep the per-property walk unconditionally:
+
+| | Why |
+|---|---|
+| Applying a **received** row | Runs once per received block, not once per replayed tick, and it is the one apply that must land `Cosmetic` values too. |
+| The **quantized write-back** | Writes only the props that carry a quantizer, which is zero for most schemas. A bulk write-back would fire every setter in the lane to canonicalize the few that changed. |
 
 Two non-negotiable rules:
 

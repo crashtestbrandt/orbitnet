@@ -6,6 +6,19 @@
 //! one `Object::get` each into a preallocated row, and restoring is the mirror image — no
 //! property-table walks, no per-tick allocation, no `Dictionary`.
 //!
+//! **A lane may replace that walk with one crossing.** A synchronizer that declares a
+//! `bulk_capture_method` / `bulk_restore_method` is handed a preallocated `Array` and fills or
+//! reads it in a single `Object::call`, so the crossing count per lane per tick drops from `S` to
+//! `1` — see [`BulkHook`]. It is opt-in per synchronizer, the walk stays for every lane that
+//! declares none, and the row layout is unchanged either way: the hook supplies the `Variant`s and
+//! nothing else. Two paths keep the walk unconditionally, and both are deliberate:
+//!
+//! - [`apply_row`] on the receive path, which runs once per received block rather than once per
+//!   replayed tick, and is the one apply that must also land `Cosmetic` values.
+//! - [`apply_quantized_row`], the canonical write-back, which writes only the properties that
+//!   carry a quantizer. Routing it through a bulk hook would write the whole restored set instead,
+//!   firing every setter in the lane for the sake of the few that changed.
+//!
 //! The role split matters during rollback: `State` and `Input` are restored before a replayed
 //! tick; `Cosmetic` is captured and replicated but never restored and never counted as a
 //! misprediction (see docs/api.md — the test is "does the simulation read it
@@ -15,6 +28,9 @@ use godot::classes::Node;
 use godot::prelude::*;
 
 use orbitnet_core::{PropKind, PropRole, QuantKind, SchemaBuilder};
+
+/// The untyped Godot `Array` a bulk hook marshals through.
+type VariantArray = Array<Variant>;
 
 /// One resolved replicated property.
 pub struct PropBinding {
@@ -352,6 +368,11 @@ pub fn capture_row(bindings: &[PropBinding], row: &mut [u8]) {
 /// The state-capture write-back: forward simulation must continue from the canonical
 /// (wire-representable) value, or a replay restored from the row would diverge from the forward
 /// pass that recorded it — every peer would see phantom mispredicts at quantization scale.
+///
+/// **Stays per-property even when the lane captures through a bulk hook.** It writes `Q`
+/// properties, not `S`, and `Q` is zero for a lane that declares no quantizer; a bulk write-back
+/// would have to hand back the whole restored set, firing every setter in the lane to canonicalize
+/// the few that need it.
 pub fn apply_quantized_row(bindings: &[PropBinding], row: &[u8]) {
     for binding in bindings {
         if binding.quant == QuantKind::None {
@@ -401,4 +422,243 @@ pub fn fnv64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+// ======================================================================================
+// Bulk marshalling hooks
+// ======================================================================================
+
+/// One staged bulk-hook call: the game's marshalling method, and the values array it marshals
+/// through.
+///
+/// Every field is a handle, so staging one costs a refcount bump rather than a copy. It exists as
+/// a separate value because the call has to be made with **every `bind` dropped** — the same rule
+/// phase 2 of the rollback loop follows for `_rollback_tick`, and for the same reason: this is
+/// game code, and game code legally calls back into the facade. See the re-entrancy paragraph in
+/// the `orbit_net` module header.
+pub struct HookCall {
+    node: Gd<Node>,
+    method: StringName,
+    lane: i64,
+    values: VariantArray,
+}
+
+impl HookCall {
+    /// Run the game's marshalling method. A freed node is skipped, not an error.
+    pub fn invoke(&mut self) {
+        if self.node.is_instance_valid() {
+            self.node.call(
+                &self.method,
+                &[Variant::from(self.lane), self.values.to_variant()],
+            );
+        }
+    }
+}
+
+/// A resolved bulk marshalling hook: one game method that fills (capture) or reads (restore) a
+/// whole lane's values in **one** script-boundary crossing instead of one per property.
+///
+/// The per-property walk costs `S` `Object::get` calls to capture a lane and up to `S` `Object::set`
+/// calls to restore it, and the rollback loop pays both **per replayed tick, per entity**. A hook
+/// replaces each of those walks with a single `Object::call`, so the crossing count per lane per
+/// tick drops from `S` to `1`.
+///
+/// **Opt-in per synchronizer.** A lane with no declared hook keeps the per-property walk, byte for
+/// byte, so nothing existing changes behaviour.
+///
+/// **The row layout is unchanged.** The hook only supplies the `Variant`s; the encode, the byte
+/// offsets and the quantized canonicalization are the same code [`capture_row`] runs. Masks, delta
+/// bases and the mispredict compare read that layout, so it is not the hook's to decide.
+pub struct BulkHook {
+    /// The node carrying the game's marshalling method.
+    target: Gd<Node>,
+    /// Cached method name.
+    method: StringName,
+    /// Synchronizer path plus lane, for the one diagnostic this can raise. Built at resolve time
+    /// rather than at the call site so the hot path formats nothing.
+    label: String,
+    /// The lane ordinal handed to the method as its first argument, so one method can serve both
+    /// lanes of a rollback synchronizer.
+    lane: i64,
+    /// Indices into the lane's binding list, in the order the values array carries them.
+    slots: Vec<usize>,
+    /// Reused every call, so a hooked lane allocates nothing per tick.
+    values: VariantArray,
+    /// Set once the game handed back an array of the wrong length, so the fallback reports itself
+    /// once rather than once per entity per replayed tick.
+    warned: bool,
+}
+
+impl BulkHook {
+    /// Stage this hook's call, to be run once every `bind` is dropped.
+    ///
+    /// `None` when the node behind the hook has been freed — cloning a freed handle panics under
+    /// godot-rust's balanced safeguards, so it must be filtered rather than cloned.
+    pub fn stage(&self) -> Option<HookCall> {
+        if !self.target.is_instance_valid() {
+            return None;
+        }
+        Some(HookCall {
+            node: self.target.clone(),
+            method: self.method.clone(),
+            lane: self.lane,
+            values: self.values.clone(),
+        })
+    }
+
+    /// The binding indices this hook marshals, in array order.
+    #[must_use]
+    pub fn slots(&self) -> &[usize] {
+        &self.slots
+    }
+}
+
+/// Validate a declared bulk-hook method name against a root node, once per declaration.
+///
+/// `None` — every lane keeps the per-property walk — for an empty declaration (the default, and not
+/// a diagnostic), no root, or a method the root does not have. Only the last is an error, and it is
+/// a loud one: a typo in the method name would otherwise read as "the hook is on" while every tick
+/// still paid the full walk. Separate from [`resolve_hook`] so one typo is one message rather than
+/// one per lane.
+pub fn hook_target(root: Option<&Gd<Node>>, method: &GString, label: &str) -> Option<Gd<Node>> {
+    let name = method.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let root = root?;
+    if !root.has_method(&name) {
+        godot_error!(
+            "{label}: bulk hook {name:?} is not a method on {} — every lane keeps the \
+             per-property walk. Declare `func {name}(lane: int, values: Array) -> void`.",
+            root.get_path()
+        );
+        return None;
+    }
+    Some(root.clone())
+}
+
+/// Build one lane's hook against a validated target.
+///
+/// `None` for no target (see [`hook_target`]) or a lane with nothing in it — an empty slot list is
+/// a crossing that would marshal nothing.
+pub fn resolve_hook(
+    target: Option<&Gd<Node>>,
+    method: &GString,
+    lane: i64,
+    slots: Vec<usize>,
+    label: &str,
+) -> Option<BulkHook> {
+    let target = target?;
+    if slots.is_empty() {
+        return None;
+    }
+    let mut values = VariantArray::new();
+    values.resize(slots.len(), &Variant::nil());
+    Some(BulkHook {
+        target: target.clone(),
+        method: StringName::from(method.to_string().as_str()),
+        label: format!("{label} lane {lane}"),
+        lane,
+        slots,
+        values,
+        warned: false,
+    })
+}
+
+/// Encode the values the hook's method wrote into `row`.
+///
+/// Returns `false` when the array came back the wrong length, which the caller answers with the
+/// per-property walk — a game that resized the array has broken the contract, and recording a
+/// short row would shear the layout every peer decodes against.
+///
+/// Every slot the game leaves alone keeps last tick's value, because the array is preallocated and
+/// reused. **Fill every slot.** There is no sentinel for "unset" and none can be added: `null` is a
+/// value the encode would reject like any other type mismatch, which leaves the previous bytes in
+/// place — the same outcome, reached less obviously.
+pub fn capture_row_from_hook(
+    hook: &mut BulkHook,
+    bindings: &[PropBinding],
+    row: &mut [u8],
+) -> bool {
+    if hook.values.len() != hook.slots.len() {
+        if !hook.warned {
+            hook.warned = true;
+            godot_error!(
+                "{}: bulk capture hook returned {} values for {} properties — this lane falls \
+                 back to the per-property walk. Do not resize the array it is handed.",
+                hook.label,
+                hook.values.len(),
+                hook.slots.len()
+            );
+        }
+        return false;
+    }
+    for (slot, &index) in hook.slots.iter().enumerate() {
+        let binding = &bindings[index];
+        let end = binding.offset + binding.kind.stride();
+        let value = hook.values.at(slot);
+        if !encode_value(binding.kind, &value, &mut row[binding.offset..end]) {
+            // Type drifted from what registration saw. Leave the slice untouched — the same
+            // answer capture_row gives, for the same reason: zeros shear less than a half-written
+            // value, and a stale value shears not at all.
+        }
+        // Canonicalize at the source, exactly as the per-property walk does: the row must hold the
+        // value a peer reconstructs from the wire, or masks and mispredict compares fall apart.
+        orbitnet_core::quant::canonicalize_value(
+            binding.kind,
+            binding.quant,
+            &mut row[binding.offset..end],
+        );
+    }
+    true
+}
+
+/// Decode `row` into the hook's array and stage the call that hands it to the game.
+///
+/// The decode happens here, with the synchronizer bound; the call happens after every `bind` is
+/// dropped.
+///
+/// `None` means the hook cannot run — a freed node, or an array the game resized — and the caller
+/// answers it with the per-property walk, so the row lands either way. The wrong-length case is
+/// reported once and then keeps falling back, the same contract [`capture_row_from_hook`] enforces
+/// on the other direction: silently resizing the array back would leave a game that broke the
+/// contract with no signal that it had.
+pub fn stage_restore_from_row(
+    hook: &mut BulkHook,
+    bindings: &[PropBinding],
+    row: &[u8],
+) -> Option<HookCall> {
+    if hook.values.len() != hook.slots.len() {
+        if !hook.warned {
+            hook.warned = true;
+            godot_error!(
+                "{}: bulk restore hook's array is {} values for {} properties — this lane falls \
+                 back to the per-property walk. Do not resize the array it is handed.",
+                hook.label,
+                hook.values.len(),
+                hook.slots.len()
+            );
+        }
+        return None;
+    }
+    for (slot, &index) in hook.slots.iter().enumerate() {
+        let binding = &bindings[index];
+        let end = binding.offset + binding.kind.stride();
+        hook.values
+            .set(slot, &decode_value(binding.kind, &row[binding.offset..end]));
+    }
+    hook.stage()
+}
+
+/// The declared entry names a hook marshals, in the order its array carries them.
+///
+/// Published so a game can assert the order it wrote its hook against rather than infer it from
+/// the order it happened to declare its properties in. Reordering a property list silently
+/// reorders this.
+pub fn hook_order(props: &[orbitnet_core::PropSchema], slots: &[usize]) -> PackedStringArray {
+    let mut out = PackedStringArray::new();
+    for &index in slots {
+        out.push(&GString::from(props[index].name.as_str()));
+    }
+    out
 }

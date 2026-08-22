@@ -173,7 +173,8 @@ Live in **every** build, release included.
 
 ```gdscript
 Net.clock_metrics()  -> {"stretch", "offset_ms", "rtt_ms", "jitter_ms", "lead_ticks"}
-Net.perf_metrics()   -> {"resim_ticks", "rollback_ms", "net_ms", "rb_nodes"}
+Net.perf_metrics()   -> {"resim_ticks", "rollback_ms", "net_ms", "rb_nodes",
+                         "restore_ms", "sim_ms", "record_ms"}
 Net.perf_summary()   -> String
 ```
 
@@ -184,6 +185,11 @@ Net.perf_summary()   -> String
   deepens under latency and loss, and is bounded by `history_limit`.
 - **`rb_nodes`** — how many nodes the loop called `_rollback_tick` on. A quick check that your rollback
   entity count is what you think it is.
+- **`restore_ms` / `sim_ms` / `record_ms`** — the three phases `rollback_ms` wraps: writing a tick's recorded
+  state and input back, running the game's `_rollback_tick`, and capturing the result. They sum to slightly
+  less than `rollback_ms`; the remainder is range setup and the display-offset restore, left visible rather
+  than attributed. `restore_ms` and `record_ms` are the two figures a
+  [bulk hook](#bulk-marshalling-one-crossing-per-lane-per-tick) moves.
 
 ### Interest: three axes, distance, membership and the veto
 
@@ -344,6 +350,10 @@ Net.set_entity_hidden(peer_id, spy.entity_id(), false)
 | `is_predicting() -> bool` | Whether the owner is currently mispredicting — the reconciliation gate. |
 | `get_last_known_state() -> int` | Tick of the latest authoritative state received. −1 when inert. |
 | `memo_set(tick, key, value)` / `memo_get(tick, key, fallback)` | The per-tick memo ring. Record on the `is_fresh` pass; every replayed pass reads the same value back, so a resim resolves against what the fresh pass saw. Trimmed with rollback history. |
+| `set_bulk_capture(method)` / `set_bulk_restore(method)` | Declare the game methods that marshal a whole lane in one call instead of one per property — see [bulk marshalling](#bulk-marshalling-one-crossing-per-lane-per-tick). Call before `process_settings()`. |
+| `bulk_capture_order(lane)` / `bulk_restore_order(lane)` | The declared entries a hook marshals for that lane, in array order. Empty when the lane has no hook. |
+| `uses_bulk_capture(lane)` / `uses_bulk_restore(lane)` | Whether that lane marshals in bulk. Check after `process_settings()`: a method name that did not resolve leaves the lane on the per-property walk. |
+| `LANE_STATE` / `LANE_INPUT` | The lane ordinals a hook receives as its first argument. |
 
 ## `NetStateHandle`
 
@@ -357,6 +367,8 @@ Net.set_entity_hidden(peer_id, spy.entity_id(), false)
 | `entity_id() -> int` | This channel's stable replication id, for `Net.set_peer_anchor_entity()`. 0 when inert or unresolved. |
 | `set_priority(weight)` | Send-rota priority, 1..16. |
 | `last_known_state() -> int` | Tick of the newest authoritative row received. |
+| `set_bulk_capture(method)` | Declare the game method that captures this channel's whole row in one call — see [bulk marshalling](#bulk-marshalling-one-crossing-per-lane-per-tick). Capture only: this lane's apply is the receive path. Call before `process_settings()`. |
+| `bulk_capture_order()` / `uses_bulk_capture()` | The entries the hook marshals, in array order, and whether it resolved. |
 | `process_settings()` | |
 
 Server-authoritative, no prediction, and — critically — **no rollback restore**, so a value set outside the
@@ -418,6 +430,61 @@ Adding a transport is a new `Kind` branch here plus a matching `custom_features`
 platform-SDK calls elsewhere — `tools/net-check.sh` polices the boundary.
 
 ---
+
+## Bulk marshalling: one crossing per lane per tick
+
+Capturing a tick is one `Object.get` per replicated property, and restoring one is one `Object.set` per
+restored property. **The rollback loop pays both per replayed tick, per body**, so a body with `S` state props
+replaying `D` ticks costs `S × D` reads and up to `S × D` writes in a single frame.
+
+A **bulk hook** replaces each of those walks with one call. OrbitNet hands the game a preallocated `Array` and
+the game fills it (capture) or reads it (restore), so the crossing count per lane per tick is `1` instead of
+`S`.
+
+```gdscript
+# On the body's root, the node the property entries resolve against.
+func _net_marshal_out(lane: int, values: Array) -> void:
+    if lane == NetRollbackHandle.LANE_INPUT:
+        values[0] = nin_move
+        return
+    values[0] = net_pos
+    values[1] = net_orient
+    values[2] = net_rcs_lin      # cosmetic: captured, never restored
+
+func _net_marshal_in(lane: int, values: Array) -> void:
+    if lane == NetRollbackHandle.LANE_INPUT:
+        nin_move = values[0]
+        return
+    net_pos = values[0]
+    net_orient = values[1]       # the cosmetic entry is ABSENT from the restore order
+
+# Declared before process_settings().
+handle.set_bulk_capture("_net_marshal_out")
+handle.set_bulk_restore("_net_marshal_in")
+```
+
+Rules, all of them enforced or reported:
+
+| | |
+|---|---|
+| **Opt-in per synchronizer** | Declare nothing and every lane keeps the per-property walk, byte for byte. |
+| **The row is unchanged** | The hook supplies the values and nothing else. Encoding, byte offsets and wire quantization stay in the backend, because masks, delta bases and the mispredict compare all read that layout. |
+| **Fill every slot** | The array is preallocated and reused, so a slot the hook leaves alone keeps last tick's value. There is no "unset" sentinel. |
+| **Do not resize it** | A wrong-length array drops that lane back to the walk and reports it once. |
+| **The restore order is shorter** | Cosmetic entries are captured and replicated but never restored. Read `bulk_restore_order()`, not the capture order. |
+| **Assert the order** | `bulk_capture_order(lane)` publishes the declared entries in array order. Reordering a property registration silently reorders it. |
+| **Do not call `Net` from a hook** | It is a marshalling method, not a decision point. |
+| **Peers need not agree** | Nothing about a hook reaches the wire, and the schema hash is unchanged, so one peer may declare hooks while another walks the properties. |
+
+What it does not cover, deliberately:
+
+- **Applying a received row** still walks the properties. That runs once per received block rather than once
+  per replayed tick, and it is the one apply that must land cosmetics too.
+- **The quantized write-back** still walks the properties. It writes only the props that carry a quantizer,
+  and a bulk write-back would have to fire every setter in the lane to canonicalize the few that changed.
+
+Measure it with `Net.perf_metrics()`: `record_ms` is the capture half and `restore_ms` the restore half, and
+`Net.set_resim_force(ticks)` fixes the replay depth so the comparison holds still.
 
 ## Wire quantization, and the scalar reality
 
