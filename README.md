@@ -133,6 +133,11 @@ Known and filed, not hidden:
   received pose rather than leaving the scene. The rows stop; the node stays.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
 - **`@half` silently no-ops on invalid pairings** instead of warning.
+- **Bulk marshalling covers the rollback loop, not the receive path.** A synchronizer can replace the
+  per-property capture and restore walks with one call per lane per tick
+  ([api.md](docs/api.md#bulk-marshalling-one-crossing-per-lane-per-tick)), but applying a *received* row and
+  writing quantized values back are still one `Object.set` per property. Both run once per block or per tick
+  rather than once per replayed tick, so neither carries the replay multiplier the hook exists to divide.
 - **The retained interest grid is unused.** It now matches the linear path rule for rule — leaves, always-set,
   worlds — but it measures slower at the arena sizes a session runs at today, so the linear scan is what ships.
   It overtakes the scan past about ±600 m of occupancy. The measured tables are in `interest.rs`'s header.

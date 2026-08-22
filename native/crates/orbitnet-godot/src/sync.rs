@@ -14,6 +14,16 @@
 //! Entity identity is the FNV-1a hash of the synchronizer root's node path, salted per lane. Both
 //! peers derive the same id because the `MultiplayerSpawner` guarantees identical node names —
 //! the invariant any node-path-derived identity scheme leans on, made explicit.
+//!
+//! **Bulk marshalling** is opt-in per synchronizer: declare `bulk_capture_method` (and, on the
+//! rollback lane, `bulk_restore_method`) and the lane moves its whole row through one
+//! `Object::call` instead of one `Object::get` / `Object::set` per property. Because that call is
+//! game code, it is **staged** rather than made in place — `stage_capture` and `restore_tick` fill
+//! or drain the hook's preallocated array with the synchronizer bound, and `OrbitNet` runs the
+//! staged calls with every `bind` dropped, the same surrender phase 2 makes for `_rollback_tick`.
+//! Every lane that declares no hook keeps the walk, and the row it records is the same bytes
+//! either way: the hook supplies `Variant`s, and the encode, the offsets and the quantized
+//! canonicalization stay in `binding`.
 
 use godot::classes::Node;
 use godot::prelude::*;
@@ -23,11 +33,17 @@ use orbitnet_core::codec::{
 };
 use orbitnet_core::{
     ColumnarHistory, Confidence, FreshnessLedger, MembershipId, MemoRing, PropKind, PropRole,
-    SchemaBuilder, MEMBERSHIP_GLOBAL,
+    PropSchema, SchemaBuilder, MEMBERSHIP_GLOBAL,
 };
 
 use crate::binding::{self, PropBinding};
 use crate::orbit_net::SeatIndex;
+
+/// Bulk-hook lane ordinal: the STATE lane — the state entries then the cosmetic entries, in the
+/// order they were declared. The only lane an [`OrbitStateSynchronizer`] has.
+pub(crate) const LANE_STATE: i64 = 0;
+/// Bulk-hook lane ordinal: the INPUT lane of an [`OrbitRollbackSynchronizer`].
+pub(crate) const LANE_INPUT: i64 = 1;
 
 /// `relevancy`: this channel is replicated to every peer in every world, whatever the interest
 /// radius says and whatever `membership_property` names.
@@ -77,6 +93,14 @@ fn resolve_membership(
             );
             None
         }
+    }
+}
+
+/// The declared entry names one resolved hook marshals, or an empty list when the lane has none.
+fn hook_order(hook: &Option<binding::BulkHook>, props: &[PropSchema]) -> PackedStringArray {
+    match hook {
+        Some(hook) => binding::hook_order(props, hook.slots()),
+        None => PackedStringArray::new(),
     }
 }
 
@@ -255,6 +279,42 @@ pub struct OrbitRollbackSynchronizer {
     #[export]
     membership_property: GString,
 
+    /// Bulk **capture** hook: the name of a game method that fills a whole lane's values in one
+    /// script-boundary crossing, or empty for the per-property walk.
+    ///
+    /// Signature: `func <name>(lane: int, values: Array) -> void`. `lane` is `0` for the state lane
+    /// (state entries then cosmetic entries) and `1` for the input lane. Fill every slot of
+    /// `values` in the order [`Self::bulk_capture_order`] publishes — the array is preallocated and
+    /// reused, so a slot left alone keeps last tick's value.
+    ///
+    /// What it is worth: capture is `S` `Object::get` calls per lane, and the rollback loop pays
+    /// them **per replayed tick, per entity**. This makes it `1` per lane per tick. A fat channel
+    /// of 41 props replaying 12 ticks costs 492 property reads in one frame; through a hook it
+    /// costs 12 calls.
+    ///
+    /// **Opt-in, and byte-identical.** An empty declaration keeps the walk. The hook supplies the
+    /// `Variant`s and nothing else: the encode, the offsets and the quantized canonicalization stay
+    /// where they are, because masks, delta bases and the mispredict compare read that layout.
+    #[export]
+    bulk_capture_method: GString,
+
+    /// Bulk **restore** hook: the name of a game method that reads a whole lane's values back in
+    /// one crossing, or empty for the per-property walk.
+    ///
+    /// Signature: `func <name>(lane: int, values: Array) -> void`, lanes as above. Read the slots
+    /// in the order [`Self::bulk_restore_order`] publishes and write them onto the game's own
+    /// fields; do not resize the array.
+    ///
+    /// **The restore order is not the capture order.** `Cosmetic` entries are captured and
+    /// replicated but never restored, so they are absent here and present there. A lane that
+    /// declares no cosmetics has identical lists.
+    ///
+    /// **It covers the rollback loop, not the receive path.** Applying a received row still walks
+    /// the properties: that runs once per received block, not once per replayed tick, and it is the
+    /// path that must also land cosmetics.
+    #[export]
+    bulk_restore_method: GString,
+
     // --- resolved at process_settings ---
     entity_id: u64,
     state_schema: SchemaBuilder,
@@ -265,6 +325,16 @@ pub struct OrbitRollbackSynchronizer {
     rollback_nodes: Vec<Gd<Node>>,
     /// The resolved `membership_property`, or `None` when unset or unresolvable.
     membership: Option<(Gd<Node>, StringName)>,
+    /// Resolved bulk hooks, `None` where the lane keeps the per-property walk.
+    state_capture_hook: Option<binding::BulkHook>,
+    state_restore_hook: Option<binding::BulkHook>,
+    input_capture_hook: Option<binding::BulkHook>,
+    input_restore_hook: Option<binding::BulkHook>,
+    /// Whether the last staged bulk capture is the one `record_tick` / `capture_local_input`
+    /// should read. Cleared as it is consumed, so a phase that never staged the call falls back to
+    /// the walk rather than encoding a stale array.
+    state_capture_staged: bool,
+    input_capture_staged: bool,
     /// Whether the local peer authors this entity's input (its own player).
     input_local: bool,
     /// The peer id that owns this entity's input, cached at [`Self::process_authority`].
@@ -326,6 +396,8 @@ impl INode for OrbitRollbackSynchronizer {
             priority: 1,
             seat: 0,
             membership_property: GString::new(),
+            bulk_capture_method: GString::new(),
+            bulk_restore_method: GString::new(),
             entity_id: 0,
             state_schema: SchemaBuilder::new(),
             state_bindings: Vec::new(),
@@ -334,6 +406,12 @@ impl INode for OrbitRollbackSynchronizer {
             unresolved: PackedStringArray::new(),
             rollback_nodes: Vec::new(),
             membership: None,
+            state_capture_hook: None,
+            state_restore_hook: None,
+            input_capture_hook: None,
+            input_restore_hook: None,
+            state_capture_staged: false,
+            input_capture_staged: false,
             input_local: false,
             input_owner: 0,
             state_local: false,
@@ -564,6 +642,52 @@ impl OrbitRollbackSynchronizer {
         self.unresolved.clone()
     }
 
+    /// The declared entries a bulk **capture** hook marshals for `lane`, in the order its array
+    /// carries them: every property of the lane, state entries then cosmetic entries.
+    ///
+    /// Empty when the lane has no hook. Published so a game can assert the order it wrote its hook
+    /// against — reordering a property list silently reorders this.
+    #[func]
+    fn bulk_capture_order(&self, lane: i64) -> PackedStringArray {
+        match lane {
+            LANE_INPUT => hook_order(&self.input_capture_hook, self.input_schema.props()),
+            _ => hook_order(&self.state_capture_hook, self.state_schema.props()),
+        }
+    }
+
+    /// The declared entries a bulk **restore** hook marshals for `lane`, in array order.
+    ///
+    /// The restored subset, so it is SHORTER than the capture order by exactly the lane's
+    /// `Cosmetic` entries — replicated, never written back. Empty when the lane has no hook.
+    #[func]
+    fn bulk_restore_order(&self, lane: i64) -> PackedStringArray {
+        match lane {
+            LANE_INPUT => hook_order(&self.input_restore_hook, self.input_schema.props()),
+            _ => hook_order(&self.state_restore_hook, self.state_schema.props()),
+        }
+    }
+
+    /// Whether `lane` marshals through a bulk hook rather than the per-property walk.
+    ///
+    /// The answer to "did my method name resolve", which the order lists give away only by being
+    /// empty — and an empty lane is empty for both reasons.
+    #[func]
+    fn uses_bulk_capture(&self, lane: i64) -> bool {
+        match lane {
+            LANE_INPUT => self.input_capture_hook.is_some(),
+            _ => self.state_capture_hook.is_some(),
+        }
+    }
+
+    /// Whether `lane` restores through a bulk hook. See [`Self::uses_bulk_capture`].
+    #[func]
+    fn uses_bulk_restore(&self, lane: i64) -> bool {
+        match lane {
+            LANE_INPUT => self.input_restore_hook.is_some(),
+            _ => self.state_restore_hook.is_some(),
+        }
+    }
+
     /// A human-readable summary, for the console and for debugging.
     #[func]
     fn describe(&self) -> GString {
@@ -638,6 +762,12 @@ impl OrbitRollbackSynchronizer {
         self.unresolved = PackedStringArray::new();
         self.rollback_nodes.clear();
         self.membership = None;
+        self.state_capture_hook = None;
+        self.state_restore_hook = None;
+        self.input_capture_hook = None;
+        self.input_restore_hook = None;
+        self.state_capture_staged = false;
+        self.input_capture_staged = false;
 
         let state_root = self.resolved_root();
 
@@ -674,6 +804,47 @@ impl OrbitRollbackSynchronizer {
         let label = format!("OrbitRollbackSynchronizer {}", self.base().get_path());
         self.membership =
             resolve_membership(state_root.as_ref(), &self.membership_property, &label);
+
+        // Bulk hooks resolve AFTER the schemas, because the slot lists are the schemas' own
+        // orders: capture marshals every property of a lane, restore only the roles the loop
+        // writes back. Both resolve against the state root, the node every declared entry is
+        // already relative to.
+        let capture = self.bulk_capture_method.clone();
+        let restore = self.bulk_restore_method.clone();
+        let capture_target = binding::hook_target(state_root.as_ref(), &capture, &label);
+        let restore_target = binding::hook_target(state_root.as_ref(), &restore, &label);
+        let state_all: Vec<usize> = (0..self.state_bindings.len()).collect();
+        let input_all: Vec<usize> = (0..self.input_bindings.len()).collect();
+        let state_restored = self.state_schema.restored();
+        let input_restored = self.input_schema.restored();
+        self.state_capture_hook = binding::resolve_hook(
+            capture_target.as_ref(),
+            &capture,
+            LANE_STATE,
+            state_all,
+            &label,
+        );
+        self.input_capture_hook = binding::resolve_hook(
+            capture_target.as_ref(),
+            &capture,
+            LANE_INPUT,
+            input_all,
+            &label,
+        );
+        self.state_restore_hook = binding::resolve_hook(
+            restore_target.as_ref(),
+            &restore,
+            LANE_STATE,
+            state_restored,
+            &label,
+        );
+        self.input_restore_hook = binding::resolve_hook(
+            restore_target.as_ref(),
+            &restore,
+            LANE_INPUT,
+            input_restored,
+            &label,
+        );
 
         // Gather the rollback-aware nodes to simulate: the root plus every descendant that
         // implements _rollback_tick. `owned=false` so runtime-added children (the input carrier)
@@ -858,13 +1029,58 @@ impl OrbitRollbackSynchronizer {
         read_membership(self.membership.as_ref())
     }
 
+    /// Whether `lane` captures through a bulk hook — the gate on the staging pass, so an entity
+    /// that declared none never costs one.
+    pub(crate) fn has_capture_hook(&self, lane: i64) -> bool {
+        match lane {
+            LANE_INPUT => self.input_capture_hook.is_some(),
+            _ => self.state_capture_hook.is_some(),
+        }
+    }
+
+    /// Stage this entity's bulk **capture** calls, to be run once every `bind` is dropped.
+    ///
+    /// Appended to `out` rather than returned, so one reusable `Vec` carries the whole frame's
+    /// calls — the same shape phase 2 uses for `_rollback_tick`.
+    pub(crate) fn stage_capture(&mut self, lane: i64, out: &mut Vec<binding::HookCall>) {
+        let hook = match lane {
+            LANE_INPUT => self.input_capture_hook.as_ref(),
+            _ => self.state_capture_hook.as_ref(),
+        };
+        let staged = hook.and_then(binding::BulkHook::stage);
+        let armed = staged.is_some();
+        if let Some(call) = staged {
+            out.push(call);
+        }
+        match lane {
+            LANE_INPUT => self.input_capture_staged = armed,
+            _ => self.state_capture_staged = armed,
+        }
+    }
+
     /// Capture the locally-authored input for `tick` into history.
+    ///
+    /// Reads the bulk hook's array when [`Self::stage_capture`] armed one this frame, and walks the
+    /// properties otherwise — including when the hook handed back an unusable array, which is why
+    /// the walk is never removed.
     pub(crate) fn capture_local_input(&mut self, tick: u64) {
         if self.input_bindings.is_empty() {
             return;
         }
         self.scratch_input.resize(self.input_schema.row_stride(), 0);
-        binding::capture_row(&self.input_bindings, &mut self.scratch_input);
+        let bulked = self.input_capture_staged
+            && match self.input_capture_hook.as_mut() {
+                Some(hook) => binding::capture_row_from_hook(
+                    hook,
+                    &self.input_bindings,
+                    &mut self.scratch_input,
+                ),
+                None => false,
+            };
+        self.input_capture_staged = false;
+        if !bulked {
+            binding::capture_row(&self.input_bindings, &mut self.scratch_input);
+        }
         // Only stamp fresh authority if the row is novel OR the tick is new: re-capturing the
         // same tick (paused frame) must not re-arm freshness.
         if self.input_history.row(tick) != Some(self.scratch_input.as_slice())
@@ -1145,13 +1361,35 @@ impl OrbitRollbackSynchronizer {
     }
 
     /// Restore state + input for a tick about to be (re)simulated.
-    pub(crate) fn restore_tick(&mut self, tick: u64) {
+    ///
+    /// A lane with a bulk restore hook decodes its row into the hook's array HERE, with the
+    /// synchronizer bound, and appends the call to `out`; the caller runs it with every `bind`
+    /// dropped. A lane without one walks its properties as before.
+    pub(crate) fn restore_tick(&mut self, tick: u64, out: &mut Vec<binding::HookCall>) {
         if let Some(row) = self.state_history.row(tick) {
-            binding::apply_row(&self.state_bindings, row, true);
+            match self.state_restore_hook.as_mut() {
+                Some(hook) => {
+                    if let Some(call) =
+                        binding::stage_restore_from_row(hook, &self.state_bindings, row)
+                    {
+                        out.push(call);
+                    }
+                }
+                None => binding::apply_row(&self.state_bindings, row, true),
+            }
         }
         if !self.input_bindings.is_empty() {
             if let Some((input_tick, row)) = self.input_history.closest_at_or_before(tick) {
-                binding::apply_row(&self.input_bindings, row, true);
+                match self.input_restore_hook.as_mut() {
+                    Some(hook) => {
+                        if let Some(call) =
+                            binding::stage_restore_from_row(hook, &self.input_bindings, row)
+                        {
+                            out.push(call);
+                        }
+                    }
+                    None => binding::apply_row(&self.input_bindings, row, true),
+                }
                 if input_tick != tick {
                     self.ledger.set_confidence(tick, Confidence::Extrapolated);
                 }
@@ -1176,11 +1414,23 @@ impl OrbitRollbackSynchronizer {
     }
 
     /// Capture the post-simulation state of `tick` into history at `tick + 1`.
+    ///
+    /// Reads the bulk hook's array when [`Self::stage_capture`] armed one for this tick, and walks
+    /// the properties otherwise. Either way the row that lands is the same bytes: the hook supplies
+    /// `Variant`s, and the encode, the offsets and the canonicalization below are unchanged.
     pub(crate) fn record_tick(&mut self, simulated_tick: u64) {
         let next = simulated_tick + 1;
         self.scratch_state.resize(self.state_schema.row_stride(), 0);
         let mut row = std::mem::take(&mut self.scratch_state);
-        binding::capture_row(&self.state_bindings, &mut row);
+        let bulked = self.state_capture_staged
+            && match self.state_capture_hook.as_mut() {
+                Some(hook) => binding::capture_row_from_hook(hook, &self.state_bindings, &mut row),
+                None => false,
+            };
+        self.state_capture_staged = false;
+        if !bulked {
+            binding::capture_row(&self.state_bindings, &mut row);
+        }
         self.state_history.write_row(next, &row);
         // Quantized-state write-back: forward simulation must continue from the canonical
         // (wire-representable) value the row holds, or replay-from-row would diverge from the
@@ -1315,11 +1565,30 @@ pub struct OrbitStateSynchronizer {
     #[export]
     priority: i32,
 
+    /// Bulk **capture** hook: the name of a game method that fills this channel's whole row in one
+    /// script-boundary crossing, or empty for the per-property walk.
+    ///
+    /// Signature: `func <name>(lane: int, values: Array) -> void`, `lane` always [`LANE_STATE`] —
+    /// this lane has only one, and the argument is there so a game can point both synchronizers at
+    /// the same method. Fill every slot in the order [`Self::bulk_capture_order`] publishes.
+    ///
+    /// **No restore hook, deliberately.** This lane's apply is the receive path: it runs once per
+    /// received block rather than once per replayed tick, so there is no replay multiplier for a
+    /// hook to divide. Capture runs once per tick per owned channel on the authority, and the
+    /// property count is what makes it worth removing — the history-depth note above sizes a fat
+    /// channel at 41 `i64` props.
+    #[export]
+    bulk_capture_method: GString,
+
     entity_id: u64,
     schema: SchemaBuilder,
     bindings: Vec<PropBinding>,
     unresolved: PackedStringArray,
     state_local: bool,
+    /// The resolved `bulk_capture_method`, or `None` when the channel keeps the per-property walk.
+    capture_hook: Option<binding::BulkHook>,
+    /// Whether the last staged bulk capture is the one [`Self::capture_frontier`] should read.
+    capture_staged: bool,
     /// The resolved `anchor_property`, or `None` when unset, unresolvable or not a `Vector3`.
     anchor: Option<(Gd<Node>, StringName)>,
     /// The resolved `membership_property`, or `None` when unset, unresolvable or not an int.
@@ -1342,11 +1611,14 @@ impl INode for OrbitStateSynchronizer {
             anchor_property: GString::new(),
             membership_property: GString::new(),
             priority: 1,
+            bulk_capture_method: GString::new(),
             entity_id: 0,
             schema: SchemaBuilder::new(),
             bindings: Vec::new(),
             unresolved: PackedStringArray::new(),
             state_local: false,
+            capture_hook: None,
+            capture_staged: false,
             anchor: None,
             membership: None,
             history: ColumnarHistory::new(0, 1),
@@ -1396,6 +1668,8 @@ impl OrbitStateSynchronizer {
         self.schema = SchemaBuilder::new();
         self.bindings.clear();
         self.unresolved = PackedStringArray::new();
+        self.capture_hook = None;
+        self.capture_staged = false;
 
         let root = self.resolved_root();
         binding::resolve_entries(
@@ -1406,6 +1680,13 @@ impl OrbitStateSynchronizer {
             &mut self.bindings,
             &mut self.unresolved,
         );
+        // After the schema, because the slot list is the schema's own order.
+        let label = format!("OrbitStateSynchronizer {}", self.base().get_path());
+        let capture = self.bulk_capture_method.clone();
+        let target = binding::hook_target(root.as_ref(), &capture, &label);
+        let slots: Vec<usize> = (0..self.bindings.len()).collect();
+        self.capture_hook =
+            binding::resolve_hook(target.as_ref(), &capture, LANE_STATE, slots, &label);
         if let Some(root) = &root {
             if root.is_inside_tree() {
                 let path = root.get_path().to_string();
@@ -1456,6 +1737,21 @@ impl OrbitStateSynchronizer {
     #[func]
     fn unresolved_properties(&self) -> PackedStringArray {
         self.unresolved.clone()
+    }
+
+    /// The declared entries the bulk capture hook marshals, in the order its array carries them.
+    /// Empty when the channel has no hook. `lane` is accepted and ignored — this lane has only one.
+    #[func]
+    fn bulk_capture_order(&self, lane: i64) -> PackedStringArray {
+        let _ = lane;
+        hook_order(&self.capture_hook, self.schema.props())
+    }
+
+    /// Whether this channel captures through a bulk hook rather than the per-property walk.
+    #[func]
+    fn uses_bulk_capture(&self, lane: i64) -> bool {
+        let _ = lane;
+        self.capture_hook.is_some()
     }
 
     /// The tick of the newest authoritative row this channel has (-1 before any).
@@ -1600,11 +1896,34 @@ impl OrbitStateSynchronizer {
         read_membership(self.membership.as_ref())
     }
 
+    /// Stage this channel's bulk capture call, to be run once every `bind` is dropped.
+    pub(crate) fn stage_capture(&mut self, out: &mut Vec<binding::HookCall>) {
+        let staged = self
+            .capture_hook
+            .as_ref()
+            .and_then(binding::BulkHook::stage);
+        self.capture_staged = staged.is_some();
+        if let Some(call) = staged {
+            out.push(call);
+        }
+    }
+
     /// Capture the live values as the authority's frontier row for `tick`.
+    ///
+    /// Reads the bulk hook's array when [`Self::stage_capture`] armed one, and walks the properties
+    /// otherwise. The row that lands is the same bytes either way.
     pub(crate) fn capture_frontier(&mut self, tick: u64) {
         self.scratch.resize(self.schema.row_stride(), 0);
         let mut row = std::mem::take(&mut self.scratch);
-        binding::capture_row(&self.bindings, &mut row);
+        let bulked = self.capture_staged
+            && match self.capture_hook.as_mut() {
+                Some(hook) => binding::capture_row_from_hook(hook, &self.bindings, &mut row),
+                None => false,
+            };
+        self.capture_staged = false;
+        if !bulked {
+            binding::capture_row(&self.bindings, &mut row);
+        }
         self.history.write_row(tick, &row);
         self.latest_tick = self
             .latest_tick

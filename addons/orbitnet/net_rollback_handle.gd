@@ -8,6 +8,11 @@ class_name NetRollbackHandle
 ## OFFLINE / no synchronizer: _sync is null and every method no-ops, so callers wire the same code path whether
 ## or not networking is live.
 
+## Bulk-hook lane: this body's STATE lane -- its state entries followed by its cosmetic entries.
+const LANE_STATE: int = 0
+## Bulk-hook lane: this body's INPUT lane.
+const LANE_INPUT: int = 1
+
 var _sync: Node = null   # the backend rollback synchronizer node (created + owned by orbitnet/net.gd), or null OFFLINE
 
 func _init(sync: Node) -> void:
@@ -188,3 +193,77 @@ func entity_id() -> int:
 	if _sync == null or not _sync.has_method(&"get_entity_id"):
 		return 0
 	return _sync.get_entity_id()
+
+## Declare the game method that CAPTURES a whole lane's values in one call, replacing the per-property walk.
+##
+## Signature: `func <method>(lane: int, values: Array) -> void`, declared on the body's ROOT (the node the
+## property entries resolve against). Fill every slot of `values` in the order [method bulk_capture_order]
+## publishes for that lane; the array is preallocated and reused, so a slot left alone keeps last tick's value,
+## and resizing it drops the lane back to the walk with an error.
+##
+## What it buys: capture is one `Object.get` per property, and the rollback loop pays that PER REPLAYED TICK,
+## PER BODY. This makes it one call per lane per tick. A body with 41 state props replaying 12 ticks pays 492
+## property reads a frame without it and 12 calls with it. Measure it with `Net.perf_metrics()` -- `record_ms`
+## is the capture half and `restore_ms` the restore half -- and `Net.set_resim_force()` fixes the replay depth
+## so the comparison holds still.
+##
+## OPT-IN, AND THE ROW IS UNCHANGED. Declare nothing and every lane keeps the walk, byte for byte. The hook
+## supplies the values and nothing else -- the encoding, the byte offsets and the wire quantization are the
+## backend's, because masks, delta bases and the mispredict compare all read that layout.
+##
+## Call BEFORE process_settings(); the hook resolves with the property list.
+func set_bulk_capture(method: String) -> void:
+	if _sync != null:
+		_sync.set(&"bulk_capture_method", method)
+
+## Declare the game method that RESTORES a whole lane's values in one call. Same signature and same shape as
+## [method set_bulk_capture]; read the slots and write them onto your own fields.
+##
+## THE RESTORE ORDER IS NOT THE CAPTURE ORDER. Cosmetic entries are captured and replicated but never restored,
+## so they are absent here and present there. Read [method bulk_restore_order], not the capture order, and a
+## body that declares no cosmetics sees identical lists.
+##
+## It covers the rollback loop only. Applying a RECEIVED row still walks the properties: that runs once per
+## received block rather than once per replayed tick, and it is the one apply that must land cosmetics too.
+##
+## Call BEFORE process_settings().
+func set_bulk_restore(method: String) -> void:
+	if _sync != null:
+		_sync.set(&"bulk_restore_method", method)
+
+## The declared entries a bulk CAPTURE hook marshals for `lane`, in the order its array carries them.
+##
+## Empty when the lane has no hook, when the handle is inert, or on a backend too old to answer. Assert against
+## it rather than inferring the order from the order you happened to register properties in -- reordering a
+## registration silently reorders this.
+func bulk_capture_order(lane: int) -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"bulk_capture_order"):
+		return PackedStringArray()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant, and the
+	# GDScript rule for a wire-ish value is that the conversion is an assignment, never a cast.
+	var order: PackedStringArray = _sync.bulk_capture_order(lane)
+	return order
+
+## The declared entries a bulk RESTORE hook marshals for `lane`, in array order -- the restored subset, shorter
+## than the capture order by exactly the lane's cosmetic entries. Empty when the lane has no hook.
+func bulk_restore_order(lane: int) -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"bulk_restore_order"):
+		return PackedStringArray()
+	var order: PackedStringArray = _sync.bulk_restore_order(lane)
+	return order
+
+## Whether `lane` captures through a bulk hook rather than the per-property walk.
+##
+## CHECK THIS AFTER process_settings() WHEN A HOOK SEEMS TO DO NOTHING. A method name that does not resolve
+## leaves the lane on the walk, and the order lists give that away only by being empty -- which an empty lane
+## also is.
+func uses_bulk_capture(lane: int) -> bool:
+	if _sync == null or not _sync.has_method(&"uses_bulk_capture"):
+		return false
+	return _sync.uses_bulk_capture(lane)
+
+## Whether `lane` restores through a bulk hook. See [method uses_bulk_capture].
+func uses_bulk_restore(lane: int) -> bool:
+	if _sync == null or not _sync.has_method(&"uses_bulk_restore"):
+		return false
+	return _sync.uses_bulk_restore(lane)
