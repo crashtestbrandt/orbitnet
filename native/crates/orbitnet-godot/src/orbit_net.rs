@@ -512,8 +512,8 @@ impl PeerState {
     /// Start or stop withholding one entity from this peer. The whole of what
     /// [`OrbitNet::set_entity_hidden`] does, as a method a test can call without a `SceneTree`.
     ///
-    /// [`PeerInterest::set_hidden`] carries the filter half — the refusal, and dropping the entity
-    /// from the set in this call rather than at the next update. What is here is the other half:
+    /// [`ConnectionInterest::set_hidden`] carries the filter half — the refusal on every seat of the
+    /// connection, and dropping the entity from the set in this call rather than at the next update. What is here is the other half:
     /// **starting a veto clears the same three per-entity entries a leave clears**. It is a leave —
     /// it just happened between updates, so no `leaves` list will ever name it, and the clearing
     /// cannot be left to the loop that reads one. Without it a later retraction encodes a delta
@@ -1249,8 +1249,9 @@ impl OrbitNet {
     ///
     /// **The veto beats everything the filter would otherwise say**, `always` included, and it
     /// refuses at the candidate rather than at the cap, so a withheld entity occupies no slot in
-    /// `aoi_max_entities`. See [`PeerState::set_entity_hidden`] for the delta bookkeeping it clears
-    /// and [`PeerInterest::set_hidden`] for the filter rule itself.
+    /// `aoi_max_entities`. It withholds from the whole CONNECTION — a datagram is shared by every
+    /// seat on it — see [`PeerState::set_entity_hidden`] for the delta bookkeeping it clears and
+    /// [`ConnectionInterest::set_hidden`] for the filter rule itself.
     ///
     /// **THE CLIENT-SIDE CONTRACT, STATED PLAINLY: a veto stops the rows and nothing else.** No
     /// despawn is sent, the receiving client's node is not removed, and the entity manifest still
@@ -2820,11 +2821,11 @@ impl OrbitNet {
     /// distance second, which is [`candidate_for_row`] plus `update_linear_into`.
     ///
     /// **The shared candidate list carries no per-peer facts and does not have to.** A visibility
-    /// veto ([`OrbitNet::set_entity_hidden`]) is held on the peer's own `PeerInterest` and applied
-    /// inside the filter, so it costs this loop nothing and cannot be forgotten by a caller that
-    /// builds candidates some other way. A vetoed entity is absent from `interest`, so the cull
-    /// figure below — `rows.len() - interest.len()` — already counts it, on every tick the veto
-    /// holds.
+    /// veto ([`OrbitNet::set_entity_hidden`]) is held on the connection's own `ConnectionInterest`,
+    /// mirrored onto each of its seats and applied inside the filter, so it costs this loop nothing
+    /// and cannot be forgotten by a caller that builds candidates some other way. A vetoed entity is
+    /// absent from `interest`, so the cull figure below — `rows.len() - interest.len()` — already
+    /// counts it, on every tick the veto holds.
     ///
     /// The leave half is the correctness requirement here. Re-entry is already *safe* — a
     /// delta against a base the peer dropped is rejected and raises `WANT_FULL` — but `want_full` is
