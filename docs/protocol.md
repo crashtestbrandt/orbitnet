@@ -10,7 +10,7 @@ Little-endian.
 **Hot frame** — unreliable, one per peer per tick:
 
 ```
-frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | input-arrival margin byte
+frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | 32-bit ack token | input-arrival margin byte
 then per entity:  { entity id | flags | changed-property bitmask | packed payload }
 then the trailer: { sequence (u32) | MAC tag (u64) }
 ```
@@ -43,6 +43,7 @@ operator-readable version mismatch. An all-zero key is then refused with a messa
 | --- | --- |
 | 2 | Quantized wire encodings. |
 | 3 | Per-datagram authentication, and the handshake's session key. |
+| 4 | The hot-frame header carries an **ack token**. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -82,6 +83,32 @@ before a single field is decoded unless both check out.
   who can read the handshake can do everything the client can** — closing that needs a key exchange. Recorded
   as a limit in the [README](../README.md#limits).
 
+## The ack token
+
+`ack_tick` says which snapshot frame a client holds. The server spends that number twice — it is the base
+every masked delta is encoded against, and it is the round-trip sample that sets that peer's rewind depth —
+so it is checked rather than believed.
+
+- **The server mints a token per snapshot frame**, from a 16-byte secret it draws per connection at the
+  handshake and **never transmits**. The token is SipHash-2-4 over the frame's tick under that secret, so it
+  is derived rather than stored and any tick can be checked, including one the sent log has expired.
+- **The client quotes back the token of the frame its `ack_tick` names.** It moves only when
+  `ack_tick` moves, so the two always name the same frame.
+- **An ack that does not carry the right token is discarded whole**: no `newest_ack`, no round-trip sample,
+  no `acked_base` promotion. Every one of those is granted on the strength of the claim. It is counted as
+  `unproven_acks_s` in [`bandwidth_metrics()`](api.md); an honest client cannot produce one.
+- The 32 ack **bits** name frames older than `ack_tick` and prove nothing themselves. They are consumed
+  because the tick they hang off was proven, and refused with it when it was not. A peer that lies in the
+  bits breaks its own delta chain and NACKs.
+
+**What it does not settle.** A token says the peer received the frame it names, not that it received nothing
+newer. A client that advances its ack at full rate while holding a constant lag quotes a real token every
+time and is measured at that lag — indistinguishable from a peer behind a traffic shaper, and it gains
+nothing that peer does not gain honestly. No wire field closes that: `current - ack` is the whole round trip
+whatever tick lead the client runs at, so there is no second quantity the server could derive an independent
+figure from. The containment is `NetLagComp.max_delay_ms`, 250 ms by default, which bounds every rewind
+whatever the estimate says.
+
 ## What the receive path refuses, and what it does not
 
 The backend checks the wire. It does not check your game.
@@ -90,6 +117,7 @@ The backend checks the wire. It does not check your game.
 | --- | --- |
 | A datagram whose MAC does not verify | Forged, corrupted, or reflected. |
 | A datagram replaying a sequence number | Or one further back than the replay window reaches. |
+| An ack for a frame the peer cannot prove it received | The frame token; see above. The rest of that frame's input blocks are still processed. |
 | Anything from a peer that has not handshaken | Including pings. |
 | A peer speaking a different protocol major | Rejected at the handshake with a readable message. |
 | An input block for an entity the sender does not own | The live `get_multiplayer_authority()` check on the input node. |

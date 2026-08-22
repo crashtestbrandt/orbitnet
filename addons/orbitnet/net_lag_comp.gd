@@ -48,15 +48,16 @@ static var delay_ms: float = 50.0
 ## Published figures for other engines are usually a ROUND TRIP and this is a rewind DEPTH; confusing them is how
 ## a ceiling ends up worth twice what its author meant.
 ##
-## IT IS THE WHOLE CONTAINMENT, so read what it is containing rather than assuming the backend has already
-## handled it. The estimate is derived from acknowledgements the client chooses when to send, and nothing ties
-## that report to what the peer actually received. The backend refuses to measure an ack that did not ADVANCE and
-## keeps the MINIMUM of a recent window, which together stop a peer inflating for free -- but a steady
-## under-report still reads as a slow link, is believed, and is indistinguishable from a player who put a traffic
-## shaper in front of their connection and is honestly that far away. Neither case can be told apart, and neither
-## needs to be: both get at most this many milliseconds of rewind, which is what the worst supported legitimate
-## link already receives. Lowering this number is the only lever that narrows either. See `note_ack` in
-## `orbit_net.rs` for the two backend rules and what they do not cover.
+## IT IS THE CONTAINMENT ON WHAT IS LEFT, so read what it is containing rather than assuming the backend has
+## already handled it. The estimate is derived from acknowledgements the client chooses when to send. Three
+## backend rules narrow that: an ack must carry the frame token the server minted for the tick it names, so a
+## peer cannot acknowledge a frame that never reached it; an ack that did not ADVANCE takes no sample at all;
+## and the estimate is the MINIMUM of a recent window. What survives all three is a peer that acknowledges a
+## frame OLDER than the newest it holds. That reads as a slow link, is believed, and is indistinguishable from a
+## player who put a traffic shaper in front of their connection and is honestly that far away. Neither case can
+## be told apart, and neither needs to be: both get at most this many milliseconds of rewind, which is what the
+## worst supported legitimate link already receives. Lowering this number is the only lever that narrows either.
+## See `consume_ack` and `note_ack` in `orbit_net.rs` for the three rules and what they do not cover.
 static var max_delay_ms: float = 250.0
 
 ## Whether a shot is rewound by its own shooter's measured round trip, or by the flat [member delay_ms] every

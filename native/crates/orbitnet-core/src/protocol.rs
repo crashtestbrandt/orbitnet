@@ -25,12 +25,13 @@
 /// | --- | --- |
 /// | 2 | Quantized wire encodings (`QuantKind`). |
 /// | 3 | Every datagram but the handshake carries a sequence number and a MAC (`crate::auth`); the handshake carries the session key and no longer carries a session-wide schema hash. |
+/// | 4 | The hot-frame header carries `ack_token`: a server-minted per-frame value the client quotes back, so an ack names a frame the peer provably received. |
 ///
 /// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
 /// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
 /// documented absent-value behaviour, a newer peer reads it when it is there. Anything that shifts an
 /// existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
-pub const PROTOCOL_VERSION: u32 = 0x0003_0000;
+pub const PROTOCOL_VERSION: u32 = 0x0004_0000;
 
 /// Extract the major component of a protocol version.
 #[must_use]
@@ -309,8 +310,8 @@ mod tests {
 
     #[test]
     fn protocol_major_is_extracted() {
-        assert_eq!(protocol_major(PROTOCOL_VERSION), 3);
-        assert_eq!(protocol_major(0x0004_0201), 4);
+        assert_eq!(protocol_major(PROTOCOL_VERSION), 4);
+        assert_eq!(protocol_major(0x0005_0201), 5);
     }
 
     #[test]

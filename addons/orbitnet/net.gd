@@ -729,6 +729,13 @@ func perf_metrics() -> Dictionary[String, float]:
 ##                                     Kept apart from deferred because conflating them hides the failure.
 ##   want_full_nacks_s              -- WANT_FULL NACKs received. SERVER-SIDE ONLY: it is counted where a
 ##                                     client's INPUT frame is decoded, so a client reads a structural 0.00.
+##   unproven_acks_s                -- acks discarded because the frame token quoted was not the one this
+##                                     server minted for the tick the ack named, so the peer cannot have
+##                                     received the frame it claimed. SERVER-SIDE ONLY, same reason. An
+##                                     honest client cannot produce one. A sustained reading is a peer
+##                                     sending acks it cannot substantiate, and that peer pays for it in
+##                                     the next column: its acked_base never advances, so blocks_full_s
+##                                     climbs toward blocks_admitted_s.
 ##   blocks_full_s                  -- blocks sent as full rows rather than masked deltas: the send lane's
 ##                                     composition, and what the keyframe interval costs. Floor is about
 ##                                     blocks_admitted_s / 16, since every entity owes one keyframe per
@@ -808,7 +815,7 @@ func bandwidth_metrics() -> Dictionary[String, float]:
 		"tx_bytes_s": 0.0, "tx_datagrams_s": 0.0, "tx_wire_bytes_s": 0.0, "tx_peak_peer_bytes_s": 0.0,
 		"rx_bytes_s": 0.0, "rx_datagrams_s": 0.0,
 		"blocks_admitted_s": 0.0, "blocks_deferred_s": 0.0, "blocks_culled_s": 0.0,
-		"want_full_nacks_s": 0.0, "stale_blocks_s": 0.0, "blocks_oversize_s": 0.0,
+		"want_full_nacks_s": 0.0, "unproven_acks_s": 0.0, "stale_blocks_s": 0.0, "blocks_oversize_s": 0.0,
 		"blocks_full_s": 0.0,
 		"starve_ticks_max": 0.0, "unsent_backlog_max": 0.0,
 		"interest_ms": 0.0,
