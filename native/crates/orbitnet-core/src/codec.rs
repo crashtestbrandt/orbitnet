@@ -22,6 +22,7 @@ use core::fmt;
 use crate::auth::KEY_LEN;
 use crate::columnar::changed_mask;
 use crate::protocol::{protocol_major, PropSchema, PROTOCOL_VERSION};
+use crate::seats::SeatIndex;
 
 /// Frame magic, present only on the reliable handshake.
 pub const MAGIC: [u8; 4] = *b"OBNW";
@@ -1000,8 +1001,8 @@ impl Pong {
     }
 }
 
-/// One entity's row in a [`FrameKind::EntityManifest`] frame: its slot binding and its schema
-/// fingerprints.
+/// One entity's row in a [`FrameKind::EntityManifest`] frame: its slot binding, its schema
+/// fingerprints, and the seat that drives it.
 ///
 /// **The manifest carries the whole slot table, both lanes, every time.** It covered the rollback
 /// lane only while it was purely a schema check, because a state-lane entity has no input schema to
@@ -1011,6 +1012,13 @@ impl Pong {
 /// It is a **complete snapshot rather than a diff**, which is what makes a receiver's table
 /// self-repairing: rebuilding from each manifest drops the binding of every entity that has
 /// unregistered since the last one, with no removal record to lose.
+///
+/// **THE SEAT ROSTER RIDES HERE RATHER THAN ON A FRAME OF ITS OWN.** A seat exists because some
+/// entity says it is driven by that connection under that label ([`crate::seats`]), so the roster is
+/// a projection of this table and cannot disagree with it. A separate frame would be a second source
+/// of truth arriving on its own schedule, and the two would differ for exactly as long as one of
+/// them was in flight. The complete-snapshot rule then carries over for free: a receiver rebuilds
+/// the roster from each manifest, so a seat that went away needs no removal record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestEntry {
     /// The dense session slot this entity's blocks are named by on the wire.
@@ -1021,12 +1029,26 @@ pub struct ManifestEntry {
     pub state_hash: u32,
     /// Hash of the entity's input schema. `0` for a state-lane entity, which has no input schema.
     pub input_hash: u32,
+    /// The transport peer whose input drives this entity, or `0` when nobody's does.
+    ///
+    /// **Not an authority grant.** The server still checks a received input block against the
+    /// entity's live multiplayer authority; this is what it has already decided, published so a
+    /// client can name the same seats the server does.
+    ///
+    /// **A DEDICATED SERVER WRITES `0` FOR A BODY IT HOLDS ITSELF.** Handing input back to peer 1 is
+    /// how a game says a body is unclaimed, and a server with no local player has no viewpoint to
+    /// announce; a LISTEN server writes `1`, because there peer 1 is the host player. The two are
+    /// indistinguishable to a client, so the decision is made where it is known.
+    pub owner: i32,
+    /// Which seat on `owner` drives it — `0` for every body that declares none, and meaningless
+    /// when `owner` is `0`.
+    pub seat: SeatIndex,
 }
 
 /// Encode an entity manifest frame.
 #[must_use]
 pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
-    let mut writer = Writer::with_capacity(4 + entries.len() * 14);
+    let mut writer = Writer::with_capacity(4 + entries.len() * 17);
     writer.u8(FrameKind::EntityManifest.tag());
     writer.varint(entries.len() as u64);
     for entry in entries {
@@ -1038,6 +1060,11 @@ pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
         writer.varint(entry.id);
         writer.u32(entry.state_hash);
         writer.u32(entry.input_hash);
+        // A transport peer id is positive and small — 1 for the server, then one per joiner — so a
+        // varint spends one byte on every session that will ever exist. A negative value is not a
+        // peer id and is written as the `0` that means "nobody drives this".
+        writer.varint(entry.owner.max(0) as u64);
+        writer.u16(entry.seat);
     }
     writer.into_inner()
 }
@@ -1045,15 +1072,22 @@ pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
 /// Decode an entity manifest's payload after the kind tag has been consumed.
 pub fn decode_manifest(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, CodecError> {
     let count = reader.varint()?;
-    // Each entry is at least 11 bytes; a hostile count cannot make us over-allocate.
+    // Each entry is at least 14 bytes; a hostile count cannot make us over-allocate.
     let cap = usize::try_from(count.min(4096)).unwrap_or(0);
     let mut entries = Vec::with_capacity(cap);
     for _ in 0..count {
+        // Field order here IS wire order: a struct literal evaluates its fields as written, and
+        // every one of these reads advances the same cursor.
         entries.push(ManifestEntry {
             slot: reader.u16()?,
             id: reader.varint()?,
             state_hash: reader.u32()?,
             input_hash: reader.u32()?,
+            // A peer id past `i32::MAX` cannot have been minted by any transport, so it is a
+            // corrupt or hostile frame; it reads as unowned rather than as a wrapped id that would
+            // name somebody.
+            owner: i32::try_from(reader.varint()?).unwrap_or(0),
+            seat: reader.u16()?,
         });
     }
     Ok(entries)
@@ -1809,20 +1843,26 @@ mod tests {
                 id: 1,
                 state_hash: 0xaaaa_bbbb,
                 input_hash: 0xcccc_dddd,
+                owner: 4,
+                seat: 0,
             },
             ManifestEntry {
                 slot: u16::MAX,
                 id: u64::MAX,
                 state_hash: 0,
                 input_hash: 1,
+                owner: i32::MAX,
+                seat: u16::MAX,
             },
             // A state-lane entity: a slot binding and a state hash, no input schema to disagree
-            // about.
+            // about, and no seat because nothing drives its input.
             ManifestEntry {
                 slot: 7,
                 id: 0x0f0f_0f0f_0f0f_0f0f,
                 state_hash: 0x1234_5678,
                 input_hash: 0,
+                owner: 0,
+                seat: 0,
             },
         ];
         let bytes = encode_manifest(&entries);
@@ -1832,6 +1872,62 @@ mod tests {
             Ok(FrameKind::EntityManifest)
         );
         assert_eq!(decode_manifest(&mut reader).unwrap(), entries);
+    }
+
+    #[test]
+    fn manifest_seats_survive_a_second_body_on_the_same_connection() {
+        // Local split-screen as the wire carries it: one connection, two labels, and a third body
+        // it does not drive at all.
+        let entries = vec![
+            ManifestEntry {
+                slot: 1,
+                id: 11,
+                state_hash: 1,
+                input_hash: 2,
+                owner: 3,
+                seat: 0,
+            },
+            ManifestEntry {
+                slot: 2,
+                id: 12,
+                state_hash: 1,
+                input_hash: 2,
+                owner: 3,
+                seat: 1,
+            },
+            ManifestEntry {
+                slot: 3,
+                id: 13,
+                state_hash: 1,
+                input_hash: 2,
+                owner: 9,
+                seat: 0,
+            },
+        ];
+        let bytes = encode_manifest(&entries);
+        let mut reader = Reader::new(&bytes);
+        let _ = reader.u8().unwrap();
+        assert_eq!(decode_manifest(&mut reader).unwrap(), entries);
+    }
+
+    #[test]
+    fn a_manifest_owner_that_cannot_be_a_peer_id_decodes_as_unowned() {
+        // A varint past i32::MAX names no connection any transport minted, so it reads as "nobody
+        // drives this" rather than wrapping into an id that would name somebody.
+        let mut writer = Writer::new();
+        writer.u8(FrameKind::EntityManifest.tag());
+        writer.varint(1);
+        writer.u16(5);
+        writer.varint(42);
+        writer.u32(1);
+        writer.u32(2);
+        writer.varint(u64::from(u32::MAX));
+        writer.u16(3);
+        let bytes = writer.into_inner();
+        let mut reader = Reader::new(&bytes);
+        let _ = reader.u8().unwrap();
+        let entries = decode_manifest(&mut reader).unwrap();
+        assert_eq!(entries[0].owner, 0);
     }
 
     #[test]

@@ -54,6 +54,8 @@ local player.
 | `peer_joined(peer, session_id, resumed_from)` | **Server-side.** A peer finished the handshake. `resumed_from` is the peer id it held before it dropped, or 0 for a newcomer. **Seat players here**, not on the transport's `peer_connected`. Fires once per peer, however many times its handshake is retried. |
 | `peer_dropped(peer, session_id, held)` | **Server-side.** A peer's connection is gone. `held` is whether its session is being kept open for the grace window — false for no identity, for a grace of 0, and for a ghost whose identity a returning player already took back (such a drop reports `session_id` 0). |
 | `peer_session_expired(session_id, peer)` | **Server-side.** A held session's window closed unclaimed. The release point — the addon does not act on it. |
+| `seat_opened(peer, seat)` | **Both sides.** A seat arrived on a connection — the server as it seats the body, a client one entity manifest later. **Bind presentation here**: a split-screen viewport, a camera, a HUD panel. A joining connection's first seat is announced here too. |
+| `seat_closed(peer, seat)` | **Both sides.** Nothing drives `(peer, seat)` any more. A dropped connection does **not** close its seats by itself — its bodies keep the authority they were given until the game changes them. |
 
 ### Session identity and reconnection
 
@@ -207,7 +209,7 @@ veto is the only per-(peer, entity) fact in the filter, and the only one that ca
 **The seat's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
 authority is that peer, which declares that seat, and which resolved an anchor — unless the peer declares them,
 below. A **seat** is one owned, predicted body behind a connection; every body is on seat `0` until
-`NetRollbackHandle.set_seat()` says otherwise, which is one seat per connection.
+`NetRollbackHandle.assign_seat()` or `set_seat()` says otherwise, which is one seat per connection.
 
 Three consequences people find the hard way:
 
@@ -216,7 +218,8 @@ Three consequences people find the hard way:
    to every peer, which is the default and is the fail-open direction.
 2. **A peer with no rollback body and no declaration has no anchor**, so the backend falls back to "everything
    is in interest" — every world, at every distance. Either give every peer a rollback entity, which is why the
-   RTS demo puts the command cursor on that lane, or declare the pair with `Net.set_peer_anchor()`.
+   RTS demo puts the command cursor on that lane, or declare the pair with `Net.set_peer_anchor()`. The fallback
+   is per **connection**: a peer whose *one* seat of several has not resolved is not opened up by it.
 3. **Membership is what a positionless channel has instead of a radius.** Health, inventory, a door's state:
    none of them replicate a position, so no radius reaches them. `set_membership()` bounds them to one world
    while leaving them uncullable inside it.
@@ -232,14 +235,24 @@ single transport peer. Each is a **seat**, and the second player's surroundings 
 
 | | |
 |---|---|
-| Declaring a seat | `NetRollbackHandle.set_seat(index)`, **on the server**. Every body starts at `0`. |
+| Seating a body | `NetRollbackHandle.assign_seat(peer, index)`, **on the server**. Writes the owning connection and the label in one call. |
+| Emptying a seat | `NetRollbackHandle.release_seat()`. Input goes back to the server, the label back to `0`; the body stays registered and stays replicated. |
+| Declaring the label alone | `NetRollbackHandle.set_seat(index)`. Only when the owning connection is not changing. Every body starts at `0`. |
 | What a seat gets | Its own interest anchor, its own centre, its own world, its own hysteresis band and its own nearest-N cap. |
 | What the connection gets | The **union** of its seats' sets, with the **nearest** seat's distance kept per entity — which is the band the send rota scores it in. |
 | What stays per connection | The delta base, the ack window, `want_full`, the byte budget and the **veto**. Those are properties of a datagram, and a datagram is per connection. |
 
-- **A seat with no body yet culls nothing of its own.** Culling is decided per seat, so a seat whose body has
-  not spawned does not inherit another seat's centre and have its surroundings culled around a position it is
-  nowhere near.
+- **A seat is derived from `(input owner, seat label)`, never declared on its own.** That is why
+  `assign_seat()` writes both: two separate writes leave a tick in which the body reads as
+  `(new peer, old label)`, which is announced as a seat opening and closing again.
+- **A seat change is announced on both sides**, as `Net.seat_opened` / `Net.seat_closed`. `Net.seats_of(peer)`
+  answers which seats a connection holds and `Net.seat_entities(peer, seat)` which bodies one seat drives.
+  A client learns both from the entity manifest, which is reliable and republished on every seat change.
+- **A seat that has not spawned yet contributes no viewpoint.** Culling is decided per seat, so a seat is never
+  centred on a position it is nowhere near — and a seat whose body has no state row yet is **skipped** rather
+  than treated as seeing everything, because the connection's set is a union and one unresolved seat would
+  otherwise open the whole connection to every world. Fail-open is per **connection**: a peer with no resolved
+  seat at all still sees everything, which is what stops a joining player arriving in an empty world.
 - **A leave is a leave from the union.** An entity one seat lets go of keeps its delta chain while another seat
   still holds it.
 - **`Net.set_peer_anchor()` collapses the connection to one viewpoint.** A declaration states where a
@@ -251,8 +264,16 @@ single transport peer. Each is a **seat**, and the second player's surroundings 
 - **Commands are per connection, not per seat.** `NetCommand` hands its validator the sender's peer id — the
   only identity a client cannot author. A game with several seats on one connection puts the seat in the
   payload and validates it against the seats the server assigned to that sender.
-- **Nothing on the wire carries a seat.** Interest runs where state authority is, so a seat is a server-side
-  declaration; the anti-forgery check on received input is per entity and is unchanged.
+- **The seat label is a server-side declaration; the roster is published.** Interest runs where state authority
+  is, so a client never authors a seat — the entity manifest tells it which connection and label drive each
+  entity. No hot-path frame carries a seat, and the anti-forgery check on received input is per entity and is
+  unchanged.
+- **A dropped connection keeps its seats until the game releases them.** The bodies keep the authority they
+  were given, exactly as `peer_session_expired` describes. Call `release_seat()` and `seat_closed` fires.
+- **A dedicated server holds no seat of its own; a listen server does.** Handing input back to peer 1 is how a
+  game says a body is unclaimed, so a server with no local player announces nothing for it. On a listen server
+  peer 1 *is* the host player, which also means a body the host holds unclaimed reads the same as one the host
+  player drives — seat the host player on a non-zero label if you have to tell them apart.
 - **`Net.set_entity_hidden()` withholds from the whole connection.** A veto refuses a row in a datagram every
   seat shares, so it is applied to each of them — including a seat that joins later — rather than to the union.
 
@@ -281,6 +302,8 @@ worlds observes exactly one of them.
 | `set_peer_anchor_entity(peer, entity_id, membership = 0)` | Observe from an entity, wherever it is, in this world. `entity_id` comes from `entity_id()` on a rollback or state handle; `0` retracts. |
 | `clear_peer_anchor(peer)` | Retract the centre **and** the world, back to the inferred body — one per seat. |
 | `peer_membership(peer)` | The **declared** world, 0 when nothing was declared. Not what an undeclared peer is filtered in — that is `NetRollbackHandle.membership()`. |
+| `seats_of(peer)` | Which seats a connection currently holds, ascending. **Both sides**; empty OFFLINE. Answered from the announced roster, so it agrees with `seat_opened` / `seat_closed`. |
+| `seat_entities(peer, seat)` | Which bodies one seat drives, as entity ids — opaque tokens, never compared or ordered. **Both sides**; empty OFFLINE. What a camera or a split-screen viewport needs when `seat_opened` fires. |
 
 - **A declaration replaces inference on both axes at once.** The driven body is consulted for neither until
   `clear_peer_anchor()`, and a connection with several seats is collapsed to the one declared viewpoint.
@@ -341,7 +364,9 @@ Net.set_entity_hidden(peer_id, spy.entity_id(), false)
 | `is_active() -> bool` | False when inert (OFFLINE). |
 | `add_state(node, property)` / `add_input(node, property)` | For handles built with `make_rollback()`. |
 | `set_membership(entry) -> void` | Declare which **world** this body is in, as a `"NodePath:property"` naming an `int`. Also sets the owning seat's own world, unless that peer declared its own with `Net.set_peer_anchor()`. Call before `process_settings()`. |
-| `set_seat(index) -> void` | Declare which **seat** on the owning connection drives this body. Server-side; `0` unless set, which is one seat per connection. |
+| `assign_seat(peer, index) -> void` | Seat this body: point its input at `peer` **and** put it on that connection's seat `index`, in one call. Use whenever both change — two separate writes leave a tick in which the body reads as `(new peer, old label)`. Local, like every authority write: call it on every peer. |
+| `release_seat() -> void` | Empty the seat: input back to the server, label back to `0`. The body stays registered and replicated — what leaves is the viewpoint. |
+| `set_seat(index) -> void` | Declare the **label** alone, when the owning connection is not changing. Server-side; `0` unless set, which is one seat per connection. |
 | `seat() -> int` | The declared seat, `0` when inert. |
 | `entity_id() -> int` | This body's stable replication id, for `Net.set_peer_anchor_entity()`. An opaque token — routinely negative, never compared or ordered. 0 when inert or unresolved. |
 | `process_settings() -> void` | Re-resolve after the property set changes. |

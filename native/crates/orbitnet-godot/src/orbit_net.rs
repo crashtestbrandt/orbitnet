@@ -41,6 +41,7 @@ use orbitnet_core::interest::{
     MEMBERSHIP_GLOBAL,
 };
 use orbitnet_core::priority::{self, Band};
+use orbitnet_core::seats::{SeatId, SeatIndex, SeatRoster};
 use orbitnet_core::slots::SlotTable;
 use orbitnet_core::{
     AoiConfig, AuthError, ClockEstimator, CoupledSlew, Direction, LeadTracker, ReceiveBudget,
@@ -56,7 +57,7 @@ const MODE_CLIENT: i64 = 1;
 const MODE_SERVER: i64 = 2;
 const MODE_HOST: i64 = 3;
 
-const SERVER_PEER: i32 = 1;
+pub(crate) const SERVER_PEER: i32 = 1;
 /// Seconds between clock probes.
 const PING_INTERVAL: f64 = 0.25;
 /// Ticks between forced full-state blocks per entity (phase-offset by entity id).
@@ -104,37 +105,6 @@ const WIRE_OVERHEAD_BYTES: u64 = 28 + 12 + 1;
 /// Seconds per accounting window — the period the per-second bandwidth figures are averaged over.
 const BANDWIDTH_WINDOW_SECONDS: f64 = 1.0;
 
-/// Which seat on a connection a body belongs to, as the game declared it.
-///
-/// A `u16` because it is a **label** rather than a count: the interest pass holds one set per
-/// distinct label present on a connection, so the numbers need not be small or contiguous, and
-/// nothing is sized by the value.
-pub(crate) type SeatIndex = u16;
-
-/// One owned viewpoint: a connection, and which of its seats.
-///
-/// **The identity ownership could not express before.** `input_owner_peer()` answers "which
-/// connection", and that is the whole answer only while a connection drives one predicted body.
-/// Local split-screen drives several — two players on one couch behind one socket — and each needs
-/// its own interest anchor, its own centre and its own world, because the second player's
-/// surroundings are not the first player's.
-///
-/// **Seat is the word the demos already use for a player side**, and this is the same idea: a seat
-/// is a player position, and what changes is only that a connection may hold more than one of them.
-/// A game whose bodies all leave `seat` at `0` has one seat per connection, which is the bijection
-/// the demos assume and is unchanged by any of this.
-///
-/// Ordered peer-major so [`owned_rows_into`]'s sort groups a connection's rows together and its
-/// seats in ascending label order within that group — which is what makes both lookups a
-/// `partition_point` rather than a per-tick map.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct SeatId {
-    /// The connection this seat sits on.
-    peer: i32,
-    /// Which seat on it. `0` for every body that declares nothing.
-    seat: SeatIndex,
-}
-
 /// One replicated entity as the send path sees it, gathered once per tick before any peer is
 /// considered.
 ///
@@ -180,18 +150,41 @@ impl EntityRow {
 /// its own on the wire or in the registry, and taking it from the body that already anchors the
 /// seat's radius keeps the two answers about one entity rather than about two that could disagree.
 ///
-/// A seat with no such row has no entry here at all: it is not distance-culled, and its membership
-/// reads as [`MEMBERSHIP_GLOBAL`], so it sees every world. Both halves fail open together, which is
-/// the only defensible direction — blanking a seat's world because its body has not spawned yet is
-/// not. **That failure is now per seat.** It used to be per connection: one anchored seat supplied
-/// the centre for the whole connection, so a second seat had its surroundings culled around a
-/// position it was nowhere near.
+/// A seat with no such row has no entry here at all, and [`seat_observers_into`] then gives it
+/// **no viewpoint** rather than an unlocatable one — while any other seat on the connection has
+/// resolved. Fail-open is a per-CONNECTION rule: a connection where nothing resolved sees everything,
+/// which is what protects a peer whose avatar has not spawned; a connection where one seat resolved
+/// and another has not is not blanked by the one that has not. Per-seat fail-open made adding a seat
+/// a full-world burst for the whole connection, because the connection's set is the union of its
+/// seats'.
+///
+/// **The centre is per seat, and that half stays per seat.** It used to be per connection: one
+/// anchored seat supplied the centre for the whole connection, so a second seat had its surroundings
+/// culled around a position it was nowhere near.
 #[derive(Clone, Copy)]
 struct PeerObserver {
     /// The centre this seat's interest radius is measured from.
     center: [f32; 3],
     /// The world this seat is in.
     membership: MembershipId,
+}
+
+/// One connection's anchor declaration as the interest pass reads it for a tick.
+///
+/// The four facts [`resolve_observer`] needs, carried together because they are one statement about
+/// one connection: what the game declared, and — for a declaration that names an entity — where that
+/// entity is now and where it last was.
+#[derive(Clone, Copy)]
+struct PeerDeclaration {
+    /// What the game declared, or [`PeerAnchor::Inferred`] when it declared nothing.
+    anchor: PeerAnchor,
+    /// The world declared alongside it. Read only when a declaration exists.
+    membership: MembershipId,
+    /// Where a [`PeerAnchor::Entity`] target is THIS tick, if it is still here and still positioned.
+    tracked: Option<[f32; 3]>,
+    /// Where it last resolved to, so its despawn leaves the peer there rather than opening its
+    /// radius to the whole world.
+    last: Option<[f32; 3]>,
 }
 
 /// What one peer's filter actually runs against this tick: where it observes from, and its world.
@@ -1099,6 +1092,31 @@ pub struct OrbitNet {
     aoi_leaves: Vec<u64>,
     order_scratch: Vec<(priority::Candidate, Band)>,
 
+    // --- the seat roster, and the announcement it feeds ---
+    /// The seats this session has already announced. See [`Self::announce_seats`].
+    seat_roster: SeatRoster,
+    /// `(entity id, owner, seat)` for every replicated entity, ascending by id — the seat half of
+    /// what the entity manifest carries.
+    ///
+    /// **The server derives it and a client is told it.** On a server it is rebuilt from the
+    /// registry once per frame and compared against itself to decide whether the manifest owes a
+    /// republish; on a client it is rebuilt from each received manifest, which is a complete table.
+    /// Both then project the same roster out of it, so a seat event means the same thing on either
+    /// end of the link.
+    entity_seats: Vec<(u64, i32, SeatIndex)>,
+    /// Announcement scratch, pooled so a steady session allocates nothing: the server's per-frame
+    /// rescan, the projected seat set, and the two transition lists [`SeatRoster::replace_into`] fills.
+    seat_scan: Vec<(u64, i32, SeatIndex)>,
+    seat_gather: Vec<SeatId>,
+    seat_opened: Vec<SeatId>,
+    seat_closed: Vec<SeatId>,
+    /// Whether [`Self::entity_seats`] has changed since the roster was last projected from it.
+    ///
+    /// The projection is the sort-and-dedup plus the diff, and a steady session changes seats
+    /// approximately never — so the flag is what keeps the per-frame cost at the rescan that detects
+    /// the change, rather than at re-deriving an answer that did not move.
+    seats_dirty: bool,
+
     mask_scratch: Vec<bool>,
     signals_connected: bool,
     debug_wire: bool,
@@ -1217,6 +1235,13 @@ impl INode for OrbitNet {
             aoi_seat_scratch: SeatScratch::default(),
             aoi_members: Vec::new(),
             aoi_leaves: Vec::new(),
+            seat_roster: SeatRoster::new(),
+            entity_seats: Vec::new(),
+            seat_scan: Vec::new(),
+            seat_gather: Vec::new(),
+            seat_opened: Vec::new(),
+            seat_closed: Vec::new(),
+            seats_dirty: false,
             order_scratch: Vec::new(),
             mask_scratch: Vec::new(),
             signals_connected: false,
@@ -1330,6 +1355,34 @@ impl OrbitNet {
     #[signal]
     fn peer_session_expired(session_id: i64, peer: i64);
 
+    /// A seat arrived on a connection that is already in session. Emitted on **both sides**.
+    ///
+    /// A seat is one owned viewpoint: `(peer, seat)`. It exists because some replicated body says it
+    /// is driven by that connection under that label, so this fires the tick after
+    /// `OrbitRollbackSynchronizer::assign_seat` (or an equivalent authority write) lands on the
+    /// server, and on a client the tick after the manifest carrying it does.
+    ///
+    /// **A joining connection's first seat is announced here too.** It is the same event — a seat
+    /// arriving — and a game that seats every player through one handler needs no second one for the
+    /// first player on a connection. `peer_joined` says a connection completed the handshake, which
+    /// is before it drives anything.
+    #[signal]
+    fn seat_opened(peer: i64, seat: i64);
+
+    /// A seat left a connection that stays in session. Emitted on **both sides**.
+    ///
+    /// It fires when nothing drives `(peer, seat)` any more: the body was released
+    /// (`OrbitRollbackSynchronizer::release_seat`), re-pointed at another connection, or
+    /// unregistered. The connection itself is unaffected and may still hold other seats.
+    ///
+    /// **A dropped connection does NOT close its seats by itself.** Its bodies keep the authority
+    /// they were given until the game changes them, which is deliberate and is the same rule
+    /// [`Self::peer_session_expired`] states: what to do with a body whose player is gone — free it,
+    /// hand it back, hold it for a reconnect — is the game's decision. Release the seat and this
+    /// fires.
+    #[signal]
+    fn seat_closed(peer: i64, seat: i64);
+
     // ------------------------------------------------------------------
     // Session control (facade API)
     // ------------------------------------------------------------------
@@ -1413,6 +1466,12 @@ impl OrbitNet {
         self.slots.clear();
         self.slots_dirty = true;
         self.slots_exhausted_warned = false;
+        // Seats name viewpoints within ONE session, and this one is over. Dropped rather than
+        // announced away: a `seat_closed` per seat is what a session DRAINING looks like, and a game
+        // that just tore the session down is not seating anybody in response to it.
+        self.seat_roster.clear();
+        self.entity_seats.clear();
+        self.seats_dirty = false;
         self.stretch_now = 1.0;
         // The window describes a session that has ended; carrying its rates into the next one would make the
         // first second of every session read as the last second of the previous.
@@ -1656,6 +1715,41 @@ impl OrbitNet {
                 PeerAnchor::Inferred => MEMBERSHIP_GLOBAL,
                 _ => state.anchor_membership,
             }) as i64
+    }
+
+    /// Which seats one connection currently holds, ascending by label. Empty for a connection that
+    /// drives nothing.
+    ///
+    /// Answered from the announced roster, so it agrees with the last
+    /// [`Self::seat_opened`]/[`Self::seat_closed`] pair rather than with whatever the registry looks
+    /// like part-way through a frame. A client answers from the manifest it last received; a server
+    /// from its own registry.
+    #[func]
+    fn seats_of(&self, peer: i32) -> PackedInt32Array {
+        self.seat_roster
+            .seats_of(peer)
+            .iter()
+            .map(|id| i32::from(id.seat))
+            .collect()
+    }
+
+    /// Every entity id driven by `(peer, seat)`. Empty when the seat holds none.
+    ///
+    /// **What makes a seat event actionable.** `seat_opened` names a viewpoint; a presentation layer
+    /// binding a camera or a split-screen viewport to it needs the body, and a seat may drive several.
+    /// The ids are the opaque tokens `get_entity_id()` answers — routinely negative, meaningless to
+    /// compare or order, only ever passed back unmodified. The order here is the backend's own and is
+    /// stable within a session; it is not a ranking.
+    #[func]
+    fn seat_entities(&self, peer: i32, seat: i64) -> PackedInt64Array {
+        let Ok(label) = SeatIndex::try_from(seat) else {
+            return PackedInt64Array::new();
+        };
+        self.entity_seats
+            .iter()
+            .filter(|&&(_, owner, held)| owner == peer && held == label)
+            .map(|&(id, _, _)| id as i64)
+            .collect()
     }
 
     /// Withhold one entity from one peer, or stop withholding it.
@@ -2438,6 +2532,11 @@ impl OrbitNet {
         // Batch boundary: land buffered authoritative rows before anything reads state.
         self.apply_pending_rows();
 
+        // Before the first tick of the batch, so a seat a handler opens in response is driving a
+        // viewpoint from the next frame rather than from part-way through this one — the same
+        // tick-boundary rule `drain_pending` gives a registration.
+        self.announce_seats();
+
         for offset in 0..u64::from(ticks) {
             let tick = first_tick + offset;
             self.emitting_tick = Some(tick);
@@ -2460,6 +2559,112 @@ impl OrbitNet {
         self.flush_network(current);
 
         self.signals().after_rollback_loop().emit();
+    }
+
+    /// Rebuild the seat roster and emit what arrived and what left. Once per frame that runs a tick.
+    ///
+    /// **A seat is derived, never declared on its own.** It exists because some replicated body says
+    /// its input is driven by connection `p` under label `s`; the roster is the deduplicated set of
+    /// those pairs. Holding a seat table the game writes directly would be a second source of truth
+    /// about ownership, and ownership is what the anti-forgery check on a received input block reads
+    /// — the two disagreeing is a seat the server believes in and refuses input for.
+    ///
+    /// **Where the answer comes from differs by role and the announcement does not.** A server (and
+    /// an offline session, and a host) rescans its own registry; a client projects the table the
+    /// entity manifest gave it. Both then run the same diff, so `seat_opened` on a client means what
+    /// it means on the server, one manifest later.
+    ///
+    /// **The rescan is the per-frame cost and the projection is not.** Detecting an authority write
+    /// needs the walk — nothing signals one, and `set_input_authority` is a node property write the
+    /// backend never sees — so this pays one cached-field read per rollback entity per frame, the
+    /// same order as the per-tick gather the send path already does. Everything past it is behind
+    /// `seats_dirty`, because a session changes seats approximately never.
+    ///
+    /// **A change here republishes the manifest.** The manifest carries the seat half of this table,
+    /// and registration is the only thing that already dirties it; an authority or seat write on an
+    /// entity that stays registered is exactly the case nothing else notices.
+    ///
+    /// **A DEDICATED SERVER HOLDS NO SEAT OF ITS OWN**, and a listen server does. See the filter
+    /// below for why the distinction is made here rather than where the roster is projected.
+    fn announce_seats(&mut self) {
+        // A client is TOLD its roster. Deriving one from local authority instead would answer with
+        // whatever this peer happens to have set on its own copy of the scene — which for every body
+        // it does not drive is nothing at all.
+        if self.mode != MODE_CLIENT {
+            // **A DEDICATED SERVER IS NOT A PLAYER, SO IT HOLDS NO SEAT.** `set_input_authority(1)`
+            // is how a game says a body is UNCLAIMED — it is what `release_seat` does — so counting
+            // peer 1 there would announce a viewpoint for every body nobody is driving, and a client
+            // running one seating handler would open a split-screen viewport for a player that does
+            // not exist. A LISTEN SERVER is the opposite case: peer 1 is the host player, and the
+            // couch this feature exists for is usually theirs.
+            //
+            // The two are indistinguishable to a client, which is why the rule is applied here
+            // rather than at the projection. It leaves one ambiguity, on a listen server only: a
+            // body the host holds unclaimed reads the same as one the host player drives. A game
+            // that has to tell them apart seats its host player on a non-zero label.
+            let local_is_a_player = self.mode != MODE_SERVER;
+            let mut scan = std::mem::take(&mut self.seat_scan);
+            scan.clear();
+            for (&id, sync) in &self.rollback_entities {
+                let Some(sync) = live_handle(sync) else {
+                    continue;
+                };
+                let bound = sync.bind();
+                let (owner, seat) = (bound.input_owner_hint(), bound.seat_hint());
+                drop(bound);
+                // `0` is an unresolved input root, not a connection. A body nobody drives seats
+                // nobody, and the state lane never reaches here at all.
+                if owner > 0 && (owner != SERVER_PEER || local_is_a_player) {
+                    scan.push((id, owner, seat));
+                }
+            }
+            // Ascending by id, so the comparison below is about the scene rather than about
+            // `HashMap` iteration order — and so the manifest's rows come out in a stable order.
+            scan.sort_unstable();
+            if scan != self.entity_seats {
+                self.manifest_dirty = true;
+                self.seats_dirty = true;
+                std::mem::swap(&mut self.entity_seats, &mut scan);
+            }
+            self.seat_scan = scan;
+        }
+
+        if !self.seats_dirty {
+            return;
+        }
+        self.seats_dirty = false;
+
+        let mut gather = std::mem::take(&mut self.seat_gather);
+        let mut opened = std::mem::take(&mut self.seat_opened);
+        let mut closed = std::mem::take(&mut self.seat_closed);
+        gather.clear();
+        gather.extend(
+            self.entity_seats
+                .iter()
+                .map(|&(_, peer, seat)| SeatId::new(peer, seat)),
+        );
+        self.seat_roster
+            .replace_into(&mut gather, &mut opened, &mut closed);
+        // `replace_into` swapped the gathered set into the roster, so `gather` now holds the
+        // previous one — returned to the pool as the buffer for the next announcement.
+        self.seat_gather = gather;
+
+        // Closed before opened, so a body moving between connections is reported as the old
+        // viewpoint ending and then the new one beginning rather than the other way round. The emit
+        // surrenders our borrow, so a handler may call back into this node; the roster is already
+        // updated, so what it does lands in the next announcement.
+        for id in &closed {
+            self.signals()
+                .seat_closed()
+                .emit(i64::from(id.peer), i64::from(id.seat));
+        }
+        for id in &opened {
+            self.signals()
+                .seat_opened()
+                .emit(i64::from(id.peer), i64::from(id.seat));
+        }
+        self.seat_opened = opened;
+        self.seat_closed = closed;
     }
 
     /// Capture every locally-authored input row for `tick`.
@@ -3090,6 +3295,11 @@ impl OrbitNet {
     /// **An empty table is sent, not skipped.** A session whose last entity unregistered has to
     /// tell its peers so; returning early there left every client holding bindings for entities
     /// that no longer exist.
+    ///
+    /// **The seat columns come from the ANNOUNCED table, not from a live read.** `entity_seats` is
+    /// what [`Self::announce_seats`] emitted from at the top of this frame, and a handler it woke may
+    /// have re-seated a body since. Publishing the announced values is what keeps a client's roster
+    /// equal to the server's rather than one frame ahead of it in places.
     fn send_manifest_if_dirty(&mut self) {
         if !self.manifest_dirty {
             return;
@@ -3101,12 +3311,21 @@ impl OrbitNet {
                 if !sync.is_instance_valid() {
                     continue;
                 }
+                let (owner, seat) = self
+                    .entity_seats
+                    .binary_search_by_key(&id, |&(seated, _, _)| seated)
+                    .map_or((0, 0), |index| {
+                        let (_, owner, seat) = self.entity_seats[index];
+                        (owner, seat)
+                    });
                 let bound = sync.bind();
                 entries.push(ManifestEntry {
                     slot,
                     id,
                     state_hash: bound.schema_hash() as u32,
                     input_hash: bound.input_schema_hash() as u32,
+                    owner,
+                    seat,
                 });
             } else if let Some(sync) = self.state_entities.get(&id) {
                 if !sync.is_instance_valid() {
@@ -3122,6 +3341,10 @@ impl OrbitNet {
                     // rollback synchronizers only, and a state entity's id can never reach one —
                     // the two lanes salt the node path differently (`S|` against `R|`).
                     input_hash: 0,
+                    // The state lane has no input authority, so it drives no seat. `owner == 0` is
+                    // what every reader keys on and the label beside it is never consulted.
+                    owner: 0,
+                    seat: 0,
                 });
             }
         }
@@ -3626,8 +3849,10 @@ impl OrbitNet {
     /// than contributing its membership, so a seat's centre and its world always describe the same
     /// body. Splitting the picks would let a seat be centred on one entity and filtered against
     /// another's world, which is the same class of failure the lowest-id rule exists to prevent. A
-    /// seat that contributes no row at all still exists — [`Self::update_interest`] finds it in
-    /// [`owned_rows_into`]'s output and gives it an unresolvable centre, which fails open.
+    /// seat that contributes no row at all still exists — [`owned_rows_into`]'s output is what
+    /// enumerates a connection's seats — and [`seat_observers_into`] decides what that seat is worth:
+    /// no viewpoint at all while another seat on the connection resolved, and the connection-wide
+    /// fail-open when none did.
     ///
     /// **THE LIMIT THIS INHERITS, AND WHAT IT COSTS FOR MEMBERSHIP.** "Lowest id" is lowest FNV hash
     /// of a node path, so among a seat's several bodies it is arbitrary — deterministic across peers
@@ -3723,12 +3948,17 @@ impl OrbitNet {
     ///
     /// * **A leave is a leave from the UNION.** Clearing `last_sent` when one seat lets go would
     ///   break the delta chain of a body the other seat is still watching.
-    /// * **Culling is decided per seat.** A seat whose body has no state row yet gets
-    ///   [`UNLOCATABLE_CENTRE`] of its own and stays relevant, instead of inheriting the centre of a
-    ///   seat it is nowhere near.
+    /// * **Culling is decided per seat, and an unresolved seat decides nothing.** A seat is filtered
+    ///   around its own body rather than inheriting the centre of a seat it is nowhere near; a seat
+    ///   whose body has no state row yet is skipped instead, so a seat ARRIVING does not open the
+    ///   whole connection to every world for as long as its body takes to spawn. Only a connection
+    ///   with no resolved seat at all falls back to [`UNLOCATABLE_CENTRE`].
     /// * **A declaration is per connection and collapses it to one seat.** See
     ///   [`resolve_observer`]: a game that stated where a connection observes from is not then
     ///   re-split by seat.
+    ///
+    /// All three are [`seat_observers_into`], which states the whole rule — including what happens
+    /// when the connection's set of seats CHANGES — as one table.
     fn update_interest(
         &mut self,
         peer_ids: &[i32],
@@ -3773,37 +4003,18 @@ impl OrbitNet {
                 candidates[index as usize] = candidate_for_own_row(&rows[index as usize]);
             }
 
-            seats.clear();
-            if matches!(anchor, PeerAnchor::Inferred) {
-                // One seat per distinct label the connection's own rows declare. `mine` is sorted by
-                // seat, so the run check is what deduplicates it — several bodies on one seat are
-                // one viewpoint, anchored by the lowest-id one of them.
-                let seen = Self::observers_of(observers, peer_id);
-                let mut previous: Option<SeatIndex> = None;
-                for &(seat_id, _) in mine {
-                    if previous == Some(seat_id.seat) {
-                        continue;
-                    }
-                    previous = Some(seat_id.seat);
-                    let inferred = seen
-                        .binary_search_by_key(&seat_id, |&(seat, _)| seat)
-                        .ok()
-                        .map(|index| seen[index].1);
-                    let (resolved, membership) =
-                        resolve_observer(anchor, declared, tracked, last, inferred);
-                    seats.push(seat_observer(&cfg, resolved, membership));
-                }
-            }
-            // Reached two ways, and they are one statement: this connection observes from ONE place.
-            // A declaration says so outright, and an undeclared connection that drives nothing has
-            // no seat to read a centre off — the fail-open every peer without a body has always
-            // taken. An EMPTY slice is the different claim that there is no viewpoint at all, which
-            // the filter reads as an empty set, so neither case may leave it empty.
-            if seats.is_empty() {
-                let (resolved, membership) =
-                    resolve_observer(anchor, declared, tracked, last, None);
-                seats.push(seat_observer(&cfg, resolved, membership));
-            }
+            seat_observers_into(
+                &cfg,
+                mine,
+                Self::observers_of(observers, peer_id),
+                PeerDeclaration {
+                    anchor,
+                    membership: declared,
+                    tracked,
+                    last,
+                },
+                &mut seats,
+            );
 
             if let Some(peer) = self.peers.get_mut(&peer_id) {
                 // Remember where a tracked entity was, so its despawn leaves the peer here rather
@@ -3912,17 +4123,32 @@ impl OrbitNet {
                         // than merged. That is what retires the binding of an entity the server has
                         // unregistered: a merge would keep naming it, and a slot reissued to a
                         // different entity would then be resolved to the wrong one.
+                        //
+                        // The seat table is rebuilt the same way and for the same reason: a seat
+                        // that went away leaves no removal record, it is simply absent from the next
+                        // table. The roster is projected from it on the next tick boundary rather
+                        // than here, so a client emits its seat events where a server emits its own
+                        // — see `announce_seats`.
                         self.slots.clear();
+                        self.entity_seats.clear();
+                        self.seats_dirty = true;
                         for entry in entries {
                             self.slots.bind(entry.slot, entry.id);
                             self.expected_schemas
                                 .insert(entry.id, (entry.state_hash, entry.input_hash));
+                            if entry.owner > 0 {
+                                self.entity_seats.push((entry.id, entry.owner, entry.seat));
+                            }
                             if let Some(sync) = self.rollback_entities.get(&entry.id) {
                                 if sync.is_instance_valid() {
                                     self.check_expected_schema(entry.id, sync);
                                 }
                             }
                         }
+                        // Ascending by id, the order the server's own table is held in. The frame
+                        // arrives in SLOT order, so this is a sort rather than an assumption, and
+                        // it is what makes the two sides' tables comparable row for row.
+                        self.entity_seats.sort_unstable();
                     }
                 }
             }
@@ -4493,6 +4719,70 @@ fn seat_observer(
     SeatObserver { center, membership }
 }
 
+/// Fill `seats` with the observers one connection's filter runs against this tick — one per seat it
+/// drives, or exactly one for the connection when it observes from a single place.
+///
+/// **THE ANCHOR RULE WHEN A CONNECTION'S SEAT SET CHANGES**, which is why this is a function of its
+/// own rather than a loop inside [`OrbitNet::update_interest`]. Adding and removing a seat mid-session
+/// is a supported verb (`OrbitRollbackSynchronizer::assign_seat` / `release_seat`), so what the
+/// arriving and departing ends do to the connection's interest has to be stated rather than inherited
+/// from whichever body happened to sort lowest.
+///
+/// | Case | Observers |
+/// | --- | --- |
+/// | The connection declared an anchor ([`PeerAnchor::Fixed`] / [`PeerAnchor::Entity`]) | exactly one, the declared pair — a declaration collapses a connection to one viewpoint |
+/// | Undeclared, some seats resolved a centre | one per RESOLVED seat; unresolved seats contribute nothing |
+/// | Undeclared, no seat resolved a centre (or it drives nothing) | exactly one, unlocatable — the connection fails open |
+///
+/// **An unresolved seat is skipped, not passed through unlocatable.** That is the row that matters for
+/// a seat arriving. The connection's interest is the UNION of its seats', and an unlocatable centre
+/// fails open, so a seat whose body has not produced a state row yet would blank the culling of every
+/// other seat on the connection for as many ticks as that body took to spawn — a full-world burst
+/// down one datagram, caused by a body that is not in the world yet. It costs the arriving seat
+/// nothing: every body the connection drives is `always` to it whatever any seat can see.
+///
+/// **Fail-open is kept, at CONNECTION granularity.** The last row above is what protects a peer whose
+/// only avatar has not spawned, and it is the direction every other unresolved axis takes. An EMPTY
+/// output is the different claim that there is no viewpoint at all, which the filter reads as an empty
+/// set, so no case may leave it empty.
+fn seat_observers_into(
+    cfg: &AoiConfig,
+    mine: &[(SeatId, u32)],
+    seen: &[(SeatId, PeerObserver)],
+    declaration: PeerDeclaration,
+    seats: &mut Vec<SeatObserver>,
+) {
+    let PeerDeclaration {
+        anchor,
+        membership: declared,
+        tracked,
+        last,
+    } = declaration;
+    seats.clear();
+    if matches!(anchor, PeerAnchor::Inferred) {
+        // One seat per distinct label the connection's own rows declare. `mine` is sorted by seat,
+        // so the run check is what deduplicates it — several bodies on one seat are one viewpoint,
+        // anchored by the lowest-id one of them.
+        let mut previous: Option<SeatIndex> = None;
+        for &(seat_id, _) in mine {
+            if previous == Some(seat_id.seat) {
+                continue;
+            }
+            previous = Some(seat_id.seat);
+            let Ok(index) = seen.binary_search_by_key(&seat_id, |&(seat, _)| seat) else {
+                continue;
+            };
+            let (resolved, membership) =
+                resolve_observer(anchor, declared, tracked, last, Some(seen[index].1));
+            seats.push(seat_observer(cfg, resolved, membership));
+        }
+    }
+    if seats.is_empty() {
+        let (resolved, membership) = resolve_observer(anchor, declared, tracked, last, None);
+        seats.push(seat_observer(cfg, resolved, membership));
+    }
+}
+
 /// Fill `out` with `(seat, row index)` for every row a peer drives, ascending by seat.
 ///
 /// Sorted so [`owned_rows_of`] can binary-search a peer's slice — and, within that slice, so a run
@@ -4582,10 +4872,10 @@ mod tests {
     use super::{
         admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
         full_block_due, hold_on_drop, owned_rows_into, owned_rows_of, resolve_observer,
-        seat_observer, session_directions, AckOutcome, EntityRow, OrbitNet, PeerAnchor,
-        PeerObserver, PeerState, ResumeTable, RxOutcome, SeatId, SeatIndex, StateIntegration,
-        FULL_STATE_INTERVAL, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER, RTT_SAMPLE_MAX_MS,
-        RTT_WINDOW, UNLOCATABLE_CENTRE,
+        seat_observer, seat_observers_into, session_directions, AckOutcome, EntityRow, OrbitNet,
+        PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResumeTable, RxOutcome, SeatId,
+        SeatIndex, StateIntegration, FULL_STATE_INTERVAL, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
+        MODE_SERVER, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
     use orbitnet_core::interest::{
         AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatObserver,
@@ -4723,50 +5013,178 @@ mod tests {
         assert_eq!(located.center, [1.0, 2.0, 3.0]);
     }
 
-    /// **The failure the per-seat centre removes**, composed the way `update_interest` composes it:
-    /// two seats on one connection, one anchored and one whose body has no state row yet.
-    ///
-    /// Culling used to be decided per connection, so the anchored seat supplied the centre for both
-    /// and the unspawned seat had its surroundings culled around a position it was nowhere near.
-    /// Per seat, the unanchored one measures nothing and refuses nothing.
-    #[test]
-    fn an_unanchored_seat_does_not_inherit_the_other_seats_centre() {
-        let cfg = AoiConfig {
+    /// The observers `update_interest` would build for one connection, from a row set.
+    fn observers_for(
+        cfg: &AoiConfig,
+        rows: &[EntityRow],
+        peer: i32,
+        anchor: PeerAnchor,
+        declared: MembershipId,
+    ) -> Vec<SeatObserver> {
+        let mut observers = Vec::new();
+        OrbitNet::collect_observers(rows, &mut observers);
+        let mut owned = Vec::new();
+        owned_rows_into(rows, &mut owned);
+        let mut seats = Vec::new();
+        seat_observers_into(
+            cfg,
+            owned_rows_of(&owned, peer),
+            OrbitNet::observers_of(&observers, peer),
+            PeerDeclaration {
+                anchor,
+                membership: declared,
+                tracked: None,
+                last: None,
+            },
+            &mut seats,
+        );
+        seats
+    }
+
+    fn radius_cfg(enter_radius: f32) -> AoiConfig {
+        AoiConfig {
             cell_size: 8.0,
-            enter_radius: 50.0,
+            enter_radius,
             exit_factor: 1.25,
             max_entities: 0,
-        };
-        let rows = [
-            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL), // seat 0's body, anchored
-            row_seat(2, 42, 1, None, MEMBERSHIP_GLOBAL),           // seat 1's body, not yet spawned
-            row(3, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // far scenery
-        ];
-        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
-        let mut observers = Vec::new();
-        OrbitNet::collect_observers(&rows, &mut observers);
-        let seen = OrbitNet::observers_of(&observers, 42);
+        }
+    }
 
-        // Seat 0 resolved; seat 1 has no observer at all and takes the unlocatable centre.
-        let seats = [
-            seat_observer(&cfg, Some(seen[0].1.center), seen[0].1.membership),
-            seat_observer(&cfg, None, MEMBERSHIP_GLOBAL),
+    /// **The failure the per-seat centre removes**, composed the way `update_interest` composes it:
+    /// two seats on one connection, each with its own anchored body.
+    ///
+    /// Culling used to be decided per connection, so whichever body sorted lowest supplied the centre
+    /// for both and the other player had its surroundings culled around a position it was nowhere
+    /// near. Per seat, each measures from its own body.
+    #[test]
+    fn each_seat_is_centred_on_its_own_body() {
+        let cfg = radius_cfg(50.0);
+        let rows = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row_seat(2, 42, 1, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+            row(3, 0, Some([905.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // scenery beside seat 1 only
         ];
+        let seats = observers_for(&cfg, &rows, 42, PeerAnchor::Inferred, MEMBERSHIP_GLOBAL);
+        assert_eq!(seats.len(), 2, "one viewpoint per seat");
+        assert_eq!(seats[0].center, [0.0; 3]);
+        assert_eq!(seats[1].center, [900.0, 0.0, 0.0]);
+
+        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
         let mut connection = ConnectionInterest::new();
         let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
         connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut leaves);
         assert_eq!(
             connection.iter().collect::<Vec<_>>(),
             vec![1, 2, 3],
-            "the far row rides on the unlocatable seat"
+            "the union carries what either seat can see"
+        );
+    }
+
+    /// **THE RULE A SEAT ARRIVING NEEDS.** A seat whose body has no state row yet contributes no
+    /// viewpoint while another seat on the connection has one.
+    ///
+    /// The union is what makes this matter: an unlocatable centre refuses nothing, so passing the
+    /// arriving seat through as unlocatable would blank the CONNECTION's culling — every far row in
+    /// every world admitted down one datagram — for as many ticks as the new body took to spawn.
+    /// That is a full-state burst caused by a body that is not in the world yet, and it arrives
+    /// exactly when a player is being seated.
+    #[test]
+    fn a_seat_that_has_not_spawned_does_not_open_the_connections_culling() {
+        let cfg = radius_cfg(50.0);
+        let rows = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL), // seated and spawned
+            row_seat(2, 42, 1, None, MEMBERSHIP_GLOBAL),           // just seated, no state row yet
+            row(3, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // far scenery
+        ];
+        let seats = observers_for(&cfg, &rows, 42, PeerAnchor::Inferred, MEMBERSHIP_GLOBAL);
+        assert_eq!(seats.len(), 1, "the unresolved seat contributes nothing");
+        assert_eq!(seats[0].center, [0.0; 3]);
+
+        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        let mut connection = ConnectionInterest::new();
+        let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
+        connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut leaves);
+        assert_eq!(
+            connection.iter().collect::<Vec<_>>(),
+            vec![1, 2],
+            "the far row stays culled while the arriving seat has nowhere to observe from"
+        );
+        assert!(
+            leaves.is_empty(),
+            "and nothing the connection already held left"
+        );
+    }
+
+    /// The other half of the same rule: fail-open survives, at CONNECTION granularity.
+    ///
+    /// A connection whose every seat is still unresolved — a peer being seated for the first time,
+    /// before any of its bodies has a state row — is not distance-culled at all. Refusing rows there
+    /// would leave a joining player with an empty world, which is the failure the fail-open direction
+    /// exists to prevent.
+    #[test]
+    fn a_connection_with_no_resolved_seat_still_fails_open() {
+        let cfg = radius_cfg(50.0);
+        let rows = [
+            row_seat(1, 42, 0, None, MEMBERSHIP_GLOBAL),
+            row_seat(2, 42, 1, None, MEMBERSHIP_GLOBAL),
+            row(3, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+        let seats = observers_for(&cfg, &rows, 42, PeerAnchor::Inferred, MEMBERSHIP_GLOBAL);
+        assert_eq!(
+            seats.len(),
+            1,
+            "never empty — an empty slice is no viewpoint"
+        );
+        assert!(seats[0].center[0].is_nan(), "and it refuses nothing");
+        assert_eq!(seats[0].membership, MEMBERSHIP_GLOBAL);
+
+        // A connection that drives nothing at all reaches the same place.
+        let none = observers_for(&cfg, &rows, 99, PeerAnchor::Inferred, MEMBERSHIP_GLOBAL);
+        assert_eq!(none.len(), 1);
+        assert!(none[0].center[0].is_nan());
+    }
+
+    /// A seat LEAVING takes its viewpoint with it, and leaves the connection's other seats alone.
+    #[test]
+    fn releasing_a_seat_removes_that_viewpoint_and_no_other() {
+        let cfg = radius_cfg(50.0);
+        let seated = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row_seat(2, 42, 1, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+        assert_eq!(
+            observers_for(&cfg, &seated, 42, PeerAnchor::Inferred, MEMBERSHIP_GLOBAL).len(),
+            2
         );
 
-        // The same connection with both seats anchored at the origin culls the far row — so the
-        // admission above is the unlocatable seat's doing, not the candidate list's.
-        let both = [seats[0], seats[0]];
-        connection.update_linear_into(&cfg, &both, &candidates, &mut scratch, &mut leaves);
-        assert_eq!(connection.iter().collect::<Vec<_>>(), vec![1, 2]);
-        assert_eq!(leaves, vec![3]);
+        // `release_seat` hands the body's input back to the server: same body, same position, no
+        // longer this connection's. The body stays replicated — what left is the viewpoint.
+        let released = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row_seat(2, 1, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+        let seats = observers_for(&cfg, &released, 42, PeerAnchor::Inferred, MEMBERSHIP_GLOBAL);
+        assert_eq!(seats.len(), 1);
+        assert_eq!(
+            seats[0].center, [0.0; 3],
+            "the seat that stayed is untouched"
+        );
+    }
+
+    /// A DECLARATION collapses a split-screen connection to one viewpoint, whatever its seats are
+    /// doing — including while a seat is arriving. The precedence that stops a declared centre from
+    /// falling back to an avatar's applies to the seat split as well.
+    #[test]
+    fn a_declared_anchor_is_one_viewpoint_however_many_seats_the_connection_has() {
+        let cfg = radius_cfg(50.0);
+        let rows = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row_seat(2, 42, 1, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+        let seats = observers_for(&cfg, &rows, 42, PeerAnchor::Fixed([5.0, 6.0, 7.0]), 3);
+        assert_eq!(seats.len(), 1);
+        assert_eq!(seats[0].center, [5.0, 6.0, 7.0]);
+        assert_eq!(seats[0].membership, 3, "the declared world, not a body's");
     }
 
     // ------------------------------------------------------------------

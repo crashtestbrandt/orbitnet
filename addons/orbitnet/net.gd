@@ -96,6 +96,41 @@ signal peer_dropped(peer: int, session_id: int, held: bool)
 ## same shape of decision as an entity a cull stopped sending.
 signal peer_session_expired(session_id: int, peer: int)
 
+## A SEAT ARRIVED on a connection. Fires on BOTH SIDES -- the server when it seats the body, every client
+## one entity manifest later. Inert OFFLINE (the tick loop is not running) and against a backend that
+## predates the signal.
+##
+## A seat is one owned, predicted viewpoint: `(peer, seat)`. It exists because some replicated body says its
+## input is driven by that connection under that label, so this follows
+## [method NetRollbackHandle.assign_seat] -- or any other write of the same two facts -- on the next tick
+## boundary.
+##
+## BIND PRESENTATION HERE. A split-screen viewport to open, a camera to attach, a HUD panel to add: those
+## are per-VIEWPOINT and a connection may hold several. [method seat_entities] answers which bodies the seat
+## drives, which is what a camera needs.
+##
+## A JOINING CONNECTION'S FIRST SEAT IS ANNOUNCED HERE TOO -- it is the same event, so a game that seats every
+## player through one handler needs no second one for the first player on a connection. [signal peer_joined]
+## says a connection finished the handshake, which is before it drives anything.
+##
+## A DEDICATED SERVER HOLDS NO SEAT OF ITS OWN. Handing a body's input back to peer 1 is how a game says it is
+## unclaimed, so a server with no local player announces nothing for it. A LISTEN server does hold seats -- peer
+## 1 is the host player there -- which also means a body the host holds unclaimed reads the same as one the host
+## player drives. Seat the host player on a non-zero label if you have to tell them apart.
+signal seat_opened(peer: int, seat: int)
+
+## A SEAT LEFT a connection that stays in session. Fires on both sides, like [signal seat_opened].
+##
+## It fires when nothing drives `(peer, seat)` any more: the body was released
+## ([method NetRollbackHandle.release_seat]), re-pointed at another connection, or unregistered. The
+## connection is unaffected and may still hold other seats.
+##
+## A DROPPED CONNECTION DOES NOT CLOSE ITS SEATS BY ITSELF. Its bodies keep the authority they were given
+## until the game changes them -- the same rule [signal peer_session_expired] states, for the same reason:
+## whether to free the body, hand it back, or hold it for a reconnect is your decision. Release the seat and
+## this fires.
+signal seat_closed(peer: int, seat: int)
+
 func _init() -> void:
 	# _init, not _ready: the unit-test runner (--script SceneTree mode) calls into the facade before the
 	# tree delivers _ready, and the OFFLINE contract must hold there too. Children attached here enter the
@@ -132,6 +167,11 @@ func _init() -> void:
 		_orbit.connect(&"peer_joined", _on_backend_peer_joined)
 		_orbit.connect(&"peer_dropped", _on_backend_peer_dropped)
 		_orbit.connect(&"peer_session_expired", _on_backend_peer_session_expired)
+	# Probed separately from the block above: the seat signals are newer than it, so a binary that carries the
+	# session-lifecycle three need not carry these two.
+	if _orbit.has_signal(&"seat_opened"):
+		_orbit.connect(&"seat_opened", _on_backend_seat_opened)
+		_orbit.connect(&"seat_closed", _on_backend_seat_closed)
 	# One identity per process, minted before anything can join. A consumer that wants a session to survive a
 	# RESTART overwrites it with a stored value -- see set_session_id().
 	set_session_id(_mint_session_id())
@@ -151,6 +191,12 @@ func _on_backend_peer_dropped(peer: int, session_id: int, held: bool) -> void:
 
 func _on_backend_peer_session_expired(session_id: int, peer: int) -> void:
 	peer_session_expired.emit(session_id, peer)
+
+func _on_backend_seat_opened(peer: int, seat: int) -> void:
+	seat_opened.emit(peer, seat)
+
+func _on_backend_seat_closed(peer: int, seat: int) -> void:
+	seat_closed.emit(peer, seat)
 
 ## Install the NATIVE crash handler, appending reports to `<dir>/crash-native.log`. Returns false if it was
 ## already installed (or the path did not fit). `dir` must be an absolute, already-created directory.
@@ -650,6 +696,37 @@ func peer_membership(peer: int) -> int:
 	if _mode == Mode.OFFLINE or not _backend_has(&"peer_membership"):
 		return 0
 	return _orbit.peer_membership(peer)
+
+## Which SEATS a connection currently holds, ascending. Empty for a connection that drives nothing, empty
+## OFFLINE, and empty against a backend that predates the call.
+##
+## Answered from the announced roster -- the one the last [signal seat_opened] / [signal seat_closed] pair
+## described -- so it agrees with the events rather than with whatever the scene looks like part-way through a
+## frame. WORKS ON BOTH SIDES: a server answers from its own registry, a client from the entity manifest it
+## last received.
+##
+## An empty answer on a client for a connection the server has seated means the manifest carrying it has not
+## arrived yet. It is reliable and it is sent on every seat change, so this resolves on its own.
+func seats_of(peer: int) -> PackedInt32Array:
+	if _mode == Mode.OFFLINE or not _backend_has(&"seats_of"):
+		return PackedInt32Array()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant, and the
+	# GDScript rule for a wire-ish value is that the conversion is an assignment, never a cast.
+	var seats: PackedInt32Array = _orbit.seats_of(peer)
+	return seats
+
+## Every entity driven by one seat, as opaque entity ids. Empty when the seat holds none, empty OFFLINE, and
+## empty against a backend that predates the call.
+##
+## WHAT MAKES A SEAT EVENT ACTIONABLE. [signal seat_opened] names a viewpoint; attaching a camera or a
+## split-screen viewport to it needs the body, and one seat may drive several. The ids are the tokens
+## `entity_id()` answers on either handle -- routinely negative, meaningless to compare or order, only ever
+## passed back unmodified, and the same number on every peer.
+func seat_entities(peer: int, seat: int) -> PackedInt64Array:
+	if _mode == Mode.OFFLINE or not _backend_has(&"seat_entities"):
+		return PackedInt64Array()
+	var ids: PackedInt64Array = _orbit.seat_entities(peer, seat)
+	return ids
 
 ## Withhold ONE entity from ONE peer, or stop withholding it. SERVER-SIDE ONLY; no-op OFFLINE or against a
 ## backend that predates the call.
