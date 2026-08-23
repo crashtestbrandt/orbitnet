@@ -1,17 +1,17 @@
 {
-  "tag": "v0.1.1",
+  "tag": "v0.2.0",
   "assets": {
-    "orbitnet-0.1.1.zip": { "size": 9803193, "sha256": "c42a79153314068a4bb06540b3dc09cca0b0be41a2865f92f5138c486546bbc3" },
-    "liborbitnet.linux.template_debug.x86_64.so": { "size": 4414488, "sha256": "2af76cfebf6c9c9f149078f855624950e7e99bba9921ba90212759a42c06fef7" },
-    "liborbitnet.linux.template_release.x86_64.so": { "size": 3987120, "sha256": "5b95ae70c293c4e8efdf41836eafa1e106307f15173214295674deb8ea506d6d" },
-    "liborbitnet.macos.template_debug.universal.dylib": { "size": 8080624, "sha256": "4d3b3be5acef36eeb6975c4ccb6eae103c4fc8d9761c7942e4a6d4499565c8e3" },
-    "liborbitnet.macos.template_release.universal.dylib": { "size": 7292416, "sha256": "33643b8f5c0eeb9e6926e7029d31f9a2158517ee9d0c7d48480bb95ad6bff34d" },
-    "orbitnet.windows.template_debug.x86_64.dll": { "size": 4761088, "sha256": "aea4eeac78c342baa0c476110f00b38e55afa7435c6d1b5cb00c778f9e2b0e1a" },
-    "orbitnet.windows.template_release.x86_64.dll": { "size": 4359680, "sha256": "c569b500ec7d9834bd224a2fc516569c7a9cd64b8c47ffb2ea5e0c90459fd186" },
-    "liborbitnet.linux.profiling.x86_64.so": { "size": 15015808, "sha256": "95bccb50784314c5a66ae2837e440a224768a213b515e40f54033ada829b81ad" },
-    "liborbitnet.macos.profiling.arm64.dylib": { "size": 3656256, "sha256": "ed41b9bdd1893153733f6a8bd05bd777eab636ec77911260eafce99778f2fd70" },
-    "liborbitnet.macos.profiling.arm64.dylib.dSYM.tar.gz": { "size": 4179052, "sha256": "a83e4965ab4d8e1fb6a7614caaa28b8615969ffd79f3baf950d3c01e15c20333" },
-    "orbitnet.pdb": { "size": 9375744, "sha256": "afa2650598e2ca8f19155d4d097af5d1fd0903a955fb04e2dd2ccf5231fe3309" },
-    "orbitnet.windows.profiling.x86_64.dll": { "size": 4359168, "sha256": "241a39a5dc87ad574489082189ffd87aeca237d9376fc57a65460d494c8e6652" }
+    "orbitnet-0.2.0.zip": { "size": 10967450, "sha256": "7d1ef1ded00ec35d3a100cb2d7528b61b573e6518b582b60081f6e4cab4b2ce0" },
+    "liborbitnet.linux.template_debug.x86_64.so": { "size": 4882704, "sha256": "93791ebe7c98a8d1f1fed65225697c928243e0a087109d3b8ffa3af28c15f909" },
+    "liborbitnet.linux.template_release.x86_64.so": { "size": 4325152, "sha256": "4c61f1126091e42b0e8e25f5388d018ccfb71c368a1a919a5ed84aa43f230339" },
+    "liborbitnet.macos.template_debug.universal.dylib": { "size": 8946432, "sha256": "4734d38204b3091d98e2a31a373638d4aba7439db6b19659374013e22014d534" },
+    "liborbitnet.macos.template_release.universal.dylib": { "size": 7904640, "sha256": "b755718bd31543f6985ab97185fed1f65944250e833f96f5b853bd14957c8374" },
+    "orbitnet.windows.template_debug.x86_64.dll": { "size": 5312512, "sha256": "982bbe4f3e7f66a79652137c56d7ccfc63aada0ee8eabc2b83fda030e14b2b9b" },
+    "orbitnet.windows.template_release.x86_64.dll": { "size": 4780032, "sha256": "6fbd2f8f87df6ab7778206b40c380ecb590a12e12bcfaf5562f1411a843e0269" },
+    "liborbitnet.linux.profiling.x86_64.so": { "size": 17042536, "sha256": "801c16a985d9bb72c72bbdce4a6ba57e8cca9f688373f2b54ac5f7100c9a155c" },
+    "liborbitnet.macos.profiling.arm64.dylib": { "size": 3958624, "sha256": "aee2a9c55efe1688b6620d2b9bb8d44156dfc11f5bc2c7a7ac1bb42477a51677" },
+    "liborbitnet.macos.profiling.arm64.dylib.dSYM.tar.gz": { "size": 4735471, "sha256": "7fed711798f12e93b01effa3f14834ff091a46e897d393de079fbbd55163b83e" },
+    "orbitnet.pdb": { "size": 10473472, "sha256": "5c6df9b34d12ce08cfe1a6f0da4f8870b5ca0ae7a0f967783d7890e390c9a0f8" },
+    "orbitnet.windows.profiling.x86_64.dll": { "size": 4779520, "sha256": "65d43990f556909ebf6c130c38c47ad6f94cc6009df46a9fceb6f417406239f7" }
   }
 }
