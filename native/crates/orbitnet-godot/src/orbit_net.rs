@@ -49,7 +49,9 @@ use orbitnet_core::{
 };
 
 use crate::binding;
-use crate::sync::{self, OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration};
+use crate::sync::{
+    self, OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration, STATE_HISTORY_DEPTH,
+};
 
 /// Network role, mirroring the facade's `Net.Mode`.
 const MODE_OFFLINE: i64 = 0;
@@ -701,6 +703,27 @@ impl PeerState {
     /// [`note_ack`]: PeerState::note_ack
     fn ack_is_proven(&self, ack: u64, token: u32) -> bool {
         self.frame_token(ack) == Some(token)
+    }
+
+    /// Take a NACK from this peer: ask for full rows, and stop trusting every delta base held for it.
+    ///
+    /// **AN ACK PROVES A FRAME ARRIVED, NOT THAT ITS BLOCKS INTEGRATED**, and the difference is what
+    /// makes a NACK self-sustaining without this. [`consume_ack`] promotes `acked_base` for every
+    /// entity a confirmed frame carried; a receiver that answered [`StateIntegration::NoBase`] for
+    /// one of those blocks never called `keep_auth_row` and stored nothing. The sender is then
+    /// holding a base the receiver provably does not have, and every later masked delta against it
+    /// fails the same way -- forever, because `want_full` is per-peer and names no entity, so there
+    /// is nothing to invalidate selectively.
+    ///
+    /// Dropping the whole map is what breaks the loop. `reference` degrades to `None` for this peer,
+    /// so its next blocks are full rows: those always decode, are always stored, and re-promote a
+    /// base that is real. The cost is one burst of full state per NACK -- which is what the NACK
+    /// asked for. Leaving the map in place costs one every tick instead.
+    ///
+    /// [`consume_ack`]: PeerState::consume_ack
+    fn note_nack(&mut self) {
+        self.want_full = true;
+        self.acked_base.clear();
     }
 
     /// Consume one arriving acknowledgement whole: check its proof, raise `newest_ack`, take a
@@ -3443,6 +3466,15 @@ impl OrbitNet {
         let tiering = self.rate_tiering;
         let mut order = std::mem::take(&mut self.order_scratch);
         let mut members = std::mem::take(&mut self.aoi_members);
+        // The receiver's own retention, in ticks, and THE SHORTER OF THE TWO LANES holds for both.
+        // A rollback receiver keeps its bases in `auth_rows`, sized from the same `history_limit`
+        // both ends read out of the `[orbitnet]` block. A state receiver keeps them in `history`,
+        // sized from the fixed `STATE_HISTORY_DEPTH` instead -- which does NOT track
+        // `history_limit`, and at the default 128 is half of it. Taking the minimum spends a few
+        // more full rows on the rollback lane and is correct on both; taking `history_limit` alone
+        // would leave the state lane, the fatter one on the wire, doing exactly what this guard
+        // exists to stop.
+        let base_span = (self.history_limit.max(2) as u64).min(STATE_HISTORY_DEPTH as u64);
 
         for peer_id in peer_ids {
             let (want_full, ack_tick, ack_token, margin) = {
@@ -3616,6 +3648,7 @@ impl OrbitNet {
                         .get(&peer_id)
                         .and_then(|p| p.acked_base.get(&id))
                         .copied()
+                        .and_then(|base| delta_reference(base, current, base_span))
                 };
 
                 // An entity block's encoded size is not known until it is written, so the budget can only
@@ -4349,7 +4382,7 @@ impl OrbitNet {
                 return; // No handshake, no input.
             };
             if header.flags & FrameHeader::FLAG_WANT_FULL != 0 {
-                peer.want_full = true;
+                peer.note_nack();
                 nacked = true;
             }
             // Consume the ack window: every snapshot frame the client PROVES it received promotes
@@ -4843,6 +4876,37 @@ fn hold_on_drop(session_id: u64, grace_ms: u64, server: bool) -> bool {
     server && grace_ms > 0 && session_id != 0
 }
 
+/// The tick a masked delta may reference, or `None` when the sender must send a full row instead.
+///
+/// **A BASE THE RECEIVER CANNOT STILL HOLD IS NOT A BASE.** `acked_base` records that the peer once
+/// acknowledged a frame carrying this row. It does not record that the row is still RESIDENT. A
+/// receiver keeps its authoritative rows in a direct-mapped ring of `history_limit` ticks
+/// (`Synchronizer::keep_auth_row`), so the row for tick `t` is overwritten the moment a row for
+/// `t + history_limit` is written into the same slot.
+///
+/// The two run apart under loss. `acked_base` only advances when an ack arrives, and a lost ack
+/// leaves it frozen while `current` runs on -- so the gap widens on exactly the links that can least
+/// afford what happens next.
+///
+/// **What happens next is the expensive part.** A delta against an evicted base decodes to
+/// [`StateIntegration::NoBase`], which raises the per-peer, ALL-ENTITY `want_full`. The server
+/// answers that by marking every entity in the peer's next frame full-due, the frame budget carries
+/// a fraction of them, and the rest defer -- so one unanswerable delta buys a multi-tick full-state
+/// burst, and the flag re-arms while it drains. Degrading to a full block here spends the same bytes
+/// the NACK was going to cost anyway, without the round trip and without the burst.
+///
+/// Conservative in the safe direction: a base inside the span may still have been evicted if the
+/// receiver wrote a colliding tick, and a full block is always decodable, so a false full costs
+/// bytes while a false delta costs a storm.
+#[must_use]
+fn delta_reference(base: u64, current: u64, span: u64) -> Option<u64> {
+    if current.saturating_sub(base) < span {
+        Some(base)
+    } else {
+        None
+    }
+}
+
 /// Whether this entity's next block for this peer must be a full row. A free function so the rule
 /// the send loop runs is the rule a test can call.
 ///
@@ -4871,11 +4935,11 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 mod tests {
     use super::{
         admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
-        full_block_due, hold_on_drop, owned_rows_into, owned_rows_of, resolve_observer,
-        seat_observer, seat_observers_into, session_directions, AckOutcome, EntityRow, OrbitNet,
-        PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResumeTable, RxOutcome, SeatId,
-        SeatIndex, StateIntegration, FULL_STATE_INTERVAL, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
-        MODE_SERVER, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
+        delta_reference, full_block_due, hold_on_drop, owned_rows_into, owned_rows_of,
+        resolve_observer, seat_observer, seat_observers_into, session_directions, AckOutcome,
+        EntityRow, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResumeTable,
+        RxOutcome, SeatId, SeatIndex, StateIntegration, FULL_STATE_INTERVAL, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
     };
     use orbitnet_core::interest::{
         AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatObserver,
@@ -5724,6 +5788,121 @@ mod tests {
     /// cannot decode has `last_sent == current`, so an interval measured from the last send never
     /// elapses and the only unconditional repair never comes due. Measured from the last full
     /// block it comes due on schedule, whatever the delta traffic in between is doing.
+    // ------------------------------------------------------------------
+    // What a NACK invalidates. See `PeerState::note_nack`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_nack_asks_for_full_rows() {
+        let mut peer = PeerState::default();
+        assert!(!peer.want_full);
+        peer.note_nack();
+        assert!(peer.want_full, "the peer asked for full state");
+    }
+
+    #[test]
+    fn a_nack_drops_every_delta_base_held_for_that_peer() {
+        // The loop this closes: the peer acked the FRAME, so `consume_ack` promoted a base for
+        // every entity it carried -- including the one whose block answered NoBase and was never
+        // stored. Keeping those bases means every later masked delta against them fails the same
+        // way, and the NACK is per-peer so no single entry can be picked out as the bad one.
+        let mut peer = PeerState::default();
+        peer.acked_base.insert(7, 400);
+        peer.acked_base.insert(8, 401);
+        peer.acked_base.insert(9, 402);
+        peer.note_nack();
+        assert!(
+            peer.acked_base.is_empty(),
+            "an ack proves a frame arrived, not that its blocks integrated, so none of these bases \
+             survives the peer telling us one of them was undecodable"
+        );
+    }
+
+    #[test]
+    fn a_dropped_base_sends_a_full_row_rather_than_a_delta() {
+        // The consequence the drop exists for, at the one place it is read: no entry means no
+        // reference, and no reference is a full block -- which always decodes.
+        let mut peer = PeerState::default();
+        peer.acked_base.insert(7, 400);
+        assert_eq!(peer.acked_base.get(&7).copied(), Some(400));
+        peer.note_nack();
+        assert_eq!(
+            peer.acked_base.get(&7).copied(),
+            None,
+            "and the send path turns a missing base into a full row"
+        );
+    }
+
+    #[test]
+    fn a_nack_leaves_the_other_per_entity_bookkeeping_alone() {
+        // `last_sent` and `last_full` describe what the SENDER did, which a NACK does not call into
+        // question. Clearing `last_full` here would re-arm the keyframe interval on every NACK and
+        // spend a second full block on entities that just had one.
+        let mut peer = PeerState::default();
+        peer.last_sent.insert(7, 400);
+        peer.last_full.insert(7, 396);
+        peer.acked_base.insert(7, 400);
+        peer.note_nack();
+        assert_eq!(peer.last_sent.get(&7).copied(), Some(400));
+        assert_eq!(peer.last_full.get(&7).copied(), Some(396));
+        assert!(peer.acked_base.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // The delta base a receiver can still hold. See `delta_reference`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_base_is_referenced() {
+        assert_eq!(delta_reference(100, 104, 128), Some(100));
+    }
+
+    #[test]
+    fn a_base_one_tick_inside_the_span_is_still_referenced() {
+        // `current - base == span - 1` is the oldest tick the ring still maps to its own slot.
+        assert_eq!(delta_reference(100, 100 + 127, 128), Some(100));
+    }
+
+    #[test]
+    fn a_base_exactly_one_span_old_is_refused() {
+        // `t + span` lands in the same ring slot as `t`, so writing it evicts the base. This is the
+        // boundary the guard exists for: one tick either side is a keyframe or a want_full storm.
+        assert_eq!(delta_reference(100, 100 + 128, 128), None);
+    }
+
+    #[test]
+    fn a_base_far_beyond_the_span_is_refused() {
+        assert_eq!(delta_reference(100, 100_000, 128), None);
+    }
+
+    #[test]
+    fn a_frozen_base_is_refused_once_the_tick_runs_past_it() {
+        // What a lost ack looks like: `acked_base` stops advancing while `current` does not. The
+        // guard has to flip from Some to None as the gap crosses the span, because every delta after
+        // that point is one the peer is guaranteed to reject.
+        let span: u64 = 64;
+        let base: u64 = 500;
+        assert!(delta_reference(base, base + span - 1, span).is_some());
+        assert!(delta_reference(base, base + span, span).is_none());
+        assert!(delta_reference(base, base + span + 1, span).is_none());
+    }
+
+    #[test]
+    fn a_base_at_or_ahead_of_the_current_tick_is_referenced() {
+        // `saturating_sub` floors at zero rather than wrapping to a huge gap. Ticks are published
+        // before the send phase runs and a peer's clock leads, so this is reachable, not defensive.
+        assert_eq!(delta_reference(120, 100, 128), Some(120));
+        assert_eq!(delta_reference(100, 100, 128), Some(100));
+    }
+
+    #[test]
+    fn the_smallest_span_still_admits_the_present_tick() {
+        // The caller passes `history_limit.max(2)`, so the span is never 0 or 1.
+        assert_eq!(delta_reference(10, 10, 2), Some(10));
+        assert_eq!(delta_reference(10, 11, 2), Some(10));
+        assert_eq!(delta_reference(10, 12, 2), None);
+    }
+
     #[test]
     fn a_keyframe_comes_due_even_while_deltas_keep_going_out() {
         let id: u64 = 7;

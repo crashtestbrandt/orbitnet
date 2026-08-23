@@ -161,7 +161,7 @@ fn read_membership(pair: Option<&(Gd<Node>, StringName)>) -> MembershipId {
 /// The cost is `64 × row_stride` bytes per entity, which for a fat channel — 41 `i64` props at
 /// 328 B/row, say an inventory or equipment block — is 21 kB, or 2.6 MB across a full 100-player
 /// session, on the server alone.
-const STATE_HISTORY_DEPTH: usize = 64;
+pub(crate) const STATE_HISTORY_DEPTH: usize = 64;
 
 /// What integrating a received authoritative state concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
