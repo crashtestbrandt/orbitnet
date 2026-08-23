@@ -262,5 +262,6 @@ looks exactly like a netcode bug. `puck_physics_test.gd` asserts the derivation 
   [filed gap](../README.md#limits); the HUD says so rather than leaving the line suspiciously empty.
 - **No InputMap** — raw key constants and the raw pointer, so there is no project-settings dependency to break
   across Godot versions. A real game should use one.
-- **No PR-gating probe.** `tools/rts-probe.sh` is the only scene-bound gate and CONTRIBUTING.md says to keep it
-  that way; this demo's coverage is twelve unit suites over its pure functions.
+- **No PR-gating probe.** The scene-bound gates are `tools/rts-probe.sh` and `tools/server-shape-probe.sh`, and
+  CONTRIBUTING.md admits a third only for a fundamental regression neither reaches; this demo's coverage is
+  twelve unit suites over its pure functions.

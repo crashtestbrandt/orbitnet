@@ -366,7 +366,8 @@ Net.set_entity_hidden(peer_id, spy.entity_id(), false)
 | `membership() -> int` | The world the filter reads this tick, `0` meaning every world. A property that did not resolve reports `0`. |
 | `entity_id() -> int` | This channel's stable replication id, for `Net.set_peer_anchor_entity()`. 0 when inert or unresolved. |
 | `set_priority(weight)` | Send-rota priority, 1..16. |
-| `last_known_state() -> int` | Tick of the newest authoritative row received. |
+| `last_known_state() -> int` | Tick of the newest authoritative row received. **Fails open**: on a backend with no `get_last_known_state` it answers `Net.current_tick()`, so a staleness rule degrades rather than blanking the world. |
+| `reports_last_known_state() -> bool` | Whether the line above is a measured tick rather than that fallback. `false` on an inert handle and on a backend that cannot answer. Check it wherever the reading is used as evidence that rows arrived — the fallback is invisible in the number. |
 | `set_bulk_capture(method)` | Declare the game method that captures this channel's whole row in one call — see [bulk marshalling](#bulk-marshalling-one-crossing-per-lane-per-tick). Capture only: this lane's apply is the receive path. Call before `process_settings()`. |
 | `bulk_capture_order()` / `uses_bulk_capture()` | The entries the hook marshals, in array order, and whether it resolved. |
 | `process_settings()` | |
