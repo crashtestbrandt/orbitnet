@@ -28,6 +28,14 @@ extends Node
 ## lane's `get_last_known_state()` does not fail open, so it is reported beside the state lane as a
 ## second, independent reading.
 ##
+## THE ROLLBACK LANE IS HERE FOR THE SERVER'S SAKE, and it predicts on the client too. A seated peer's body
+## is what gives the server an OWNED row -- the row the send path reads a peer's interest centre off, and the
+## thing a listen server has one more of than a dedicated one. The client also predicts the seat it is given,
+## which takes one non-obvious pair of calls (see `_bind_channels` and `_apply_owners`) because a client binds
+## before it knows its seat. Both peers COUNT their rollback ticks and assert on the count: a client that
+## silently sits out the loop still receives and applies every row, so no other reading in this file would
+## notice.
+##
 ## THE INTEREST PASS IS ON, DELIBERATELY. `aoi_radius` is set on the server, which is what makes the send path
 ## run its per-peer interest and priority passes at all -- the passes the two shapes disagree about. The radius
 ## is orders of magnitude larger than anything this world puts on the wire, so it culls nothing; the server
@@ -72,6 +80,10 @@ class SeatInput extends Node:
 class SeatBody extends Node3D:
 	var sim_pos: Vector3 = Vector3.ZERO
 	var input: SeatInput = null
+	## How many times the backend has run this body's rollback tick on THIS peer. Counted rather than
+	## assumed: whether a body joins the loop is `!exempt and (state_local or (input_local and
+	## enable_prediction))` inside the backend, and none of those three are readable from here.
+	var sims: int = 0
 
 	## The rollback tick, run by the backend on the server for every body and on the owning client for its own.
 	## One line of validation, which is all a scenario body needs: the authoritative position is the requested
@@ -79,6 +91,7 @@ class SeatBody extends Node3D:
 	## backend's call list, so its lane never simulates and the shape difference this file measures would be
 	## between two sets of inert entities.
 	func _rollback_tick(_delta: float, _tick: int, _is_fresh: bool) -> void:
+		sims += 1
 		sim_pos = input.nin_move.clamp(Vector3(-8.0, 0.0, -8.0), Vector3(8.0, 0.0, 8.0))
 		position = sim_pos
 
@@ -157,6 +170,10 @@ func _ready() -> void:
 	_build_world()
 	if not _start_session():
 		_finish(false, "the session did not start")
+		# QUIT HERE rather than falling through to the `--run` timer below, which this return would skip.
+		# A bind-port conflict would otherwise idle until the driver's watchdog fires, turning an instant
+		# failure into a 60-second one on every affected run.
+		get_tree().quit(1)
 		return
 	_bind_channels()
 	_apply_owners()
@@ -215,9 +232,23 @@ func _bind_channels() -> void:
 		# owner. Set before registration -- the backend reads the authority when it processes settings.
 		var owner_peer: int = _owners[seat] if _owners[seat] > 0 else 1
 		body.input.set_multiplayer_authority(owner_peer)
-		var predict: bool = Net.is_server() or owner_peer == multiplayer.get_unique_id()
+		# `predict` UNCONDITIONALLY, and this is the subtle part of the file.
+		#
+		# The obvious form is `Net.is_server() or owner_peer == multiplayer.get_unique_id()`. On a CLIENT
+		# that is false for every seat, because this runs from _ready() and the roster has not arrived --
+		# `_owners` is still all zeros, so every `owner_peer` reads 1. And `predict = false` does not merely
+		# defer prediction, it EXEMPTS the body: net.gd sets `enable_prediction` here and nowhere else, and
+		# `set_input_authority()` re-resolves only who owns the lanes. So the seat the client is about to be
+		# given would sit out the rollback loop for the whole run, silently -- its received rows still land,
+		# so every reading in this file would look normal.
+		#
+		# Passing `true` is safe for a seat this peer does not own, because the backend gates simulation on
+		# `!exempt and (owns_state or (owns_input and enable_prediction))`: a client owns neither lane of a
+		# body it was not given, so it still does not simulate. What `true` buys is that the moment
+		# `set_input_authority()` points the input here, `owns_input` flips and the body starts predicting --
+		# no re-registration. `_apply_owners()` re-establishes the display exemption; see there.
 		_body_handles.push_back(Net.register_rollback_body(
-			body, body.input, ["sim_pos"], ["nin_move"], predict))
+			body, body.input, ["sim_pos"], ["nin_move"], true))
 
 		var handle: NetStateHandle = Net.make_state(status)
 		handle.add_state(status, "status_value")
@@ -302,6 +333,17 @@ func _apply_owners() -> void:
 			_body_handles[seat].set_input_authority(_owners[seat] if _owners[seat] > 0 else 1)
 		if _owners[seat] == me:
 			found = seat
+	# THE OTHER HALF OF THE `predict = true` ABOVE, and it must run AFTER the authority calls.
+	#
+	# Registering every body as predicting leaves each one un-exempt, and an un-exempt body owning neither
+	# lane is what `net.remote_resim` turns on -- remote prediction, which this scenario does not want and
+	# which is off by default. Re-asserting the lever walks the bodies and exempts exactly those owning
+	# neither state nor input, which after the authority calls above is precisely the seats this peer was
+	# not given. The seat it WAS given owns its input and is left alone, so it predicts.
+	#
+	# Client-side only: a server owns every body's state, so the lever finds nothing to exempt there.
+	if not Net.is_server():
+		Net.set_remote_resim(false)
 	if found != _local_seat:
 		_local_seat = found
 		print("SHAPE-SEAT role=%s shape=%s seat=%d" % [_role, _shape, _local_seat])
@@ -353,9 +395,21 @@ func _report() -> void:
 		print("SHAPE-BW role=server shape=%s peers=%.0f interest_entities=%.0f admitted=%.2f deferred=%.2f culled=%.2f" % [
 			_shape, bw["peers"], bw["interest_entities"],
 			bw["blocks_admitted_s"], bw["blocks_deferred_s"], bw["blocks_culled_s"]])
+		print("SHAPE-SIM role=server shape=%s seat0_sims=%d seat1_sims=%d" % [
+			_shape, _bodies[0].sims, _bodies[1].sims])
 		print("SHAPE-OWN role=server shape=%s seat0_owner=%d seat1_owner=%d local_seat=%d seated_peers=%d" % [
 			_shape, _owners[0], _owners[1], _local_seat, _seated_peers])
-		_finish(_seated_peers > 0, "no remote peer was ever seated")
+		if _seated_peers <= 0:
+			_finish(false, "no remote peer was ever seated")
+			return
+		# The server simulates EVERY body on both shapes -- that is what "authoritative" means here, and it
+		# is the premise the whole comparison rests on. Asserted so the scenario cannot quietly degrade into
+		# two sets of inert entities and still report a difference between the shapes.
+		if _bodies[0].sims <= 0 or _bodies[1].sims <= 0:
+			_finish(false, "the server ran %d and %d rollback ticks for its two seats -- it is not "
+				% [_bodies[0].sims, _bodies[1].sims] + "simulating the world it is authoritative for")
+			return
+		_finish(true, "")
 		return
 
 	# THE BRANCH, PRINTED BEFORE THE READING. Everything below is the fail-open fallback when this is 0.
@@ -372,6 +426,8 @@ func _report() -> void:
 	print("SHAPE-BODY role=client shape=%s own_last=%d other_last=%d tick=%d" % [
 		_shape,
 		_body_last_state(own), _body_last_state(other), Net.current_tick()])
+	print("SHAPE-SIM role=client shape=%s own_sims=%d other_sims=%d" % [
+		_shape, _sims(own), _sims(other)])
 
 	if own < 0:
 		_finish(false, "this client was never seated")
@@ -383,10 +439,24 @@ func _report() -> void:
 		_finish(false, "the client's OWN seat-%d state channel advanced %d times in %.0fs" % [
 			own, _rises[own], _elapsed])
 		return
+	# The rollback lane's own health, asserted rather than assumed. A client that does not simulate its own
+	# body still receives and applies every row, so nothing above this line would notice -- which is exactly
+	# how the seat this peer is given can sit out the whole rollback loop unremarked.
+	if _sims(own) <= 0:
+		_finish(false, "the client's OWN seat-%d body never ran a rollback tick -- it is exempt from the "
+			% own + "loop, so this run exercised no owner prediction")
+		return
+	if other >= 0 and _sims(other) > 0:
+		_finish(false, "the client simulated seat %d, which it does not own -- remote prediction is on and "
+			% other + "this run is not the display-only shape it reports")
+		return
 	_finish(true, "")
 
 func _reading(values: PackedInt32Array, seat: int) -> int:
 	return -3 if seat < 0 else values[seat]
+
+func _sims(seat: int) -> int:
+	return -3 if seat < 0 else _bodies[seat].sims
 
 func _body_last_state(seat: int) -> int:
 	return -3 if seat < 0 else _body_handles[seat].get_last_known_state()

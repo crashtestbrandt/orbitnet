@@ -117,6 +117,8 @@ run_shape() {
 	REPORT["$label.other_last"]="$(field "$CLIENT_LOG" 'SHAPE-STATE .* other_last=-?[0-9]+' '.*[^_]other_last=')"
 	REPORT["$label.other_rises"]="$(field "$CLIENT_LOG" 'other_rises=-?[0-9]+' 'other_rises=')"
 	REPORT["$label.body_own"]="$(field "$CLIENT_LOG" 'SHAPE-BODY .* own_last=-?[0-9]+' '.*[^_]own_last=')"
+	REPORT["$label.own_sims"]="$(field "$CLIENT_LOG" 'own_sims=-?[0-9]+' 'own_sims=')"
+	REPORT["$label.other_sims"]="$(field "$CLIENT_LOG" 'other_sims=-?[0-9]+' 'other_sims=')"
 	REPORT["$label.skipped"]="$(field "$CLIENT_LOG" 'skipped=[0-9]+' 'skipped=')"
 	REPORT["$label.admitted"]="$(field "$SERVER_LOG" 'admitted=[0-9.]+' 'admitted=')"
 	REPORT["$label.deferred"]="$(field "$SERVER_LOG" 'deferred=[0-9.]+' 'deferred=')"
@@ -153,17 +155,30 @@ for shape in dedicated listen; do
 		fail "the $shape client's backend cannot answer last_known_state -- every tick it reported is the
        fail-open fallback. Run \`just native-install\` and try again."
 	fi
+	# The rollback lane's own health, checked here as well as in the scenario so a driver reading old logs
+	# still sees it. A client binds its bodies before it knows which seat it is given, and a body registered
+	# as non-predicting is EXEMPTED rather than merely deferred -- so the seat it ends up owning can sit out
+	# the whole rollback loop while every state-lane reading above stays perfectly healthy.
+	if [ "$(value "$shape.own_sims")" = "0" ]; then
+		fail "the $shape client never ran a rollback tick for its OWN body -- it is exempt from the loop, so
+       that run exercised no owner prediction even though its state-lane readings look healthy"
+	fi
+	if [ "$(value "$shape.other_sims")" != "0" ] && [ "$(value "$shape.other_sims")" != "?" ]; then
+		fail "the $shape client simulated a seat it does not own ($(value "$shape.other_sims") ticks) --
+       remote prediction is on, so that run is not the display-only shape it reports"
+	fi
 done
 
 # The readings, always printed. This is what the issue asks to be recorded, and it is the comparison that
 # makes any single run mean anything: three runs, one scenario, one table.
-printf '\n%-10s %-5s %-9s %-9s %-10s %-11s %-12s %-9s %-11s %-9s\n' \
-	run seat own_first own_last own_rises other_last other_rises body_own rx_skipped admitted
+printf '\n%-10s %-5s %-9s %-9s %-10s %-11s %-12s %-9s %-9s %-10s %-11s %-9s\n' \
+	run seat own_first own_last own_rises other_last other_rises body_own own_sims other_sims rx_skipped admitted
 for shape in dedicated listen veto; do
-	printf '%-10s %-5s %-9s %-9s %-10s %-11s %-12s %-9s %-11s %-9s\n' \
+	printf '%-10s %-5s %-9s %-9s %-10s %-11s %-12s %-9s %-9s %-10s %-11s %-9s\n' \
 		"$shape" "$(value "$shape.seat")" "$(value "$shape.own_first")" "$(value "$shape.own_last")" \
 		"$(value "$shape.own_rises")" "$(value "$shape.other_last")" "$(value "$shape.other_rises")" \
-		"$(value "$shape.body_own")" "$(value "$shape.skipped")" "$(value "$shape.admitted")"
+		"$(value "$shape.body_own")" "$(value "$shape.own_sims")" "$(value "$shape.other_sims")" \
+		"$(value "$shape.skipped")" "$(value "$shape.admitted")"
 done
 printf '\n'
 
