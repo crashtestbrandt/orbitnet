@@ -128,11 +128,6 @@ func bind_net() -> void:
 	_state_handle.set_anchor("position")
 	_state_handle.process_settings()
 
-## This unit's session-global entity id, or 0 while the facade is OFFLINE and the handle is inert. An
-## observer tracking a unit names it by this; so does a veto withholding it from one peer.
-func entity_id() -> int:
-	return 0 if _state_handle == null else _state_handle.entity_id()
-
 	# Interpolation is for peers that RECEIVE this unit. The server writes position every tick from its own
 	# sim, so smoothing there would fight the authoritative value; a listen host is a server and takes the
 	# same branch. At a 20 Hz net tick a receiving client without this visibly steps -- which is exactly what
@@ -142,6 +137,11 @@ func entity_id() -> int:
 		_interp.add_property(self, "position")
 		_interp.add_property(self, "net_aux")
 		_interp.process_settings()
+
+## This unit's session-global entity id, or 0 while the facade is OFFLINE and the handle is inert. An
+## observer tracking a unit names it by this; so does a veto withholding it from one peer.
+func entity_id() -> int:
+	return 0 if _state_handle == null else _state_handle.entity_id()
 
 # --- server-side simulation ----------------------------------------------------------------------
 ## Place the unit (world build, and every respawn). Server-side; the position replicates from there.

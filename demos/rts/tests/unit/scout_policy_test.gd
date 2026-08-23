@@ -22,11 +22,18 @@ func _refresh(policy: ScoutPolicy, range_m: float) -> PackedInt32Array:
 	return policy.refresh(SEAT_A, seats, positions, alive)
 
 # --- the first pass ---------------------------------------------------------------------------------
-func test_the_first_refresh_reports_nothing() -> void:
+func test_the_first_refresh_reports_the_units_to_withhold() -> void:
 	var policy: ScoutPolicy = ScoutPolicy.new()
 	var changed: PackedInt32Array = _refresh(policy, 500.0)
+	assert_eq(changed.size(), 1,
+		"the far enemy unit starts out of vision, and the first pass is the only chance to withhold it")
+	assert_eq(changed[0], 2, "and it is the seat-1 unit, not either of seat 0's own")
+
+func test_the_first_refresh_reports_nothing_when_everything_is_already_visible() -> void:
+	var policy: ScoutPolicy = ScoutPolicy.new()
+	var changed: PackedInt32Array = _refresh(policy, ScoutPolicy.VISION_RADIUS_M * 0.5)
 	assert_eq(changed.size(), 0,
-		"no veto has been placed yet, so the initial set is not a change and must not be reported as one")
+		"every unit is inside vision and the backend holds no veto, so nothing has to change")
 
 func test_your_own_units_are_never_hidden() -> void:
 	var policy: ScoutPolicy = ScoutPolicy.new()
@@ -97,8 +104,8 @@ func test_clear_forgets_everything() -> void:
 	assert_eq(policy.hidden_count(), 0, "and after a clear, nothing is withheld")
 	assert_true(policy.is_visible(2),
 		"because the backend's vetoes were retracted at the same moment; the two memories clear together")
-	assert_eq(_refresh(policy, 500.0).size(), 0,
-		"the next refresh is a first refresh again, and reports nothing")
+	assert_eq(_refresh(policy, 500.0).size(), 1,
+		"a first refresh again: the vetoes went with them, so a unit still out of vision is reported anew")
 
 func test_an_out_of_range_index_is_visible() -> void:
 	var policy: ScoutPolicy = ScoutPolicy.new()

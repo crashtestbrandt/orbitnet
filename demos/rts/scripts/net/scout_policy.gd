@@ -47,7 +47,11 @@ func refresh(viewer_seat: int, seats: PackedInt32Array, positions: PackedVector3
 	var count: int = mini(mini(seats.size(), positions.size()), alive.size())
 	if _visible.size() != count:
 		_visible.resize(count)
-		_visible.fill(0)
+		# SEEDED VISIBLE, BECAUSE THAT IS WHERE THE BACKEND STARTS. No veto has been placed yet, so every
+		# unit is reaching every peer. Seeding the mirror to 0 would make the first pass's diff report only
+		# the units that ARE seen -- and those are precisely the ones needing no veto -- while the units to
+		# withhold would compare equal to the seed and never be reported at all.
+		_visible.fill(1)
 		_primed = false
 
 	var eyes: PackedVector3Array = PackedVector3Array()
@@ -64,12 +68,11 @@ func refresh(viewer_seat: int, seats: PackedInt32Array, positions: PackedVector3
 		_visible[index] = 1 if seen else 0
 		if seen != was:
 			changed.push_back(index)
-	# The FIRST refresh reports nothing even though every value was just written. Every unit starts visible
-	# to everybody -- no veto has been placed yet -- so reporting the initial set as "changed" would have the
-	# caller withhold nothing and place a veto on nothing, twice.
-	if not _primed:
-		_primed = true
-		return PackedInt32Array()
+	# The first refresh REPORTS, and reports the units to withhold. The mirror was seeded to the backend's
+	# own starting state (everything visible), so `changed` here holds exactly the indices that resolved to
+	# not-seen -- the set the caller has to place a veto on. Returning nothing would leave every unit that
+	# began the session out of vision replicating, while `hidden_count()` counted it as withheld.
+	_primed = true
 	return changed
 
 ## Whether `index` is currently visible to the seat this policy belongs to. Everything is visible before the
@@ -95,7 +98,7 @@ func hidden_count() -> int:
 ## every veto is retracted: the policy's memory and the backend's state have to be cleared together, or the
 ## next refresh reports no change and leaves half the units withheld.
 func clear() -> void:
-	_visible.fill(0)
+	_visible.fill(1)
 	_primed = false
 
 func _resolve(index: int, viewer_seat: int, seats: PackedInt32Array, positions: PackedVector3Array,
