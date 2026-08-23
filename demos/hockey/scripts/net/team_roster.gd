@@ -52,6 +52,12 @@ func assign(peer: int, session_id: int = NO_SESSION) -> int:
 		var held: int = _seat_of_session[session_id]
 		_seat_of_peer[peer] = held
 		_peer_of_seat[held] = peer
+		# THE HOLD ENDS WHERE THE SITTING BEGINS. `occupied_on_team()` walks `_peer_of_seat` and
+		# `_session_of_seat` in turn and `is_full()` adds `occupied()` to `reserved()`, so a seat left in
+		# both counts twice: the rink balances against a phantom player and reports itself full with seats
+		# still free. `release()` erases all four for the same reason.
+		_seat_of_session.erase(session_id)
+		_session_of_seat.erase(held)
 		return held
 	var preferred: int = 0 if occupied_on_team(0) <= occupied_on_team(1) else 1
 	var seat: int = _lowest_free_seat_on(preferred)

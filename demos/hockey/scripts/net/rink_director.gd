@@ -129,9 +129,6 @@ func set_seat_owner(seat: int, peer: int) -> void:
 	if mallet != null:
 		mallet.set_owner_peer(peer)
 
-## The signature of the world this peer built -- see HockeyNames.world_signature(). Printed at build and
-## compared between peers by hand: it is the direct gate on deterministic naming, and therefore on entity-id
-## agreement.
 ## Turn bulk marshalling on or off across every rollback body at once. The lever behind F7.
 ##
 ## NOTHING ABOUT A HOOK REACHES THE WIRE. The row, the mask, the delta base and the mispredict compare all
@@ -163,6 +160,9 @@ func bulk_mallet_counts() -> Vector2i:
 			counts.y += 1
 	return counts
 
+## The signature of the world this peer built -- see HockeyNames.world_signature(). Printed at build and
+## compared between peers by hand: it is the direct gate on deterministic naming, and therefore on entity-id
+## agreement.
 func world_signature() -> int:
 	var paths: PackedStringArray = PackedStringArray()
 	for mallet: MalletBody in mallets:

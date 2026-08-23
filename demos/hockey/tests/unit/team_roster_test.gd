@@ -92,6 +92,19 @@ func test_a_held_seat_goes_back_to_the_identity_that_left_it() -> void:
 		"and the same identity on a NEW peer id takes the same seat, which is what keeps a player's end of "
 		+ "the rink across a reconnect")
 
+func test_reclaiming_a_held_seat_ends_the_hold() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	var seat: int = roster.assign(10)
+	roster.hold(10, SESSION_A)
+	roster.assign(11, SESSION_A)
+	assert_eq(roster.reserved(), 0,
+		"the identity is sitting in the seat now, not waiting for it")
+	assert_eq(roster.occupied(), 1, "one peer, one seat")
+	assert_eq(roster.occupied_on_team(HockeyConfig.team_of_seat(seat)), 1,
+		"counted once -- a seat left in both the live and the held table balances against a phantom player")
+	assert_false(roster.is_full(),
+		"and a rink with one of its seats taken is not full")
+
 func test_a_held_seat_is_not_handed_to_a_newcomer() -> void:
 	var roster: TeamRoster = TeamRoster.new()
 	var seat: int = roster.assign(10)

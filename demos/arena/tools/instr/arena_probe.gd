@@ -121,7 +121,7 @@ func _baseline() -> void:
 ##
 ## THE CLOAK is taken by walking onto a pickup, and a bot that happened not to walk there would leave the veto
 ## untested with the gate still green. The server places it directly, which is the same state the pickup
-## produces -- `take_cloak()` is the one call either path makes.
+## produces -- `queue_cloak()` is the one call either path makes.
 func _provoke() -> void:
 	if not Net.is_server() or _net.world == null:
 		return
