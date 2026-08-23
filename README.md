@@ -126,10 +126,11 @@ Known and filed, not hidden:
   `Net.set_peer_anchor_entity()` state both outright; without one they are read off the lowest-id rollback
   entity each of that peer's **seats** drives, so a seat driving more than one body is centred and placed by
   whichever that is, and a peer driving none has neither and sees everything.
-- **A seat cannot arrive or leave mid-session cleanly.** Seats are declared per body and are read where the
-  filter runs, so adding one to a connection already in session re-indexes that connection's interest sets for
-  one tick: the sets are recomputed against the wrong seat's prior members, then correct themselves on the next
-  update. Split-screen players seated at join are unaffected.
+- **Releasing a seat is the game's call, and a dropped connection does not release its own.** A seat arrives and
+  leaves mid-session through `NetRollbackHandle.assign_seat()` / `release_seat()`, announced on both sides as
+  `Net.seat_opened` / `Net.seat_closed`. A connection whose transport is gone keeps its seats: its bodies hold
+  the authority they were given until the game changes them, the same rule `Net.peer_session_expired` states,
+  because whether to free the body, hand it back or hold it for a reconnect is the game's decision.
 - **Nothing despawns.** A culled entity — or one `Net.set_entity_hidden()` withholds — freezes at its last
   received pose rather than leaving the scene. The rows stop; the node stays.
 - **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.

@@ -48,6 +48,7 @@ operator-readable version mismatch. An all-zero key is then refused with a messa
 | 3 | Per-datagram authentication, and the handshake's session key. |
 | 4 | The hot-frame header carries an **ack token**. |
 | 5 | Blocks name entities by a **16-bit session slot**; the entity manifest distributes the slot table for both lanes. |
+| 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -98,9 +99,9 @@ The id needed no distribution: every peer derived the same value from the same n
 reconnecting client re-derives its ids with no handshake. A slot is **assigned by the server**, so it has to
 be distributed and held.
 
-- **The entity manifest carries it**, reliably, as `(slot, id, state hash, input hash)` per entity. That
-  frame covered the rollback lane only while it was purely a schema check; it now names **both lanes**,
-  because state-lane blocks carry slots too.
+- **The entity manifest carries it**, reliably, as `(slot, id, state hash, input hash, owner, seat)` per
+  entity. That frame covered the rollback lane only while it was purely a schema check; it now names **both
+  lanes**, because state-lane blocks carry slots too.
 - **It is a complete table, sent whole**, including when it is empty. A receiver rebuilds its copy from each
   frame rather than merging, which is what retires the binding of an entity that has unregistered — there is
   no removal record to lose.
@@ -133,6 +134,26 @@ wire name. A refusal while every free slot is still cooling is transient and ret
 **Rate tiering still phases on the 64-bit id**, not the slot. Dense sequential indices spread across an
 interval *more* evenly than hashes do, so the choice is about stability: a slot is released and reissued,
 and an entity that took a different one would jump its tier phase and its keyframe phase mid-interval.
+
+## The seat roster
+
+A **seat** is one owned viewpoint: `(peer, seat label)`. A connection may hold several — local split-screen
+is two players behind one socket — and each is anchored, culled and world-filtered on its own.
+
+- **The roster is derived from ownership, never declared beside it.** A seat exists because some replicated
+  entity says its input is driven by that connection under that label. A seat table the game wrote directly
+  would be a second source of truth about ownership, and ownership is what the anti-forgery check on a
+  received input block reads.
+- **It rides the entity manifest**, as the `owner` and `seat` columns above, rather than on a frame of its
+  own. The roster is a projection of that table and so cannot disagree with it; a separate frame would differ
+  from it for as long as either was in flight. The complete-table rule carries over: a receiver rebuilds the
+  roster from each manifest, so a seat that went away needs no removal record.
+- **A change republishes the manifest.** Registration already dirtied it; an authority or label write on an
+  entity that stays registered is the case nothing else noticed.
+- **Both ends diff their own roster and announce the transitions** as `Net.seat_opened` / `Net.seat_closed`,
+  on a tick boundary. A server announces from its registry, a client one manifest later.
+- **No hot-path frame carries a seat.** Interest runs where state authority is, and a client never authors a
+  seat — it is told which connection and label drive each entity.
 
 ## Datagram authentication
 

@@ -45,10 +45,15 @@ func add_input(node: Object, property: String) -> void:
 ## THIS ALSO SETS THE OWNING SEAT'S OWN WORLD. A seat's world is read off the body that anchors its interest
 ## radius -- the lowest-id body whose input authority is that peer and which declares that seat. That body's
 ## membership is the world every other entity is then filtered against for that seat, so declaring it on player
-## bodies is what makes the feature work at all; declaring it only on scenery filters nothing. A seat with no
-## rollback body has no anchor and no world, and sees every world (the same fail-open as its radius). A
-## connection carries the union of its seats' sets, so a peer with a body in each of two worlds sees both --
-## see [method set_seat].
+## bodies is what makes the feature work at all; declaring it only on scenery filters nothing. A connection
+## carries the union of its seats' sets, so a peer with a body in each of two worlds sees both -- see
+## [method set_seat].
+##
+## A SEAT WHOSE BODY HAS NOT SPAWNED YET HAS NO WORLD AND NO ANCHOR, AND CONTRIBUTES NEITHER. It is skipped
+## rather than passed through as "sees everything", because the connection's set is a union and one unresolved
+## seat would otherwise open the whole connection to every world until that body produced a state row. The
+## fail-open is per CONNECTION: a peer with no resolved seat at all still sees everything, which is what stops
+## a joining player from arriving in an empty world.
 ##
 ## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's centre and world directly, and
 ## a peer that used it reads neither off any body -- which is the way out when a peer drives bodies in more than
@@ -76,6 +81,10 @@ func membership() -> int:
 	return _sync.get_membership()
 
 ## Declare which SEAT on the owning connection drives this body. 0 unless you say otherwise.
+##
+## THIS IS THE LABEL HALF ONLY. Changing the label and the owning connection together is [method assign_seat],
+## which writes both in one statement; emptying the seat is [method release_seat]. Use this alone only when the
+## connection is not changing.
 ##
 ## A seat is one owned, predicted body behind one connection. Local split-screen over a network session is two
 ## or more locally-owned bodies on a single socket, and each needs its own interest anchor -- the second
@@ -115,6 +124,50 @@ func seat() -> int:
 	var index: int = declared
 	return index
 
+## SEAT THIS BODY: point its input at `peer` AND put it on that connection's seat `seat`. The add verb.
+##
+## Use this rather than [method set_input_authority] plus [method set_seat] whenever both change. The roster is
+## derived from the pair, so writing them separately leaves a window -- the tick between the two calls -- in
+## which the body reads as `(new peer, old label)`. That is a seat nobody assigned: [signal Net.seat_opened]
+## announces it, the backend keeps an interest set for it, and [signal Net.seat_closed] retracts it a tick later.
+##
+## IT IS LOCAL AND MUST BE CALLED ON EVERY PEER, exactly as [method set_input_authority] is -- the authority half
+## replicates nothing. The seat half is read only where state authority is, so a client may leave it at 0; the
+## announcement reaches clients over the entity manifest rather than from this call.
+##
+## Announced on the NEXT TICK BOUNDARY, not inside this call, so a handler that seats another player in response
+## is not doing it part-way through a tick.
+##
+## No-op OFFLINE. Against a backend that predates the call it falls back to the same two writes from here, in the
+## order that cannot invent a seat: the label first, then the connection.
+func assign_seat(peer: int, seat: int) -> void:
+	if _sync == null:
+		return
+	if _sync.has_method(&"assign_seat"):
+		_sync.assign_seat(peer, seat)
+		return
+	_sync.set(&"seat", seat)
+	set_input_authority(peer)
+
+## EMPTY THIS BODY'S SEAT: hand its input back to the server and return the body to seat 0. The remove verb.
+##
+## IT DOES NOT UNREGISTER ANYTHING. The body stays in the scene and stays replicated -- what leaves is the
+## VIEWPOINT, so the connection stops carrying an interest set for it and [signal Net.seat_closed] fires.
+## Freeing the body, or handing it to somebody else, is a separate decision and it is yours.
+##
+## Both halves for the same reason [method assign_seat] does both: releasing the connection while leaving the
+## label behind means the next player seated on this body inherits a label nobody chose for them.
+##
+## No-op OFFLINE. Against a backend that predates the call it falls back to the same two writes from here.
+func release_seat() -> void:
+	if _sync == null:
+		return
+	if _sync.has_method(&"release_seat"):
+		_sync.release_seat()
+		return
+	_sync.set(&"seat", 0)
+	set_input_authority(1)
+
 ## Re-read the synchronizer's configuration after its state/input sets change (the backend re-resolves its schema here).
 func process_settings() -> void:
 	if _sync != null:
@@ -133,6 +186,9 @@ func process_authority() -> void:
 ## body's input. [method set_seat] is the other axis and is unaffected -- it says which of that connection's
 ## owned bodies this one is, for interest. Re-pointing a body at another connection leaves its seat index
 ## alone, which is right: the body is the same body, driven by somebody else.
+##
+## CHANGING BOTH IS [method assign_seat]. The seat roster is derived from the pair, so two separate writes are
+## announced as a seat opening and closing again on the tick between them.
 ##
 ## THE TWO HALVES HAVE TO HAPPEN TOGETHER, and doing them by hand is where this goes wrong. Writing the node's
 ## multiplayer authority alone changes who the backend accepts input frames FROM, but leaves the cached owner

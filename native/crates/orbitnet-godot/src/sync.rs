@@ -31,13 +31,14 @@ use godot::prelude::*;
 use orbitnet_core::codec::{
     decode_state_block_into, encode_state_block, Reader, StateBlockMeta, Writer,
 };
+use orbitnet_core::seats::SeatIndex;
 use orbitnet_core::{
     ColumnarHistory, Confidence, FreshnessLedger, MembershipId, MemoRing, PropKind, PropRole,
     PropSchema, SchemaBuilder, MEMBERSHIP_GLOBAL,
 };
 
 use crate::binding::{self, PropBinding};
-use crate::orbit_net::SeatIndex;
+use crate::orbit_net::SERVER_PEER;
 
 /// Bulk-hook lane ordinal: the STATE lane — the state entries then the cosmetic entries, in the
 /// order they were declared. The only lane an [`OrbitStateSynchronizer`] has.
@@ -542,6 +543,44 @@ impl OrbitRollbackSynchronizer {
             node.set_multiplayer_authority(peer as i32);
         }
         self.process_authority();
+    }
+
+    /// Seat this body: point its input at `peer` AND put it on that connection's seat `seat`.
+    ///
+    /// **The add verb for a seat, and it is one call because the roster is derived from both
+    /// halves.** A seat exists because some body says it is driven by that connection under that
+    /// label, so `(input owner, seat)` is the whole declaration. Writing the two separately leaves a
+    /// window — the tick between them — in which the body reads as `(new peer, old label)`, which is
+    /// a seat that was never assigned: the roster announces it opening and then closing again, and
+    /// the interest pass keeps a set for it in between.
+    ///
+    /// `seat` is a **label**, clamped into the range the interest pass keys on. Bodies sharing a
+    /// `(peer, seat)` pair are one viewpoint; every distinct pair is one more interest set that
+    /// connection carries.
+    ///
+    /// **Local, like every authority write** — see [`Self::set_input_authority`]. The seat half is
+    /// read only where state authority is, so a client may leave it alone; the announcement it feeds
+    /// reaches clients over the entity manifest rather than from this call.
+    #[func]
+    fn assign_seat(&mut self, peer: i64, seat: i64) {
+        self.seat = seat.clamp(0, i64::from(SeatIndex::MAX)) as i32;
+        self.set_input_authority(peer);
+    }
+
+    /// Empty this body's seat: hand its input back to the server and return it to seat `0`.
+    ///
+    /// **The remove verb, and it does not unregister anything.** The body stays replicated and stays
+    /// in the scene — what leaves is the *viewpoint*, so the connection stops carrying an interest
+    /// set for it and the roster announces the seat closing. Freeing the body is a separate decision
+    /// and is the game's, exactly as it is for a session whose grace window expired.
+    ///
+    /// It is `set_input_authority(1)` plus the label, for the same reason [`Self::assign_seat`] is
+    /// one call: releasing the connection while leaving the label behind means the next player
+    /// seated here inherits a label nobody chose for them.
+    #[func]
+    fn release_seat(&mut self) {
+        self.seat = 0;
+        self.set_input_authority(i64::from(SERVER_PEER));
     }
 
     /// Whether the most recent simulated tick ran on non-authoritative (predicted or
