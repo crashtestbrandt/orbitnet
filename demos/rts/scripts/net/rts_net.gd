@@ -38,6 +38,22 @@ class_name RtsNet
 ## roster broadcast re-points the commander at the new peer id. When the window closes instead,
 ## Net.peer_session_expired frees the seat and the commander goes back to the server.
 ##
+## OBSERVERS: A PEER THAT DECLARES A CENTRE INSTEAD OF DRIVING ONE. What a peer OBSERVES is not what its input
+## CONTROLS, and until `Net.set_peer_anchor()` existed this demo could not say so: an interest centre was read
+## off the peer's own rollback body, so a peer with no body had no centre, and a peer with no centre was
+## filtered in nowhere -- the backend falls open and sends it everything. That is why a seatless spectator used
+## to be refused at the door rather than admitted.
+##
+## It is now a supported state. An observer holds no seat, drives no commander, and has its centre and world
+## DECLARED for it by the server, either at a ground point (`Net.set_peer_anchor`) or on an entity it follows
+## (`Net.set_peer_anchor_entity`). Two consequences worth stating:
+##
+##   - A PEER ARRIVING AT A FULL TABLE IS ADMITTED AS AN OBSERVER, not disconnected. The old refusal was the
+##     honest answer to "there is nothing I can do with you"; there is now something.
+##   - THE DECLARATION IS THROTTLED, and ObserverDesk decides when. A panning observer moves its centre every
+##     frame, and one reliable message per frame to restate a centre that slid 20 cm is how a spectator costs
+##     more than a player.
+##
 ## Deliberately omitted, and listed as known gaps rather than hidden: a build/protocol version handshake (two
 ## incompatible peers will connect and misbehave rather than being refused with a reason), a join browser, and
 ## invites. Each is real work in a shipping session layer and none of it teaches anything about the
@@ -50,10 +66,17 @@ enum State { OFFLINE, CONNECTING, PLAYING, ERROR }
 
 var world: WorldDirector = null
 var roster: SeatRoster = SeatRoster.new()
+## THIS peer's view of where it is watching from, when it is observing. Client-side and pure; the server is
+## told about it by `_observe_request`, and only the server ever calls the facade.
+var observer: ObserverDesk = ObserverDesk.new()
 
 var _state: State = State.OFFLINE
 var _local_seat: int = -1
 var _error: String = ""
+var _observing: bool = false
+## SERVER-SIDE: the peers currently observing. A value of `true` is the only value ever stored -- this is a
+## set, and GDScript's Dictionary is what a typed set is spelled as here.
+var _observers: Dictionary[int, bool] = {}
 
 func _init() -> void:
 	# Named at construction: the roster RPC below routes by node path, so this node's name is part of the
@@ -118,7 +141,10 @@ func _host(port: int, dedicated: bool) -> bool:
 	# RULE 1, first half — the node graph exists before anything can send it packets.
 	_build_world()
 
-	var peer: MultiplayerPeer = NetTransport.create_server(port, RtsConfig.SEATS)
+	# Seats PLUS observer slots: a cap of SEATS refuses a spectator at the socket, before the session layer
+	# ever sees a handshake to decide about.
+	var peer: MultiplayerPeer = NetTransport.create_server(
+		port, RtsConfig.SEATS + RtsConfig.OBSERVER_SLOTS)
 	if peer == null:
 		_fail("could not bind a server peer on port %d" % port)
 		return false
@@ -162,6 +188,15 @@ func leave() -> void:
 	Net.set_mode(Net.Mode.OFFLINE)
 	Net.set_net_tick_coupled()   # RULE 3
 	roster.clear()
+	# The anchors went with the socket. What survives a teardown is this layer's memory of having SENT a
+	# declaration, and leaving that set would have the next session's observer wait a resend interval before
+	# telling a server that has never heard of it where it is watching from.
+	_observers.clear()
+	_observing = false
+	observer.forget_sent()
+	# Static state on a class the process shares. Leaving a previous session's cadences behind is the same
+	# family of leak as leaving the tick decoupled -- see RULE 3.
+	NetLagComp.reset_observed_interp()
 	_local_seat = -1
 	_teardown_world()
 	_set_state(State.OFFLINE)
@@ -170,6 +205,26 @@ func leave() -> void:
 func _on_pre_tick(_tick: int) -> void:
 	if world != null and Net.is_server():
 		world.net_step()
+	_refresh_interp_estimates()
+
+## SERVER-SIDE, once per net tick: hand NetLagComp each peer's measured send cadence.
+##
+## THE ADDON DOES NOT DO THIS FOR YOU. `NetLagComp`'s estimate is static state on a class the game owns, and
+## the backend has no reason to write it -- a game with no rewind never reads it. Feeding it is three lines
+## and they belong here, in the one place that already runs per tick on the authority.
+##
+## PER PEER, NOT POOLED. The byte budget is charged per peer and the send path rebuilds its candidate list per
+## peer, so a peer with a small interest set gets its rows every tick while a peer in a dense part of the map
+## waits several. Pooling them hands the first peer a window measured partly from the second: over-rewound
+## above the mean, under-rewound below it. The pooled figure is still refreshed, because it is the fallback
+## for a peer nothing has been measured about yet -- a fresh joiner is better served by the session's mean
+## than by the one-tick floor, at exactly the moment its link is least settled.
+func _refresh_interp_estimates() -> void:
+	if not Net.is_server():
+		return
+	NetLagComp.refresh_observed_interp(Net.interarrival_all_ticks())
+	for peer: int in multiplayer.get_peers():
+		NetLagComp.refresh_observed_interp_for(peer, Net.interarrival_ticks(peer))
 
 # --- peer lifecycle ------------------------------------------------------------------------------
 ## The CLIENT-side transport signals only. The server's join and leave both come from Net (RULE 4): the
@@ -198,10 +253,12 @@ func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 		return
 	var seat: int = roster.assign(peer, session_id)
 	if seat < 0:
-		# Every seat taken. Refusing here is the honest answer; silently admitting a seatless spectator would
-		# let them connect, receive the whole world, and have every order rejected with no explanation.
-		print("RTS: refusing peer %d -- every seat is taken" % peer)
-		multiplayer.multiplayer_peer.disconnect_peer(peer)
+		# Every seat taken -- so this peer OBSERVES. Refusing used to be the honest answer, because a seatless
+		# peer had no rollback body, therefore no interest centre, therefore no filter: it would have received
+		# the whole world and had every order rejected with no explanation. Declaring its centre is what
+		# changed, and the middle of the map is where a spectator with no preference is put.
+		print("RTS: peer %d admitted as an observer -- every seat is taken" % peer)
+		_apply_observe(peer, true, 0, Vector3.ZERO)
 		return
 	if resumed_from > 0:
 		print("RTS: peer %d resumed seat %d (was peer %d)" % [peer, seat, resumed_from])
@@ -220,6 +277,13 @@ func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 func _on_net_peer_dropped(peer: int, session_id: int, held: bool) -> void:
 	if not Net.is_server():
 		return
+	# The backend drops a departed peer's anchor with its connection, so there is nothing to retract here --
+	# only this layer's own bookkeeping to forget, and it must be forgotten either way. A held session keeps
+	# its SEAT, not its viewpoint: an observer that returns declares where it is watching from again.
+	_observers.erase(peer)
+	# The cadence measured about a departed peer describes a link that no longer exists, and peer ids are
+	# reused. Left behind, it would be handed to whoever arrives next under that id.
+	NetLagComp.forget_peer_interp(peer)
 	var seat: int = roster.seat_of_peer(peer)
 	if held and seat >= 0:
 		print("RTS: peer %d dropped -- holding seat %d for %.0fs" % [peer, seat, Net.reconnect_grace()])
@@ -253,6 +317,106 @@ func _on_server_disconnected() -> void:
 	# the error state immediately overwritten and the player would be dropped to a menu with no explanation.
 	leave()
 	_fail("the server closed the session")
+
+
+# --- observers ------------------------------------------------------------------------------------
+## Whether THIS peer is observing rather than playing.
+func is_observing() -> bool:
+	return _observing
+
+## SERVER-SIDE: whether `peer` is observing. The HUD reads it to report how many are watching.
+func observer_count() -> int:
+	return _observers.size()
+
+## Ask the server to hand this peer's seat back and watch instead, or to seat it again.
+##
+## A REQUEST, NOT A SETTING. The server owns seating and owns every anchor declaration -- a client that could
+## set its own interest centre could set it anywhere, which is the whole reason the call is server-side in the
+## facade. `_observing` is updated when the request is sent rather than when it is answered, because the only
+## thing it drives locally is which viewpoint this peer offers next, and offering the wrong one costs a
+## message rather than correctness.
+func request_observe(on: bool) -> void:
+	if Net.is_offline():
+		return
+	if _observing == on:
+		return
+	_observing = on
+	if not on:
+		observer.forget_sent()
+	if Net.is_server():
+		# A listen host asking itself. There is no datagram, and its own peer id is the server's.
+		_apply_observe(SeatRoster.SERVER_PEER, on, observer.tracked_entity(), observer.point())
+		return
+	_observe_request.rpc_id(SeatRoster.SERVER_PEER, on, observer.tracked_entity(), observer.point())
+
+## Offer a ground point as this peer's viewpoint. Called every frame while observing; sends only when
+## ObserverDesk says the declaration has moved enough to be worth a reliable message.
+func observe_from(point: Vector3) -> void:
+	observer.watch_point(point)
+	_offer_viewpoint()
+
+## Offer an entity to follow instead. `entity_id` comes from `entity_id()` on a handle; 0 is refused by the
+## desk, because it is the facade's retraction value rather than an entity.
+func observe_entity(entity_id: int) -> void:
+	if observer.watch_entity(entity_id):
+		_offer_viewpoint()
+
+func _offer_viewpoint() -> void:
+	if not _observing or Net.is_offline():
+		return
+	var now_s: float = float(Time.get_ticks_msec()) / 1000.0
+	if not observer.due(now_s):
+		return
+	observer.mark_sent(now_s)
+	if Net.is_server():
+		_apply_observe(SeatRoster.SERVER_PEER, true, observer.tracked_entity(), observer.point())
+		return
+	_observe_request.rpc_id(SeatRoster.SERVER_PEER, true, observer.tracked_entity(), observer.point())
+
+## CLIENT -> SERVER. `any_peer` because every client calls it; the sender id is read from the multiplayer
+## layer rather than taken from the payload, which is the same rule every order in this demo is validated by.
+@rpc("any_peer", "call_remote", "reliable")
+func _observe_request(on: bool, entity_id: int, point: Vector3) -> void:
+	if not Net.is_server():
+		return
+	_apply_observe(multiplayer.get_remote_sender_id(), on, entity_id, point)
+
+## SERVER-SIDE. The only place in this demo that declares an anchor.
+##
+## THE ORDER MATTERS ON THE WAY IN AND ON THE WAY OUT. Starting to observe releases the seat FIRST and then
+## declares, so the roster broadcast that hands the commander back to the server does not race a centre that
+## is about to be replaced anyway. Stopping retracts FIRST and then seats, so the peer is inferring from its
+## own commander by the time it has one -- `clear_peer_anchor` hands both the centre and the world back to
+## inference, and inference needs the body to exist.
+func _apply_observe(peer: int, on: bool, entity_id: int, point: Vector3) -> void:
+	if not on:
+		if not _observers.has(peer):
+			return
+		_observers.erase(peer)
+		Net.clear_peer_anchor(peer)
+		var seat: int = roster.assign(peer, Net.peer_session_id(peer))
+		if seat < 0:
+			# Somebody took the seat while this peer was watching. It stays a spectator rather than being
+			# disconnected: it asked to play, not to leave.
+			_observers[peer] = true
+			Net.set_peer_anchor(peer, point, 0)
+			print("RTS: peer %d asked to play, but every seat is taken -- still observing" % peer)
+			return
+		print("RTS: peer %d stopped observing and took seat %d" % [peer, seat])
+		_broadcast_roster()
+		return
+
+	var was_seated: int = roster.seat_of_peer(peer)
+	if was_seated >= 0:
+		roster.release(peer)
+	_observers[peer] = true
+	if entity_id != 0:
+		Net.set_peer_anchor_entity(peer, entity_id, 0)
+	else:
+		Net.set_peer_anchor(peer, point, 0)
+	if was_seated >= 0:
+		print("RTS: peer %d gave up seat %d to observe" % [peer, was_seated])
+		_broadcast_roster()
 
 # --- roster replication ---------------------------------------------------------------------------
 # One reliable broadcast of the whole seat table on every change, rather than per-seat deltas. The table is

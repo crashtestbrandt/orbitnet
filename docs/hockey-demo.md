@@ -15,6 +15,9 @@ just hockey-join   # terminal 2, and 3, and 4 …
 `hockey-join` takes `ADDR` or `ADDR:PORT`, defaulting to `127.0.0.1:47800` — so a session hosted on a
 non-default port with `just hockey-host 47900` is reached with `just hockey-join 127.0.0.1:47900`.
 
+The counterparts are [rts-demo.md](rts-demo.md), a decoupled 20 Hz tick where the lane an entity belongs on is
+the whole question, and [arena-demo.md](arena-demo.md), a decoupled 30 Hz shooter about who receives what.
+
 ![A client's view of a three-peer air hockey session](img/hockey-demo.png)
 
 <sub>A client at seat 2, with a host and one other client connected. Every number on the left is live.</sub>
@@ -226,11 +229,63 @@ between reading a mallet at the start or the end of a tick is under a centimetre
 | `F4` | `display_offset` — presents an older, more-confirmed tick. |
 | `F5` | correction smoothing. Off leaves the puck exactly where the wire put it. |
 | `F6` | team-mate fade. |
+| `F7` | **bulk marshalling.** Off puts every lane back on the per-property walk; `restore_ms` and `record_ms` move. |
 | `Space` | serve. Refused while the puck is live. |
 
-There is no AOI lever. `Net.set_aoi_radius()` culls the rollback lane against a peer's own body, and a 2 m
-table has nothing to cull; [rts-demo.md](rts-demo.md#aoi-reported-honestly) is where interest management is
-explained.
+There is no AOI lever. A 2 m table with 34 entities has nothing to cull, and every one of them is relevant to
+every peer — [rts-demo.md](rts-demo.md#aoi-on-both-lanes) explains distance culling and
+[arena-demo.md](arena-demo.md) the other two interest axes.
+
+## Bulk marshalling, which this demo is the case for
+
+Capturing a tick is one `Object.get` per replicated property and restoring one is one `Object.set`, and **the
+rollback loop pays both per replayed tick, per body**. This demo is where that multiplies: the puck is
+predicted on *every* peer, so every peer replays it, and 32 mallets sit on the same lane with state and input.
+
+```gdscript
+handle.set_bulk_capture("_net_marshal_out")   # one call per lane per tick
+handle.set_bulk_restore("_net_marshal_in")
+```
+
+Three state props over a twelve-tick resim is 36 property reads and 36 writes in one frame for the puck alone;
+the hook makes it 12 and 12.
+
+**Nothing about a hook reaches the wire.** The row, the mask, the delta base and the mispredict compare all
+read the backend's own layout, so `F7` can be flipped mid-session on one peer while another keeps walking its
+properties and neither notices anything about the other.
+
+**The declared order is load-bearing and is asserted.** `bulk_capture_order()` is derived from the
+registration, so reordering two `add_state` calls silently reorders what the hook must write — and a hook
+writing the right values into the wrong slots replays wrong rather than erroring.
+`demos/hockey/tests/unit/bulk_marshal_test.gd` pins the correspondence, and the boot line
+`HOCKEY-MARSHAL puck=bulk mallets_state=32/32 mallets_input=32/32` says whether the hooks actually resolved —
+a name that does not resolve leaves the lane on the walk and reports nothing at the call site.
+
+The mallet's input entry lives on its **child** input node while the hook resolves on the body's root, so that
+half reaches through `input`. Where a value is stored is the game's business; the hook only has to supply it.
+
+## A seat is kept for a player who comes back
+
+A dropped peer's seat is **held** for `Net.reconnect_grace()` seconds: the roster stops naming the peer and
+starts naming its **identity**, so the seat is taken but empty. The backend holds the mallet on the neutral
+input row with its state still broadcasting, so it comes to rest where it was rather than freezing and then
+jumping when its owner returns.
+
+Players are therefore seated on `Net.peer_joined`, **not** on `multiplayer.peer_connected`. The transport
+signal fires when the socket comes up, which is before the OrbitNet handshake — so no identity is known yet,
+and identity is the only thing that can tell a returning player from a newcomer. On this table, seating on the
+transport signal is what makes a rejoiner come back onto the other team.
+
+**This demo takes the conservative rule, where the RTS demo takes the permissive one.** A session identity is
+client-asserted and unauthenticated, so a peer presenting an identity it watched someone else use takes that
+player's seat while the original keeps its connection with no error. So a reclaim is honoured only for an
+identity this layer already saw `Net.peer_dropped` report with `held = true`. The price is the one the facade
+names: a player whose old socket the transport has not yet noticed is gone comes back as a newcomer. On a
+32-seat table that costs them their end of the rink, which is cheap; on the RTS's two-seat table it would cost
+them the game.
+
+`--session=N` pins the identity so a *restarted binary* can reclaim its seat; `Net` mints a random one per
+process, which already covers a player who returns through the same process.
 
 ## No token bucket on the command channel
 
@@ -262,6 +317,20 @@ looks exactly like a netcode bug. `puck_physics_test.gd` asserts the derivation 
   [filed gap](../README.md#limits); the HUD says so rather than leaving the line suspiciously empty.
 - **No InputMap** — raw key constants and the raw pointer, so there is no project-settings dependency to break
   across Godot versions. A real game should use one.
-- **No PR-gating probe.** The scene-bound gates are `tools/rts-probe.sh` and `tools/server-shape-probe.sh`, and
-  CONTRIBUTING.md admits a third only for a fundamental regression neither reaches; this demo's coverage is
-  twelve unit suites over its pure functions.
+- **No PR-gating probe.** The three scene-bound gates are `tools/rts-probe.sh`, `tools/server-shape-probe.sh`
+  and `tools/arena-probe.sh`, and CONTRIBUTING.md admits a fourth only for a fundamental regression none of
+  them reaches; this demo's coverage is fourteen unit suites over its pure functions.
+- **No interest filtering of any kind.** One shared rink, 34 entities, every one of them relevant to every
+  peer. There is nothing to cull by distance, no second world to be a member of, and no exception inside the
+  one world worth naming — [arena-demo.md](arena-demo.md) is the demo those three axes are about.
+- **One seat per connection.** Split-screen — several owned, predicted bodies behind one socket, each with its
+  own interest anchor — is `NetRollbackHandle.set_seat()`, and it is shown in
+  [arena-demo.md](arena-demo.md#split-screen-is-what-a-seat-is-for).
+
+## What a 16-bit slot removed
+
+A block names its entity by a **16-bit session slot** rather than the 64-bit id, which is where about a third
+of a small block used to go. On a 34-entity rink that is invisible in the totals and it is still the reason
+the puck's row is as small as it is; [protocol.md](protocol.md#entity-slots) has the format. The cost it moves
+rather than removes — the manifest restating the whole slot table each time it changes — needs thousands of
+entities to matter, which is [arena-demo.md](arena-demo.md#entity-slots).

@@ -77,20 +77,22 @@ need no instance at all. Do not reach for a probe just because a class extends `
 
 **Genuinely needs a live scene, physics or network?** → a probe: a driver script under `tools/`, plus its
 instrumentation inside the project it drives (`tools/instr/` in a demo, a scene of its own in `harness/`). But
-a probe gates PRs **only** if it guards a fundamental netcode regression: rollback determinism, prediction and reconciliation,
-two-peer sync, dedicated-server boot, the facade, or the transport factory.
+a probe gates PRs **only** if it guards a fundamental netcode regression: rollback determinism, prediction and
+reconciliation, two-peer sync, dedicated-server boot, interest filtering, the facade, or the transport factory.
 
-Two probes gate PRs today, and each reaches one item on that list that nothing else can:
+Three probes gate PRs today, and each reaches one item on that list the other two cannot:
 
 | Probe | What it guards |
 | --- | --- |
 | `tools/rts-probe.sh` | two-peer sync: identical worlds, orders replicated, a forged order refused |
 | `tools/server-shape-probe.sh` | both **server shapes** end to end -- a joining client's own state channel delivers rows against a dedicated server and against a listen server alike |
+| `tools/arena-probe.sh` | **interest filtering**: membership across three worlds, a per-peer veto, several seats on one connection, a declared anchor, and a session resume |
 
-**A third needs a line on that list that neither already covers.** If a probe's assertions are pure math, port
-them to a unit test and delete the redundant block. And a probe that can only ever pass is not coverage: the
-shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL) for
-exactly that reason.
+**A fourth needs a line on that list none of the three already covers.** If a probe's assertions are pure math,
+port them to a unit test and delete the redundant block. And a probe that can only ever pass is not coverage:
+the shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL)
+and the arena probe asserts a withheld entity's rows stop while its neighbours keep arriving, for exactly that
+reason.
 
 An empty run is a failure, not a pass — the runner exits non-zero on no suites or no `test_*` methods.
 

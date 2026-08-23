@@ -1,0 +1,88 @@
+; OrbitNet arena demo — a Godot project of its own, NOT a scene folder inside a shared one.
+;
+; A THIRD [orbitnet] BLOCK, and a third configuration. The RTS demo is decoupled at 20 Hz with a 64-tick ring
+; because it predicts one cursor per player; the hockey demo is coupled at 60 Hz with a 128-tick ring because
+; it predicts a shared puck every tick. This demo is decoupled at 30 Hz with a 128-tick ring, and the decouple
+; is load-bearing rather than a preference: the two lag-compensation features it exists to show are about the
+; INTERPOLATION DELAY a receiver applies, and a coupled demo has none. Two projects cannot share one settings
+; block, so each is its own Godot project. The addon is mirror-copied in by tools/sync-addons.sh; addons/ here
+; is a build artifact and is gitignored.
+
+config_version=5
+
+[application]
+
+config/name="OrbitNet Arena Demo"
+config/description="A lag-compensated laser-tag arena demonstrating OrbitNet's interest filter: several independent arenas in one session, several seats behind one connection, an observer that declares where it watches from, and one fighter withheld from one peer."
+run/main_scene="res://scenes/arena_main.tscn"
+; Declared as 4.4 to match the extension's compatibility_minimum. A newer editor opens it fine (and offers to
+; bump this line); the point is that a 4.4 user is not locked out.
+config/features=PackedStringArray("4.4", "GL Compatibility")
+
+[autoload]
+
+; Written here rather than left to the EditorPlugin because this entry is what makes `Net` exist in an
+; EXPORTED build and under `--headless --script` (the unit-test runner). The plugin adds the same line when
+; enabled in the editor; both must agree.
+Net="*res://addons/orbitnet/net.gd"
+
+[debug]
+
+; The typed-GDScript rules this repo is written to, promoted from warnings to ERRORS. Identical to the other
+; two demos' blocks on purpose: a demo that needed an @warning_ignore to compile would be a demo proving the
+; facade has a hole.
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/unsafe_method_access=2
+gdscript/warnings/unsafe_cast=2
+gdscript/warnings/unsafe_call_argument=2
+; The addon's own unavoidable opaque-Node backend calls live under addons/; exclude that tree from the
+; promotion above so the facade lints. Demo code under scripts/ stays strict. Default is true; pinned explicit.
+gdscript/warnings/exclude_addons=true
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=800
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/orbitnet/plugin.cfg")
+
+[orbitnet]
+
+; Read once by addons/orbitnet/net.gd when it creates the backend node.
+;
+; sync_to_physics=false + tickrate=30: DECOUPLED, and that is the point rather than a saving. A decoupled
+; receiver draws every remote body some measured number of ticks behind the server's present, and that delay is
+; half of the rewind window a lag-compensated shot has to undo. A coupled demo has no such delay to measure, so
+; the per-peer and per-band interpolation terms this demo reports would be constants there.
+;
+; 30 rather than 60 because a shooter that pays for a deep rewind ring does not also have to pay for a 60 Hz
+; net tick: the deeper the ring, the more the rate costs, and the whole argument of the rewind is that the
+; server can reconstruct what the client saw without being sent it more often.
+sync_to_physics=false
+tickrate=30
+; 128 slots. At 30 Hz that is 4.27 s of ring, far past NetLagComp.max_delay_ms -- so what actually bounds the
+; rewind is the policy, not the storage, which is the arrangement a shooter wants. NetLagComp.retain_ticks()
+; evicts anything older than the maximum window plus a margin, so the residency is bounded by duration rather
+; than by slot count.
+history_limit=128
+max_time_stretch=1.05
+
+[physics]
+
+; A fighter is NOT a PhysicsBody: its motion is pure math over a plane (FighterMotion), because the rollback
+; loop REPLAYS a tick and Godot's physics server cannot be rewound and re-stepped.
+;
+; The physics server is still used, for the one thing it is right for here: STATIC cover. A lag-compensated
+; shot casts the static half of its mask live against geometry that does not move, and reconstructs only the
+; moving half from the rewind ring. Cover being static is what makes that split correct.
+common/physics_ticks_per_second=60
+3d/default_gravity=0.0
+
+[rendering]
+
+; GL Compatibility, not Forward+: this demo must run on a software GL CI runner and on old hardware, and it
+; renders boxes.
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

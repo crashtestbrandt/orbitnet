@@ -117,6 +117,15 @@ func bind_net() -> void:
 	_state_handle.add_state(self, "position@half")
 	_state_handle.add_state(self, "net_aux@half")
 	_state_handle.add_state(self, "net_meta")
+	# THE ANCHOR IS DECLARED, NOT INFERRED, AND WITHOUT IT THESE 96 UNITS ARE NEVER CULLED. A state channel
+	# that names no anchor is ALWAYS relevant, at every distance, in every world -- so before this line the
+	# demo's AOI radius reached the two cursors on the rollback lane and nothing else, leaving the units that
+	# are actually the bandwidth replicating to every peer regardless of where that peer was looking.
+	#
+	# `"position"`, NOT `"position@half"`. The entry names a live Vector3 read on the AUTHORITY to compute
+	# relevancy; it is not a wire entry, so it takes no quantization suffix and costs no bytes. That it happens
+	# to also be replicated here is a coincidence of this unit having a position worth sending.
+	_state_handle.set_anchor("position")
 	_state_handle.process_settings()
 
 	# Interpolation is for peers that RECEIVE this unit. The server writes position every tick from its own
@@ -128,6 +137,11 @@ func bind_net() -> void:
 		_interp.add_property(self, "position")
 		_interp.add_property(self, "net_aux")
 		_interp.process_settings()
+
+## This unit's session-global entity id, or 0 while the facade is OFFLINE and the handle is inert. An
+## observer tracking a unit names it by this; so does a veto withholding it from one peer.
+func entity_id() -> int:
+	return 0 if _state_handle == null else _state_handle.entity_id()
 
 # --- server-side simulation ----------------------------------------------------------------------
 ## Place the unit (world build, and every respawn). Server-side; the position replicates from there.

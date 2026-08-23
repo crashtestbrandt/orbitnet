@@ -105,6 +105,14 @@ func configure(pool: Array[MalletBody], record: Scoreboard) -> void:
 	# Dead with a countdown running, so a fresh world serves itself rather than waiting for someone to ask.
 	net_flags = pack_flags(false, HockeyConfig.FACEOFF_TICKS, 0, 0)
 
+## The state lane's entries, in the order the bulk hook fills its array.
+##
+## ONE LIST, USED TWICE: by the registration below and by the suite that asserts the hook agrees with it.
+## `bulk_capture_order()` is derived from the registration, so reordering these two lines silently reorders
+## what the hook must write -- and a hook writing the right values into the wrong slots produces a body that
+## replays wrong rather than an error.
+const STATE_PROPS: Array[String] = ["net_pos@half", "net_vel@half", "net_flags"]
+
 ## Register the rollback lane. Called AFTER the puck is in the tree at its final path.
 ##
 ## The puck is its OWN input node. There is no input to carry, and a child node that never holds a property
@@ -117,9 +125,61 @@ func bind_net() -> void:
 	_handle = Net.register_rollback_body(
 		self,
 		self,
-		["net_pos@half", "net_vel@half", "net_flags"],
+		STATE_PROPS,
 		[],      # NO INPUT -- nobody authors the puck
 		true)    # predicted on EVERY peer, which is the whole demo
+	set_bulk_marshalling(true)
+
+# --- bulk marshalling ------------------------------------------------------------------------------
+## Marshal the whole state lane in ONE script-boundary crossing instead of one per property.
+##
+## THE PUCK IS THE BODY THIS EXISTS FOR, and the reason is the same one the demo leads with: it is predicted
+## on EVERY peer, so every peer replays it. The rollback loop pays the capture and the restore walk PER
+## REPLAYED TICK, PER BODY -- three state props across a twelve-tick resim is 36 property reads and 36 writes
+## in one frame, for one puck. The hook makes it 12 and 12.
+##
+## FILL EVERY SLOT. The array is preallocated and reused, so a slot left alone silently keeps last tick's
+## value; there is no unset sentinel. Do not resize it -- a wrong-length array drops the lane back to the walk
+## and says so once.
+##
+## The input lane returns immediately because the puck registered an EMPTY input list. Its array is
+## zero-length, and writing to it is the resize the rules forbid.
+func _net_marshal_out(lane: int, values: Array) -> void:
+	if lane == NetRollbackHandle.LANE_INPUT:
+		return
+	values[0] = net_pos
+	values[1] = net_vel
+	values[2] = net_flags
+
+## The restore half. The order here is `bulk_restore_order()`, which is shorter than the capture order by
+## exactly the lane's cosmetic entries -- the puck declares none, so the two lists are identical.
+##
+## Assigned to the typed fields rather than cast: `values[i]` is a Variant, and an assignment is the
+## conversion this project allows.
+func _net_marshal_in(lane: int, values: Array) -> void:
+	if lane == NetRollbackHandle.LANE_INPUT:
+		return
+	net_pos = values[0]
+	net_vel = values[1]
+	net_flags = values[2]
+
+## Declare the hooks, or take them away. Live: an unresolvable method name is the documented way back to the
+## per-property walk, so passing `false` sets an empty name and re-processes the settings.
+##
+## `process_settings()` AGAIN, because `register_rollback_body()` already processed them once and a hook is
+## resolved with the property list. The schema is unchanged either way -- nothing about a hook reaches the
+## wire -- so this can be toggled mid-session without the peers having to agree.
+func set_bulk_marshalling(on: bool) -> void:
+	if _handle == null:
+		return
+	_handle.set_bulk_capture(HockeyConfig.MARSHAL_OUT if on else "")
+	_handle.set_bulk_restore(HockeyConfig.MARSHAL_IN if on else "")
+	_handle.process_settings()
+
+## Whether the state lane is actually marshalling in bulk. Asked rather than assumed: a name that does not
+## resolve leaves the lane on the walk and reports nothing at the call site.
+func uses_bulk_marshalling() -> bool:
+	return _handle != null and _handle.uses_bulk_capture(NetRollbackHandle.LANE_STATE)
 
 ## Accept a validated serve request. Called on the server (or offline) from the NetCommand handler, i.e.
 ## OUTSIDE the tick, which is why it writes a plain server-only field rather than any replicated property.

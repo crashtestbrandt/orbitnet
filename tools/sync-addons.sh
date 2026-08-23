@@ -41,7 +41,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # Every Godot project that consumes the addon. Add a demo here and it is wired by the next sync.
-PROJECTS=(harness demos/rts demos/hockey)
+PROJECTS=(harness demos/rts demos/hockey demos/arena)
 # What gets mirrored, as `source:destination-inside-each-project` pairs.
 #
 # The two addon directories are the payload proper -- exactly what an AssetLib zip contains and exactly

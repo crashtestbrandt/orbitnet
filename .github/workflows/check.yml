@@ -151,12 +151,14 @@ jobs:
           tools/lint-gdscript.sh harness
           tools/lint-gdscript.sh demos/rts
           tools/lint-gdscript.sh demos/hockey
+          tools/lint-gdscript.sh demos/arena
 
       - name: Unit suites
         run: |
           godot --headless --path harness --script tests/support/run_unit_tests.gd
           godot --headless --path demos/rts --script tests/support/run_unit_tests.gd
           godot --headless --path demos/hockey --script tests/support/run_unit_tests.gd
+          godot --headless --path demos/arena --script tests/support/run_unit_tests.gd
 
       # --skip-build because the build already happened above; the smoke loads what that step installed
       # rather than compiling a second copy.
@@ -171,6 +173,12 @@ jobs:
       - name: Two-peer RTS probe
         run: tools/rts-probe.sh
 
+      # The third gating probe. It covers the interest axis the other two cannot: membership filtering across
+      # three worlds, a per-peer veto, several seats on one connection, a declared anchor, and a session
+      # resume. CONTRIBUTING.md records why three probes gate rather than one.
+      - name: Three-process arena probe
+        run: tools/arena-probe.sh
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -179,6 +187,7 @@ jobs:
           path: |
             /tmp/rtsprobe-*
             /tmp/shapeprobe-*
+            /tmp/arenaprobe-*
             /tmp/orbitnet-lint*
           if-no-files-found: ignore
           retention-days: 7

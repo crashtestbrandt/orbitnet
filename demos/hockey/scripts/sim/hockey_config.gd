@@ -115,6 +115,13 @@ const CORRECTION_DEADBAND_M: float = 0.0012
 const CORRECTION_SNAP_M: float = 0.09
 const CORRECTION_HALF_LIFE: float = 0.06
 
+# --- bulk marshalling ------------------------------------------------------------------------------
+## The two hook method names, declared here rather than spelled at each call site. They are resolved by NAME
+## on the body's root, so a rename that misses one call site does not error -- the lane quietly keeps the
+## per-property walk, and `uses_bulk_capture()` is the only thing that would have told you.
+const MARSHAL_OUT: String = "_net_marshal_out"
+const MARSHAL_IN: String = "_net_marshal_in"
+
 # --- teams -----------------------------------------------------------------------------------------
 ## Seat parity fixes the end: even seats defend -z, odd seats defend +z. Team is DERIVED from the seat index
 ## and never replicated -- every peer already knows the seat, so sending the team would be sending a
