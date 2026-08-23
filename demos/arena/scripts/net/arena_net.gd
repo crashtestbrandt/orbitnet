@@ -69,6 +69,8 @@ func _init() -> void:
 	name = "ArenaNet"
 
 func _ready() -> void:
+	if not Net.pre_tick.is_connected(_on_pre_tick):
+		Net.pre_tick.connect(_on_pre_tick)
 	if not Net.post_tick.is_connected(_on_post_tick):
 		Net.post_tick.connect(_on_post_tick)
 	if not Net.peer_joined.is_connected(_on_net_peer_joined):
@@ -184,9 +186,15 @@ func _apply_interest_settings() -> void:
 	Net.set_aoi_band_radius(ArenaConfig.BAND_SCALE_M)
 
 # --- the authoritative step --------------------------------------------------------------------------
-## AFTER the rollback loop rather than before it, and the difference matters twice: every fighter's pose is
-## the authoritative present-tick value here, which is what the rewind ring must record, and a cloak taken
-## this tick is withheld from this tick's datagram rather than the next one.
+## BEFORE the rollback loop. The veto pass has to run here: a cloak is applied inside the loop, from the same
+## values this tick's rows are built from, so a pass that ran afterwards would first see the flag on the tick
+## whose row already carried it. See MatchDirector.pre_tick().
+func _on_pre_tick(_tick: int) -> void:
+	if world != null and Net.is_server():
+		world.pre_tick()
+
+## AFTER the rollback loop, where every fighter's pose is the authoritative present-tick value -- which is what
+## the rewind ring must record, and what a cloak pickup must be decided against.
 func _on_post_tick() -> void:
 	if world != null and Net.is_server():
 		world.post_tick(Net.current_tick())

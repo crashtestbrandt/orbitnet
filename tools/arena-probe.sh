@@ -86,11 +86,16 @@ newlog client-a; CLIENT_A="$LOG"
 newlog observer-a; OBSERVER_A="$LOG"
 
 echo "arena-probe: pass A -- dedicated server on port $PORT_A"
-spawn "$SERVER_A" --dedicated="$PORT_A" --arena-probe --quit-after="$((RUN_S + 3))"; SPID=$SPAWNED
+spawn "$SERVER_A" --dedicated="$PORT_A" --arena-probe --quit-after="$((RUN_S + 5))"; SPID=$SPAWNED
 sleep 3
 spawn "$CLIENT_A" --join="127.0.0.1:$PORT_A" --seats=2 --arena-probe --quit-after="$RUN_S"; CPID=$SPAWNED
+# THE SEATED CLIENT GOES FIRST, AND THE GAP IS NOT COSMETIC. Seats are handed out in handshake order, so two
+# peers arriving in the same instant race for seat 0 -- and a client that ended up holding the seat the server
+# cloaks would be asked whether it can see its OWN body, which it always can. Staggering makes the seating
+# deterministic; the client's verdict checks the assumption anyway.
+sleep 2
 spawn "$OBSERVER_A" --join="127.0.0.1:$PORT_A" --observe --watch="$WATCH_ARENA" \
-	--arena-probe --quit-after="$RUN_S"; OPID=$SPAWNED
+	--arena-probe --quit-after="$((RUN_S - 2))"; OPID=$SPAWNED
 
 # Watchdog: a hung session must fail loudly rather than hang CI forever.
 ( sleep "$WATCHDOG_S"; kill -9 $PIDS 2>/dev/null ) &

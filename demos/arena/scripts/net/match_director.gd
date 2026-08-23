@@ -211,20 +211,32 @@ func set_seat_owner(seat: int, peer: int, seat_index: int) -> void:
 		fighter.set_owner_peer(peer, seat_index)
 
 # --- the authoritative step --------------------------------------------------------------------------
+## Called once per net tick BEFORE the rollback loop, on the server.
+##
+## THE VETO PASS RUNS HERE, AND AFTER THE TICK IT DOES NOT WORK. A cloak is QUEUED between ticks and applied
+## inside `advance()`, which is also where this tick's row is built from -- so a pass that ran after the loop
+## would first see the flag on the tick whose row already carried it, and the peer the cloak is hidden from
+## would learn about it exactly once. One tick of leak is the whole cloak.
+##
+## Running before the loop closes it, because the pass reads a PENDING cloak as well as an applied one: the
+## veto is in force before the flag it hides has ever been written.
+func pre_tick() -> void:
+	if not Net.is_server():
+		return
+	_veto_pass()
+
 ## Called once per net tick AFTER the rollback loop, on the server. Every fighter has already advanced -- the
 ## backend called `_rollback_tick` on each -- so this is where the things that are NOT per-body happen.
 ##
 ## THE ORDER IS DELIBERATE. The rewind ring is recorded FIRST, from the poses this tick just produced, because
-## a shot resolved later in the same tick rewinds into it. Cloaks are taken next, and only then does the veto
-## pass read who is cloaked -- so a fighter that cloaked this tick is withheld from this tick's datagram
-## rather than the next one.
+## a shot resolved later in the same tick rewinds into it. Kills are credited next, from what the tick decided,
+## and cloaks are picked up last -- queued, for the pass at the top of the next tick to act on.
 func post_tick(tick: int) -> void:
 	if not Net.is_server():
 		return
 	resolver.record(tick)
 	_credit_kills()
 	_cloak_pass(tick)
-	_veto_pass()
 
 ## Credit every kill the tick just produced. Read from the fighters AFTER the tick rather than decided during
 ## the shot resolution, because whether a hit was fatal is decided INSIDE the tick -- see
@@ -254,6 +266,8 @@ func _physics_process(delta: float) -> void:
 		_offline_accumulator -= ArenaConfig.NET_TICK_DT
 		guard += 1
 		_offline_tick += 1
+		# No veto pass offline: there is no peer to withhold anything from, and `Net.set_entity_hidden()` is a
+		# no-op there anyway. The cloak still applies, so the local player still turns green.
 		for fighter: FighterBody in fighters:
 			if fighter != null:
 				# `is_fresh` is unconditionally true offline: there is no rollback loop, so no tick is ever
@@ -344,7 +358,12 @@ func _veto_pass() -> void:
 	for seat: int in fighters.size():
 		var fighter: FighterBody = fighters[seat]
 		teams[seat] = 0 if fighter == null else fighter.team
-		cloaked[seat] = 1 if (fighter != null and fighter.is_cloaked() and fighter.is_alive()) else 0
+		# A PENDING CLOAK COUNTS. It is applied inside the tick this pass runs at the top of, so treating it as
+		# already in force is what puts the veto in place before the flag exists to be leaked. A queued cloak
+		# that never applies -- the fighter died in between -- costs one withheld tick and then retracts.
+		var hidden: bool = fighter != null and fighter.is_alive() \
+			and (fighter.is_cloaked() or fighter.cloak_pending())
+		cloaked[seat] = 1 if hidden else 0
 
 	# Cheap: 24 bytes compared per tick, against a pass that is every seat times every connection. The
 	# comparison is what lets the pass itself be slow.

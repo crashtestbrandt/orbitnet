@@ -15,6 +15,12 @@ extends Node
 
 ## The seat the server forces a cloak onto. Arena 1, team 1 (odd seat) -- so a client holding seat 0, which is
 ## arena 1 team 0, must be withheld it. Both sides know the constant; neither is told it.
+##
+## WHICH MEANS THE CLIENT MUST NOT OWN IT, and the shell script is what guarantees that: it starts the seated
+## client BEFORE the observer, so seats are handed out in a known order. If two peers handshake in the same
+## instant the roster hands seat 0 to whichever arrived first, and a client that ended up holding seat 1 would
+## be asked whether it can see its own body -- which it always can, and which proves nothing about a veto. The
+## verdict below checks the assumption rather than trusting it.
 const CLOAK_SEAT: int = 1
 ## The seat a client watches for a stall. The same one.
 const WATCHED_SEAT: int = CLOAK_SEAT
@@ -245,7 +251,13 @@ func _client_verdict(role: String) -> bool:
 	# What a withheld peer can observe for certain is that it never learned the FLAG. The cloak bit rides in
 	# `net_flags`, in the rows the veto is refusing, so a peer that is being sent those rows knows within a
 	# tick and a peer that is not never finds out. That is also the fact the game is actually about.
-	if role == "client" and seated_arenas.has(ArenaConfig.arena_of_seat(WATCHED_SEAT)):
+	if role == "client" and _net.local_seats().has(WATCHED_SEAT):
+		# A peer is never withheld its own body, so this run cannot say anything about the veto. It means the
+		# seating order the shell script arranges did not hold, which is worth failing on rather than skipping.
+		print("ARENA-PROBE client: this peer OWNS seat %d, so the veto cannot be observed from here" % [
+			WATCHED_SEAT])
+		ok = false
+	elif role == "client" and seated_arenas.has(ArenaConfig.arena_of_seat(WATCHED_SEAT)):
 		if _early_watched < 0 or _baseline_watched <= _early_watched:
 			print("ARENA-PROBE client: seat %d was not arriving before it cloaked, so the veto proves nothing" % [
 				WATCHED_SEAT])
