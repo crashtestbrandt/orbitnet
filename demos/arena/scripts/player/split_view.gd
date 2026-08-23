@@ -32,6 +32,17 @@ static func rects(count: int, size: Vector2) -> Array[Rect2]:
 
 func build(count: int) -> void:
 	set_anchors_preset(Control.PRESET_FULL_RECT)
+	# ANCHORS ARE NOT A SIZE, and this node is the one place in the demo where the difference is visible.
+	# `set_anchors_preset()` sets anchors only; `size` stays (0, 0) until something assigns it, and a Control
+	# whose parent is a plain Node is never sent the window's resize either. The HUDs survive that because
+	# their contents are positioned by anchors and a custom_minimum_size. `_layout()` instead DIVIDES `size`
+	# between the seats, so a zero size gives every SubViewportContainer a zero rect, the SubViewport inside
+	# it collapses to its 2x2 minimum, and the 3D world renders nowhere at all -- an empty window behind a
+	# HUD that is still reporting a healthy session. Take the size from the viewport and follow it from here.
+	size = get_viewport_rect().size
+	var window: Viewport = get_viewport()
+	if not window.size_changed.is_connected(_follow_viewport):
+		window.size_changed.connect(_follow_viewport)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_clear()
 	for index: int in maxi(1, count):
@@ -63,6 +74,10 @@ func build(count: int) -> void:
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_RESIZED:
 		_layout()
+
+## The window changed shape. Assigning `size` raises NOTIFICATION_RESIZED, which re-runs `_layout()`.
+func _follow_viewport() -> void:
+	size = get_viewport_rect().size
 
 func _layout() -> void:
 	var layout: Array[Rect2] = rects(_containers.size(), size)
