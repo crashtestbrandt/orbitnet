@@ -4381,10 +4381,6 @@ impl OrbitNet {
             let Some(peer) = self.peers.get_mut(&sender) else {
                 return; // No handshake, no input.
             };
-            if header.flags & FrameHeader::FLAG_WANT_FULL != 0 {
-                peer.note_nack();
-                nacked = true;
-            }
             // Consume the ack window: every snapshot frame the client PROVES it received promotes
             // the entity ticks that frame carried to `acked_base` — the only ticks a masked delta
             // may reference, because the client provably holds those rows. An ack that carries the
@@ -4397,6 +4393,23 @@ impl OrbitNet {
                 tick_ms,
             );
             unproven_ack = outcome == AckOutcome::Unproven;
+            // THE NACK IS TAKEN AFTER THE ACK, AND THE ORDER IS THE WHOLE POINT. One packet carries
+            // both: a receiver that answered `NoBase` for a block sets its `want_full` inside the
+            // per-entity loop, while `handle_snapshot` has already advanced the ack fields for that
+            // same frame unconditionally. So the packet reporting the failure also acknowledges the
+            // frame that failed, and `sent_log` records every entity that frame carried regardless
+            // of what the receiver made of them.
+            //
+            // Clearing first and consuming second therefore re-promotes the exact base that just
+            // proved undecodable. `want_full` hides it for one round, because `full_block_due`
+            // forces every entity full — but only for the entities that fit the byte budget, and the
+            // ones deferred past that round carry the re-poisoned entry into a masked delta with the
+            // flag already back down. Taking the NACK last leaves no base this peer has not proven
+            // it holds.
+            if header.flags & FrameHeader::FLAG_WANT_FULL != 0 {
+                peer.note_nack();
+                nacked = true;
+            }
         }
         // The acceptance bar for turning AOI on: a re-entering entity must get its full block
         // WITHOUT a want_full storm, and this is the number that says whether it did.
