@@ -77,3 +77,77 @@ func test_clear_forgets_everyone() -> void:
 	roster.clear()
 	assert_eq(roster.occupied(), 0, "session teardown empties the table")
 	assert_eq(roster.assign(12), 0, "and the next session starts from seat 0")
+
+# --- seats held across a reconnect -------------------------------------------------------------------
+const SESSION_A: int = 0x51DE01
+const SESSION_B: int = 0x51DE02
+
+func test_a_held_seat_goes_back_to_the_identity_that_left_it() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	var seat: int = roster.assign(10)
+	roster.hold(10, SESSION_A)
+	assert_eq(roster.seat_of_peer(10), -1, "the departed peer is no longer sitting in it")
+	assert_eq(roster.seat_of_session(SESSION_A), seat, "but its identity is holding it")
+	assert_eq(roster.assign(11, SESSION_A), seat,
+		"and the same identity on a NEW peer id takes the same seat, which is what keeps a player's end of "
+		+ "the rink across a reconnect")
+
+func test_a_held_seat_is_not_handed_to_a_newcomer() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	var seat: int = roster.assign(10)
+	roster.hold(10, SESSION_A)
+	assert_true(roster.assign(11) != seat,
+		"a newcomer claiming no identity is seated elsewhere; the held seat is taken, not free")
+
+func test_a_forged_or_unknown_identity_gets_a_fresh_seat_not_the_held_one() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	var seat: int = roster.assign(10)
+	roster.hold(10, SESSION_A)
+	assert_true(roster.assign(11, SESSION_B) != seat,
+		"an identity nobody is holding a seat for is a newcomer, however confidently it is presented")
+
+func test_no_session_can_never_hold_a_seat() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	roster.assign(10)
+	assert_eq(roster.hold(10, TeamRoster.NO_SESSION), -1,
+		"several peers present NO_SESSION at once, so a seat held under it would go to whichever reconnected "
+		+ "first -- which is not the player who left")
+	assert_eq(roster.seat_of_peer(10), 0, "and the peer keeps its seat rather than losing it to a bad hold")
+
+func test_a_held_seat_counts_as_taken_for_balance_and_for_fullness() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	roster.assign(10)
+	var team: int = HockeyConfig.team_of_seat(0)
+	roster.hold(10, SESSION_A)
+	assert_eq(roster.occupied(), 0, "nobody is sitting anywhere")
+	assert_eq(roster.reserved(), 1, "and one seat is waiting for its player")
+	assert_eq(roster.occupied_on_team(team), 1,
+		"balance is decided from what is AVAILABLE, and a seat waiting for a return is not available")
+
+func test_an_expired_session_frees_its_seat() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	var seat: int = roster.assign(10)
+	roster.hold(10, SESSION_A)
+	roster.release_session(SESSION_A)
+	assert_eq(roster.seat_of_session(SESSION_A), -1, "the identity holds nothing")
+	assert_eq(roster.reserved(), 0, "and nothing is reserved")
+	assert_eq(roster.assign(11), seat, "so the next arrival takes the seat")
+
+func test_releasing_a_seated_peer_also_drops_any_hold_on_its_seat() -> void:
+	# The ghost case: a killed client's identity was already taken back by the returning player, and then the
+	# dead socket's drop arrives. Releasing must not strand the hold the new peer just cleared.
+	var roster: TeamRoster = TeamRoster.new()
+	var seat: int = roster.assign(10)
+	roster.hold(10, SESSION_A)
+	roster.assign(11, SESSION_A)
+	roster.release(11)
+	assert_eq(roster.seat_of_session(SESSION_A), -1, "no identity is left holding a seat nobody is in")
+	assert_eq(roster.assign(12), seat, "and the seat is genuinely free again")
+
+func test_clear_forgets_held_seats_too() -> void:
+	var roster: TeamRoster = TeamRoster.new()
+	roster.assign(10)
+	roster.hold(10, SESSION_A)
+	roster.clear()
+	assert_eq(roster.reserved(), 0, "a teardown leaves no reclaims for the next session to honour")
+	assert_eq(roster.assign(11, SESSION_A), 0, "and that identity is simply a newcomer again")

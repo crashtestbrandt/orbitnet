@@ -110,8 +110,15 @@ func bind_net_all() -> void:
 			mallet.bind_net()
 	scoreboard.bind_net()
 	puck.bind_net()
+	# The marshalling state is printed at bind rather than left to the HUD, and the reason is that a hook is
+	# resolved by NAME: a rename that misses a call site leaves the lane on the per-property walk with nothing
+	# erroring. One greppable line at boot turns "is it actually on" into a question with an answer, on a
+	# dedicated server that draws no HUD as much as on a client that does.
+	var bulk: Vector2i = bulk_mallet_counts()
 	print("HOCKEY rink bound to the %s lane set (%d rollback bodies, 1 state channel)" % [
 		Net.mode_name(Net.current_mode()), mallets.size() + 1])
+	print("HOCKEY-MARSHAL puck=%s mallets_state=%d/%d mallets_input=%d/%d" % [
+		"bulk" if uses_bulk_marshalling() else "walk", bulk.x, mallets.size(), bulk.y, mallets.size()])
 
 ## Re-point a seat's mallet at a new owning peer, and re-evaluate prediction. Called on every peer when the
 ## roster changes, so authority agrees everywhere.
@@ -125,6 +132,37 @@ func set_seat_owner(seat: int, peer: int) -> void:
 ## The signature of the world this peer built -- see HockeyNames.world_signature(). Printed at build and
 ## compared between peers by hand: it is the direct gate on deterministic naming, and therefore on entity-id
 ## agreement.
+## Turn bulk marshalling on or off across every rollback body at once. The lever behind F7.
+##
+## NOTHING ABOUT A HOOK REACHES THE WIRE. The row, the mask, the delta base and the mispredict compare all
+## read the backend's own layout, so this can be flipped mid-session on one peer while another keeps walking
+## its properties, and neither notices anything about the other.
+func set_bulk_marshalling(on: bool) -> void:
+	for mallet: MalletBody in mallets:
+		if mallet != null:
+			mallet.set_bulk_marshalling(on)
+	if puck != null:
+		puck.set_bulk_marshalling(on)
+
+## Whether the puck's state lane is marshalling in bulk right now. Asked of the backend rather than tracked
+## here, so the readout cannot claim a hook that failed to resolve.
+func uses_bulk_marshalling() -> bool:
+	return puck != null and puck.uses_bulk_marshalling()
+
+## How many of the pool's mallets have each lane marshalling in bulk: state in x, input in y. The input half
+## is the one worth counting separately -- its entry lives on a child node while the hook resolves on the
+## root, so it is the half that can quietly stay on the walk.
+func bulk_mallet_counts() -> Vector2i:
+	var counts: Vector2i = Vector2i.ZERO
+	for mallet: MalletBody in mallets:
+		if mallet == null:
+			continue
+		if mallet.uses_bulk_marshalling():
+			counts.x += 1
+		if mallet.uses_bulk_input_marshalling():
+			counts.y += 1
+	return counts
+
 func world_signature() -> int:
 	var paths: PackedStringArray = PackedStringArray()
 	for mallet: MalletBody in mallets:

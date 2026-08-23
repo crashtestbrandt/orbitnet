@@ -11,8 +11,10 @@ just rts-host     # terminal 1
 just rts-join     # terminal 2
 ```
 
-The counterpart is [hockey-demo.md](hockey-demo.md): a coupled 60 Hz tick where everything is on the rollback
-lane, including a puck nobody authors. Between them the two demos cover both halves of the lane decision.
+The counterparts are [hockey-demo.md](hockey-demo.md), a coupled 60 Hz tick where everything is on the
+rollback lane including a puck nobody authors, and [arena-demo.md](arena-demo.md), a decoupled 30 Hz shooter
+about who receives what. Between them the three demos cover the lane decision, prediction of a body you do not
+author, and the interest filter.
 
 ## The lane split
 
@@ -195,6 +197,11 @@ cases are unit-testable with no session. Four rules:
 
 Plus a per-sender token bucket, checked *first* as the cheapest rejection.
 
+`ScoutPolicy` is the other pure one — which enemy units a seat can currently see, with the same 1.25× exit
+hysteresis the backend's own interest band uses, reporting only what CHANGED. The session layer turns those
+indices into `Net.set_entity_hidden()` calls; the policy never names `Net` and never touches the tree, which
+is what makes it a unit suite rather than a probe.
+
 **Selection is entirely client-local.** It changes at mouse-move rates, the payload names its ids explicitly,
 and a client-authored id list is safe by construction because the server re-derives ownership from the ids.
 Only the *count* rides the wire, on the cosmetic channel.
@@ -211,18 +218,72 @@ Measuring it needs **no new networking**: the server stamps each accepted order 
 every unit it names, and that already replicates inside `net_meta`. The client records the sequence it saw at
 send time and stops the clock when any targeted unit's changes.
 
-## AOI, reported honestly
+## AOI, on both lanes
 
 The HUD reads:
 
 ```
-AOI     128 m -- ROLLBACK LANE ONLY: 1/1 cursors culled, 0/96 units (state lane is never culled)
+AOI     128 m -- rollback 1/1 cursors culled, state 61/96 units culled
 ```
 
-Because that is the truth: AOI iterates rollback entities, the 96 units are on the state lane and always
-replicate, so AOI can cull exactly one thing — the other player's cursor. Showing that teaches the lane
-distinction better than a slider that appears to do something. Making AOI work on the state lane is
-[a filed gap](../README.md#limits), not a demo bug.
+`Net.set_aoi_radius()` filters every entity that declares an **anchor**. A rollback body anchors on its first
+`Vector3` state property automatically; a state channel anchors where `NetStateHandle.set_anchor()` says, and
+declares nothing by default:
+
+```gdscript
+# UnitBody.bind_net()
+_state_handle.add_state(self, "position@half")
+_state_handle.set_anchor("position")     # a live Vector3 read on the AUTHORITY, not a wire entry
+```
+
+**Without that line the 96 units are never culled**, at any radius, in any world — a state channel that names
+no anchor is always relevant. That default is fail-open and it is worth knowing: a game that forgets the call
+gets a radius that appears to work and culls nothing. The line above prints the count per lane so the
+difference is visible on screen.
+
+`"position"`, not `"position@half"`: the anchor names a live `Vector3` read on the authority to compute
+relevancy. It is not a wire entry, so it takes no quantization suffix and costs no bytes.
+
+Distance is one of three axes. The other two — a declared **world**, and a per-peer **veto** — are below and in
+[arena-demo.md](arena-demo.md#the-three-axes-and-what-each-one-can-say), which is the demo they are the point
+of.
+
+## Fog of war, which is the one thing a radius cannot do
+
+**F9.** Off by default, like every other lever here.
+
+A radius and a membership are both properties of the *entity* — one position, one world, read the same way by
+every peer. Fog of war is a property of the *pair*: seat 0 can see a unit that seat 1 cannot, at the same
+instant, at the same distance. `Net.set_entity_hidden(peer, entity, true)` is the only call in the facade that
+can say that.
+
+The behaviour a veto has is exactly the one the genre wants: **the rows stop and the node stays**, frozen at
+the last pose that arrived. That is the last-known-position ghost, and it costs no code.
+
+`ScoutPolicy` decides and reports only what CHANGED. Re-asserting a veto that is already in force clears that
+peer's delta bookkeeping again, which would hold every withheld unit permanently at "send a full block next".
+It enters at `VISION_RADIUS_M` and leaves at 1.25× that, matching the band the backend's own filter uses — a
+unit walking the vision edge would otherwise flip every tick, and each flip is a full block on the way back
+in.
+
+A **listen host's own seat is skipped**, and that is not an omission: a veto refuses a row in a datagram, and
+the server sends itself none.
+
+## Watching without playing
+
+**F7**, or `--observe` at launch.
+
+A peer with no rollback body has no interest centre, and a peer with no centre is filtered in nowhere — the
+backend falls open and sends it everything. That is why this demo puts a cursor on the rollback lane at all,
+and why a seatless peer used to be refused at the door.
+
+`Net.set_peer_anchor()` removes the compulsion. An observer holds no seat, drives no commander, and has its
+centre declared for it; **F8** cycles between its own camera (`set_peer_anchor`) and following a seat's lead
+unit (`set_peer_anchor_entity`). A peer arriving at a full table is now admitted as an observer instead of
+disconnected.
+
+The declaration is throttled — an observer pans every frame, and one reliable message per frame restating a
+centre that slid twenty centimetres is how a spectator costs more than a player.
 
 ## Reconnection: the seat is the player's, not the connection's
 
@@ -285,6 +346,19 @@ later `seat released -- peer N did not return`, and the next joiner takes seat 1
 - **No join browser or invites.**
 - **No InputMap** — raw key constants, so there is no project-settings dependency to break across Godot
   versions. A real game should use one.
-- **No fog of war.** It would be presentation-only and maphack-vulnerable: closing it needs a per-peer
-  visibility veto the library does not have.
 - **No pathfinding.** Units slide along boxes.
+- **One seat per connection.** That is this demo's own rule, not the backend's: `NetRollbackHandle.set_seat()`
+  lets one connection drive several owned bodies, each with its own interest anchor, which is what local
+  split-screen needs. `SeatRoster` refusing a second seat to the same peer is a rule about *this game*;
+  [arena-demo.md](arena-demo.md#split-screen-is-what-a-seat-is-for) is where several are shown.
+- **No bulk marshalling.** The commander cursor is one `Vector3` and the units are on the state lane, so there
+  is no replay multiplier to divide — [hockey-demo.md](hockey-demo.md#bulk-marshalling-which-this-demo-is-the-case-for)
+  is the case for it.
+- **No lag compensation.** Orders are adjudicated, not traced; there is no hitscan to rewind for.
+
+## What a 16-bit slot removed from the budget
+
+A block names its entity by a **16-bit session slot** rather than the 64-bit id. On this demo's 20-byte unit
+row that used to be eight bytes of every block spent on naming the thing the block was about —
+[protocol.md](protocol.md#entity-slots) has the format. The budget arithmetic above is stated in *property*
+bytes and is unchanged by it; what changed is how many of those rows fit in a datagram.

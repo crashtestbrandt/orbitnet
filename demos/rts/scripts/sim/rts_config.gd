@@ -25,6 +25,10 @@ class_name RtsConfig
 # --- scale ---------------------------------------------------------------------------------------
 ## Player seats. Two is the demo; the wire schema and the validator are not limited to it.
 const SEATS: int = 2
+## Connections admitted BEYOND the seats, for peers that watch without playing. The transport's peer cap is
+## seats plus this, because a cap of SEATS refuses an observer at the socket -- before the session layer ever
+## gets to decide what to do with it. An observer costs a datagram stream and no seat.
+const OBSERVER_SLOTS: int = 2
 ## Units per seat. See the budget derivation above before changing it.
 const UNITS_PER_SEAT: int = 48
 ## Total unit pool. Every peer builds exactly this many unit nodes at world build, with identical names, and

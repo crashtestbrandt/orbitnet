@@ -11,6 +11,8 @@ class_name RtsMain
 ##   --join=ADDR[:PORT]  client
 ##   --dedicated[=PORT]  authoritative server with no local player (headless)
 ##   --session=N         pin this peer's session identity, so a RESTARTED process reclaims its seat
+##   --observe           watch without playing: no seat, no commander, an interest centre DECLARED by the
+##                       server and driven by this peer's camera
 ##   --rts-probe         attach the automated gate (tools/instr/rts_probe.gd)
 ##   --bench             attach netbench's harness with this demo's BenchSubject
 ##   --quit-after=SEC    exit after N seconds (probes and smoke runs)
@@ -119,6 +121,21 @@ func _on_session_state(state: RtsNet.State) -> void:
 	print("RTS-STATE %s" % RtsNet.State.keys()[state])
 	if state == RtsNet.State.ERROR:
 		printerr("RTS-ERROR %s" % net.error_message())
+	# Asked for HERE rather than at boot, because the request is a reliable message to the server and there is
+	# no server to send it to until the session is up. A listen host takes the same path and answers itself.
+	if state == RtsNet.State.PLAYING and _has_flag("--observe") and not net.is_observing():
+		net.request_observe(true)
+
+## An observing peer's viewpoint follows its camera, and the camera moves every frame. Offering it every
+## frame is correct and cheap: ObserverDesk decides which offers are worth a message, and the throttle is
+## the reason this can be wired to _process at all.
+func _process(_delta: float) -> void:
+	if net == null or camera == null or not net.is_observing():
+		return
+	if net.observer.mode() == ObserverDesk.Mode.TRACKED:
+		net.observe_entity(net.observer.tracked_entity())
+		return
+	net.observe_from(camera.position)
 
 func _on_local_seat(seat: int) -> void:
 	print("RTS-SEAT %d" % seat)

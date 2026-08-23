@@ -36,6 +36,9 @@ var _last_goal: String = ""
 # --- lever state (all per-client and live) ---------------------------------------------------------
 var _tick_hz: int = HockeyConfig.NET_TICK_HZ
 var _remote_resim: bool = true
+## Whether the bulk-marshalling hooks are declared. On at build, because it is the configuration a game
+## should ship; F7 takes them away so the cost of the per-property walk is visible beside them.
+var _bulk: bool = true
 var _input_delay: int = 0
 var _display_offset: int = 0
 
@@ -119,8 +122,18 @@ func _compose() -> String:
 	var resim: float = perf.get("resim_ticks", 0.0)
 	var rollback_ms: float = perf.get("rollback_ms", 0.0)
 	var rb_nodes: float = perf.get("rb_nodes", 0.0)
+	var restore_ms: float = perf.get("restore_ms", 0.0)
+	var record_ms: float = perf.get("record_ms", 0.0)
+	var sim_ms: float = perf.get("sim_ms", 0.0)
 	lines.push_back("ROLLBACK  resim=%d ticks  loop=%.2f ms  rb_nodes=%d" % [
 		int(resim), rollback_ms, int(rb_nodes)])
+	# The three phases the loop time wraps. RESTORE writes a tick's recorded state back onto every replaying
+	# body, SIM is this demo's own physics, RECORD captures the result -- and restore plus record is exactly
+	# what F7's bulk marshalling divides. Printing them beside the lever is what makes the lever legible.
+	lines.push_back("          restore=%.2f ms  sim=%.2f ms  record=%.2f ms" % [
+		restore_ms, sim_ms, record_ms])
+	lines.push_back(_wire_line())
+	lines.push_back(_marshal_line())
 	lines.push_back("")
 
 	lines.push_back(_lane_line())
@@ -138,8 +151,34 @@ func _compose() -> String:
 		_display_offset,
 		"on" if puck_view == null or puck_view.smoothing else "off",
 		"on" if mallets == null or mallets.fade else "off"])
+	lines.push_back("F7 bulk marshalling %s" % ["on" if _bulk else "off"])
 	lines.push_back("Move the pointer to drive your mallet.   SPACE serve.")
 	return "\n".join(lines)
+
+## The wire, per second.
+##
+## `unproven acks` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret
+## it never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot claim a
+## frame that never reached it. A clean session sits at 0.
+func _wire_line() -> String:
+	var wire: Dictionary[String, float] = Net.bandwidth_metrics()
+	return "WIRE    tx=%.0f B/s in %.0f dg/s   rx=%.0f B/s   peers=%d   unproven acks=%.0f/s" % [
+		wire["tx_bytes_s"], wire["tx_datagrams_s"], wire["rx_bytes_s"],
+		int(wire["peers"]), wire["unproven_acks_s"]]
+
+## Which lanes are actually marshalling in bulk, asked of the backend rather than of the lever.
+##
+## THE TWO ANSWERS CAN DISAGREE, and that is why this is a readout rather than an echo of `_bulk`. A hook is
+## resolved by NAME on the body's root; a name that does not resolve leaves the lane on the per-property walk
+## and reports nothing at the call site. The mallet's INPUT entry lives on a child node while its hook
+## resolves on the root, which makes that half the one worth counting on its own.
+func _marshal_line() -> String:
+	if rink == null:
+		return "MARSHAL no rink"
+	var counts: Vector2i = rink.bulk_mallet_counts()
+	return "MARSHAL puck state=%s   mallets state=%d/%d  input=%d/%d   (one crossing per lane per tick)" % [
+		"bulk" if rink.uses_bulk_marshalling() else "walk",
+		counts.x, HockeyConfig.SEATS, counts.y, HockeyConfig.SEATS]
 
 func _lane_line() -> String:
 	var counts: Vector2i = Vector2i.ZERO if rink == null else rink.team_counts()
@@ -231,6 +270,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		KEY_F4:
 			_display_offset = (_display_offset + 2) % 8
 			Net.set_display_offset(_display_offset)
+		KEY_F7:
+			# Live, and it needs no agreement between peers: nothing about a hook reaches the wire, so one
+			# peer may marshal in bulk while another walks its properties.
+			_bulk = not _bulk
+			if rink != null:
+				rink.set_bulk_marshalling(_bulk)
 		KEY_F5:
 			if puck_view != null:
 				puck_view.smoothing = not puck_view.smoothing

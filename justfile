@@ -50,14 +50,14 @@ descriptor-parity:
 
 # Headless project load for each Godot project -- catches every GDScript compile and parse error, with the
 # project's warnings-as-errors promotion applied.
-lint: (lint-project "harness") (lint-project "demos/rts") (lint-project "demos/hockey")
+lint: (lint-project "harness") (lint-project "demos/rts") (lint-project "demos/hockey") (lint-project "demos/arena")
 
 lint-project PROJECT:
     GODOT="{{godot}}" tools/lint-gdscript.sh {{PROJECT}}
 
 # The unit suites. Sub-second, no scene tree, no physics, no sockets. This is where coverage belongs unless
 # it genuinely needs a live session -- see CONTRIBUTING.md.
-test: harness-test rts-test hockey-test
+test: harness-test rts-test hockey-test arena-test
 
 harness-test:
     "{{godot}}" --headless --path harness --script tests/support/run_unit_tests.gd
@@ -68,19 +68,27 @@ rts-test:
 hockey-test:
     "{{godot}}" --headless --path demos/hockey --script tests/support/run_unit_tests.gd
 
+arena-test:
+    "{{godot}}" --headless --path demos/arena --script tests/support/run_unit_tests.gd
+
 # Prove the extension loads and registers its classes in a THROWAWAY project -- no autoload, no plugin, no
 # addon GDScript. Catches the pointer-file / wrong-architecture / stale-filename class of failure.
 harness-smoke:
     # --quit-after is a frame-count backstop only: smoke.gd quits itself as soon as it has a verdict.
     "{{godot}}" --headless --path harness --quit-after 600
 
-# The two-peer networked gate: identical worlds, orders replicated, a forged order refused. This is the PR
-# gate, and the only scene-bound one.
+# The two-peer networked gate: identical worlds, orders replicated, a forged order refused.
 rts-probe:
     GODOT="{{godot}}" tools/rts-probe.sh
 
+# The three-process networked gate: a DEDICATED server and two clients. It covers what the RTS probe cannot --
+# dedicated-server boot, membership filtering, a per-peer veto, several seats on one connection, and the
+# dedicated-versus-listen comparison. See CONTRIBUTING.md for why there are two gating probes rather than one.
+arena-probe:
+    GODOT="{{godot}}" tools/arena-probe.sh
+
 # Everything a PR must pass, in the order that fails fastest first.
-check: addon-tracked addon-drift net-check descriptor-parity native-test lint test rts-probe
+check: addon-tracked addon-drift net-check descriptor-parity native-test lint test rts-probe arena-probe
 
 # =====================================================================================================
 # the native backend (Rust)
@@ -187,6 +195,58 @@ hockey-stress SECONDS="60":
         --bench-duration={{SECONDS}} --quit-after={{SECONDS}}
 
 hockey-lint: (lint-project "demos/hockey")
+
+
+# =====================================================================================================
+# the arena demo
+#
+# The third [orbitnet] configuration -- DECOUPLED at 30 Hz with a 128-tick history -- and the decouple is what
+# the demo is about: the two lag-compensation features it shows are about the interpolation delay a RECEIVER
+# applies, and a coupled demo has none. Three independent arenas in one session, several seats behind one
+# connection, observers that declare where they watch from, and one fighter withheld from one peer.
+# =====================================================================================================
+
+# Single player. No peer, no socket -- the facade stays OFFLINE and every handle it hands out is inert.
+arena:
+    "{{godot}}" --path demos/arena
+
+arena-editor:
+    "{{godot}}" --editor --path demos/arena
+
+# Listen server: authoritative AND a local player.
+arena-host PORT="47800":
+    "{{godot}}" --path demos/arena -- --host={{PORT}}
+
+# A client. SEATS=2 is local split-screen: two locally-driven fighters behind ONE connection, each with its
+# own interest anchor, and by default in DIFFERENT arenas -- which is the case worth seeing, because a
+# connection with a body in two worlds has no inferred world of its own.
+arena-join ADDR="127.0.0.1" SEATS="1":
+    "{{godot}}" --path demos/arena -- --join={{ADDR}} --seats={{SEATS}}
+
+# A spectator: no seat, no fighter, and an interest centre AND ARENA declared for it by the server. Before
+# `Net.set_peer_anchor()` this peer had no centre, and a peer with no centre is filtered in nowhere.
+arena-observe ADDR="127.0.0.1":
+    "{{godot}}" --path demos/arena -- --join={{ADDR}} --observe
+
+# Dedicated server: authoritative, headless, no local player.
+arena-serve PORT="47800":
+    "{{godot}}" --headless --path demos/arena -- --dedicated={{PORT}}
+
+# A single-peer soak with the bench bot playing itself. This demo is the one that can fill BenchSubject's
+# HIT REGISTRATION columns, because it is the only one with an authoritative shot to confirm.
+arena-stress SECONDS="60":
+    "{{godot}}" --headless --path demos/arena -- --host --bench --bench-bot=strafe_fire \
+        --bench-duration={{SECONDS}} --quit-after={{SECONDS}}
+
+# Entity-slot pressure. A block names its entity by a 16-bit session slot, and the table binding slots to ids
+# is redistributed as a WHOLE TABLE each time it changes -- so a session with tens of thousands of entities
+# spends real reliable bandwidth restating bindings that did not move. PROPS is per arena; the session names
+# three times that plus the fighters and the scorecards. Past 65,536 the server refuses to replicate the
+# entity and says so, rather than wrapping an index onto a live one.
+arena-slots PROPS="8000" SECONDS="20":
+    "{{godot}}" --headless --path demos/arena -- --host --props={{PROPS}} --quit-after={{SECONDS}}
+
+arena-lint: (lint-project "demos/arena")
 
 # =====================================================================================================
 # netbench -- the netcode test bench

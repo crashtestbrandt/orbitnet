@@ -39,6 +39,11 @@ func configure(seat_index: int, peer: int) -> void:
 	input.nin_target = net_pos
 	add_child(input)
 
+## The two lanes' entries, in the order the bulk hooks fill their arrays. See PuckBody.STATE_PROPS for why
+## they are named once rather than spelled at the registration.
+const STATE_PROPS: Array[String] = ["net_pos@half", "net_vel@half"]
+const INPUT_PROPS: Array[String] = ["nin_target@half"]
+
 ## Register the rollback lane. Called AFTER the mallet is in the tree at its final path.
 func bind_net() -> void:
 	if Net.is_offline():
@@ -53,9 +58,47 @@ func bind_net() -> void:
 	_handle = Net.register_rollback_body(
 		self,
 		input,
-		["net_pos@half", "net_vel@half"],   # STATE  -- server-authored
-		["nin_target@half"],                # INPUT  -- client-authored, validated by node authority
+		STATE_PROPS,   # server-authored
+		INPUT_PROPS,   # client-authored, validated by node authority
 		predict)
+	set_bulk_marshalling(true)
+
+# --- bulk marshalling ------------------------------------------------------------------------------
+## Marshal a whole lane in one crossing. See PuckBody for the arithmetic; the mallets multiply it, because
+## there are up to 32 of them and every one a peer predicts replays with the puck.
+##
+## BOTH LANES GO THROUGH ONE METHOD, dispatched on `lane`. The input entry lives on the CHILD input node while
+## the hook is resolved on the body's ROOT, so the state half reads this node's own fields and the input half
+## reaches through `input`. Where the value is stored is the game's business; the hook only has to supply it.
+func _net_marshal_out(lane: int, values: Array) -> void:
+	if lane == NetRollbackHandle.LANE_INPUT:
+		values[0] = input.nin_target
+		return
+	values[0] = net_pos
+	values[1] = net_vel
+
+func _net_marshal_in(lane: int, values: Array) -> void:
+	if lane == NetRollbackHandle.LANE_INPUT:
+		input.nin_target = values[0]
+		return
+	net_pos = values[0]
+	net_vel = values[1]
+
+## Declare the hooks, or take them away. See PuckBody.set_bulk_marshalling().
+func set_bulk_marshalling(on: bool) -> void:
+	if _handle == null:
+		return
+	_handle.set_bulk_capture(HockeyConfig.MARSHAL_OUT if on else "")
+	_handle.set_bulk_restore(HockeyConfig.MARSHAL_IN if on else "")
+	_handle.process_settings()
+
+## Whether each lane is actually marshalling in bulk, state first. Reported per lane rather than as one
+## answer, because the two resolve independently and the input half is the one that can quietly fail.
+func uses_bulk_marshalling() -> bool:
+	return _handle != null and _handle.uses_bulk_capture(NetRollbackHandle.LANE_STATE)
+
+func uses_bulk_input_marshalling() -> bool:
+	return _handle != null and _handle.uses_bulk_capture(NetRollbackHandle.LANE_INPUT)
 
 ## One simulation step. Called by the backend as `_rollback_tick` when networked, and by RinkDirector's offline
 ## accumulator when there is no session -- one body, two clocks, so "it behaves differently offline" cannot

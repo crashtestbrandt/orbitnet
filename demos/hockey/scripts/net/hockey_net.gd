@@ -32,13 +32,33 @@ class_name HockeyNet
 ## CLIENT too -- the alternative, blocking the world build on a welcome packet, re-opens exactly the window
 ## rule 1 closes.
 ##
-## DROP-IN AND DROP-OUT ARE THE SAME MECHANISM. A peer connecting takes the lowest free seat on the thinner
-## end; a peer leaving releases it; the whole seat table is rebroadcast either way. No spawn, no despawn, no
-## reconnection handshake -- the mallet pool is static and only its ownership moves.
+## DROP-IN AND DROP-OUT ARE THE SAME MECHANISM. A peer joining takes the lowest free seat on the thinner end; a
+## peer leaving gives it up; the whole seat table is rebroadcast either way. No spawn, no despawn -- the mallet
+## pool is static and only its ownership moves.
+##
+##   4. PLAYERS ARE SEATED ON Net.peer_joined, NOT ON multiplayer.peer_connected. The transport signal fires
+##      when the socket comes up, which is BEFORE the OrbitNet handshake -- so the peer's SESSION IDENTITY is
+##      not known yet, and identity is the only thing that can tell a returning player from a newcomer.
+##      Seating on the transport signal is what makes a rejoiner land in whatever seat happens to be free,
+##      which on this table means coming back onto the other team.
+##
+## RECONNECTION, AND THE RULE THIS DEMO TAKES. A dropped peer's seat is HELD for `Net.reconnect_grace()`
+## seconds: the roster stops naming the peer and starts naming its IDENTITY, so the seat is taken but empty and
+## the backend holds the mallet on the neutral input row with its state still broadcasting. It comes to rest
+## where it was rather than freezing and then jumping when its owner returns.
+##
+## THE CONSERVATIVE RULE, AND WHY THIS DEMO TAKES IT WHERE THE RTS DEMO DOES NOT. `resumed_from` names a
+## connection that MAY STILL BE UP, and a session identity is client-asserted and unauthenticated -- so a peer
+## presenting an identity it watched someone else use takes that player's seat, and the original keeps its
+## connection with no error. This demo therefore honours a reclaim only for an identity it already saw
+## `Net.peer_dropped` report with `held = true`. The price is the one the facade names: a player whose old
+## socket the transport has not yet noticed is gone comes back as a newcomer. On a 32-seat table that costs
+## them their end of the rink, which is cheap; on the RTS's two-seat table it would cost them the game, which
+## is why that demo takes the permissive rule and says so.
 ##
 ## Deliberately omitted, and listed as known gaps rather than hidden: a build/protocol version handshake (two
-## incompatible peers will connect and misbehave rather than being refused with a reason), a join browser,
-## invites, and seat retention across a reconnect.
+## incompatible peers will connect and misbehave rather than being refused with a reason), a join browser, and
+## invites.
 
 signal session_state_changed(state: State)
 signal local_seat_changed(seat: int)
@@ -51,11 +71,26 @@ var roster: TeamRoster = TeamRoster.new()
 var _state: State = State.OFFLINE
 var _local_seat: int = -1
 var _error: String = ""
+## SERVER-SIDE: the identities this layer has SEEN drop with their session held. The conservative rule reads
+## exactly this set, and a reclaim by an identity that is not in it is refused -- which is what makes a forged
+## identity worth no more than a fresh seat.
+var _held_sessions: Dictionary[int, bool] = {}
 
 func _init() -> void:
 	# Named at construction: the roster RPC below routes by node path, so this node's name is part of the wire
 	# contract and must not change after the node is in the tree.
 	name = "HockeyNet"
+
+func _ready() -> void:
+	# The session-lifecycle signals, connected ONCE rather than per session: they are inert until a session is
+	# hosted, and only ever fire on the authority. Connecting them here also means a listen host and a
+	# dedicated server take exactly the same path, which is the property RULE 4 is protecting.
+	if not Net.peer_joined.is_connected(_on_net_peer_joined):
+		Net.peer_joined.connect(_on_net_peer_joined)
+	if not Net.peer_dropped.is_connected(_on_net_peer_dropped):
+		Net.peer_dropped.connect(_on_net_peer_dropped)
+	if not Net.peer_session_expired.is_connected(_on_net_session_expired):
+		Net.peer_session_expired.connect(_on_net_session_expired)
 
 func state() -> State:
 	return _state
@@ -179,16 +214,18 @@ func leave() -> void:
 	Net.set_mode(Net.Mode.OFFLINE)
 	Net.set_remote_resim(false)   # RULE 3 -- back to the facade's own default
 	roster.clear()
+	# The identities this layer watched leave describe a session that no longer exists. Carried into the next
+	# one they would be a set of reclaims nobody in it ever earned.
+	_held_sessions.clear()
 	_local_seat = -1
 	_teardown_rink()
 	_set_state(State.OFFLINE)
 
 # --- peer lifecycle --------------------------------------------------------------------------------
+## The CLIENT-side transport signals only. The server's join and leave both come from `Net` -- see RULE 4: the
+## transport's peer_connected fires before any identity is known, and its peer_disconnected cannot say whether
+## the session is being held open.
 func _connect_peer_signals() -> void:
-	if not multiplayer.peer_connected.is_connected(_on_peer_connected):
-		multiplayer.peer_connected.connect(_on_peer_connected)
-	if not multiplayer.peer_disconnected.is_connected(_on_peer_disconnected):
-		multiplayer.peer_disconnected.connect(_on_peer_disconnected)
 	if not multiplayer.connected_to_server.is_connected(_on_connected_to_server):
 		multiplayer.connected_to_server.connect(_on_connected_to_server)
 	if not multiplayer.connection_failed.is_connected(_on_connection_failed):
@@ -196,24 +233,68 @@ func _connect_peer_signals() -> void:
 	if not multiplayer.server_disconnected.is_connected(_on_server_disconnected):
 		multiplayer.server_disconnected.connect(_on_server_disconnected)
 
-func _on_peer_connected(peer: int) -> void:
+## The seat assignment, on the OrbitNet handshake rather than the transport connect -- RULE 4. `session_id` is
+## the identity this peer's handshake carried, and `resumed_from` is the peer id it held before it dropped, or
+## 0 for a first-time joiner.
+func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	if not Net.is_server():
 		return
-	var seat: int = roster.assign(peer)
+	# THE CONSERVATIVE RULE, and it is one line: an identity is worth a seat back only if this layer watched
+	# that identity leave. `resumed_from` alone is the backend saying "somebody claimed this before", which a
+	# forger can also make true.
+	var reclaim: int = session_id if _held_sessions.has(session_id) else TeamRoster.NO_SESSION
+	var seat: int = roster.assign(peer, reclaim)
 	if seat < 0:
-		# The transport cap and the seat pool are the same number, so this is unreachable unless the two are
-		# ever allowed to disagree. Refusing here is what keeps that a caught mistake rather than a silent one.
-		print("HOCKEY: refusing peer %d -- every seat is taken" % peer)
+		# Every seat taken, held seats included. Refusing is the honest answer on a rink where a mallet is the
+		# only thing to be: there is no spectator viewpoint in this demo to admit them to.
+		print("HOCKEY: refusing peer %d -- every seat is taken or held" % peer)
 		multiplayer.multiplayer_peer.disconnect_peer(peer)
 		return
-	print("HOCKEY: peer %d seated at %d (team %d)" % [peer, seat, HockeyConfig.team_of_seat(seat)])
+	if reclaim != TeamRoster.NO_SESSION:
+		_held_sessions.erase(session_id)
+		print("HOCKEY: peer %d resumed seat %d (was peer %d, team %d)" % [
+			peer, seat, resumed_from, HockeyConfig.team_of_seat(seat)])
+	else:
+		if resumed_from > 0:
+			# Worth saying out loud rather than seating them quietly: this is the conservative rule costing a
+			# returning player their seat, and it looks identical to a forgery being refused.
+			print("HOCKEY: peer %d claimed session %d, which was never seen to drop -- seating as new" % [
+				peer, session_id])
+		print("HOCKEY: peer %d seated at %d (team %d)" % [peer, seat, HockeyConfig.team_of_seat(seat)])
 	_broadcast_roster()
 
-func _on_peer_disconnected(peer: int) -> void:
+## A peer's connection is gone. `held` is whether the backend is keeping its session open.
+##
+## A HELD SEAT IS NOT RELEASED, it changes hands from the peer to the IDENTITY. The mallet keeps its input
+## authority pointed at a peer id that no longer exists, which is exactly what the backend's gap policy
+## covers: it is written the neutral input row and its state keeps broadcasting, so the other players watch it
+## come to rest rather than freeze.
+func _on_net_peer_dropped(peer: int, session_id: int, held: bool) -> void:
 	if not Net.is_server():
 		return
+	if held and session_id != TeamRoster.NO_SESSION:
+		var kept: int = roster.hold(peer, session_id)
+		if kept >= 0:
+			_held_sessions[session_id] = true
+			print("HOCKEY: peer %d dropped -- holding seat %d for %.0fs" % [
+				peer, kept, Net.reconnect_grace()])
+			_broadcast_roster()
+			return
+	# Not held, holding nothing, or claiming no identity. The third way in is the one worth knowing about: a
+	# GHOST connection whose identity a returning player already took back, which a killed client leaves behind
+	# until its keepalive times out. release() is a no-op there, because the seat already moved.
 	roster.release(peer)
-	print("HOCKEY: peer %d left" % peer)
+	print("HOCKEY: peer %d left (session %d, not held)" % [peer, session_id])
+	_broadcast_roster()
+
+## The grace window closed with nobody claiming the session: that player is not coming back. Free the seat and
+## let the roster broadcast park the mallet.
+func _on_net_session_expired(session_id: int, peer: int) -> void:
+	if not Net.is_server():
+		return
+	_held_sessions.erase(session_id)
+	roster.release_session(session_id)
+	print("HOCKEY: seat released -- peer %d did not return" % peer)
 	_broadcast_roster()
 
 func _on_connected_to_server() -> void:

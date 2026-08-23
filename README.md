@@ -73,6 +73,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 | [api.md](docs/api.md) | The full surface, wire quantization, and the f64/i64 scalar reality. |
 | [rts-demo.md](docs/rts-demo.md) | A worked example that is not a character shooter, with the byte budget spelled out. |
 | [hockey-demo.md](docs/hockey-demo.md) | The rollback lane on an object nobody authors, and the correction measured in millimetres. |
+| [arena-demo.md](docs/arena-demo.md) | Three interest axes, several seats on one connection, and a rewind sized per shooter and per target. |
 | [architecture.md](docs/architecture.md) | Crate layout, batching, history, prop roles, threading. |
 | [protocol.md](docs/protocol.md) | Wire format, clock, `is_fresh`, entity lifecycle. |
 | [netbench.md](docs/netbench.md) | Impairment relay, bot fleet, tick-domain gates. |
@@ -117,6 +118,29 @@ author**:
 Its signature number is the **puck correction in millimetres** — the distance between what this peer predicted
 for a tick and what the server said about it, reported beside the wire quantization floor that bounds it.
 
+## The arena demo
+
+`demos/arena/` is the third configuration — **decoupled at 30 Hz with a 128-tick history**, which is what a
+shooter wants and what neither other demo has. It exists to show that **who receives what is decided by the
+game**:
+
+- **Three arenas in one session**, each rebased to its own origin. What replicates is arena-local, so two
+  fighters standing on the same spot in different arenas are zero metres apart — no radius can separate them,
+  and `set_membership()` is the only thing in the facade that can.
+- **A cloak is a per-peer veto.** `Net.set_entity_hidden()` withholds one fighter from the connections not on
+  its team, which is a fact about a *pair* and therefore the one thing neither distance nor membership can
+  say.
+- **Split-screen is seats.** `--seats=2` drives two locally-predicted fighters on one connection, each with
+  its own interest anchor, in two different arenas by default; the connection receives the union.
+- **An observer declares where it watches from.** No seat, no body, and therefore no inferred centre or world
+  — `Net.set_peer_anchor()` supplies both, and a peer arriving at a full table is admitted rather than
+  refused.
+- **The scorecard is membership only.** It replicates two integers and no position, so there is no distance to
+  cull it by.
+
+Its signature number is the **rewind depth per band** — the three ticks one shot is resolved at, one per
+distance band, beside the flat per-shooter window they refine.
+
 ## Limits
 
 Known and filed, not hidden:
@@ -124,7 +148,13 @@ Known and filed, not hidden:
 - **A peer that declares nothing still has its centre and world inferred.** `Net.set_peer_anchor()` and
   `Net.set_peer_anchor_entity()` state both outright; without one they are read off the lowest-id rollback
   entity each of that peer's **seats** drives, so a seat driving more than one body is centred and placed by
-  whichever that is, and a peer driving none has neither and sees everything.
+  whichever that is, and a peer driving none has neither and sees everything. Both demos with an `--observe`
+  mode declare instead, and admit a seatless peer rather than refusing it.
+- **A withheld ROLLBACK body's `get_last_known_state()` keeps advancing on the client.** For a state channel,
+  that number ceasing to advance is the documented client-side signal that the rows stopped — by a cull, a
+  membership or a veto alike. On the rollback lane it is not: a client's reading keeps rising for a body it is
+  no longer being sent, so a game that wants to notice has to key on a replicated value instead. The arena
+  demo keys on a flag carried in the withheld rows, and its probe asserts on that rather than on the tick.
 - **A seat cannot arrive or leave mid-session cleanly.** Seats are declared per body and are read where the
   filter runs, so adding one to a connection already in session re-indexes that connection's interest sets for
   one tick: the sets are recomputed against the wrong seat's prior members, then correct themselves on the next

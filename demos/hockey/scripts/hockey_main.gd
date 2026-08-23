@@ -10,6 +10,7 @@ class_name HockeyMain
 ##   --host[=PORT]       listen server: authoritative AND a local player
 ##   --join=ADDR[:PORT]  client
 ##   --dedicated[=PORT]  authoritative server with no local player (headless)
+##   --session=N         pin this peer's session identity, so a RESTARTED process reclaims its seat
 ##   --bench             attach netbench's harness with this demo's BenchSubject
 ##   --quit-after=SEC    exit after N seconds (smoke runs)
 ##
@@ -52,6 +53,13 @@ func _ready() -> void:
 		get_tree().create_timer(quit_after).timeout.connect(_quit)
 
 func _start_session() -> void:
+	# BEFORE any join: the identity is read out of the handshake, and the handshake is the first thing a client
+	# sends. `Net` mints a random one per process, which already resumes a player who returns through the same
+	# process -- this flag is for the other case, a RESTARTED binary, where the demo has no store to remember
+	# itself from. A real game persists the value instead of taking it from the command line.
+	var session: int = _int_flag("--session=", 0)
+	if session != 0:
+		Net.set_session_id(session)
 	# A build exported with the dedicated-server preset boots authoritative with NO argument. That is the
 	# property that makes a server image deployable: an operator runs the binary, not a command line.
 	if OS.has_feature("dedicated_server"):

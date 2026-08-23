@@ -108,6 +108,13 @@ const FADE_FLOOR: float = 0.12
 ##
 ## Sized at the wire's own resolution: `net_pos` rides as binary16, whose spacing at this table's scale is
 ## about a millimetre, so a disagreement below that is not distinguishable from quantization anyway.
+# --- bulk marshalling ------------------------------------------------------------------------------
+## The two hook method names, declared here rather than spelled at each call site. They are resolved by NAME
+## on the body's root, so a rename that misses one call site does not error -- the lane quietly keeps the
+## per-property walk, and `uses_bulk_capture()` is the only thing that would have told you.
+const MARSHAL_OUT: String = "_net_marshal_out"
+const MARSHAL_IN: String = "_net_marshal_in"
+
 const CORRECTION_DEADBAND_M: float = 0.0012
 
 ## Metres of correction above which the puck's render position SNAPS instead of blending. Below it the view

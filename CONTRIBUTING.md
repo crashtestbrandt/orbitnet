@@ -79,8 +79,17 @@ need no instance at all. Do not reach for a probe just because a class extends `
 **only** if it guards a fundamental netcode regression: rollback determinism, prediction and reconciliation,
 two-peer sync, dedicated-server boot, the facade, or the transport factory.
 
-Exactly one probe gates PRs today: `tools/rts-probe.sh`. **Keep it that way.** If a probe's assertions are
-pure math, port them to a unit test and delete the redundant block.
+**Two** probes gate PRs, and adding a third needs the same argument these two make. If a probe's assertions
+are pure math, port them to a unit test and delete the redundant block.
+
+| Probe | Guards |
+| --- | --- |
+| `tools/rts-probe.sh` | two-peer sync against a LISTEN host: identical worlds, orders replicated, a forged order refused |
+| `tools/arena-probe.sh` | DEDICATED-server boot, membership filtering, a per-peer veto, several seats on one connection, a declared interest anchor, and a session resume |
+
+The second exists because the first cannot reach any of that: a listen host holds a body of its own and
+therefore takes a different path through every per-entity pass, so "the server boots and replicates" was
+untested for the shape a shipped server image actually runs in.
 
 An empty run is a failure, not a pass — the runner exits non-zero on no suites or no `test_*` methods.
 

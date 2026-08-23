@@ -45,6 +45,19 @@ var _throttle: CommandThrottle = null
 # fetch where a node property read is a Variant round-trip.
 var _positions: PackedVector3Array = PackedVector3Array()
 var _alive: PackedByteArray = PackedByteArray()
+## Each unit's seat, parallel to the two mirrors above. Derived once from the id and never changed -- the
+## pool is static -- so the fog pass reads an array instead of calling RtsConfig.seat_of() per unit per tick.
+var _unit_seats: PackedInt32Array = PackedInt32Array()
+
+## SERVER-SIDE fog of war: one ScoutPolicy per seat, and the per-peer vetoes they drive.
+##
+## OFF BY DEFAULT, like every other lever in this demo. The plain configuration is the one a reader should
+## see first, and fog is a rule about this GAME rather than a property of the netcode -- what the netcode
+## supplies is `Net.set_entity_hidden()`, and a demo that turned it on unasked would make a policy look like
+## a default.
+var _fog: Array[ScoutPolicy] = []
+var _fog_on: bool = false
+var _fog_ticks: int = 0
 
 var _clock: float = 0.0          # seconds of simulated time, server-side
 var _offline_accumulator: float = 0.0
@@ -80,12 +93,21 @@ func build(seat_roster: SeatRoster, seat_owners: PackedInt32Array) -> void:
 	# Units. configure() before add_child, because the NAME is part of the path the entity id is hashed from.
 	# Registration is a SEPARATE pass -- see bind_net_all().
 	units.resize(RtsConfig.UNIT_COUNT)
+	_unit_seats.resize(RtsConfig.UNIT_COUNT)
 	for id: int in RtsConfig.UNIT_COUNT:
 		var unit: UnitBody = UnitBody.new()
 		unit.configure(id)
 		_units_root.add_child(unit)
 		unit.place(spawn_position(id), spawn_facing(id))
 		units[id] = unit
+		_unit_seats[id] = unit.seat
+
+	# One visibility policy per seat, built here rather than lazily so the fog lever has something to switch
+	# on. They are inert until set_fog(true), and on a client they are never refreshed at all -- a client does
+	# not decide what it may receive.
+	_fog.resize(RtsConfig.SEATS)
+	for seat: int in RtsConfig.SEATS:
+		_fog[seat] = ScoutPolicy.new()
 
 	# Commanders: one per SEAT, always all of them, whether or not anyone is sitting there. Creating them
 	# lazily as players join would mean the two peers build different node sets and therefore different
@@ -139,6 +161,12 @@ func set_seat_owner(seat: int, peer: int) -> void:
 	var commander: CommanderAvatar = commanders[seat]
 	if commander != null:
 		commander.set_owner_peer(peer)
+	# THE FOG IS KEYED ON THE PEER, AND THE PEER JUST CHANGED. A veto is dropped when its peer disconnects, so
+	# the arriving peer holds none -- while this seat's policy still remembers what the DEPARTED one could
+	# see. Left alone, the next refresh would report only the difference against that stale memory and leave
+	# the newcomer permanently able to see whatever its predecessor could.
+	if seat < _fog.size():
+		_fog[seat].clear()
 
 ## The signature of the world this peer built -- see RtsNames.world_signature(). Printed at build and asserted
 ## equal across peers by the probe: it is the direct gate on deterministic naming, and therefore on entity-id
@@ -198,6 +226,10 @@ func net_step() -> void:
 	if not _ready_to_step():
 		return
 	step(RtsConfig.NET_TICK_DT)
+	# AFTER the step, so the vetoes are decided from the poses this tick will actually broadcast. Before it,
+	# every visibility answer would be one tick stale -- which is survivable, and is still the wrong tick to
+	# have withheld a row from.
+	_fog_pass()
 
 func _physics_process(delta: float) -> void:
 	if not _built:
@@ -281,6 +313,69 @@ func _refresh_mirrors() -> void:
 			continue
 		_positions[id] = unit.position
 		_alive[id] = 1 if unit.is_alive() else 0
+
+
+# --- fog of war ----------------------------------------------------------------------------------
+## How many net ticks between visibility passes. A pass is every unit against every eye, and vision does not
+## change meaningfully inside 200 ms at these speeds -- the hysteresis band is wider than a unit walks in
+## that time, which is what makes the interval safe rather than merely cheap.
+const FOG_REFRESH_TICKS: int = 4
+
+## Turn fog of war on or off. SERVER-SIDE: on a client this changes nothing, because a client cannot decide
+## what it is allowed to receive, which is the entire security property the veto has.
+func set_fog(on: bool) -> void:
+	if _fog_on == on:
+		return
+	_fog_on = on
+	if not on:
+		_retract_every_veto()
+	_fog_ticks = 0
+
+func fog_enabled() -> bool:
+	return _fog_on
+
+## How many units are currently withheld from `seat`. 0 when the fog is off or the seat is unknown.
+func fog_hidden_count(seat: int) -> int:
+	if not _fog_on or seat < 0 or seat >= _fog.size():
+		return 0
+	return _fog[seat].hidden_count()
+
+## Recompute what each seat can see and move the vetoes to match.
+##
+## A LISTEN HOST'S OWN SEAT IS SKIPPED, and that is not an omission. The veto refuses a row in a DATAGRAM, and
+## the server sends itself none -- it holds the authoritative world by construction. Fog is a thing you do to
+## remote peers; a host sees everything and always did.
+func _fog_pass() -> void:
+	if not _fog_on or not Net.is_server():
+		return
+	_fog_ticks += 1
+	if _fog_ticks < FOG_REFRESH_TICKS:
+		return
+	_fog_ticks = 0
+	for seat: int in mini(RtsConfig.SEATS, _fog.size()):
+		var peer: int = roster.peer_of_seat(seat)
+		if peer <= SeatRoster.SERVER_PEER:
+			continue
+		var policy: ScoutPolicy = _fog[seat]
+		var changed: PackedInt32Array = policy.refresh(seat, _unit_seats, _positions, _alive)
+		for index: int in changed:
+			var unit: UnitBody = units[index]
+			if unit != null:
+				Net.set_entity_hidden(peer, unit.entity_id(), not policy.is_visible(index))
+
+## Hand every withheld unit back, then forget. Both halves are required: retracting without clearing leaves
+## each policy believing units are hidden that are not, and clearing without retracting strands live vetoes
+## the demo can no longer name.
+func _retract_every_veto() -> void:
+	for seat: int in mini(RtsConfig.SEATS, _fog.size()):
+		var peer: int = roster.peer_of_seat(seat)
+		var policy: ScoutPolicy = _fog[seat]
+		if peer > SeatRoster.SERVER_PEER:
+			for index: int in units.size():
+				var unit: UnitBody = units[index]
+				if unit != null and not policy.is_visible(index):
+					Net.set_entity_hidden(peer, unit.entity_id(), false)
+		policy.clear()
 
 ## The current liveness mirror, for the order validator and the HUD. A copy, so a caller cannot reach in and
 ## edit the server's view of who is alive.

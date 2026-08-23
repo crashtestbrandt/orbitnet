@@ -1,0 +1,12 @@
+[gd_scene load_steps=2 format=3]
+
+; The entire scene. Everything else -- the three arenas, the fighter pool, the props, the cameras, the HUD --
+; is built from code by arena_main.gd, deliberately: node paths are what OrbitNet derives entity ids from, and
+; code that builds them explicitly is far easier to keep identical across peers than a .tscn a stray editor
+; drag can reorder. The root's NAME is part of every entity's path, so renaming it is a wire-compatibility
+; break.
+
+[ext_resource type="Script" path="res://scripts/arena_main.gd" id="1_main"]
+
+[node name="Main" type="Node"]
+script = ExtResource("1_main")
