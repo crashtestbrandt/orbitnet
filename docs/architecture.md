@@ -142,9 +142,9 @@ inherits the same limit — nothing despawns, so the withheld entity's node stay
 session-global either way: the entity manifest goes to every synced peer whatever any one of them receives.
 
 **A seat's centre and its world both come from one body**: the lowest-id entity whose *input* authority is that
-peer, which declares that seat, and which resolved an anchor. A seat with no such body has neither, and the
-backend correctly falls back to "everything is in interest" — every world, at every distance. This is the
-limitation most likely to surprise you — see
+peer, which declares that seat, and which resolved an anchor. A connection with no such body on any seat has
+neither, and the backend correctly falls back to "everything is in interest" — every world, at every distance.
+This is the limitation most likely to surprise you — see
 [api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
 
 **A connection may hold several seats, and the filter runs once per seat.** A seat is one owned, predicted body
@@ -154,8 +154,21 @@ a viewpoint, so each seat gets its own centre, world, hysteresis band and cap �
 window, the veto and the byte budget stay per connection, because those are properties of a datagram. What the
 datagram carries is the **union** of the connection's seats, holding the **nearest** seat's distance per entity,
 and an entity leaves only when every seat has let go of it. Every body is on seat `0` until
-`NetRollbackHandle.set_seat()` says otherwise, which is one seat per connection and is what every connection had
-before seats existed.
+`NetRollbackHandle.assign_seat()` or `set_seat()` says otherwise, which is one seat per connection and is what
+every connection had before seats existed.
+
+**The fail-open is per connection, which is what makes a seat ARRIVING cheap.** Because the datagram carries the
+union, a seat with no resolved anchor would refuse nothing and so open the whole connection to every world — a
+full-state burst caused by a body that has not spawned yet, arriving exactly as a player is being seated. So an
+unresolved seat contributes no viewpoint while any other seat on the connection has one; only a connection where
+nothing resolved sees everything.
+
+**A seat is derived from `(input owner, seat label)` and the roster is announced from that.** Nothing holds a
+seat table beside ownership — a second source of truth about who drives a body is one that can disagree with the
+anti-forgery check on received input. The server rescans its registry once per frame, diffs the deduplicated
+pairs against what it last announced, and emits `Net.seat_opened` / `Net.seat_closed`; the entity manifest
+carries the same two columns per entity, so a client rebuilds the roster from a complete table and emits the same
+two events one manifest later.
 
 **That inference is a fallback, and `Net.set_peer_anchor()` replaces it.** What a peer observes is a different
 question from what its input drives — a spectator drives nothing, and a peer with a body in each of two worlds

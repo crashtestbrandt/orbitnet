@@ -21,6 +21,8 @@
 //!   input *novelty* rather than tick visitation, plus the tick-indexed memo ring.
 //! * [`interest`] — AOI: the uniform grid, per-seat interest sets with hysteresis, and the
 //!   per-connection union of them.
+//! * [`seats`] — which owned viewpoints a connection holds, and the add/remove diff both ends
+//!   announce from.
 //! * [`slots`] — the dense per-session entity index the wire carries in place of the 64-bit id.
 //! * [`priority`] — the send rota: distance bands, weights, and `staleness × weight` ordering.
 //! * [`pacing`] — coupled-mode tick slewing and the input-lead margin tracker.
@@ -39,6 +41,7 @@ pub mod pacing;
 pub mod priority;
 pub mod protocol;
 pub mod quant;
+pub mod seats;
 pub mod slots;
 pub mod tick;
 
@@ -55,5 +58,6 @@ pub use interest::{
 pub use pacing::{CoupledSlew, LeadTracker, SlewDecision};
 pub use priority::{Band, Candidate, WEIGHT_ONE, WEIGHT_OWNED};
 pub use protocol::{PropKind, PropRole, PropSchema, QuantKind, SchemaBuilder, PROTOCOL_VERSION};
+pub use seats::{SeatId, SeatIndex, SeatRoster};
 pub use slots::{SlotError, SlotTable, MAX_SLOTS, SLOT_QUARANTINE_TICKS};
 pub use tick::{TickAccumulator, TickRate, TickStep};
