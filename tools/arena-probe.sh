@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Three-process networked gate for the arena demo. This is the SECOND PR gate.
+# Three-process networked gate for the arena demo. This is the THIRD PR gate.
 #
-# WHAT IT COVERS THAT tools/rts-probe.sh CANNOT, which is why a second gating probe exists at all:
+# WHAT IT COVERS THAT tools/rts-probe.sh AND tools/server-shape-probe.sh CANNOT, which is why a third gating
+# probe exists at all. Every line is the INTEREST axis -- who receives what -- which neither other probe
+# reaches: the RTS probe replicates one world to every peer, and the shape probe reads one client's own seat.
 #
-#   * A DEDICATED server boots and replicates. No probe covered that shape before, and it is the shape a
-#     shipped server image runs in -- the RTS probe drives a listen host, which holds a body of its own and
-#     therefore takes a different path through every per-entity pass.
 #   * MEMBERSHIP filtering. Three arenas replicate the same LOCAL coordinates, so no radius can separate
 #     them: a client receiving nothing from an arena it holds no seat in is membership doing it and nothing
 #     else could have.
@@ -13,7 +12,11 @@
 #   * SEVERAL SEATS ON ONE CONNECTION, in two different arenas, receiving the union of both.
 #   * A DECLARED interest anchor: an observer that drives nothing still has exactly one arena in interest.
 #   * A SESSION RESUME: a relaunched process presenting the same identity gets its seats back.
-#   * The DEDICATED-VERSUS-LISTEN comparison, run as the same channel twice with both readings printed.
+#
+# It also runs the DEDICATED-VERSUS-LISTEN comparison, with both readings printed. That one is NOT this
+# probe's reason to exist -- tools/server-shape-probe.sh owns it, in the addon's own project where a failure
+# cannot be a demo's fault. It is kept here because these three arenas exercise it under interest filtering,
+# which the shape probe's single-seat scenario does not.
 #
 # THE READINGS ARE RISES, NOT VALUES. `NetStateHandle.last_known_state()` FAILS OPEN -- on a backend that
 # cannot answer it returns the present tick -- so a threshold test would be satisfied by the fallback and

@@ -317,8 +317,9 @@ looks exactly like a netcode bug. `puck_physics_test.gd` asserts the derivation 
   [filed gap](../README.md#limits); the HUD says so rather than leaving the line suspiciously empty.
 - **No InputMap** — raw key constants and the raw pointer, so there is no project-settings dependency to break
   across Godot versions. A real game should use one.
-- **No PR-gating probe.** The two scene-bound gates are `tools/rts-probe.sh` and `tools/arena-probe.sh`; this
-  demo's coverage is fourteen unit suites over its pure functions.
+- **No PR-gating probe.** The three scene-bound gates are `tools/rts-probe.sh`, `tools/server-shape-probe.sh`
+  and `tools/arena-probe.sh`, and CONTRIBUTING.md admits a fourth only for a fundamental regression none of
+  them reaches; this demo's coverage is fourteen unit suites over its pure functions.
 - **No interest filtering of any kind.** One shared rink, 34 entities, every one of them relevant to every
   peer. There is nothing to cull by distance, no second world to be a member of, and no exception inside the
   one world worth naming — [arena-demo.md](arena-demo.md) is the demo those three axes are about.

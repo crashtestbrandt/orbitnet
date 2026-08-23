@@ -4,14 +4,14 @@
 //! (`platform/linuxbsd/crash_handler_linuxbsd.cpp` `#ifndef DEBUG_ENABLED / #undef
 //! CRASH_HANDLER_ENABLED`, `platform/windows/crash_handler_windows.h` `#if defined(DEBUG_ENABLED) /
 //! #define CRASH_HANDLER_EXCEPTION`). A shipped build therefore prints **no** backtrace and never
-//! posts `MainLoop::NOTIFICATION_CRASH`, so `CrashLogger` never writes a report either — the absence
-//! of both in a field log is the expected baseline, not a clue. That is exactly how the death/respawn
-//! use-after-free arrived: three logs truncated mid-line with nothing after them.
+//! posts `MainLoop::NOTIFICATION_CRASH`, so a game's own crash reporter never writes a report either
+//! — the absence of both in a field log is the expected baseline, not a clue. That is exactly how the
+//! death/respawn use-after-free arrived: three logs truncated mid-line with nothing after them.
 //!
 //! This extension is first-party and loads in every build, debug and release alike, so it can install
 //! what the engine does not. What lands here is deliberately small: the signal/exception number and a
 //! frame list, written with async-signal-safe calls only, appended to `<user>/logs/crash-native.log`.
-//! Addresses without symbols are still actionable — the shipped cdylib is in Git LFS, so
+//! Addresses without symbols are still actionable — keep the shipped cdylib, and
 //! `addr2line -e liborbitnet.*.so <addr>` resolves them after the fact.
 //!
 //! ## What it does and does not catch
@@ -21,9 +21,26 @@
 //!   actually kills the process, and Godot's handler does not install it even in debug builds.
 //!   `SA_ONSTACK` + a dedicated alt stack means a stack overflow is captured too.
 //! * **Windows**: access violations and friends, via `SetUnhandledExceptionFilter`. It does **not**
-//!   see `__fastfail` — which is what the CRT raises on detected heap corruption, and it bypasses SEH
-//!   and unhandled-exception filters by design. Capturing that one needs an out-of-process collector
-//!   (WER `LocalDumps`); see the README's "Native crash capture in a SHIPPED build" note.
+//!   see `__fastfail` — what the CRT raises on detected heap corruption, and the Windows counterpart
+//!   of the `SIGABRT` case above. A fail-fast bypasses every frame-based and vector-based handler by
+//!   design, so nothing in-process can catch it. Only an out-of-process collector sees that one.
+//!
+//! ## Windows Error Reporting is READ, never written
+//!
+//! WER's `LocalDumps` is that out-of-process collector, and it does still run for a fail-fast.
+//! OrbitNet does not configure it, and cannot:
+//!
+//! * All four `LocalDumps` values are documented HKLM-only — "This setting is not supported in the
+//!   **HKEY_CURRENT_USER** registry hive" (WER Settings) — so there is no per-user hive to fall back
+//!   to when the machine-wide one is out of reach.
+//! * Writing the machine-wide key needs administrator privileges, and it sets crash-collection policy
+//!   for **every** application on the machine, not just the one that called. A game process has no
+//!   business holding either.
+//!
+//! So [`local_dumps`] READS the effective policy instead — the HKLM key, overridden by the per-image
+//! subkey — and the facade republishes it. A crash report can then name the folder a dump would land
+//! in (`<DumpFolder>\<image>.<pid>.dmp`), or say plainly that nothing collects. Setting the keys is
+//! the consuming project's installer's job; `docs/crash-capture.md` carries them and this decision.
 //!
 //! Every handler chains: it restores the previous disposition and re-raises (POSIX) or returns
 //! `EXCEPTION_CONTINUE_SEARCH` (Windows), so a debugger, a core dump, and Godot's own debug-build
@@ -70,6 +87,135 @@ pub(crate) fn install(dir: &str) -> bool {
     PATH_READY.store(true, Ordering::Release);
     platform::install();
     true
+}
+
+// --- Windows Error Reporting: the fail-fast path -------------------------------------------------
+//
+// Read-only, and called from the game thread rather than from a handler, so the async-signal-safety
+// rules the rest of this module lives under do not apply here: this half may allocate. The decision
+// this implements -- OrbitNet reads WER's policy and never writes it -- is in the module header.
+
+/// WER's own documented defaults, applied when the `LocalDumps` key exists but leaves a value unset.
+/// Reproduced here because "the key is present with no values" is the common configuration, and a
+/// report that says `dump_type 1` beats one that says the value was absent.
+#[cfg(any(windows, test))]
+const DEFAULT_DUMP_TYPE: i64 = 1;
+#[cfg(any(windows, test))]
+const DEFAULT_DUMP_COUNT: i64 = 10;
+/// The documented default folder, unexpanded. Only ever reported when `%LOCALAPPDATA%` is not in the
+/// environment, which on Windows means something is already wrong.
+#[cfg(windows)]
+const DEFAULT_DUMP_FOLDER: &str = r"%LOCALAPPDATA%\CrashDumps";
+
+/// What one `LocalDumps` key sets. `None` per field means the key does not set it, which is what
+/// makes the two-key merge below a per-VALUE override rather than a whole-key one -- WER reads the
+/// global key first and then overrides individual values from the per-image subkey.
+#[cfg(any(windows, test))]
+#[derive(Default, Clone)]
+pub(crate) struct DumpKey {
+    folder: Option<String>,
+    dump_type: Option<i64>,
+    dump_count: Option<i64>,
+}
+
+/// The effective `LocalDumps` policy for THIS process.
+///
+/// `configured` is what a report should lead with: false means a fail-fast leaves nothing behind at
+/// all, so the absence of a dump is the expected baseline rather than a lost file to hunt for.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LocalDumps {
+    /// False off Windows, where the question does not arise.
+    pub(crate) supported: bool,
+    /// Whether WER collects a dump for this process at all. The `LocalDumps` key's PRESENCE is what
+    /// enables collection; its values only override the defaults.
+    pub(crate) configured: bool,
+    /// Which key decided it: `none`, `global`, or `image` for the per-executable subkey.
+    pub(crate) scope: &'static str,
+    /// Where a dump would land, environment-expanded. Empty when nothing collects.
+    pub(crate) folder: String,
+    /// 0 custom, 1 mini (WER's default), 2 full.
+    pub(crate) dump_type: i64,
+    /// How many dumps the folder keeps before the oldest is replaced.
+    pub(crate) dump_count: i64,
+    /// This process's executable file name -- the name WER matches a per-image subkey on, and the
+    /// stem of the dump file (`<image>.<pid>.dmp`).
+    pub(crate) image: String,
+}
+
+impl LocalDumps {
+    /// Nothing collects: either the platform has no WER, or neither `LocalDumps` key exists.
+    fn none(supported: bool, image: String) -> Self {
+        Self {
+            supported,
+            configured: false,
+            scope: "none",
+            folder: String::new(),
+            dump_type: 0,
+            dump_count: 0,
+            image,
+        }
+    }
+}
+
+/// Merge the global key with the per-image subkey the way WER does: global first, then each value the
+/// per-image subkey sets. Either key on its own enables collection.
+///
+/// Pure, so it is a unit test on every platform rather than a Windows-only claim.
+#[cfg(any(windows, test))]
+fn resolve(
+    global: Option<DumpKey>,
+    per_image: Option<DumpKey>,
+    image: &str,
+    default_folder: &str,
+) -> LocalDumps {
+    if global.is_none() && per_image.is_none() {
+        return LocalDumps::none(true, image.to_string());
+    }
+    let scope = if per_image.is_some() {
+        "image"
+    } else {
+        "global"
+    };
+    let global = global.unwrap_or_default();
+    let per_image = per_image.unwrap_or_default();
+    LocalDumps {
+        supported: true,
+        configured: true,
+        scope,
+        folder: per_image
+            .folder
+            .or(global.folder)
+            .unwrap_or_else(|| default_folder.to_string()),
+        dump_type: per_image
+            .dump_type
+            .or(global.dump_type)
+            .unwrap_or(DEFAULT_DUMP_TYPE),
+        dump_count: per_image
+            .dump_count
+            .or(global.dump_count)
+            .unwrap_or(DEFAULT_DUMP_COUNT),
+        image: image.to_string(),
+    }
+}
+
+/// The file name from a full image path. WER keys its per-image subkey on the file name alone, and
+/// both separators are accepted because a path that reached us through Godot may carry either.
+#[cfg(any(windows, test))]
+fn image_base(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or("").to_string()
+}
+
+/// The effective WER `LocalDumps` policy for this process. Never writes the registry.
+#[cfg(windows)]
+pub(crate) fn local_dumps() -> LocalDumps {
+    platform::local_dumps()
+}
+
+/// No WER off Windows -- and no gap either: the POSIX handler above already covers `SIGABRT`, which
+/// is the case a fail-fast stands in for.
+#[cfg(not(windows))]
+pub(crate) fn local_dumps() -> LocalDumps {
+    LocalDumps::none(false, String::new())
 }
 
 /// Append `bytes` to `fd`, retrying a short write. Async-signal-safe (write(2) only).
@@ -225,7 +371,10 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::{render_u64, LOG_PATH, MAX_FRAMES, PATH_READY};
+    use super::{
+        image_base, render_u64, resolve, DumpKey, LocalDumps, DEFAULT_DUMP_FOLDER, LOG_PATH,
+        MAX_FRAMES, PATH_READY,
+    };
     use std::sync::atomic::Ordering;
 
     type Handle = *mut core::ffi::c_void;
@@ -288,6 +437,7 @@ mod platform {
         fn SetUnhandledExceptionFilter(
             filter: Option<TopLevelExceptionFilter>,
         ) -> Option<TopLevelExceptionFilter>;
+        fn GetModuleFileNameW(module: Handle, buf: *mut u16, size: u32) -> u32;
     }
 
     unsafe fn write_all(file: Handle, bytes: &[u8]) {
@@ -374,6 +524,194 @@ mod platform {
         // SAFETY: called once from the boot path.
         unsafe { SetUnhandledExceptionFilter(Some(filter)) };
     }
+
+    // --- WER LocalDumps read-back ---------------------------------------------------------------
+
+    type HKey = *mut core::ffi::c_void;
+    const HKEY_LOCAL_MACHINE: HKey = 0x8000_0002u32 as usize as HKey;
+    const ERROR_SUCCESS: i32 = 0;
+    const ERROR_MORE_DATA: i32 = 234;
+    /// `KEY_READ | KEY_WOW64_64KEY`. The 64-bit view is named explicitly so a 32-bit export reads the
+    /// key WER itself consults rather than the `Wow6432Node` mirror; on a 32-bit OS the flag is
+    /// ignored.
+    const KEY_READ_64: u32 = 0x0002_0019 | 0x0000_0100;
+    /// `RRF_RT_ANY`, with the returned type checked against [`REG_SZ`] / [`REG_EXPAND_SZ`] instead.
+    ///
+    /// `RRF_NOEXPAND` is deliberately ABSENT: `DumpFolder` is a `REG_EXPAND_SZ` holding
+    /// `%LOCALAPPDATA%\CrashDumps` by default, and the expansion has to happen in THIS process's
+    /// environment, because this process is the one that would crash. Expansion turns the reported
+    /// type into `REG_SZ`, which is exactly what a type-restricting flag combination gets wrong -- so
+    /// the restriction is dropped and the type is inspected after the fact.
+    const RRF_ANY: u32 = 0x0000_ffff;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const RRF_DWORD: u32 = 0x0000_0010;
+    /// The machine-wide key. There is no `HKEY_CURRENT_USER` counterpart -- see the module header.
+    const LOCAL_DUMPS_KEY: &str = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps";
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            key: HKey,
+            sub_key: *const u16,
+            options: u32,
+            desired: u32,
+            out: *mut HKey,
+        ) -> i32;
+        fn RegCloseKey(key: HKey) -> i32;
+        fn RegGetValueW(
+            key: HKey,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut core::ffi::c_void,
+            len: *mut u32,
+        ) -> i32;
+    }
+
+    /// A NUL-terminated UTF-16 copy, which is what every `W` entry point wants.
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// One string value, environment-expanded. `None` if it is absent or is not a string.
+    unsafe fn read_string(key: HKey, name: &str) -> Option<String> {
+        let name = wide(name);
+        let mut bytes: u32 = 0;
+        // SAFETY: `key` is open for KEY_QUERY_VALUE; a null data pointer asks for the size alone.
+        let status = unsafe {
+            RegGetValueW(
+                key,
+                std::ptr::null(),
+                name.as_ptr(),
+                RRF_ANY,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        // Two attempts rather than one: the size a probing call reports is the UNEXPANDED string's,
+        // and `%LOCALAPPDATA%` expands longer than it reads. A short buffer comes back as
+        // ERROR_MORE_DATA carrying the real size, which the second attempt allocates to.
+        for _ in 0..2 {
+            let mut buf = vec![0u16; (bytes as usize / 2) + 1];
+            let mut size = (buf.len() * 2) as u32;
+            let mut kind: u32 = 0;
+            // SAFETY: the buffer is live and `size` states its true length in bytes.
+            let status = unsafe {
+                RegGetValueW(
+                    key,
+                    std::ptr::null(),
+                    name.as_ptr(),
+                    RRF_ANY,
+                    &mut kind,
+                    buf.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            };
+            if status == ERROR_SUCCESS {
+                if kind != REG_SZ && kind != REG_EXPAND_SZ {
+                    return None;
+                }
+                // RegGetValue counts the terminator; a registry string may also be stored without
+                // one, so clamp rather than trusting the arithmetic.
+                let chars = ((size as usize / 2).saturating_sub(1)).min(buf.len());
+                return Some(String::from_utf16_lossy(&buf[..chars]));
+            }
+            if status != ERROR_MORE_DATA {
+                return None;
+            }
+            bytes = size;
+        }
+        None
+    }
+
+    /// One `REG_DWORD` value. `None` if it is absent or is not a DWORD.
+    unsafe fn read_dword(key: HKey, name: &str) -> Option<i64> {
+        let name = wide(name);
+        let mut value: u32 = 0;
+        let mut size: u32 = 4;
+        // SAFETY: `key` is open for KEY_QUERY_VALUE; the destination is a live u32 and `size` says so.
+        let status = unsafe {
+            RegGetValueW(
+                key,
+                std::ptr::null(),
+                name.as_ptr(),
+                RRF_DWORD,
+                std::ptr::null_mut(),
+                (&raw mut value).cast(),
+                &mut size,
+            )
+        };
+        (status == ERROR_SUCCESS).then_some(i64::from(value))
+    }
+
+    /// The three values one `LocalDumps` key sets, or `None` if the key does not exist. The
+    /// distinction matters: an EMPTY key still enables collection, at WER's defaults.
+    unsafe fn read_key(sub_key: &str) -> Option<DumpKey> {
+        let sub_key = wide(sub_key);
+        let mut key: HKey = std::ptr::null_mut();
+        // SAFETY: both pointers are to live locals; the string is NUL-terminated.
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                sub_key.as_ptr(),
+                0,
+                KEY_READ_64,
+                &mut key,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        // SAFETY: `key` is open until the RegCloseKey below.
+        let values = unsafe {
+            DumpKey {
+                folder: read_string(key, "DumpFolder"),
+                dump_type: read_dword(key, "DumpType"),
+                dump_count: read_dword(key, "DumpCount"),
+            }
+        };
+        // SAFETY: closing the handle this function opened, exactly once.
+        unsafe { RegCloseKey(key) };
+        Some(values)
+    }
+
+    /// This process's executable file name, which is what WER matches a per-image subkey on.
+    fn image_name() -> String {
+        let mut buf = [0u16; 1024];
+        // SAFETY: a null module handle asks for this process's own image; `buf.len()` bounds the write.
+        let written =
+            unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) }
+                as usize;
+        image_base(&String::from_utf16_lossy(&buf[..written.min(buf.len())]))
+    }
+
+    /// WER's default folder, expanded here rather than reported as the literal the documentation
+    /// gives: a report that names a path a player can paste into Explorer is worth more than one that
+    /// names an environment variable.
+    fn default_folder() -> String {
+        match std::env::var("LOCALAPPDATA") {
+            Ok(local) if !local.is_empty() => format!(r"{local}\CrashDumps"),
+            _ => DEFAULT_DUMP_FOLDER.to_string(),
+        }
+    }
+
+    pub(super) fn local_dumps() -> LocalDumps {
+        let image = image_name();
+        // SAFETY: both calls only read; each opens and closes its own key.
+        let global = unsafe { read_key(LOCAL_DUMPS_KEY) };
+        let per_image = if image.is_empty() {
+            None
+        } else {
+            unsafe { read_key(&format!(r"{LOCAL_DUMPS_KEY}\{image}")) }
+        };
+        resolve(global, per_image, &image, &default_folder())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -383,7 +721,7 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::render_u64;
+    use super::{image_base, local_dumps, render_u64, resolve, DumpKey};
 
     #[test]
     fn renders_decimal_without_allocating() {
@@ -395,5 +733,102 @@ mod tests {
         assert_eq!(render_u64(1234567890, &mut buf), b"1234567890");
         let mut buf = [0u8; 24];
         assert_eq!(render_u64(u64::MAX, &mut buf), b"18446744073709551615");
+    }
+
+    /// The three values a key sets, spelled out at each call site so a test reads as the registry
+    /// state it stands for.
+    fn key(folder: Option<&str>, dump_type: Option<i64>, dump_count: Option<i64>) -> DumpKey {
+        DumpKey {
+            folder: folder.map(str::to_string),
+            dump_type,
+            dump_count,
+        }
+    }
+
+    #[test]
+    fn no_local_dumps_key_means_nothing_collects() {
+        let dumps = resolve(
+            None,
+            None,
+            "game.exe",
+            r"C:\Users\ada\AppData\Local\CrashDumps",
+        );
+        assert!(!dumps.configured);
+        assert_eq!(dumps.scope, "none");
+        // Empty rather than the default folder: naming a folder nothing writes to would send a
+        // player hunting for a file that was never created.
+        assert_eq!(dumps.folder, "");
+        assert_eq!(dumps.image, "game.exe");
+    }
+
+    #[test]
+    fn an_empty_key_still_collects_at_wers_defaults() {
+        let dumps = resolve(
+            Some(key(None, None, None)),
+            None,
+            "game.exe",
+            r"C:\Users\ada\AppData\Local\CrashDumps",
+        );
+        assert!(
+            dumps.configured,
+            "the key's PRESENCE is what enables collection"
+        );
+        assert_eq!(dumps.scope, "global");
+        assert_eq!(dumps.folder, r"C:\Users\ada\AppData\Local\CrashDumps");
+        assert_eq!(dumps.dump_type, 1);
+        assert_eq!(dumps.dump_count, 10);
+    }
+
+    #[test]
+    fn the_per_image_subkey_overrides_value_by_value() {
+        let dumps = resolve(
+            Some(key(Some(r"D:\dumps"), Some(1), Some(10))),
+            Some(key(None, Some(2), None)),
+            "game.exe",
+            r"C:\Users\ada\AppData\Local\CrashDumps",
+        );
+        assert_eq!(dumps.scope, "image");
+        // Folder and count fall through from the global key -- WER reads that one first and then
+        // overrides only the values the per-image subkey actually sets.
+        assert_eq!(dumps.folder, r"D:\dumps");
+        assert_eq!(dumps.dump_count, 10);
+        assert_eq!(dumps.dump_type, 2, "a full dump was asked for per image");
+    }
+
+    #[test]
+    fn a_per_image_subkey_alone_collects() {
+        let dumps = resolve(
+            None,
+            Some(key(Some(r"D:\dumps"), None, None)),
+            "game.exe",
+            r"C:\Users\ada\AppData\Local\CrashDumps",
+        );
+        assert!(dumps.configured);
+        assert_eq!(dumps.scope, "image");
+        assert_eq!(dumps.folder, r"D:\dumps");
+        assert_eq!(dumps.dump_type, 1);
+    }
+
+    #[test]
+    fn the_image_name_is_the_file_name_either_separator() {
+        assert_eq!(image_base(r"C:\Program Files\Game\game.exe"), "game.exe");
+        assert_eq!(image_base("/opt/game/game.x86_64"), "game.x86_64");
+        assert_eq!(image_base("game.exe"), "game.exe");
+        assert_eq!(image_base(""), "");
+    }
+
+    #[test]
+    fn the_readback_never_claims_a_dump_folder_it_did_not_find() {
+        // Holds on every platform, and is the invariant a crash report reads: a folder is reported
+        // only when something is configured to write into it. Off Windows both are false/empty.
+        let dumps = local_dumps();
+        assert_eq!(
+            dumps.configured,
+            !dumps.folder.is_empty(),
+            "configured and a named folder travel together"
+        );
+        if !cfg!(windows) {
+            assert!(!dumps.supported, "WER is a Windows question");
+        }
     }
 }

@@ -79,6 +79,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 | [netbench.md](docs/netbench.md) | Impairment relay, bot fleet, tick-domain gates. |
 | [building.md](docs/building.md) | Rust toolchain and the binary distribution policy. |
 | [steam.md](docs/steam.md) | The Steam transport contract. |
+| [crash-capture.md](docs/crash-capture.md) | What a release build records when it dies, and the Windows fail-fast gap. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Layout, the enforced boundaries, the GDScript rules. |
 
 ## The RTS demo

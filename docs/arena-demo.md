@@ -271,7 +271,7 @@ rather than a limitation — a peer cannot decide what it is allowed to receive.
 
 ## The gate
 
-`tools/arena-probe.sh` is the second PR-gating probe. Three passes:
+`tools/arena-probe.sh` is the third PR-gating probe. Three passes:
 
 | Pass | Shape | What it establishes |
 |---|---|---|

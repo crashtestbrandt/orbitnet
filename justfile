@@ -77,18 +77,27 @@ harness-smoke:
     # --quit-after is a frame-count backstop only: smoke.gd quits itself as soon as it has a verdict.
     "{{godot}}" --headless --path harness --quit-after 600
 
+# Both SERVER SHAPES end to end, in the harness project: a joining client's own state channel delivers rows
+# against a dedicated server and against a listen server alike, and a third run with that channel vetoed
+# proves the assertion can see a channel that delivers none.
+server-shape-probe:
+    GODOT="{{godot}}" tools/server-shape-probe.sh
+
 # The two-peer networked gate: identical worlds, orders replicated, a forged order refused.
 rts-probe:
     GODOT="{{godot}}" tools/rts-probe.sh
 
-# The three-process networked gate: a DEDICATED server and two clients. It covers what the RTS probe cannot --
-# dedicated-server boot, membership filtering, a per-peer veto, several seats on one connection, and the
-# dedicated-versus-listen comparison. See CONTRIBUTING.md for why there are two gating probes rather than one.
+# The three-process networked gate: a DEDICATED server and two clients. It covers the interest axis neither
+# other probe reaches -- membership filtering across three worlds, a per-peer veto, several seats on one
+# connection, a declared anchor, and a session resume. See CONTRIBUTING.md for why three probes gate rather
+# than one.
 arena-probe:
     GODOT="{{godot}}" tools/arena-probe.sh
 
-# Everything a PR must pass, in the order that fails fastest first.
-check: addon-tracked addon-drift net-check descriptor-parity native-test lint test rts-probe arena-probe
+# Everything a PR must pass, in the order that fails fastest first. The shape probe runs before the two demo
+# probes because it is the addon's own project: a failure there is the addon, where a failure in a demo could
+# be either.
+check: addon-tracked addon-drift net-check descriptor-parity native-test lint test server-shape-probe rts-probe arena-probe
 
 # =====================================================================================================
 # the native backend (Rust)

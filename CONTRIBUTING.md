@@ -8,7 +8,7 @@ just check           # everything a PR must pass
 ```
 
 `check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → cargo gates → lint →
-unit suites → the two-peer RTS probe.
+unit suites → the server-shape probe → the two-peer RTS probe.
 
 ## Layout, and where to edit
 
@@ -75,21 +75,24 @@ all pure, all unit tests.
 Logic on a `Node` is usually *still* unit-testable via `.new()` without calling `_ready()`, and static methods
 need no instance at all. Do not reach for a probe just because a class extends `Node`.
 
-**Genuinely needs a live scene, physics or network?** → a probe under `tools/instr/`. But a probe gates PRs
-**only** if it guards a fundamental netcode regression: rollback determinism, prediction and reconciliation,
-two-peer sync, dedicated-server boot, the facade, or the transport factory.
+**Genuinely needs a live scene, physics or network?** → a probe: a driver script under `tools/`, plus its
+instrumentation inside the project it drives (`tools/instr/` in a demo, a scene of its own in `harness/`). But
+a probe gates PRs **only** if it guards a fundamental netcode regression: rollback determinism, prediction and
+reconciliation, two-peer sync, dedicated-server boot, interest filtering, the facade, or the transport factory.
 
-**Two** probes gate PRs, and adding a third needs the same argument these two make. If a probe's assertions
-are pure math, port them to a unit test and delete the redundant block.
+Three probes gate PRs today, and each reaches one item on that list the other two cannot:
 
-| Probe | Guards |
+| Probe | What it guards |
 | --- | --- |
-| `tools/rts-probe.sh` | two-peer sync against a LISTEN host: identical worlds, orders replicated, a forged order refused |
-| `tools/arena-probe.sh` | DEDICATED-server boot, membership filtering, a per-peer veto, several seats on one connection, a declared interest anchor, and a session resume |
+| `tools/rts-probe.sh` | two-peer sync: identical worlds, orders replicated, a forged order refused |
+| `tools/server-shape-probe.sh` | both **server shapes** end to end -- a joining client's own state channel delivers rows against a dedicated server and against a listen server alike |
+| `tools/arena-probe.sh` | **interest filtering**: membership across three worlds, a per-peer veto, several seats on one connection, a declared anchor, and a session resume |
 
-The second exists because the first cannot reach any of that: a listen host holds a body of its own and
-therefore takes a different path through every per-entity pass, so "the server boots and replicates" was
-untested for the shape a shipped server image actually runs in.
+**A fourth needs a line on that list none of the three already covers.** If a probe's assertions are pure math,
+port them to a unit test and delete the redundant block. And a probe that can only ever pass is not coverage:
+the shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL)
+and the arena probe asserts a withheld entity's rows stop while its neighbours keep arriving, for exactly that
+reason.
 
 An empty run is a failure, not a pass — the runner exits non-zero on no suites or no `test_*` methods.
 

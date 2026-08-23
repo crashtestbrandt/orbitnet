@@ -170,6 +170,53 @@ func install_native_crash_handler(dir: String) -> bool:
 		return false
 	return _orbit.install_crash_handler(dir)
 
+## Where a Windows FAIL-FAST crash would leave a dump, read back from Windows Error Reporting (WER).
+##
+## The handler [method install_native_crash_handler] installs catches everything an in-process handler can. On
+## Windows that excludes `__fastfail` -- what the CRT raises on detected heap corruption, the counterpart of the
+## SIGABRT case covered on Linux and macOS -- because a fail-fast bypasses every frame-based and vector-based
+## handler by design. WER's out-of-process `LocalDumps` collector is the only thing that sees it.
+##
+## THE ADDON NEVER WRITES THOSE REGISTRY KEYS. All four are documented HKLM-only (there is no HKEY_CURRENT_USER
+## fallback), writing them needs administrator privileges, and they set crash-collection policy for EVERY
+## application on the machine. So this reads what the machine is already configured to do, and a game's crash
+## report can name the folder a dump would land in -- `<folder>/<image>.<pid>.dmp` -- or say plainly that
+## nothing collects. Setting the keys is an installer's job; docs/crash-capture.md carries them.
+##
+##   supported   -- false off Windows, and on a backend binary too old to answer. The question does not arise.
+##   configured  -- whether WER collects a dump for this process at all. FALSE MEANS A FAIL-FAST LEAVES NOTHING.
+##   scope       -- which key decided it: "none", "global", or "image" for the per-executable subkey
+##   folder      -- where a dump would land, environment-expanded. EMPTY whenever nothing collects
+##   dump_type   -- 0 custom, 1 mini (WER's default), 2 full
+##   dump_count  -- how many dumps the folder keeps before the oldest is replaced
+##   image       -- this process's executable file name, which is also the dump file's stem
+func native_crash_dump_config() -> Dictionary[String, Variant]:
+	var nothing: Dictionary[String, Variant] = {
+		"supported": false, "configured": false, "scope": "none",
+		"folder": "", "dump_type": 0, "dump_count": 0, "image": "",
+	}
+	# Probed for the same reason install_native_crash_handler probes: the committed binary and this script are
+	# refreshed on different schedules, and a diagnostics read has no business erroring on an older backend.
+	if _orbit == null or not _orbit.has_method(&"crash_dump_config"):
+		return nothing
+	var cfg: Dictionary = _orbit.crash_dump_config()
+	var supported: bool = cfg.get("supported", false)
+	var configured: bool = cfg.get("configured", false)
+	var scope: String = cfg.get("scope", "none")
+	var folder: String = cfg.get("folder", "")
+	var dump_type: int = cfg.get("dump_type", 0)
+	var dump_count: int = cfg.get("dump_count", 0)
+	var image: String = cfg.get("image", "")
+	return {
+		"supported": supported,
+		"configured": configured,
+		"scope": scope,
+		"folder": folder,
+		"dump_type": dump_type,
+		"dump_count": dump_count,
+		"image": image,
+	}
+
 # --- backend-version tolerance -------------------------------------------------------------------
 ## Read a backend property that may not exist on the loaded binary yet, falling back to `fallback`.
 ##

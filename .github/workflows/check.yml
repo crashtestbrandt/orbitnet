@@ -165,12 +165,17 @@ jobs:
       - name: Extension load smoke (throwaway project)
         run: tools/orbitnet-smoke.sh --skip-build
 
+      # Before the RTS probe because it runs in the harness project, which contains no game: a failure there
+      # is the addon, where a failure in a demo could be the demo's fault or the addon's.
+      - name: Server-shape probe (dedicated and listen, end to end)
+        run: tools/server-shape-probe.sh
+
       - name: Two-peer RTS probe
         run: tools/rts-probe.sh
 
-      # The second gating probe. It covers what the RTS one cannot: a DEDICATED server boots (no probe covered
-      # that shape before), membership filtering across three worlds, a per-peer veto, and several seats on one
-      # connection. CONTRIBUTING.md records why there are two rather than one.
+      # The third gating probe. It covers the interest axis the other two cannot: membership filtering across
+      # three worlds, a per-peer veto, several seats on one connection, a declared anchor, and a session
+      # resume. CONTRIBUTING.md records why three probes gate rather than one.
       - name: Three-process arena probe
         run: tools/arena-probe.sh
 
@@ -181,6 +186,7 @@ jobs:
           name: check-logs
           path: |
             /tmp/rtsprobe-*
+            /tmp/shapeprobe-*
             /tmp/arenaprobe-*
             /tmp/orbitnet-lint*
           if-no-files-found: ignore
