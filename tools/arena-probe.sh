@@ -44,7 +44,10 @@ PIDS=""
 LOGS=""
 
 cleanup() {
-	kill -9 "${WATCHPID:-0}" 2>/dev/null
+	# NOT "${WATCHPID:-0}". `kill -9 0` signals every process in the CALLER'S process group, so on the one
+	# exit path that runs before the watchdog is armed -- the missing-addon guard below -- the trap would
+	# SIGKILL the shell that invoked the probe, and in CI the rest of the job with it.
+	[ -n "${WATCHPID:-}" ] && kill -9 "$WATCHPID" 2>/dev/null
 	for pid in $PIDS; do kill -9 "$pid" 2>/dev/null; done
 	for log in $LOGS; do rm -f "$log"; done
 	return 0
@@ -75,6 +78,16 @@ spawn() {
 	PIDS="$PIDS $SPAWNED"
 }
 
+# A hung session must fail loudly rather than hang CI forever. RE-ARMED PER PASS, because the subshell
+# expands $PIDS at FORK time: one watchdog started in pass A holds pass A's three pids and would let a hung
+# process in pass B or C block `wait` until the CI job's own timeout, which reports as a stall rather than as
+# this gate failing.
+arm_watchdog() {
+	[ -n "${WATCHPID:-}" ] && kill -9 "$WATCHPID" 2>/dev/null
+	( sleep "$WATCHDOG_S"; kill -9 $PIDS 2>/dev/null ) &
+	WATCHPID=$!
+}
+
 ok=1
 fail() { printf 'arena-probe: %s\n' "$1"; ok=0; }
 
@@ -100,9 +113,7 @@ sleep 2
 spawn "$OBSERVER_A" --join="127.0.0.1:$PORT_A" --observe --watch="$WATCH_ARENA" \
 	--arena-probe --quit-after="$((RUN_S - 2))"; OPID=$SPAWNED
 
-# Watchdog: a hung session must fail loudly rather than hang CI forever.
-( sleep "$WATCHDOG_S"; kill -9 $PIDS 2>/dev/null ) &
-WATCHPID=$!
+arm_watchdog
 
 wait "$CPID" 2>/dev/null
 wait "$OPID" 2>/dev/null
@@ -208,6 +219,7 @@ echo "arena-probe: pass B -- listen server on port $PORT_B"
 spawn "$SERVER_B" --host="$PORT_B" --arena-probe --quit-after="$((RUN_S + 3))"; SPID_B=$SPAWNED
 sleep 3
 spawn "$CLIENT_B" --join="127.0.0.1:$PORT_B" --seats=2 --arena-probe --quit-after="$RUN_S"; CPID_B=$SPAWNED
+arm_watchdog
 
 wait "$CPID_B" 2>/dev/null
 wait "$SPID_B" 2>/dev/null
@@ -252,10 +264,12 @@ spawn "$SERVER_C" --dedicated="$PORT_C" --quit-after="$((RESUME_S * 2 + 10))"; S
 sleep 3
 spawn "$CLIENT_C1" --join="127.0.0.1:$PORT_C" --seats=2 --session="$SESSION_ID" \
 	--quit-after="$RESUME_S"; C1=$SPAWNED
+arm_watchdog
 wait "$C1" 2>/dev/null
 sleep 2
 spawn "$CLIENT_C2" --join="127.0.0.1:$PORT_C" --seats=2 --session="$SESSION_ID" \
 	--quit-after="$RESUME_S"; C2=$SPAWNED
+arm_watchdog
 wait "$C2" 2>/dev/null
 wait "$SPID_C" 2>/dev/null
 
