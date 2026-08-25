@@ -42,7 +42,7 @@ func _init() -> void:
 
 ## Record `position` as the simulation's answer for `tick`.
 ##
-## Returns the correction in METRES when this tick had already been simulated, or -1.0 on a first visit. The
+## Returns the correction in METERS when this tick had already been simulated, or -1.0 on a first visit. The
 ## caller distinguishes the two: -1.0 is "nothing to compare against", which is not the same as "no error".
 func note(tick: int, position: Vector3) -> float:
 	if tick < 0:
@@ -60,7 +60,7 @@ func note(tick: int, position: Vector3) -> float:
 		_corrections += 1
 	return error
 
-## The `fraction` percentile of the recorded corrections, in MILLIMETRES. 0.0 when nothing has been recorded.
+## The `fraction` percentile of the recorded corrections, in MILLIMETERS. 0.0 when nothing has been recorded.
 func percentile_mm(fraction: float) -> float:
 	if _errors.is_empty():
 		return 0.0

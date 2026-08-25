@@ -128,7 +128,7 @@ func _seats_text() -> String:
 
 ## The wire, per second.
 ##
-## `unproven acks` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret
+## `unproven acks` COUNTS REFUSED ACKNOWLEDGMENTS. The server mints a token per snapshot frame from a secret
 ## it never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot claim to
 ## have received a frame that never reached it -- and therefore cannot deepen its own rewind by lying about
 ## its link. A clean session sits at 0.

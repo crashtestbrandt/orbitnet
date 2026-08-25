@@ -107,7 +107,7 @@ func sample(_body: Node) -> Dictionary:
 	var out: Dictionary = {}
 	if _net == null or _net.rink == null or _net.rink.puck == null:
 		return out
-	# In METRES, the game's own units, as the vocabulary asks. The meter reports millimeters because that is
+	# In METERS, the game's own units, as the vocabulary asks. The meter reports millimeters because that is
 	# what a human reads; the CSV keeps the unit the rest of the bench uses.
 	var meter: ReconcileMeter = _net.rink.puck.meter()
 	out[KEY_RECONCILE_ERROR] = meter.percentile_mm(0.5) / 1000.0

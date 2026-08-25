@@ -9,7 +9,7 @@ class_name ArenaView
 ## ONE MULTIMESH PER ARENA FOR THE PROPS. Several hundred props per arena is several hundred draw calls as
 ## separate nodes and one as a MultiMesh, and they never move -- a static MultiMesh is what that is for.
 
-const FLOOR_COLOURS: Array[Color] = [
+const FLOOR_COLORS: Array[Color] = [
 	Color(0.10, 0.11, 0.14),
 	Color(0.12, 0.10, 0.13),
 	Color(0.10, 0.13, 0.13),
@@ -34,7 +34,7 @@ func _build_floor(root: Node3D, offset: int) -> void:
 	plane.size = Vector3(ArenaConfig.ARENA_HALF_X * 2.0, 0.2, ArenaConfig.ARENA_HALF_Z * 2.0)
 	floor_mesh.mesh = plane
 	floor_mesh.position = Vector3(0.0, -0.1, 0.0)
-	floor_mesh.material_override = _flat(FLOOR_COLOURS[offset % FLOOR_COLOURS.size()])
+	floor_mesh.material_override = _flat(FLOOR_COLORS[offset % FLOOR_COLORS.size()])
 	root.add_child(floor_mesh)
 
 func _build_cover(root: Node3D) -> void:

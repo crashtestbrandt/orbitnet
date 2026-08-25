@@ -315,7 +315,7 @@ fragment costs the whole frame.
 
 ### How an unreliable datagram carries an event
 
-- **The pending delta is a net difference, not a log.** Queueing a leave drops any pending enter for the same
+- **The pending delta is a net difference, not a log.** Queuing a leave drops any pending enter for the same
   entity and vice versa, so an id is named in at most one half and the section says where that entity stands
   now.
 - **It is re-sent until the peer's `ack_tick` reaches the tick it first rode on.** The ack window and the frame

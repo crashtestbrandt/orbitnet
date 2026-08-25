@@ -2197,7 +2197,7 @@ impl OrbitNet {
     ///
     /// **`resumed_from` NAMES A CONNECTION THAT MAY STILL BE UP.** It is whichever connection last claimed
     /// this identity, whether the server saw it drop or not — the second case is a relaunched client that
-    /// beat its own keepalive timeout. Honouring it hands the new claimant that peer's body.
+    /// beat its own keepalive timeout. Honoring it hands the new claimant that peer's body.
     ///
     /// **It is reported only for a claim the server GRANTED**, and a claim is granted only when the joiner
     /// quoted the [`Handshake::resume_token`] this server issued for that identity — see [`resume_grant`].

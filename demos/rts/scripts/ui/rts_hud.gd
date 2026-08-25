@@ -195,7 +195,7 @@ func _local_commander() -> CommanderAvatar:
 
 ## The wire, per second. Two columns here are facts the demo could not report before.
 ##
-## `unproven` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret it
+## `unproven` COUNTS REFUSED ACKNOWLEDGMENTS. The server mints a token per snapshot frame from a secret it
 ## never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot acknowledge a
 ## frame that never reached it -- and therefore cannot deepen its own rewind by claiming a link it does not
 ## have. A clean session sits at 0. Anything else is a peer whose acks do not match what it was sent.
