@@ -161,7 +161,7 @@ func _compose() -> String:
 
 ## The wire, per second.
 ##
-## `unproven acks` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret
+## `unproven acks` COUNTS REFUSED ACKNOWLEDGMENTS. The server mints a token per snapshot frame from a secret
 ## it never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot claim a
 ## frame that never reached it. A clean session sits at 0.
 func _wire_line() -> String:

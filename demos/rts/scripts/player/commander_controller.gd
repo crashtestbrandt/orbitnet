@@ -19,7 +19,7 @@ class_name CommanderController
 ## every unit it named, and that number already replicates inside net_meta. So the client records the
 ## sequence it saw at send time and stops the clock when any targeted unit's sequence changes.
 ##
-## A REFUSED ORDER IS CANCELLED, NOT TIMED OUT. A refusal changes no sequence number, so the measurement has
+## A REFUSED ORDER IS CANCELED, NOT TIMED OUT. A refusal changes no sequence number, so the measurement has
 ## nothing to stop on; it used to sit for four seconds and then give up, which blocked the next measurement
 ## for that whole window and folded every refusal into the percentile as a four-second sample.
 ## [signal NetCommand.rejected] now reaches the peer that asked, carrying the tag [method NetCommand.request]
@@ -267,7 +267,7 @@ func _poll_pending_order() -> void:
 	if Time.get_ticks_usec() - _pending_sent_us > 4_000_000:
 		_clear_pending()
 
-# A refusal for THIS seat's channel. Cancelling on the tag rather than on the verb is what keeps the
+# A refusal for THIS seat's channel. Canceling on the tag rather than on the verb is what keeps the
 # measurement honest when a player issues a second order before the first resolves: the reply names the
 # request that failed, so an older refusal cannot cancel a newer pending order.
 func _on_order_rejected(_verb: StringName, code: int, tag: int) -> void:

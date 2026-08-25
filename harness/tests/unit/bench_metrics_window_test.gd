@@ -10,7 +10,7 @@ extends UnitTest
 ## - **A WINDOW SUBTRACTS ITS OWN FIRST READING.** The game publishes run totals, so a bench window opened
 ##   mid-session must not report the whole session's shots as its own. Reading the raw total is how a
 ##   `--bench-duration=20` run over a five-minute session reports five minutes of combat.
-## - **A COUNTER THAT GOES BACKWARDS REPORTS ZERO.** A respawn or a reconnect can re-seed a total, and a
+## - **A COUNTER THAT GOES BACKWARD REPORTS ZERO.** A respawn or a reconnect can re-seed a total, and a
 ##   negative count is worse than no count: the gate would read it as a peer that fired nothing.
 ## - **PEAK AND STANDING RESIDUAL ARE DIFFERENT FACTS.** The peak is monotonic in the LENGTH of the run, so
 ##   it cannot tell one absorbed correction from a tilt that never bled away. The standing figure -- the

@@ -346,7 +346,7 @@ mod platform {
             // Warm the unwinder OUTSIDE signal context, BEFORE arming anything. glibc's first
             // backtrace() call can dlopen libgcc and malloc its unwind state; paying that lazily
             // inside the handler would deadlock in precisely the case this module exists for --
-            // SIGABRT raised from a corrupted or already-locked malloc arena. Afterwards the
+            // SIGABRT raised from a corrupted or already-locked malloc arena. Afterward the
             // in-handler call touches no allocator.
             let mut warm = [std::ptr::null_mut::<libc::c_void>(); 8];
             backtrace(warm.as_mut_ptr(), warm.len() as libc::c_int);

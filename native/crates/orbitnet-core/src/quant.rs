@@ -435,7 +435,7 @@ pub fn decode_row(props: &[PropSchema], wire: &[u8], row: &mut [u8]) -> Option<u
 /// Both quantizers are total over poison, so an `@`-annotated property cannot carry a non-finite
 /// value in at all:
 ///
-/// | Decoder | Behaviour on poison |
+/// | Decoder | Behavior on poison |
 /// | --- | --- |
 /// | [`f16_bits_to_f32`] | exponent 31 — every inf/NaN pattern — decodes to `0.0` |
 /// | [`ss3_to_quat`] | the payload clamps, then the quaternion renormalizes to unit or identity |

@@ -13,7 +13,7 @@ class_name FighterRenderer
 ## ONE MESH PER FIGHTER rather than a MultiMesh: twenty-four of them, each needing its own color and its own
 ## transparency, and per-instance color on a MultiMesh needs a custom material to read it.
 
-const TEAM_COLOURS: Array[Color] = [
+const TEAM_COLORS: Array[Color] = [
 	Color(0.35, 0.62, 0.95),
 	Color(0.95, 0.52, 0.32),
 ]
@@ -40,7 +40,7 @@ func build(director: MatchDirector) -> void:
 		var material: StandardMaterial3D = StandardMaterial3D.new()
 		material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 		material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		material.albedo_color = TEAM_COLOURS[ArenaConfig.team_of_seat(seat) % TEAM_COLOURS.size()]
+		material.albedo_color = TEAM_COLORS[ArenaConfig.team_of_seat(seat) % TEAM_COLORS.size()]
 		mesh.material_override = material
 
 		add_child(mesh)
@@ -66,7 +66,7 @@ func _process(_delta: float) -> void:
 		_materials[seat].albedo_color = _color_for(fighter, now)
 
 func _color_for(fighter: FighterBody, now: int) -> Color:
-	var base: Color = TEAM_COLOURS[fighter.team % TEAM_COLOURS.size()]
+	var base: Color = TEAM_COLORS[fighter.team % TEAM_COLORS.size()]
 	if fighter.is_cloaked():
 		base = base.lerp(CLOAK_TINT, 0.55)
 	var alpha: float = 1.0

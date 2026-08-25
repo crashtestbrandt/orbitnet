@@ -59,7 +59,7 @@ func test_facing_survives_the_pi_wrap() -> void:
 	var aux_a: Vector3 = Vector3(sin(a), cos(a), 1.0)
 	var aux_b: Vector3 = Vector3(sin(b), cos(b), 1.0)
 	assert_true(aux_a.distance_to(aux_b) < 0.05,
-		"two nearly-identical headings either side of the wrap are NEIGHBOURS on the unit circle")
+		"two nearly-identical headings either side of the wrap are NEIGHBORS on the unit circle")
 	assert_true(absf(a - b) > 6.0,
 		"...while as raw angles they are almost a full rotation apart, which is what would be interpolated")
 
