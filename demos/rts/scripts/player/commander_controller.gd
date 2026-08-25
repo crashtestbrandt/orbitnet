@@ -271,9 +271,14 @@ func _poll_pending_order() -> void:
 # measurement honest when a player issues a second order before the first resolves: the reply names the
 # request that failed, so an older refusal cannot cancel a newer pending order.
 func _on_order_rejected(_verb: StringName, code: int, tag: int) -> void:
+	# TAG 0 IS NOT THIS PLAYER'S REFUSAL. A listen host applies every peer's request locally, and a
+	# refusal of one it did not mint arrives on this same lane under tag 0 -- so recording it put
+	# another player's forged order in the local HUD, attributed to the local player.
+	if tag == 0:
+		return
 	_last_refusal = OrderValidator.describe(code)
 	_refused_tag = tag
-	if tag != 0 and tag == _pending_tag:
+	if tag == _pending_tag:
 		_clear_pending()
 
 ## The most recent order refusal in words, for the HUD. Empty until one arrives.
