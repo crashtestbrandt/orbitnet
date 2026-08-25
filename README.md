@@ -26,8 +26,9 @@ just rts-host                    # then `just rts-join` in another terminal
 
 `native-install` builds the extension for this host; a `git clone` carries no binaries.
 
-> **0.x.** `Net` is the surface intended to be stable. The wire format and the Rust internals may change
-> between minor versions. Pin a tag.
+> **0.x.** `Net` is the surface intended to be stable, and before 1.0 that covers its shape rather than its
+> behavior. **A minor version may change what an existing `Net` call returns**, alongside the wire format and
+> the Rust internals. Pin a tag, and read [Upgrading from 0.2.x](#upgrading-from-02x) before moving one.
 
 ## Three lanes
 
@@ -64,6 +65,18 @@ project. Both directories are required: `Net` without the extension is a facade 
 | **Platforms** | Linux x86_64, Windows x86_64, macOS universal |
 | **Transports** | ENet out of the box; Steam via [GodotSteam](https://godotsteam.com/), selected by export-preset feature tag |
 | **Not supported** | Web — Godot's web export cannot load a GDExtension |
+
+## Upgrading from 0.2.x
+
+**`PROTOCOL_VERSION` moved major 6 → 7**, so a 0.2.x peer and a current one refuse each other's handshake.
+Upgrade both ends of a session together. The three `Net` changes below raise nothing — the 0.2.1 call still
+compiles, still runs, and means something else.
+
+| Change | What breaks | What to do |
+|---|---|---|
+| **`Net.peer_rtt_ms()` is capped** at `Net.rtt_believed_max_ms`, 250 ms by default | a scoreboard ping reads 250 for every player on a worse link | display `Net.peer_rtt_raw_ms()`, and keep `peer_rtt_ms()` for anything that feeds a rewind |
+| **Resuming a seat needs `Net.set_resume_token()`** beside `Net.set_session_id()` | a game that persisted only the session id is seated as a newcomer | persist `Net.resume_token()` too, and restore both before the join |
+| **A `NetCommand` validator returning a non-zero `int` is a refusal** carrying that code | a validator that returned a truthy int to mean "applied" now refuses every request | return `true`, or `NetCommand.CODE_OK` (`0`), to apply |
 
 ## Docs
 
