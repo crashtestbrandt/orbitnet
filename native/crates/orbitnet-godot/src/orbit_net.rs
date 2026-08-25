@@ -756,25 +756,14 @@ struct PeerState {
     /// delta is not, so a delta built BEFORE the table can arrive after it and undo it. A receiver
     /// refuses a section stamped below the generation it holds.
     interest_generation: u64,
-    /// The tick the last whole interest set was sent to this connection, or `None`.
-    ///
-    /// **A CLIENT THAT IS STILL ASKING IS ONE WHOSE TABLE HAS NOT ARRIVED.** The table is reliable, so
-    /// it cannot be lost, only delayed — and until it lands, every section this connection receives
-    /// is stamped at a generation it does not hold, so it drops each one and asks again. Answering
-    /// each of those asks sends another table per tick for a whole round trip, and each one
-    /// invalidates the sections behind it, which sustains the loop it was meant to end. So a
-    /// client-driven ask is refused while one is outstanding.
-    ///
-    /// The two SERVER-noticed causes are not held: an overflow or a given-up prefix names information
-    /// no outstanding table can contain, because that table was built before it.
-    interest_table_tick: Option<u64>,
     /// Whether this connection is owed a whole interest set rather than another delta.
     ///
-    /// **THREE THINGS SET IT, AND THE SERVER KNOWS TWO OF THEM ITSELF.** A pending half that
+    /// **FOUR THINGS SET IT, AND THE SERVER KNOWS THREE OF THEM ITSELF.** A pending half that
     /// overflowed dropped an event nobody can reconstruct; a prefix given up on unacknowledged left
-    /// the two ends disagreeing about what was sent. The third is the client raising
-    /// [`FrameHeader::FLAG_WANT_INTEREST`], which is the case only it can see — a delta naming a
-    /// slot its manifest has not bound yet.
+    /// the two ends disagreeing about what was sent; a rekey on a live connection threw away
+    /// everything that connection held. The fourth is the client raising
+    /// [`FrameHeader::FLAG_WANT_INTEREST`], for the two cases only it can see — a section naming a
+    /// slot its manifest has not bound, and one stamped at a generation it does not hold.
     ///
     /// Before this flag, all three were silent: the mirror stayed wrong for the rest of the session
     /// while the entity's rows kept arriving, and the documented repair
@@ -1141,8 +1130,15 @@ impl PeerState {
     fn push_pending(list: &mut Vec<u64>, sent: &mut usize, id: u64) -> bool {
         let overflowed = list.len() >= INTEREST_DELTA_PENDING_MAX;
         if overflowed {
-            list.remove(0);
-            *sent = sent.saturating_sub(1);
+            // **THE NEWEST GOES, NOT THE OLDEST.** The overflow owes this connection a whole set, and
+            // the set restates every member the slot table can name — so an evicted entry is
+            // recoverable exactly when the table could have restated it anyway. What the table CANNOT
+            // restate is a member with no slot yet, and those are the entries the front of this list
+            // holds: `send_interest_tables` retires only what it stated, so a held enter stays at the
+            // front across a table. Evicting from the front dropped precisely the one entry nothing
+            // downstream could reconstruct, on the same event that triggered the repair.
+            list.pop();
+            *sent = (*sent).min(list.len());
         }
         list.push(id);
         overflowed
@@ -1807,13 +1803,13 @@ pub struct OrbitNet {
     expected_schemas: HashMap<u64, (u32, u32)>,
     /// Client: newest snapshot frame tick received (our ack).
     newest_snapshot_tick: u64,
-    /// Client: which of the 32 frame ticks before `newest_snapshot_tick` also arrived — rides
-    /// every input header so the server deltas only against bases we provably hold.
     /// CLIENT: whether a snapshot has landed since the last input frame went out.
     ///
     /// The input frame carries this peer's ack, and it is the only frame that does. See
     /// [`input_frame_is_owed`].
     snapshot_unacked: bool,
+    /// Client: which of the 32 frame ticks before `newest_snapshot_tick` also arrived — rides
+    /// every input header so the server deltas only against bases we provably hold.
     snapshot_ack_bits: u32,
     /// Client: the token the frame at `newest_snapshot_tick` carried, quoted back in every input
     /// header. It is what turns `newest_snapshot_tick` from an assertion into a claim the server can
@@ -1964,7 +1960,7 @@ pub struct OrbitNet {
     interest_mirror_generation: u64,
     /// CLIENT: whether this peer owes the server a [`FrameHeader::FLAG_WANT_INTEREST`].
     ///
-    /// Raised three ways, and cleared only by being ANSWERED — by a whole set that this peer could
+    /// Raised four ways, and cleared only by being ANSWERED — by a whole set that this peer could
     /// name in full. Clearing it on send instead made it a one-shot NACK on an unreliable frame, with
     /// nothing to re-raise it on a session quiet enough to send no further sections.
     ///
@@ -1973,6 +1969,7 @@ pub struct OrbitNet {
     /// | a section naming an `entered` slot the manifest has not bound | nothing else will ever produce that enter |
     /// | a section stamped at a generation this peer does not hold | its baseline is one this peer is not holding |
     /// | a whole set carrying a slot this peer cannot name | the manifest that binds it re-announces nothing |
+    /// | a whole set that does not decode | there is no next one unless this asks |
     want_interest: bool,
     /// CLIENT: the entities this peer has been told are in its interest.
     ///
@@ -5275,7 +5272,7 @@ impl OrbitNet {
     ///
     /// The pending halves are cleared rather than sent: every entry in them is a transition into or
     /// out of the set this frame states outright.
-    fn send_interest_tables(&mut self, current: u64) {
+    fn send_interest_tables(&mut self) {
         if self.mode == MODE_CLIENT {
             return;
         }
@@ -5293,39 +5290,7 @@ impl OrbitNet {
             let Some(peer) = self.peers.get_mut(&peer_id) else {
                 continue;
             };
-            // A MEMBER WITH NO SLOT YET IS OMITTED AND STILL HELD. An entity can sit in a
-            // connection's interest before the slot table can name it, which is why the delta path
-            // holds such an enter rather than sending it — and why the admit loop defers its block.
-            // Stating the set without it is right, because the wire has no way to say it; dropping
-            // the enter that was holding it would be the permanent divergence this whole frame
-            // exists to close, reintroduced by the repair itself.
-            let mut named: Vec<u64> = Vec::new();
-            let mut slots: Vec<u16> = Vec::new();
-            for id in peer.interest.iter() {
-                if let Some(slot) = self.slots.slot_of(id) {
-                    slots.push(slot);
-                    named.push(id);
-                }
-            }
-            slots.sort_unstable();
-            named.sort_unstable();
-            // Saturating for the reason the manifest's is: a wrap would land on a generation some
-            // peer already believes it holds, which is the one outcome that misapplies in silence.
-            peer.interest_generation = peer.interest_generation.saturating_add(1);
-            let generation = peer.interest_generation;
-            // A leave is superseded whatever it named: the set states where every entity stands,
-            // and absence is what a leave was going to say. An enter is superseded only if the table
-            // actually named it.
-            peer.interest_pending.leaves.clear();
-            peer.interest_pending
-                .enters
-                .retain(|id| named.binary_search(id).is_err());
-            peer.interest_delta_left_sent = 0;
-            peer.interest_delta_entered_sent = 0;
-            peer.interest_delta_tick = None;
-            peer.interest_seeded = true;
-            peer.interest_full_due = false;
-            peer.interest_table_tick = Some(current);
+            let (generation, slots) = state_whole_interest_set(&self.slots, peer);
             frames.push((peer_id, encode_interest_table(generation, &slots)));
         }
         for (peer_id, bytes) in frames {
@@ -5443,7 +5408,7 @@ impl OrbitNet {
         // with no ordering between them. It also clears the pending halves, so the peer it answers
         // sends no section this tick: the table already says where every entity stands.
         if filtering {
-            self.send_interest_tables(current);
+            self.send_interest_tables();
         }
 
         // The cull radius is applied by `update_interest` above, which is the only thing that
@@ -6835,13 +6800,19 @@ impl OrbitNet {
                 peer.forget_manifest();
                 manifest_nacked = true;
             }
-            // THE INTEREST NACK: this peer could not apply a section — it named a slot the peer's
-            // manifest has not bound. Owe it the whole set; the send path answers on the next tick.
-            if header.flags & FrameHeader::FLAG_WANT_INTEREST != 0
-                && peer
-                    .interest_table_tick
-                    .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
-            {
+
+            // THE INTEREST NACK. Answered every time it is raised, and deliberately not rate
+            // limited: a client asks because it is holding a section it cannot place or a set it
+            // cannot name, and the server retires that section's prefix on this same frame's ack
+            // whether or not the client integrated it. Muting the ask for a window therefore loses
+            // exactly the transitions the ask exists to recover — a table built before them cannot
+            // restate them, and no later diff re-enters an id already in the set.
+            //
+            // What that costs is a burst: while a reliable table is still in flight, every section
+            // behind it is stamped at a generation the client does not hold, so it asks once per
+            // tick for about a round trip and is answered each time. Bounded, self-limiting, and
+            // cheaper than the alternative, which is a permanently wrong mirror.
+            if header.flags & FrameHeader::FLAG_WANT_INTEREST != 0 {
                 peer.interest_full_due = true;
             }
         }
@@ -7123,33 +7094,17 @@ impl OrbitNet {
     /// acting on those signals would rebuild nodes it never lost.
     fn adopt_interest_table(&mut self, generation: u64, slots: &[u16]) {
         let peer = self.local_peer_id();
-        let mut next: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        // A SLOT THIS PEER CANNOT NAME LEAVES THE SET SHORT, AND IS ASKED ABOUT. The manifest that
-        // binds it is reliable and will arrive, but its arrival re-announces nothing — the rebuild
-        // only ever removes — so adopting a set with a hole in it and calling the ask answered is how
-        // the hole becomes permanent. It is the same rule a section follows for the same reason.
-        let mut resolved = true;
-        for &slot in slots {
-            match self.slots.id_of(slot) {
-                Some(id) => {
-                    next.insert(id);
-                }
-                None => resolved = false,
-            }
-        }
-        for &id in self.interest_mirror.iter() {
-            if !next.contains(&id) {
-                self.interest_events.push((peer, id, false));
-            }
-        }
-        for &id in next.iter() {
-            if !self.interest_mirror.contains(&id) {
-                self.interest_events.push((peer, id, true));
-            }
-        }
-        self.interest_mirror = next;
+        let resolved = adopt_whole_set(
+            &self.slots,
+            &mut self.interest_mirror,
+            &mut self.interest_events,
+            peer,
+            slots,
+        );
         self.interest_mirror_generation = generation;
         self.interest_mirror_seeded = true;
+        // A set this peer could not read in full leaves the ask up: the manifest that binds the
+        // missing slot re-announces nothing, so calling it answered is how the hole becomes permanent.
         self.want_interest = !resolved;
     }
 
@@ -7675,6 +7630,89 @@ fn admit_input_blocks(
     }
     out.sort_unstable();
     refused.unwrap_or(start)
+}
+
+/// Adopt a whole interest set into a client's mirror, answering whether every slot resolved.
+///
+/// A free function so the rule the receive path runs is the rule a test can call.
+///
+/// **THE EVENTS ARE THE DIFF, NOT THE SET.** A resync that announced every slot would re-announce
+/// every entity the peer never lost, and a game acting on those signals would rebuild nodes that were
+/// never gone.
+///
+/// **A SLOT THIS PEER CANNOT NAME LEAVES THE SET SHORT.** The manifest that binds it is reliable and
+/// will arrive, but its arrival re-announces nothing — [`retire_unnamed_interest`] only removes — so
+/// adopting a set with a hole in it and calling the ask answered is how that hole becomes permanent.
+/// It is the same rule a section follows, for the same reason.
+#[must_use]
+fn adopt_whole_set(
+    slots: &SlotTable,
+    mirror: &mut std::collections::HashSet<u64>,
+    events: &mut Vec<(i32, u64, bool)>,
+    peer: i32,
+    stated: &[u16],
+) -> bool {
+    let mut next: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut resolved = true;
+    for &slot in stated {
+        match slots.id_of(slot) {
+            Some(id) => {
+                next.insert(id);
+            }
+            None => resolved = false,
+        }
+    }
+    for &id in mirror.iter() {
+        if !next.contains(&id) {
+            events.push((peer, id, false));
+        }
+    }
+    for &id in next.iter() {
+        if !mirror.contains(&id) {
+            events.push((peer, id, true));
+        }
+    }
+    *mirror = next;
+    resolved
+}
+
+/// Take the whole interest set a connection is owed, and retire what stating it supersedes.
+///
+/// A free function so the rule the send path runs is the rule a test can call — the same shape as
+/// [`admit_input_blocks`].
+///
+/// **A MEMBER WITH NO SLOT YET IS OMITTED AND STILL HELD.** An entity can sit in a connection's
+/// interest before the slot table can name it, which is why the delta path holds such an enter rather
+/// than sending it and why the admit loop defers its block. Stating the set without it is right — the
+/// wire has no way to say it — but dropping the enter that was holding it would be the permanent
+/// divergence this frame exists to close, reintroduced by the repair itself.
+///
+/// So a leave is superseded whatever it named, because the set says where every entity stands and
+/// absence is what a leave was going to say; an enter is superseded only if the set actually named it.
+fn state_whole_interest_set(slots: &SlotTable, peer: &mut PeerState) -> (u64, Vec<u16>) {
+    let mut named: Vec<u64> = Vec::new();
+    let mut stated: Vec<u16> = Vec::new();
+    for id in peer.interest.iter() {
+        if let Some(slot) = slots.slot_of(id) {
+            stated.push(slot);
+            named.push(id);
+        }
+    }
+    stated.sort_unstable();
+    named.sort_unstable();
+    // Saturating for the reason the manifest's is: a wrap would land on a generation some peer
+    // already believes it holds, which is the one outcome that misapplies in silence.
+    peer.interest_generation = peer.interest_generation.saturating_add(1);
+    peer.interest_pending.leaves.clear();
+    peer.interest_pending
+        .enters
+        .retain(|id| named.binary_search(id).is_err());
+    peer.interest_delta_left_sent = 0;
+    peer.interest_delta_entered_sent = 0;
+    peer.interest_delta_tick = None;
+    peer.interest_seeded = true;
+    peer.interest_full_due = false;
+    (peer.interest_generation, stated)
 }
 
 /// Whether the interest pass runs this tick.
@@ -8255,24 +8293,25 @@ fn queue_seat_release(pending: &mut Vec<i32>, peer: i32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_input_blocks, anchor_conflicts_owed, apply_interest_section, band_for_row,
-        build_interest_section, candidate_for_own_row, candidate_for_row, clamp_resume_policy,
-        clamp_seat_release_policy, clamp_unanchored_policy, classify_rx, delta_reference,
-        encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
+        admit_input_blocks, adopt_whole_set, anchor_conflicts_owed, apply_interest_section,
+        band_for_row, build_interest_section, candidate_for_own_row, candidate_for_row,
+        clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
+        delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
         input_frame_is_owed, interest_delta_reserve, is_located, manifest_owed, owned_rows_into,
         owned_rows_of, queue_seat_release, resim_input_from, resolve_observer, resume_grant,
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
-        session_is_filtering, session_key_from, AckOutcome, EntityRow, FrameHeader, InterestPass,
-        ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
-        ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent,
-        SeatReleasePolicy, SlotTable, StateIntegration, Writer, ANCHOR_SOURCE_FIXED,
-        ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INTEREST_DELTA_PENDING_MAX,
-        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
-        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
-        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
-        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
-        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        session_is_filtering, session_key_from, state_whole_interest_set, AckOutcome, EntityRow,
+        FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
+        PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
+        SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, Writer,
+        ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
+        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
+        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
+        MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
+        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
+        UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -9892,57 +9931,12 @@ mod tests {
         );
     }
 
-    /// **A CLIENT-DRIVEN ASK IS REFUSED WHILE A TABLE IS ALREADY ON ITS WAY.** The table is reliable,
-    /// so a client still asking is one whose table has not landed — and until it does, every section
-    /// is stamped at a generation it does not hold, so it drops each one and asks again. Answering
-    /// each ask sends another table per tick for a whole round trip, each invalidating the sections
-    /// behind it, which sustains the loop the table was sent to end.
-    ///
-    /// The server's own two causes are not held: they name information no outstanding table can
-    /// carry, because that table was built before them.
-    #[test]
-    fn a_client_ask_is_held_while_a_table_is_outstanding_and_the_servers_causes_are_not() {
-        let held = |peer: &PeerState, current: u64| {
-            peer.interest_table_tick
-                .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
-        };
-
-        let mut peer = PeerState::default();
-        assert!(
-            held(&peer, 0),
-            "nothing outstanding, so the first ask is answered"
-        );
-
-        peer.interest_table_tick = Some(100);
-        assert!(
-            !held(&peer, 101),
-            "an ask a tick later is the same unanswered table"
-        );
-        assert!(
-            !held(&peer, 100 + INTEREST_DELTA_RETRY_TICKS - 1),
-            "and so is every ask inside the window"
-        );
-        assert!(
-            held(&peer, 100 + INTEREST_DELTA_RETRY_TICKS),
-            "past it the table is not coming, so the ask is answered again"
-        );
-
-        // An overflow is the server noticing, and it is never held.
-        for id in 1..=(INTEREST_DELTA_PENDING_MAX as u64 + 1) {
-            peer.note_interest_enter(id);
-        }
-        assert!(
-            peer.interest_full_due,
-            "a cause the outstanding table cannot contain owes a fresh one"
-        );
-    }
-
     /// **A WHOLE SET STATES WHAT IT CAN NAME, AND KEEPS HOLDING WHAT IT CANNOT.** An entity can be in
     /// a connection's interest before the slot table can name it — the delta path holds such an enter
-    /// rather than sending it, and the admit loop defers its block — so the table has to omit it.
+    /// rather than sending it, and the admit loop defers its block — so the set has to omit it.
     /// Clearing the enter that was holding it in the same breath is what would make the omission
-    /// permanent: no later diff re-enters an id already in the set, so nothing would ever announce
-    /// it again while its rows kept arriving. That is the divergence this frame exists to close,
+    /// permanent: no later diff re-enters an id already in the set, so nothing would ever announce it
+    /// again while its rows kept arriving. That is the divergence this frame exists to close,
     /// produced by the repair itself.
     #[test]
     fn a_whole_set_keeps_holding_a_member_it_could_not_name() {
@@ -9966,31 +9960,97 @@ mod tests {
         assert!(peer.interest.contains(11) && peer.interest.contains(12));
         peer.note_interest_enter(11);
         peer.note_interest_enter(12);
+        peer.note_interest_leave(99);
+        peer.interest_full_due = true;
 
-        // What `send_interest_tables` states, and what it retires — the same two steps, in order.
-        let mut named: Vec<u64> = Vec::new();
-        let mut stated: Vec<u16> = Vec::new();
-        for id in peer.interest.iter() {
-            if let Some(slot) = slots.slot_of(id) {
-                stated.push(slot);
-                named.push(id);
-            }
-        }
-        named.sort_unstable();
-        peer.interest_pending.leaves.clear();
-        peer.interest_pending
-            .enters
-            .retain(|id| named.binary_search(id).is_err());
+        let (generation, stated) = state_whole_interest_set(&slots, &mut peer);
 
         assert_eq!(
-            stated.len(),
-            1,
-            "the table names only what the slot table can"
+            generation, 1,
+            "stating a set bumps the generation it is stamped with"
+        );
+        assert_eq!(
+            stated,
+            vec![0u16],
+            "and states only what the slot table can name"
         );
         assert_eq!(
             peer.interest_pending.enters,
             vec![12],
-            "and the member it could not name is still held, for a section to carry once it binds"
+            "the member it could not name is still held, for a section once its slot binds"
+        );
+        assert!(
+            peer.interest_pending.leaves.is_empty(),
+            "a leave is superseded whatever it named -- absence is what it was going to say"
+        );
+        assert!(peer.interest_seeded, "the connection holds a set now");
+        assert!(!peer.interest_full_due, "and is owed nothing further");
+        assert!(peer.interest_delta_tick.is_none(), "nothing is in flight");
+    }
+
+    /// The cap evicts the NEWEST entry, not the oldest. An overflow owes this connection a whole set,
+    /// and the set restates every member the slot table can name — so an evicted entry is recoverable
+    /// exactly when the set could have restated it. What the set cannot restate is a member with no
+    /// slot, and those are the entries the FRONT holds, because stating a set retires only what it
+    /// stated. Evicting from the front dropped the one entry nothing downstream could reconstruct, on
+    /// the same event that triggered the repair.
+    #[test]
+    fn the_pending_cap_evicts_what_a_whole_set_can_restate() {
+        let mut peer = PeerState::default();
+        peer.note_interest_enter(7); // the held one, at the front
+        for id in 100..(100 + INTEREST_DELTA_PENDING_MAX as u64 - 1) {
+            peer.note_interest_enter(id);
+        }
+        assert_eq!(
+            peer.interest_pending.enters.len(),
+            INTEREST_DELTA_PENDING_MAX
+        );
+        assert!(
+            !peer.interest_full_due,
+            "filling it exactly is not an overflow"
+        );
+
+        peer.note_interest_enter(9_999);
+        assert!(peer.interest_full_due, "the overflow owes a whole set");
+        assert_eq!(
+            peer.interest_pending.enters.first().copied(),
+            Some(7),
+            "and the entry at the front -- the one a whole set could not restate -- survives it"
+        );
+    }
+
+    /// Adopting a whole set emits the DIFF against what this peer held, not an event per slot: a
+    /// resync that announced the whole set would re-announce every entity the peer never lost, and a
+    /// game acting on those signals would rebuild nodes that were never gone.
+    ///
+    /// And a slot it cannot name leaves the set short, so the ask stays up. The manifest that binds
+    /// that slot re-announces nothing — the rebuild only removes — so calling the ask answered is how
+    /// the hole becomes permanent.
+    #[test]
+    fn adopting_a_whole_set_emits_the_diff_and_keeps_asking_when_it_is_short() {
+        let slots = table_naming(&[11, 12]);
+        let mut mirror = Mirror::default();
+        // Held: 11 and 99. Stated: 11 and 12. So 99 leaves, 12 enters, 11 says nothing.
+        mirror.apply(&slots, &[], &[0]);
+        mirror.held.insert(99);
+        mirror.take();
+
+        let resolved = adopt_whole_set(&slots, &mut mirror.held, &mut mirror.events, 4, &[0, 1]);
+        assert!(resolved, "every slot named resolved");
+        assert_eq!(mirror.held, std::collections::HashSet::from([11u64, 12]));
+        let mut events = mirror.take();
+        events.sort_by_key(|&(_, id, entered)| (id, entered));
+        assert_eq!(
+            events,
+            vec![(4, 12, true), (4, 99, false)],
+            "the diff, and nothing for the member that never moved"
+        );
+
+        // A slot this peer cannot name leaves the set short, and the ask stays up.
+        let resolved = adopt_whole_set(&slots, &mut mirror.held, &mut mirror.events, 4, &[0, 1, 7]);
+        assert!(
+            !resolved,
+            "an unnameable slot is a set this peer cannot hold in full"
         );
     }
 

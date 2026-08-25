@@ -3445,10 +3445,12 @@ mod tests {
         assert_eq!(FrameHeader::FLAG_WANT_FULL, 1);
         assert_eq!(FrameHeader::FLAG_INTEREST_DELTA, 2);
         assert_eq!(FrameHeader::FLAG_WANT_MANIFEST, 4);
+        assert_eq!(FrameHeader::FLAG_WANT_INTEREST, 8);
         let bits = [
             FrameHeader::FLAG_WANT_FULL,
             FrameHeader::FLAG_INTEREST_DELTA,
             FrameHeader::FLAG_WANT_MANIFEST,
+            FrameHeader::FLAG_WANT_INTEREST,
         ];
         for (index, &flag) in bits.iter().enumerate() {
             assert_eq!(

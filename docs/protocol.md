@@ -338,10 +338,15 @@ Three things owe a connection one, and the server knows two of them without bein
 
 | | Bytes |
 |---|---|
+| the section's generation varint | 1 in practice, and 10 reserved |
 | the section's two count varints | 2 |
 | per event | 2 |
-| a frame's cap (32 of each half) | 131 reserved off the send budget |
+| a frame's cap (32 of each half) | 141 reserved off the send budget |
 | at rest — a settled tick with no transitions | **0**, and no flag bit |
+
+The generation is reserved at a `u64` varint's worst case rather than measured. It reaches two bytes only
+after 127 resyncs on one connection and ten is unreachable, but the reserve is what keeps an unreliable
+datagram inside the path MTU, and a bound that holds only for small values is not a bound.
 
 The reserve is taken off the byte budget **before** the admit loop runs, not after it. A section appended to a
 frame already filled to the payload ceiling is a datagram past the path MTU, which fragments, and a lost
