@@ -24,16 +24,20 @@
 /// | Major | What changed |
 /// | --- | --- |
 /// | 2 | Quantized wire encodings (`QuantKind`). |
-/// | 3 | Every datagram but the handshake carries a sequence number and a MAC (`crate::auth`); the handshake carries the session key and no longer carries a session-wide schema hash. |
+/// | 3 | Every datagram but the handshake carries a sequence number and a MAC (`crate::auth`); the handshake carries the session key (the 16 bytes major 7 renames [`crate::codec::Handshake::session_nonce`]) and no longer carries a session-wide schema hash. |
 /// | 4 | The hot-frame header carries `ack_token`: a server-minted per-frame value the client quotes back, so an ack names a frame the peer provably received. |
 /// | 5 | Every block names its entity by a **dense 16-bit session slot** ([`crate::slots`]) instead of the 64-bit id, and the entity manifest distributes the slot bindings for both lanes. |
 /// | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster ([`crate::seats`]) to clients. |
-/// | 7 | A snapshot frame may carry a trailing **interest-delta section** ([`crate::codec::InterestDeltaSection`]), announced by `FrameHeader::FLAG_INTEREST_DELTA`, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token** ([`crate::codec::Handshake::resume_token`]), which is what a claim on a session identity has to quote. The entity manifest carries a leading **generation** and states a **change** rather than the whole table ([`crate::codec::ManifestDelta`], frame kind `0x08`); a client that cannot apply one asks for the whole table with `FrameHeader::FLAG_WANT_MANIFEST`. |
+/// | 7 | A snapshot frame may carry a trailing **interest-delta section** ([`crate::codec::InterestDeltaSection`]), announced by `FrameHeader::FLAG_INTEREST_DELTA`, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token** ([`crate::codec::Handshake::resume_token`]), which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce** ([`crate::codec::Handshake::session_nonce`]) and the handshake gains a trailing **confirm tag** ([`crate::codec::Handshake::confirm`]); with a session secret configured the key is derived from `(secret, nonce)` by [`crate::auth::derive_session_key`] rather than read off the wire. The field keeps its offset and its width, so nothing about its shape refuses a peer predating the rename -- the major does, and without it that peer would seat the nonce as the key and fail every MAC. A peer holding a secret refuses two more ways ([`crate::codec::Handshake::check_compatibility`]): an all-zero nonce, and a confirm tag that does not recompute. The entity manifest carries a leading **generation** and states a **change** rather than the whole table ([`crate::codec::ManifestDelta`], frame kind `0x08`); a client that cannot apply one asks for the whole table with `FrameHeader::FLAG_WANT_MANIFEST`. |
 ///
 /// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
 /// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
 /// documented absent-value behavior, a newer peer reads it when it is there. Anything that shifts an
 /// existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
+///
+/// **A row above records every wire change that landed at that major**, including one a minor bump alone
+/// could have carried. Major 7's confirm tag is an optional trailing field on the handshake and rode a bump
+/// the other changes had already forced.
 pub const PROTOCOL_VERSION: u32 = 0x0007_0000;
 
 /// Extract the major component of a protocol version.

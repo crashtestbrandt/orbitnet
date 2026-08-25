@@ -11,6 +11,7 @@ Little-endian.
 
 ```
 frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | 32-bit ack token | input-arrival margin byte
+           | header flags byte | entity count (varint)
 then per entity:  { slot (u16) | frame-tick delta | body length | flags | changed-property bitmask | packed payload }
 then, if the header's flags say so: the interest-delta section
 then the trailer: { sequence (u32) | MAC tag (u64) }
@@ -82,7 +83,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 4 | The hot-frame header carries an **ack token**. |
 | 5 | Blocks name entities by a **16-bit session slot**; the entity manifest distributes the slot table for both lanes. |
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
-| 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key is renamed the **session nonce** and carries a trailing **confirm tag**: with a shared secret configured, the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
+| 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the

@@ -722,8 +722,9 @@ That matters most for scalars, because of this:
 > backend records them at full width deliberately — narrowing a float would round every replayed value and
 > quietly break a bit-exact resimulation.
 
-So **there is no way to narrow a bare scalar from GDScript.** `"hp@half"` is eight bytes on the wire, exactly
-as if the suffix were absent.
+So **there is no way to narrow a bare scalar from GDScript.** `"hp@half"` is an f64 on the wire, eight bytes,
+and the suffix is reported and dropped like any other invalid pairing — an error in a checked build, and
+listed by `quantizer_fallbacks()` — so an entry list carrying one needs the suffix removed.
 
 **The idiom is to pack scalars into a `Vector3` and quantize that.** Three normalized scalars in one
 `Vector3 @half` cost 6 bytes instead of 24. The RTS demo packs `(sin θ, cos θ, hp01)` that way; see

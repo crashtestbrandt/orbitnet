@@ -4,9 +4,10 @@ class_name PropBody
 ## exists for two reasons that are both about scale rather than about play.
 ##
 ##   * THE SLOT TABLE. A block names its entity by a 16-bit session slot rather than a 64-bit id, and the
-##     table binding slots to ids is distributed by the entity manifest as a whole table each time it changes.
-##     A session with hundreds of entities is where that stops being free, and a demo with three fighters is
-##     not one.
+##     entity manifest distributes the bindings as a DELTA -- the rows that changed, applied onto the table a
+##     client already holds. A JOINER still costs a whole table, because it holds no rows to patch, and a
+##     session with hundreds of entities is where that stops being free. A demo with three fighters is not
+##     one.
 ##   * THE INTEREST PASS. The pass is charged per candidate per peer per tick, and `interest_ms` in
 ##     `Net.bandwidth_metrics()` is the number it moves. A handful of entities cannot move it.
 ##

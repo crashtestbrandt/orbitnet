@@ -48,13 +48,21 @@ class_name HockeyNet
 ## where it was rather than freezing and then jumping when its owner returns.
 ##
 ## THE CONSERVATIVE RULE, AND WHY THIS DEMO TAKES IT WHERE THE RTS DEMO DOES NOT. `resumed_from` names a
-## connection that MAY STILL BE UP, and a session identity is client-asserted and unauthenticated -- so a peer
-## presenting an identity it watched someone else use takes that player's seat, and the original keeps its
-## connection with no error. This demo therefore honors a reclaim only for an identity it already saw
-## `Net.peer_dropped` report with `held = true`. The price is the one the facade names: a player whose old
-## socket the transport has not yet noticed is gone comes back as a newcomer. On a 32-seat table that costs
-## them their end of the rink, which is cheap; on the RTS's two-seat table it would cost them the game, which
-## is why that demo takes the permissive rule and says so.
+## connection that MAY STILL BE UP: under the default resume policy a claim is granted against a live
+## connection, and the original keeps its socket with no error while its mallet stops answering it. What a
+## claim has to present is an IDENTITY PLUS THE SERVER-MINTED RESUME TOKEN for that identity, so a peer that
+## merely watched somebody's session id go past on a roster broadcast or a log line is refused and seated as
+## an anonymous newcomer with session id 0. The adversary that remains is an ON-PATH OBSERVER, who reads the
+## join reply the token arrives in and quotes it back verbatim.
+##
+## This demo therefore hands a seat back only for an identity it saw `Net.peer_dropped` report with
+## `held = true`. `Net.set_resume_policy(Net.ResumePolicy.ONLY_IF_DROPPED)` is the same rule in one call and
+## this demo does NOT set it: the gate here is a ROSTER decision about which seat an arrival gets back, kept
+## in game code where a game would make it. Neither version buys anything against the on-path observer -- the
+## facade's `set_resume_policy` docs say so -- and both charge the same price: a player whose old socket the
+## transport has not yet noticed is gone comes back as a newcomer. On a 32-seat table that costs them their
+## end of the rink, which is cheap; on the RTS's two-seat table it would cost them the game, which is why that
+## demo takes the permissive rule and says so.
 ##
 ## Deliberately omitted, and listed as known gaps rather than hidden: a build/protocol version handshake (two
 ## incompatible peers will connect and misbehave rather than being refused with a reason), a join browser, and
@@ -72,8 +80,9 @@ var _state: State = State.OFFLINE
 var _local_seat: int = -1
 var _error: String = ""
 ## SERVER-SIDE: the identities this layer has SEEN drop with their session held. The conservative rule reads
-## exactly this set, and a reclaim by an identity that is not in it is refused -- which is what makes a forged
-## identity worth no more than a fresh seat.
+## exactly this set, and a reclaim by an identity that is not in it is refused -- which is what stops a claim
+## moving a seat off a connection the roster still shows as live. A claim quoting no valid resume token never
+## reaches here as a resume at all: the backend refuses it and seats it as a newcomer.
 var _held_sessions: Dictionary[int, bool] = {}
 
 func _init() -> void:
@@ -239,9 +248,10 @@ func _connect_peer_signals() -> void:
 func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	if not Net.is_server():
 		return
-	# THE CONSERVATIVE RULE, and it is one line: an identity is worth a seat back only if this layer watched
-	# that identity leave. `resumed_from` alone is the backend saying "somebody claimed this before", which a
-	# forger can also make true.
+	# THE CONSERVATIVE RULE, and it is one line. An identity is worth a seat back only if this layer watched
+	# that identity leave. `resumed_from` alone is the backend saying it granted a claim -- which now means
+	# the token matched, so the claimant is not a forger. What it does not say is whether the incumbent is
+	# still live, and that is the case this rule refuses.
 	var reclaim: int = session_id if _held_sessions.has(session_id) else TeamRoster.NO_SESSION
 	var seat: int = roster.assign(peer, reclaim)
 	if seat < 0:
@@ -256,8 +266,10 @@ func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 			peer, seat, resumed_from, HockeyConfig.team_of_seat(seat)])
 	else:
 		if resumed_from > 0:
-			# Worth saying out loud rather than seating them quietly: this is the conservative rule costing a
-			# returning player their seat, and it looks identical to a forgery being refused.
+			# Worth saying out loud rather than seating them quietly. `resumed_from` is nonzero only for a
+			# claim the BACKEND granted, which means the token was quoted correctly -- so this line is
+			# always this layer overriding a good claim, never a forgery being caught. A forgery arrives
+			# with session id 0 and never reaches here.
 			print("HOCKEY: peer %d claimed session %d, which was never seen to drop -- seating as new" % [
 				peer, session_id])
 		print("HOCKEY: peer %d seated at %d (team %d)" % [peer, seat, HockeyConfig.team_of_seat(seat)])

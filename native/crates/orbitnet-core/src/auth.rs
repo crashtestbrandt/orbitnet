@@ -21,15 +21,24 @@
 //! messages, a 64-bit tag, no table lookups. It is ~40 lines of integer arithmetic, which is what lets
 //! `orbitnet-core` stay at zero dependencies.
 //!
-//! **The key is minted by the client and crosses the wire in the handshake in cleartext.** So what
-//! this authenticates is a datagram's membership in a session, not a peer's identity:
+//! **The key is minted by the client and crosses the wire in the handshake in cleartext, unless the
+//! game supplies a session secret.** With a secret the handshake carries a nonce instead and both ends
+//! derive the key, which is the section below. Under a client-minted key, what this authenticates is a
+//! datagram's membership in a session, not a peer's identity:
 //!
 //! - An attacker who cannot read the session's traffic cannot forge a datagram at all, whatever
 //!   sender id it puts on it. That is the case the transport does not cover.
 //! - One connected peer cannot forge another's datagrams: each session has its own key.
-//! - **An on-path observer who can read the handshake can do everything the client can.** Closing that
-//!   needs a key exchange and therefore a real asymmetric primitive, which is a dependency and a
-//!   larger change. It is recorded as a limit in `README.md` rather than hidden here.
+//! - **An on-path observer who can read the handshake can do everything the client can.** That is the
+//!   ceiling of a client-minted key. A secret both ends already hold narrows it, with the derivation
+//!   below and no new dependency.
+//!
+//!   An X25519 exchange was considered and declined. It would demote this adversary to passive-only,
+//!   which is a real narrowing rather than none -- but unauthenticated ECDH is substituted by exactly
+//!   the on-path attacker in question, so the price is several hundred lines of hand-written
+//!   constant-time field arithmetic in a zero-dependency crate with no timing harness to prove it
+//!   stayed constant-time. `README.md` records the same decision for a reader who never opens this
+//!   file.
 //!
 //! ## Deriving the key from a secret both ends already hold
 //!
@@ -48,10 +57,16 @@
 //! The secret is an **input** to the derivation and is never seated as the key itself;
 //! [`derive_session_key`] carries the reason, because seating it is the obvious wrong implementation.
 //!
-//! Three ceilings:
+//! Four ceilings:
 //!
 //! - **It adds no strength beyond the secret's own entropy.** A secret a lobby prints on screen, or one
 //!   short enough to guess, derives a key worth exactly that much.
+//! - **A recorded join can still be replayed.** The nonce is the joiner's choice and nothing here
+//!   refuses one that has been seen before, so an observer presenting a captured nonce has the
+//!   ACCEPTING side derive the key that join used. The observer does not learn that key -- the secret
+//!   is the other input and it holds none -- so it authors nothing new and the datagrams it captured
+//!   land nowhere. Closing the replay itself needs a value the acceptor contributes, and therefore a
+//!   round trip before a client may send anything.
 //! - **The tag is still 64 bits and the key still 128.** Deriving the key changes who can forge a
 //!   datagram. It does not change how hard forging one is for somebody who cannot read the secret.
 //! - **None of this encrypts anything.** Every payload is still on the wire in the clear. A MAC says a
