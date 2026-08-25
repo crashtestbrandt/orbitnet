@@ -945,6 +945,15 @@ const INTEREST_DELTA_PER_FRAME: usize = 32;
 /// repairs it is [`OrbitNet::send_interest_tables`], which the overflow asks for.
 const INTEREST_DELTA_PENDING_MAX: usize = 256;
 
+/// The ceiling a pending half is actually trimmed at, as a backstop rather than a policy.
+///
+/// Reaching [`INTEREST_DELTA_PENDING_MAX`] owes the connection a whole set, and stating that set
+/// collapses the half on the next flush — so in any session that sends one, this is unreachable.
+/// What it bounds is the connection that is never sent one, which is a peer that is not `synced`,
+/// and which therefore has no relevancy to accumulate in the first place. Four times the soft cap,
+/// because the number that matters is that it is finite.
+const INTEREST_DELTA_PENDING_HARD_MAX: usize = INTEREST_DELTA_PENDING_MAX * 4;
+
 /// How many ticks a prefix rides unacknowledged before it is given up on.
 ///
 /// **The same depth as [`SENT_LOG_DEPTH`]**, and for the same reason: past 64 frames an ack can no
@@ -1116,29 +1125,33 @@ impl PeerState {
         }
     }
 
-    /// Append `id` to one half, answering whether doing so had to drop the oldest entry.
+    /// Append `id` to one half, answering whether that took the half past
+    /// [`INTEREST_DELTA_PENDING_MAX`].
     ///
-    /// **THE DROP IS REPORTED RATHER THAN SWALLOWED.** An entry dropped here never reaches the wire,
-    /// and nothing downstream can reconstruct it — the halves are a net difference, not a log. The
-    /// caller turns a `true` into [`Self::interest_full_due`], which costs one whole set and leaves
-    /// the two ends agreeing; the alternative, which this replaced, was a client permanently short
-    /// of an entity whose rows kept arriving.
+    /// **NOTHING IS EVICTED, AND THAT IS THE POINT.** The cap cannot tell a recoverable entry from an
+    /// unrecoverable one. A whole set restates every member the slot table can name, so a dropped
+    /// entry is recoverable exactly when the set could have restated it anyway — and what the set
+    /// CANNOT restate is a member with no slot yet, whose enter is held across the set precisely
+    /// because of that. Evicting the oldest lost that held enter; evicting the newest loses the same
+    /// thing whenever the slotless member is the one that just arrived. Any end this picks is wrong
+    /// in some case, because the queue is not where the information is.
     ///
-    /// It is not only the unreachable-peer case the cap was written for: a first update in a world
-    /// of more than [`INTEREST_DELTA_PENDING_MAX`] filtered entities overflows on a healthy link.
+    /// What the overflow means is that this connection is owed a whole set, and the caller says so.
+    /// The next flush states that set and collapses the queue to the members it could not name, so
+    /// the half is bounded by the repair rather than by an eviction that guesses.
+    ///
+    /// [`INTEREST_DELTA_PENDING_HARD_MAX`] is the backstop for a connection that is never sent one —
+    /// unsynced, so it has no relevancy to accumulate — and dropping the oldest there is a last
+    /// resort rather than a policy.
+    ///
+    /// It is not only the unreachable-peer case the cap was written for: a first update in a world of
+    /// more than [`INTEREST_DELTA_PENDING_MAX`] filtered entities overflows on a healthy link.
     #[must_use]
     fn push_pending(list: &mut Vec<u64>, sent: &mut usize, id: u64) -> bool {
         let overflowed = list.len() >= INTEREST_DELTA_PENDING_MAX;
-        if overflowed {
-            // **THE NEWEST GOES, NOT THE OLDEST.** The overflow owes this connection a whole set, and
-            // the set restates every member the slot table can name — so an evicted entry is
-            // recoverable exactly when the table could have restated it anyway. What the table CANNOT
-            // restate is a member with no slot yet, and those are the entries the front of this list
-            // holds: `send_interest_tables` retires only what it stated, so a held enter stays at the
-            // front across a table. Evicting from the front dropped precisely the one entry nothing
-            // downstream could reconstruct, on the same event that triggered the repair.
-            list.pop();
-            *sent = (*sent).min(list.len());
+        if list.len() >= INTEREST_DELTA_PENDING_HARD_MAX {
+            list.remove(0);
+            *sent = sent.saturating_sub(1);
         }
         list.push(id);
         overflowed
@@ -8306,9 +8319,9 @@ mod tests {
         PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
         SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, Writer,
         ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
-        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
-        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
-        MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
+        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
         RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
         SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
         UNLOCATABLE_CENTER,
@@ -9988,14 +10001,16 @@ mod tests {
         assert!(peer.interest_delta_tick.is_none(), "nothing is in flight");
     }
 
-    /// The cap evicts the NEWEST entry, not the oldest. An overflow owes this connection a whole set,
-    /// and the set restates every member the slot table can name — so an evicted entry is recoverable
-    /// exactly when the set could have restated it. What the set cannot restate is a member with no
-    /// slot, and those are the entries the FRONT holds, because stating a set retires only what it
-    /// stated. Evicting from the front dropped the one entry nothing downstream could reconstruct, on
-    /// the same event that triggered the repair.
+    /// **THE SOFT CAP EVICTS NOTHING.** It cannot tell a recoverable entry from an unrecoverable one:
+    /// a whole set restates every member the slot table can name, so a dropped entry is recoverable
+    /// exactly when the set could have restated it — and what the set cannot restate is a member with
+    /// no slot, whose enter is held across the set for that reason. Dropping the oldest lost that held
+    /// enter; dropping the newest loses it whenever the slotless member is the one that just arrived.
+    ///
+    /// So the overflow says the connection is owed a whole set, and stating that set collapses the
+    /// half. The hard ceiling is a backstop for a connection that is never sent one.
     #[test]
-    fn the_pending_cap_evicts_what_a_whole_set_can_restate() {
+    fn the_pending_cap_owes_a_whole_set_rather_than_evicting() {
         let mut peer = PeerState::default();
         peer.note_interest_enter(7); // the held one, at the front
         for id in 100..(100 + INTEREST_DELTA_PENDING_MAX as u64 - 1) {
@@ -10013,9 +10028,30 @@ mod tests {
         peer.note_interest_enter(9_999);
         assert!(peer.interest_full_due, "the overflow owes a whole set");
         assert_eq!(
+            peer.interest_pending.enters.len(),
+            INTEREST_DELTA_PENDING_MAX + 1,
+            "and nothing was evicted to make room"
+        );
+        assert_eq!(
             peer.interest_pending.enters.first().copied(),
             Some(7),
-            "and the entry at the front -- the one a whole set could not restate -- survives it"
+            "the held enter at the front survives"
+        );
+        assert!(
+            peer.interest_pending.enters.contains(&9_999),
+            "and so does the one that just arrived"
+        );
+
+        // The backstop bounds a connection that is never sent a set. It is the only thing that drops.
+        while peer.interest_pending.enters.len() < INTEREST_DELTA_PENDING_HARD_MAX {
+            let next = 500_000 + peer.interest_pending.enters.len() as u64;
+            peer.note_interest_enter(next);
+        }
+        peer.note_interest_enter(999_999);
+        assert_eq!(
+            peer.interest_pending.enters.len(),
+            INTEREST_DELTA_PENDING_HARD_MAX,
+            "the ceiling holds"
         );
     }
 
