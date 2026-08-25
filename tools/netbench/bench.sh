@@ -67,6 +67,20 @@ if [ ! -d "$PROJECT/addons/orbitnet" ]; then
 	exit 1
 fi
 
+# A PROJECT GODOT HAS NEVER IMPORTED HAS NO GLOBAL CLASS CACHE, so every `class_name` in the demo resolves to
+# `Variant` -- which each demo's project.godot promotes from a warning to an ERROR. The run then dies at parse
+# time and the bringup wait below reports it as "dedicated server never bound", which names the symptom three
+# steps from the cause. `just check` imports all four projects on its way past, so only a bench run on a fresh
+# clone reaches a cold one.
+if [ ! -d "$PROJECT/.godot" ]; then
+	echo "netbench: $DEMO has not been imported yet -- importing it once (this takes a moment)..."
+	"$GODOT" --headless --path "$PROJECT" --import >/dev/null 2>&1 || true
+fi
+if [ ! -d "$PROJECT/.godot" ]; then
+	echo "netbench: could not import $PROJECT. Run \`$GODOT --headless --path $PROJECT --import\` and retry." >&2
+	exit 1
+fi
+
 sweep; sleep 1
 
 wait_marker() { # log timeout-seconds marker

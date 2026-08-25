@@ -28,6 +28,10 @@ the fleet size, so read the table when the two disagree.
 
 Only columns whose DIRECTION is known are judged. `rtt_ms` is set by the profile rather than by the netcode and
 `interest_entities` is a scene fact; both are printed and neither is judged.
+
+A column that is ZERO ON BOTH SIDES reads `not measured` rather than `same`. Most send-path columns are
+collected on the server and appear in no client CSV, so in a client-only comparison they are absent rather
+than unchanged -- and `same` on a dozen of them reads as a send path that was compared and found equal.
 """
 
 from __future__ import annotations
@@ -57,7 +61,6 @@ LOWER_IS_BETTER = {
     "interarrival_near": "ticks between rows for a near body",
     "interarrival_mid": "ticks between rows for a mid-band body",
     "interarrival_far": "ticks between rows for a far body",
-    "resim_ticks": "how deep the rollback loop replayed",
 }
 
 HIGHER_IS_BETTER = {
@@ -68,8 +71,12 @@ HIGHER_IS_BETTER = {
 # Printed, never judged: set by the profile, by the scene, or by the run's own bookkeeping.
 # `blocks_s` is deliberately unjudged: more blocks at the same byte count is a BETTER refresh rate, and more
 # blocks at a higher byte count is worse, so the number says nothing without the bytes beside it.
+# `resim_ticks` is unjudged for the reason the run's own gate does not judge it: resim depth legitimately
+# deepens under latency and is bounded by `history_limit`, and prediction that is actually broken shows up
+# as `reconcile_snap`, not as depth. Judging it reports a deeper-but-healthy run as a regression.
 UNJUDGED = ("rtt_ms", "jitter_ms", "stretch", "offset_ms", "interest_entities", "shots_fired",
-            "second", "tick", "mode", "peers", "ents_rollback", "ents_state", "blocks_s")
+            "second", "tick", "mode", "peers", "ents_rollback", "ents_state", "blocks_s",
+            "resim_ticks")
 
 # The server's own per-second wire line, folded out of its log by bench.sh.
 SERVER_CSV = "server.csv"
@@ -123,22 +130,31 @@ def load_run(directory: str, warmup_s: float) -> dict[str, list[float]]:
     return pooled
 
 
-def load_server(directory: str) -> dict[str, list[float]]:
-    """The server's own per-second rows, or an empty map when the run carries no server.csv."""
+def load_server(directory: str, warmup_s: float) -> dict[str, list[float]]:
+    """The server's own per-second rows, or an empty map when the run carries no server.csv.
+
+    THE SERVER IS UP BEFORE THE FLEET IS. Its first rows are the seconds between binding the port and the
+    first client arriving: `peers` is 0 and every wire column with it. Pooling those makes each figure a
+    function of how long bringup happened to take, which is the one thing a comparison must not depend on.
+    So the series starts at the first second the server had a peer, and the same warm-up the client series
+    drops comes off after that -- the first full-state burst is on the server's side of the link too.
+    """
     path = os.path.join(directory, SERVER_CSV)
     pooled: dict[str, list[float]] = {}
     if not os.path.exists(path):
         return pooled
     with open(path, newline="") as handle:
-        for row in csv.DictReader(handle):
-            for column, text in row.items():
-                if text in (None, ""):
-                    continue
-                try:
-                    value = float(text)
-                except ValueError:
-                    continue
-                pooled.setdefault(column, []).append(value)
+        rows = list(csv.DictReader(handle))
+    first_live = next((i for i, row in enumerate(rows) if float(row.get("peers") or 0.0) > 0.0), len(rows))
+    for row in rows[first_live + int(warmup_s):]:
+        for column, text in row.items():
+            if text in (None, ""):
+                continue
+            try:
+                value = float(text)
+            except ValueError:
+                continue
+            pooled.setdefault(column, []).append(value)
     return pooled
 
 
@@ -174,7 +190,14 @@ def report(title: str, before: dict[str, list[float]], after: dict[str, list[flo
     for column in columns:
         b50, a50 = percentile(before[column], 0.50), percentile(after[column], 0.50)
         b95, a95 = percentile(before[column], 0.95), percentile(after[column], 0.95)
-        call = verdict(column, b50, a50, tolerance, lower, higher)
+        # A COLUMN NOTHING POPULATED ON EITHER SIDE IS NOT EVIDENCE OF "UNCHANGED". Every send-path
+        # column reads zero in a client CSV, and `server.csv` carries only the handful the debug wire
+        # line prints -- so a dozen judged columns sit at 0.000 both sides in a client-only comparison.
+        # Printing those as `same` is how a run that measured nothing reads as a run that found nothing.
+        if not any(before[column]) and not any(after[column]):
+            call = "not measured"
+        else:
+            call = verdict(column, b50, a50, tolerance, lower, higher)
         if call == "REGRESSED":
             regressions += 1
         delta = "n/a" if b50 == 0.0 else f"{(a50 - b50) / abs(b50) * 100.0:+.1f}%"
@@ -204,7 +227,8 @@ def main() -> int:
         list(LOWER_IS_BETTER) + list(HIGHER_IS_BETTER), args.tolerance,
         LOWER_IS_BETTER, HIGHER_IS_BETTER)
 
-    server_before, server_after = load_server(args.before), load_server(args.after)
+    server_before = load_server(args.before, args.warmup)
+    server_after = load_server(args.after, args.warmup)
     if server_before and server_after:
         regressions += report(
             "== SERVER (per-second wire lines) ==",

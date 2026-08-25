@@ -350,12 +350,19 @@ wait "$SPID_D" 2>/dev/null
 echo "=== PASS D / SERVER ==="
 grep -aE "ARENA: peer" "$SERVER_D" || echo "(no output)"
 
+# THE POSITIVE CONTROL. Everything below this asserts an ABSENCE, and a second client that never started
+# produces the same absence as a forgery correctly refused. Both clients reaching a seat is what says the
+# refusal was actually exercised: D1 takes the held pair, D2 is seated as a newcomer on a different one.
+SEATED_D="$(grep -ac "seated at" "$SERVER_D" || true)"
+
 if ! grep -aq "dropped -- holding seats" "$SERVER_D"; then
 	fail "pass D: the server did not hold the departing peer's seats, so the forgery had nothing to take"
+elif [ "$SEATED_D" -lt 2 ]; then
+	fail "pass D: only $SEATED_D peer(s) were ever seated -- the forging client never connected, so the refusal below would pass vacuously"
 elif grep -aq "resumed seats" "$SERVER_D"; then
 	fail "pass D: an identity presented WITHOUT its token was given the seats back -- the token is not checked"
 else
-	echo "arena-probe: an identity presented without its token reclaimed nothing"
+	echo "arena-probe: an identity presented without its token reclaimed nothing (both clients seated)"
 fi
 
 # =====================================================================================================

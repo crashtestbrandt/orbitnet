@@ -94,6 +94,13 @@ the columns whose direction is known. It drops the first three seconds of each c
 handshake, the first full-state burst and the clock's initial convergence — and it exits non-zero on a
 regression.
 
+**A column that is zero on both sides reads `not measured`, not `same`.** Most send-path columns are
+collected on the server and appear in no client CSV, so in a client-only comparison they are absent rather
+than unchanged. `same` on a dozen of them would read as a send path that was compared and found equal.
+
+**Resim depth is printed and not judged**, for the reason the run's own gate does not judge it: it deepens
+legitimately under latency, and prediction that is actually broken shows up as `reconcile_snap`.
+
 **Two tables, and the second one is the point for a send-path change.** Every column describing the SEND path
 reads zero in a client CSV, because a client is not the authority and runs none of it. The server is therefore
 run under `ORBITNET_DEBUG=1` and its per-second wire line is folded into `server.csv`:
