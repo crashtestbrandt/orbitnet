@@ -195,6 +195,20 @@ func _submit(verb: StringName, payload: Dictionary, tag: int) -> void:
 	if code != CODE_OK:
 		_reply(sender, verb, PackedInt32Array([code]), PackedInt32Array([tag]))
 
+## One refusal code per tag -- the shape [method _announce_refusals] reads.
+##
+## THE HALVES MUST BE THE SAME LENGTH. The announce step reads the two arrays in lockstep and drops a frame
+## whose halves disagree, so a single code sent beside N tags is refused by the REQUESTER's own guard: the
+## batch is rejected in silence, with no reason code and every minted tag left outstanding. A refusal that
+## names one code for the whole batch still has to spell it against each tag.
+static func uniform_codes(code: int, count: int) -> PackedInt32Array:
+	var codes: PackedInt32Array = PackedInt32Array()
+	if count <= 0:
+		return codes
+	codes.resize(count)
+	codes.fill(code)
+	return codes
+
 # The batch counterpart. THE CAP IS RE-CHECKED HERE and not only in request_batch(): the client-side check is a
 # courtesy to an honest caller, and this one is the rule.
 @rpc("any_peer", "call_remote", "reliable")
@@ -206,7 +220,7 @@ func _submit_batch(verb: StringName, payloads: Array, tags: PackedInt32Array) ->
 		_reply(sender, verb, PackedInt32Array([CODE_BATCH_MALFORMED]), PackedInt32Array([0]))
 		return
 	if payloads.size() > MAX_BATCH:
-		_reply(sender, verb, PackedInt32Array([CODE_BATCH_TOO_LARGE]), tags)
+		_reply(sender, verb, uniform_codes(CODE_BATCH_TOO_LARGE, tags.size()), tags)
 		return
 	_apply_batch(sender, verb, payloads, tags)
 
