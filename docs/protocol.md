@@ -24,7 +24,7 @@ last N ticks for redundancy, so a single lost packet costs nothing.
 [entity slots](#entity-slots) for what that costs and what it saves.
 
 **Control frames** — reliable and **ordered**: handshake, welcome, entity manifest, entity manifest
-delta. All but the handshake carry the same 12-byte trailer. Ordering is what a manifest delta needs
+delta, and the interest table. All but the handshake carry the same 12-byte trailer. Ordering is what a manifest delta needs
 and a snapshot does not; every frame goes out `TRANSFER_MODE_RELIABLE` on one channel.
 
 **Handshake** — magic, protocol version, tick rate, a **session id**, the **session nonce**, the
@@ -641,7 +641,7 @@ The backend checks the wire. It does not check your game.
 | An entity-manifest delta against a generation the client does not hold | Refused whole, never in part. The client zeroes its generation and asks for the table; see [the manifest states a change](#the-manifest-states-a-change-not-the-table). |
 | An entity manifest that does not decode | The same answer, and the same NACK. It used to be dropped in silence, which was safe only while the next frame carried the whole table. |
 | An entity manifest whose generation is older than the one held | Ignored. Adopting it would make the client refuse every delta built on the newer table. |
-| An interest-delta entry naming a slot with no binding | Usually a leave whose cause is an unregister, naming a slot the manifest has released. Dropped in silence; the manifest rebuild emits that leave. |
+| An interest-delta entry naming a slot with no binding | A `left` entry is usually an unregister naming a slot the manifest has released: dropped in silence, and the manifest rebuild emits that leave. An `entered` entry has no second source, so it raises `WANT_INTEREST`. |
 | An input block for an entity the sender does not own | The live `get_multiplayer_authority()` check on the input node. |
 | An input block stamped too far into the future | Past `INPUT_FUTURE_HORIZON_TICKS` ahead of the server. |
 | An input row of the wrong wire stride, or for a tick history has rotated past | |

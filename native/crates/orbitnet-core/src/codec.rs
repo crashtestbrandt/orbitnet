@@ -1538,14 +1538,15 @@ fn read_manifest_entries(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, 
 pub struct InterestDeltaSection {
     /// The generation of the interest set this delta was built against.
     ///
-    /// **A MONOTONIC STAMP, NOT A CHAIN.** [`ManifestDelta::base_generation`] names one exact
-    /// predecessor because its channel is reliable and ordered, so a gap is a fault. This section
-    /// rides an unreliable snapshot and is re-sent until acknowledged, so gaps are ordinary and
-    /// chaining would turn every dropped datagram into a full resync. What the stamp is for instead
-    /// is one narrow race: a whole [`FrameKind::InterestTable`] is reliable and a delta is not, so a
-    /// delta built BEFORE the table can arrive after it and undo it. A receiver applies a section
-    /// only when its generation is at least the one the receiver holds, which drops exactly those
-    /// and nothing else.
+    /// **IT PLACES THE SECTION, AND THE MATCH IS EXACT** — see [`Self::applies_to`]. A section
+    /// states a change against one baseline, and a receiver holding any other is not holding the set
+    /// it was diffed from. A whole [`FrameKind::InterestTable`] is reliable and a section is not, so
+    /// a section built either side of a table can arrive on the wrong side of it.
+    ///
+    /// **It is not a chain.** [`ManifestDelta::base_generation`] names one exact predecessor and
+    /// refuses a gap, because its channel is ordered and a gap there is a fault. This moves only when
+    /// a whole set is sent, so an ordinary run of sections all carry the same one and a dropped
+    /// datagram costs nothing.
     pub generation: u64,
     /// Slots that left this peer's interest, ascending.
     pub left: Vec<u16>,
