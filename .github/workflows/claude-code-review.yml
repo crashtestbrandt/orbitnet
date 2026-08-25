@@ -22,7 +22,7 @@ name: Claude PR review
 # when the two differ -- an anti-tampering guard, since a pull request can otherwise rewrite the workflow that
 # reviews it. The skip exits 0, so a GREEN `claude-review` check does NOT mean a review happened; read the job
 # log, or look for the sticky comment. The pull request that adds or edits this file therefore always reviews
-# nothing, and the next one gets the new behaviour.
+# nothing, and the next one gets the new behavior.
 #
 # REQUIRES a repository secret named CLAUDE_CODE_OAUTH_TOKEN (Settings -> Secrets and variables -> Actions ->
 # New repository secret). Generate it with `claude setup-token` locally; it bills against a Claude
