@@ -84,6 +84,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 5 | Blocks name entities by a **16-bit session slot**; the entity manifest distributes the slot table for both lanes. |
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 | 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
+| 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. The leading generation shifts the offsets of the section's own counts, which is what makes this a major rather than a trailing addition. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -286,18 +287,47 @@ whose packets were lost. The section carries the decision, on the snapshot the p
 
 ```
 header flags bit 1 set, then after the entity blocks:
-varint left_count | [slot (u16)]* | varint entered_count | [slot (u16)]*
+varint generation | varint left_count | [slot (u16)]* | varint entered_count | [slot (u16)]*
 ```
 
 - **Server to client only.** Every flag owns a bit of its own: bit 0 is the client's `WANT_FULL`
-  NACK, bit 1 is this and is never set by a client, bit 2 is the client's `WANT_MANIFEST` NACK and is
-  never set by a server.
+  NACK, bit 1 is this and is never set by a client, bit 2 is the client's `WANT_MANIFEST` NACK and
+  bit 3 its `WANT_INTEREST` NACK, neither of which a server sets.
 - **A trailing section is invisible to a peer that does not know about it.** A receiver reads exactly
   `entity_count` blocks and stops, so an older build never looks at the bytes after them. It is a major bump
   anyway, because a peer that skips the section receives none of the events.
 - **Slots, not ids** — 2 fixed bytes against ~9.5 for a varint id, resolved against the table the entity
-  manifest already distributes. **An unbound slot is dropped in silence**, exactly as a block naming one is;
-  see [entity slots](#entity-slots).
+  manifest already distributes. An unbound slot in the `left` half is dropped in silence, exactly as a block
+  naming one is; see [entity slots](#entity-slots).
+- **An unbound slot in the `entered` half asks for the whole set.** The section rides an unreliable snapshot
+  and the manifest that binds its slots rides a reliable channel, with no ordering between them, so a
+  snapshot can name a slot whose binding is still being retransmitted. That enter cannot be held for later —
+  the server retires it on this frame's ack — so the client raises `WANT_INTEREST` instead.
+
+### The whole interest set
+
+`InterestTable` (kind `0x09`) is the repair path, and the only reliable frame here whose contents differ per
+recipient.
+
+```
+kind 0x09 | varint generation | varint count | [slot (u16)]*
+```
+
+Three things owe a connection one, and the server knows two of them without being told:
+
+| Cause | Noticed by |
+| --- | --- |
+| a pending half overflowed its cap | the server, queuing a transition |
+| a prefix was given up on unacknowledged | the server, retiring it |
+| a section named an `entered` slot the peer could not resolve | the client, via `WANT_INTEREST` |
+
+- **The generation is a monotonic stamp, not a chain.** A manifest delta names one exact predecessor because
+  its channel is ordered; this section is re-sent until acknowledged, so gaps are ordinary and chaining would
+  turn every dropped datagram into a resync. What the stamp catches is one race: the table is reliable and a
+  section is not, so a section built before the table can arrive after it. A receiver applies a section only
+  at or above the generation it holds.
+- **The receiver emits the diff, not the set.** A resync that announced every slot would re-announce every
+  entity the peer already had.
 - **The manifest cannot carry this.** It is a session-wide table broadcast identically to every peer, so it
   says "this entity exists" and never "this entity is relevant to you".
 
@@ -327,8 +357,9 @@ fragment costs the whole frame.
   announces only a set that actually changed, which is what makes a repeat free.
 - **Two bounds, and both are needed.** At most 32 entries of each half ride one frame, so a joining peer's
   burst is spread over frames rather than eating the budget in one. A prefix unacknowledged for 64 ticks is
-  dropped unconfirmed: past that an ack can no longer confirm the frame anyway. What is lost is those events,
-  and the game resyncs from `Net.entities_in_interest()`.
+  dropped unconfirmed: past that an ack can no longer confirm the frame anyway. The events lost with it are
+  not reconstructible, so that drop owes the connection a whole set rather than another delta — see
+  [the whole interest set](#the-whole-interest-set).
 
 ### One signal for two causes
 
@@ -585,8 +616,9 @@ newer. A client that advances its ack at full rate while holding a constant lag 
 time and is measured at that lag — indistinguishable from a peer behind a traffic shaper, and it gains
 nothing that peer does not gain honestly. No wire field closes that: `current - ack` is the whole round trip
 whatever tick lead the client runs at, so there is no second quantity the server could derive an independent
-figure from. The containment is `NetLagComp.max_delay_ms`, 250 ms by default, which bounds every rewind
-whatever the estimate says.
+figure from. The containment is `Net.rtt_believed_max_ms`, 250 ms by default, which clamps the sample at the read;
+`NetLagComp.max_delay_ms` separately bounds the rewind itself. The two are different bounds that happen to
+share a default.
 
 ## What the receive path refuses, and what it does not
 

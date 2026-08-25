@@ -31,14 +31,16 @@ use godot::classes::{
 use godot::prelude::*;
 
 use orbitnet_core::auth::{
-    compress_secret, confirm_tag, derive_session_key, siphash24, TRAILER_LEN,
+    compress_secret, confirm_tag, derive_session_key, siphash24, MAX_INPUT_BLOCKS_PER_TICK,
+    TRAILER_LEN,
 };
 use orbitnet_core::codec::{
-    apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_manifest_delta,
-    decode_manifest_full, decode_state_block_meta, diff_manifest, encode_interest_delta,
-    encode_manifest_delta, encode_manifest_full, input_block_row, skip_input_block_body,
-    skip_state_block_body, FrameHeader, FrameKind, Handshake, InterestDeltaSection, ManifestDelta,
-    ManifestEntry, Ping, Pong, Reader, Welcome, Writer, MAGIC, MAX_FRAME_PAYLOAD,
+    apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
+    decode_manifest_delta, decode_manifest_full, decode_state_block_meta, diff_manifest,
+    encode_interest_delta, encode_interest_table, encode_manifest_delta, encode_manifest_full,
+    input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
+    Handshake, InterestDeltaSection, ManifestDelta, ManifestEntry, Ping, Pong, Reader, Welcome,
+    Writer, MAGIC, MAX_FRAME_PAYLOAD,
 };
 use orbitnet_core::interest::{
     ConnectionInterest, InterestCandidate, InterestDelta, InterestGrid, InterestOccupancy,
@@ -747,6 +749,25 @@ struct PeerState {
     /// [`OrbitNet::entities_in_interest`]. So a filtering server sends the section once even when it
     /// is empty — two bytes, once per connection — and the flag retires with the first ack of it.
     interest_seeded: bool,
+    /// The generation of the interest set this connection is believed to hold.
+    ///
+    /// Bumped only when a whole [`FrameKind::InterestTable`] is sent, and stamped onto every delta
+    /// section built after it. That is the whole of what it is for: the table is reliable and a
+    /// delta is not, so a delta built BEFORE the table can arrive after it and undo it. A receiver
+    /// refuses a section stamped below the generation it holds.
+    interest_generation: u64,
+    /// Whether this connection is owed a whole interest set rather than another delta.
+    ///
+    /// **THREE THINGS SET IT, AND THE SERVER KNOWS TWO OF THEM ITSELF.** A pending half that
+    /// overflowed dropped an event nobody can reconstruct; a prefix given up on unacknowledged left
+    /// the two ends disagreeing about what was sent. The third is the client raising
+    /// [`FrameHeader::FLAG_WANT_INTEREST`], which is the case only it can see — a delta naming a
+    /// slot its manifest has not bound yet.
+    ///
+    /// Before this flag, all three were silent: the mirror stayed wrong for the rest of the session
+    /// while the entity's rows kept arriving, and the documented repair
+    /// ([`OrbitNet::entities_in_interest`]) answered a client from that same broken mirror.
+    interest_full_due: bool,
     /// Recent snapshot sends awaiting acknowledgment: (frame tick, entity ticks it carried).
     sent_log: std::collections::VecDeque<(u64, Vec<(u64, u64)>)>,
     /// Per-entity newest tick this peer CONFIRMED receiving (via ack_tick/ack_bits) — the only
@@ -914,9 +935,13 @@ const INTEREST_DELTA_PER_FRAME: usize = 32;
 /// How many entries each half of a peer's pending interest delta holds before the OLDEST is dropped.
 ///
 /// The backstop for a session churning relevancy faster than the acknowledged prefix drains — a peer
-/// on a link that is up enough to be sent to and down enough never to ack. What is dropped is the
-/// oldest event, never the newest: the recent transitions are the ones a game is about to act on,
-/// and the stale set is repaired by [`OrbitNet::entities_in_interest`] rather than by a replay.
+/// on a link that is up enough to be sent to and down enough never to ack, and a first update in a
+/// world of more than this many filtered entities. What is dropped is the oldest event, never the
+/// newest: the recent transitions are the ones a game is about to act on.
+///
+/// **THE DROP IS REPORTED, NOT ABSORBED.** `entities_in_interest` was named here as the repair and
+/// could not be one: on a client it answers out of the mirror the drop had just made wrong. What
+/// repairs it is [`OrbitNet::send_interest_tables`], which the overflow asks for.
 const INTEREST_DELTA_PENDING_MAX: usize = 256;
 
 /// How many ticks a prefix rides unacknowledged before it is given up on.
@@ -1017,7 +1042,7 @@ impl PeerState {
     ///
     /// Retracting clears nothing, because nothing was sent while the veto was in force: the entries
     /// cleared at the start are still empty, which is what makes the re-admission a full block.
-    fn set_entity_hidden(&mut self, id: u64, hidden: bool) {
+    fn set_entity_hidden(&mut self, id: u64, hidden: bool) -> bool {
         let held = self.interest.contains(id);
         self.interest.set_hidden(id, hidden);
         if hidden {
@@ -1031,10 +1056,12 @@ impl PeerState {
             if held {
                 self.note_interest_leave(id);
             }
+            return held;
         }
         // RETRACTING QUEUES NOTHING. The entity re-enters through the enter radius on the next
         // update, and that update reports it — announcing it here would name a body the filter may
         // still refuse.
+        false
     }
 
     /// Queue "this entity left your interest" for this connection.
@@ -1048,11 +1075,13 @@ impl PeerState {
             &mut self.interest_delta_entered_sent,
             id,
         );
-        Self::push_pending(
+        if Self::push_pending(
             &mut self.interest_pending.leaves,
             &mut self.interest_delta_left_sent,
             id,
-        );
+        ) {
+            self.interest_full_due = true;
+        }
     }
 
     /// Queue "this entity entered your interest" for this connection. The mirror of
@@ -1063,11 +1092,13 @@ impl PeerState {
             &mut self.interest_delta_left_sent,
             id,
         );
-        Self::push_pending(
+        if Self::push_pending(
             &mut self.interest_pending.enters,
             &mut self.interest_delta_entered_sent,
             id,
-        );
+        ) {
+            self.interest_full_due = true;
+        }
     }
 
     /// Remove `id` from one half, keeping `sent` pointing at the same entries it did.
@@ -1084,13 +1115,25 @@ impl PeerState {
         }
     }
 
-    /// Append `id` to one half, dropping the oldest entry when the half is full.
-    fn push_pending(list: &mut Vec<u64>, sent: &mut usize, id: u64) {
-        if list.len() >= INTEREST_DELTA_PENDING_MAX {
+    /// Append `id` to one half, answering whether doing so had to drop the oldest entry.
+    ///
+    /// **THE DROP IS REPORTED RATHER THAN SWALLOWED.** An entry dropped here never reaches the wire,
+    /// and nothing downstream can reconstruct it — the halves are a net difference, not a log. The
+    /// caller turns a `true` into [`Self::interest_full_due`], which costs one whole set and leaves
+    /// the two ends agreeing; the alternative, which this replaced, was a client permanently short
+    /// of an entity whose rows kept arriving.
+    ///
+    /// It is not only the unreachable-peer case the cap was written for: a first update in a world
+    /// of more than [`INTEREST_DELTA_PENDING_MAX`] filtered entities overflows on a healthy link.
+    #[must_use]
+    fn push_pending(list: &mut Vec<u64>, sent: &mut usize, id: u64) -> bool {
+        let overflowed = list.len() >= INTEREST_DELTA_PENDING_MAX;
+        if overflowed {
             list.remove(0);
             *sent = sent.saturating_sub(1);
         }
         list.push(id);
+        overflowed
     }
 
     /// Drop everything this connection holds about one entity that has left the registry, answering
@@ -1133,6 +1176,12 @@ impl PeerState {
         let acked = self.newest_ack >= stamp;
         if !acked && current < stamp.saturating_add(INTEREST_DELTA_RETRY_TICKS) {
             return;
+        }
+        if !acked {
+            // GIVEN UP ON, NOT DELIVERED. The prefix is still dropped — re-queuing it is what would
+            // make one unreachable peer accumulate for ever — but the two ends now disagree about
+            // what was sent, and a whole set is the only thing that settles that.
+            self.interest_full_due = true;
         }
         let left = self
             .interest_delta_left_sent
@@ -1891,6 +1940,16 @@ pub struct OrbitNet {
     /// The wire slots one connection's section carries, pooled so a warm tick allocates nothing.
     delta_left_scratch: Vec<u16>,
     delta_entered_scratch: Vec<u16>,
+    /// CLIENT: the generation of the interest set this peer holds.
+    ///
+    /// Set by a whole [`FrameKind::InterestTable`] and compared against every delta section, so a
+    /// section built before the table cannot undo it. See [`InterestDeltaSection::generation`].
+    interest_mirror_generation: u64,
+    /// CLIENT: whether this peer owes the server a [`FrameHeader::FLAG_WANT_INTEREST`].
+    ///
+    /// Raised for the one case only a client can see: a section naming an `entered` slot its
+    /// manifest has not bound yet. Cleared when the whole set lands.
+    want_interest: bool,
     /// CLIENT: the entities this peer has been told are in its interest.
     ///
     /// **A mirror of the server's set, not a derivation.** A client cannot compute its own interest
@@ -2099,6 +2158,8 @@ impl INode for OrbitNet {
             delta_entered_scratch: Vec::new(),
             interest_mirror: std::collections::HashSet::new(),
             interest_mirror_seeded: false,
+            interest_mirror_generation: 0,
+            want_interest: false,
             // OPEN. Today's behavior, and the only default that cannot take a world away from a
             // consumer whose binary is refreshed without their source changing.
             unanchored_policy: UNANCHORED_OPEN,
@@ -2435,6 +2496,8 @@ impl OrbitNet {
         // is not hiding nodes in response to it.
         self.interest_mirror.clear();
         self.interest_mirror_seeded = false;
+        self.interest_mirror_generation = 0;
+        self.want_interest = false;
         self.interest_events.clear();
         // The path verdict describes THIS session's occupancy, and the next session's arena is not
         // this one's. It has hysteresis, so a held verdict would survive into a world it was never
@@ -3123,6 +3186,13 @@ impl OrbitNet {
     /// seat on it — see [`PeerState::set_entity_hidden`] for the delta bookkeeping it clears and
     /// [`ConnectionInterest::set_hidden`] for the filter rule itself.
     ///
+    /// **IT NEEDS NO OTHER AXIS CONFIGURED.** A standing veto turns the interest pass on by itself,
+    /// so a session with no radius and no declared membership — the one where a per-(peer, entity)
+    /// refusal is the only lever a game has — gets the behaviour this method describes. It used to
+    /// be inert there: the veto is enforced inside the filter, the filter ran only when a radius or
+    /// a membership had already asked for it, and the two read-backs then disagreed, with
+    /// `is_entity_hidden` answering `true` while `is_entity_in_interest` also answered `true`.
+    ///
     /// **THE CLIENT-SIDE CONTRACT, STATED PLAINLY: a veto stops the rows and nothing else.** No
     /// despawn is sent, the receiving client's node is not removed, and the entity manifest still
     /// names the id — ids are session-global whatever any one peer receives. What the client sees is
@@ -3133,10 +3203,19 @@ impl OrbitNet {
         if entity_id == 0 {
             return;
         }
-        self.peers
+        let left = self
+            .peers
             .entry(peer)
             .or_default()
             .set_entity_hidden(entity_id as u64, hidden);
+        // THE SIGNAL THE WIRE LEAVE ALREADY CARRIED. A veto drops the id from the set in that same
+        // call, so no later `leaves` diff can ever name it — which is exactly why the rule stated
+        // above `update_interest` is that each between-updates leave queues its own event. Without
+        // this the server saw no `entity_left_interest` for a veto while a retraction still produced
+        // an `entity_entered_interest`, so a handler mirroring the two recorded an unpaired enter.
+        if left {
+            self.interest_events.push((peer, entity_id as u64, false));
+        }
     }
 
     /// Whether `entity_id` is currently in `peer`'s interest.
@@ -4898,6 +4977,7 @@ impl OrbitNet {
                 // Before the manifest, because the manifest is what publishes the table.
                 self.reconcile_slots(current);
                 self.send_manifest_if_dirty();
+                self.send_interest_tables();
                 self.send_snapshots(current);
             }
             _ => {}
@@ -4977,7 +5057,8 @@ impl OrbitNet {
             // broken delta base and a broken manifest have nothing to do with each other and a
             // client can be owed both on one tick.
             flags: (u8::from(self.want_full) * FrameHeader::FLAG_WANT_FULL)
-                | (u8::from(self.want_manifest) * FrameHeader::FLAG_WANT_MANIFEST),
+                | (u8::from(self.want_manifest) * FrameHeader::FLAG_WANT_MANIFEST)
+                | (u8::from(self.want_interest) * FrameHeader::FLAG_WANT_INTEREST),
             entity_count: carried.len() as u32,
         };
         header.encode(&mut writer);
@@ -4986,6 +5067,7 @@ impl OrbitNet {
         }
         self.want_full = false;
         self.want_manifest = false;
+        self.want_interest = false;
         self.send_to(SERVER_PEER, writer.as_slice(), TransferMode::UNRELIABLE);
     }
 
@@ -5149,6 +5231,70 @@ impl OrbitNet {
     ///    interest size rather than `O(peers · N log N)` over the whole registry, which is where the
     ///    real per-peer cost lived. Ordering ahead of the cull bought bandwidth and no CPU.
     /// 4. Admission spends the byte budget down the ordered list.
+    /// SERVER: send the whole interest set to every connection owed one, and bump its generation.
+    ///
+    /// **THE REPAIR PATH FOR RELEVANCY, AND THE MIRROR OF `send_manifest_if_dirty`.** Three things
+    /// owe a connection a whole set, and none of them can be answered by another delta:
+    ///
+    /// | Cause | Who noticed |
+    /// | --- | --- |
+    /// | a pending half overflowed [`INTEREST_DELTA_PENDING_MAX`] | the server, in `push_pending` |
+    /// | a prefix was given up on unacknowledged | the server, in `retire_interest_delta` |
+    /// | a section named a slot the peer could not resolve | the client, via [`FrameHeader::FLAG_WANT_INTEREST`] |
+    ///
+    /// Before this, all three were silent and permanent: the peer's mirror stayed short of an entity
+    /// whose rows kept arriving, `entity_entered_interest` never fired for it, and the documented
+    /// repair answered that client out of the same broken mirror.
+    ///
+    /// **It runs BEFORE the snapshots**, so the manifest that binds these slots has already gone out
+    /// on the reliable channel this tick, and so this tick's own section — built after
+    /// `update_interest` — carries the bumped generation and patches the set rather than racing it.
+    ///
+    /// The pending halves are cleared rather than sent: every entry in them is a transition into or
+    /// out of the set this frame states outright.
+    fn send_interest_tables(&mut self) {
+        if self.mode == MODE_CLIENT {
+            return;
+        }
+        let owed: Vec<i32> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.synced && peer.interest_full_due)
+            .map(|(&id, _)| id)
+            .collect();
+        if owed.is_empty() {
+            return;
+        }
+        let mut frames: Vec<(i32, Vec<u8>)> = Vec::with_capacity(owed.len());
+        for peer_id in owed {
+            let Some(peer) = self.peers.get_mut(&peer_id) else {
+                continue;
+            };
+            // Ascending, like every other slot run on this wire, so a receiver reads one order.
+            let mut slots: Vec<u16> = peer
+                .interest
+                .iter()
+                .filter_map(|id| self.slots.slot_of(id))
+                .collect();
+            slots.sort_unstable();
+            // Saturating for the reason the manifest's is: a wrap would land on a generation some
+            // peer already believes it holds, which is the one outcome that misapplies in silence.
+            peer.interest_generation = peer.interest_generation.saturating_add(1);
+            let generation = peer.interest_generation;
+            peer.interest_pending.leaves.clear();
+            peer.interest_pending.enters.clear();
+            peer.interest_delta_left_sent = 0;
+            peer.interest_delta_entered_sent = 0;
+            peer.interest_delta_tick = None;
+            peer.interest_seeded = true;
+            peer.interest_full_due = false;
+            frames.push((peer_id, encode_interest_table(generation, &slots)));
+        }
+        for (peer_id, bytes) in frames {
+            self.send_to(peer_id, &bytes, TransferMode::RELIABLE);
+        }
+    }
+
     fn send_snapshots(&mut self, current: u64) {
         let budget = self.effective_send_budget();
         let peer_ids: Vec<i32> = self
@@ -5203,7 +5349,18 @@ impl OrbitNet {
         // and running the pass would refuse exactly nothing. The two branches produce the same set.
         // What that tick loses is one update of `peer.interest` — which is not read on that tick
         // either, and whose next update diffs against it and emits the leaves as usual.
-        let filtering = culling || rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL);
+        // A STANDING VETO TURNS THE PASS ON BY ITSELF. `set_entity_hidden` is enforced inside
+        // `PeerInterest::classify`, which only the pass reaches — so without this term the veto did
+        // nothing at all in the configuration it exists for: no radius, no declared membership, the
+        // one case where a per-(peer, entity) refusal is the only lever a game has. It is a cheap
+        // standing count rather than a scan, and a session that vetoes nothing pays one `bool` per
+        // connection per flush and takes the same branch it always did.
+        let vetoing = self
+            .peers
+            .values()
+            .any(|peer| peer.interest.hidden_len() > 0);
+        let filtering =
+            culling || vetoing || rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL);
         if filtering {
             Self::collect_observers(&rows, &mut observers);
             self.warn_anchor_conflicts(&observers);
@@ -5350,17 +5507,24 @@ impl OrbitNet {
             // Its bytes come off the budget the loop is about to spend, because a section appended
             // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. The
             // ack that retires it is the ordinary one every frame already carries and proves.
-            let carries_delta = {
+            let (carries_delta, interest_generation) = {
                 let Some(peer) = self.peers.get_mut(&peer_id) else {
                     continue;
                 };
-                build_interest_section(
-                    &self.slots,
-                    peer,
-                    filtering,
-                    current,
-                    &mut delta_left,
-                    &mut delta_entered,
+                // READ BESIDE THE SECTION IT STAMPS, not at the encode below: a whole set sent later
+                // in this same flush would bump it, and the section would then claim a generation it
+                // was not built against.
+                let generation = peer.interest_generation;
+                (
+                    build_interest_section(
+                        &self.slots,
+                        peer,
+                        filtering,
+                        current,
+                        &mut delta_left,
+                        &mut delta_entered,
+                    ),
+                    generation,
                 )
             };
             let admit_budget = budget.saturating_sub(interest_delta_reserve(
@@ -5546,7 +5710,12 @@ impl OrbitNet {
             // AFTER the blocks, which is what makes it invisible to a peer that does not know about
             // it: a receiver reads exactly `entity_count` blocks and stops.
             if carries_delta {
-                encode_interest_delta(&delta_left, &delta_entered, &mut writer);
+                encode_interest_delta(
+                    interest_generation,
+                    &delta_left,
+                    &delta_entered,
+                    &mut writer,
+                );
             }
             self.acc_blocks_admitted += sent.len() as u64;
             self.acc_blocks_full += sent_full.len() as u64;
@@ -6128,6 +6297,27 @@ impl OrbitNet {
                     }
                 }
             }
+            FrameKind::InterestTable => {
+                if self.mode == MODE_CLIENT && sender == SERVER_PEER {
+                    let _ = reader.u8();
+                    match decode_interest_table(&mut reader) {
+                        // An older table is ignored for the reason a stale manifest is: the channel
+                        // is reliable and ordered, so it should be unreachable, and adopting one
+                        // would make this peer refuse every delta built on the newer set.
+                        Ok((generation, slots))
+                            if generation >= self.interest_mirror_generation =>
+                        {
+                            self.adopt_interest_table(generation, &slots);
+                        }
+                        Ok(_) => {}
+                        // A table that did not decode leaves the mirror as it was and asks again.
+                        // There is no next whole set unless this asks for one.
+                        Err(_) => {
+                            self.want_interest = true;
+                        }
+                    }
+                }
+            }
             FrameKind::EntityManifestDelta => {
                 if self.mode == MODE_CLIENT && sender == SERVER_PEER {
                     let _ = reader.u8();
@@ -6400,6 +6590,18 @@ impl OrbitNet {
             // repeats its nonce, derives the same key and does not enter here, so it keeps the
             // table it is still holding.
             peer.forget_manifest();
+            // AND THE DELTA BASES WITH IT. `stop()` cleared every row the client held, so an
+            // `acked_base` entry here names a row that no longer exists on the other end. `want_full`
+            // alone does not cover it: it makes the NEXT frame full for the entities that fit the
+            // byte budget, and every one deferred past that budget was then encoded as a masked delta
+            // against a base the client had already dropped — a guaranteed `NoBase` and a NACK on a
+            // connection that had just told the server everything was gone.
+            peer.acked_base.clear();
+            peer.last_full.clear();
+            peer.last_sent.clear();
+            // The interest set went the same way, and the whole set is what re-seats it.
+            peer.interest_seeded = false;
+            peer.interest_full_due = true;
         }
         // The secret this connection's frame tokens are minted from. `get_or_insert_with`, not an
         // assignment: a hello is retried, and re-minting would strand every token the client already
@@ -6553,6 +6755,11 @@ impl OrbitNet {
             if header.flags & FrameHeader::FLAG_WANT_MANIFEST != 0 {
                 peer.forget_manifest();
                 manifest_nacked = true;
+            }
+            // THE INTEREST NACK: this peer could not apply a section — it named a slot the peer's
+            // manifest has not bound. Owe it the whole set; the send path answers on the next tick.
+            if header.flags & FrameHeader::FLAG_WANT_INTEREST != 0 {
+                peer.interest_full_due = true;
             }
         }
         // The publish loop runs only on a dirty flush, and a peer asking for the table it should
@@ -6793,15 +7000,60 @@ impl OrbitNet {
     /// that names it. The leave is not lost — [`Self::apply_manifest_interest`] emits it from the
     /// rebuild — and the mirrored set is what makes the two produce exactly one event between them.
     fn apply_interest_delta(&mut self, section: &InterestDeltaSection) {
+        // A SECTION OLDER THAN THE SET THIS PEER HOLDS IS DROPPED. The whole set is reliable and a
+        // section is not, so a section built before the set can arrive after it; applying one would
+        // undo exactly the repair that set was sent to make.
+        if !section.applies_to(self.interest_mirror_generation) {
+            return;
+        }
         let peer = self.local_peer_id();
         self.interest_mirror_seeded = true;
-        apply_interest_section(
+        let resolved = apply_interest_section(
             &self.slots,
             &mut self.interest_mirror,
             &mut self.interest_events,
             peer,
             section,
         );
+        // AN ENTER NAMING A SLOT THIS PEER CANNOT RESOLVE IS THE ONE CASE ONLY A CLIENT SEES. The
+        // section rides an unreliable snapshot and the manifest that binds its slots rides a
+        // reliable channel, with no ordering between them. Dropping the enter and letting the
+        // server retire it on this frame's ack is what left the mirror permanently short.
+        if !resolved {
+            self.want_interest = true;
+        }
+    }
+
+    /// CLIENT: adopt a whole interest set, replacing what this peer believed it held.
+    ///
+    /// The events are the DIFF against the old mirror rather than an enter for every slot: a resync
+    /// that announced the whole set would re-announce every entity the peer already had, and a game
+    /// acting on those signals would rebuild nodes it never lost.
+    fn adopt_interest_table(&mut self, generation: u64, slots: &[u16]) {
+        let peer = self.local_peer_id();
+        let mut next: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for &slot in slots {
+            // A slot this peer cannot name yet is not a reason to ask again: the set is authoritative
+            // about membership, and the manifest that binds the slot is already on its way. What it
+            // cannot do is name the entity, so it cannot be mirrored or announced until then.
+            if let Some(id) = self.slots.id_of(slot) {
+                next.insert(id);
+            }
+        }
+        for &id in self.interest_mirror.iter() {
+            if !next.contains(&id) {
+                self.interest_events.push((peer, id, false));
+            }
+        }
+        for &id in next.iter() {
+            if !self.interest_mirror.contains(&id) {
+                self.interest_events.push((peer, id, true));
+            }
+        }
+        self.interest_mirror = next;
+        self.interest_mirror_generation = generation;
+        self.interest_mirror_seeded = true;
+        self.want_interest = false;
     }
 
     /// CLIENT: emit a leave for every mirrored entity the new manifest no longer names.
@@ -7053,9 +7305,13 @@ fn filter_connection(
 /// [`MAX_FRAME_PAYLOAD`] — an unreliable datagram past the path MTU fragments, and a lost fragment
 /// costs the whole frame.
 ///
-/// `3 + 2 × count`: two count varints, one byte each at any count one frame can carry, plus a byte
-/// of slack, and a flat 2 bytes per slot. Zero for an empty section, because no flag is raised and
-/// no bytes are written.
+/// `13 + 2 × count`: two count varints at one byte each for any count one frame can carry, a byte of
+/// slack, a flat 2 bytes per slot, and **ten bytes for the leading generation** — a `u64` varint's
+/// worst case, reserved in full rather than measured. The generation only reaches two bytes after 127
+/// resyncs on one connection and ten is unreachable, but the reserve is what keeps an unreliable
+/// datagram inside the path MTU, and a bound that holds only for small values is not a bound.
+///
+/// Zero for an empty section, because no flag is raised and no bytes are written.
 ///
 /// **It can leave less than one block's worth of budget**, at the 256 B floor
 /// [`OrbitNet::effective_send_budget`] clamps to: a maximal section there leaves 125 B. That does not
@@ -7066,7 +7322,7 @@ fn interest_delta_reserve(count: usize) -> usize {
     if count == 0 {
         0
     } else {
-        3 + 2 * count
+        13 + 2 * count
     }
 }
 
@@ -7196,13 +7452,14 @@ fn build_interest_section(
 /// * **An unbound slot is dropped in silence**, exactly as a block naming one is. That is the
 ///   ordinary case rather than a hostile one: a leave whose cause is an unregister names a slot the
 ///   very next manifest releases, and the reliable manifest can arrive first.
+#[must_use]
 fn apply_interest_section(
     slots: &SlotTable,
     mirror: &mut std::collections::HashSet<u64>,
     events: &mut Vec<(i32, u64, bool)>,
     peer: i32,
     section: &InterestDeltaSection,
-) {
+) -> bool {
     for &slot in &section.left {
         let Some(id) = slots.id_of(slot) else {
             continue;
@@ -7211,14 +7468,20 @@ fn apply_interest_section(
             events.push((peer, id, false));
         }
     }
+    // An unresolvable LEAVE is not reported: the id is not in the mirror to remove, and the manifest
+    // that releases the slot emits that leave from its own rebuild. An unresolvable ENTER is, because
+    // nothing else will ever produce it.
+    let mut resolved = true;
     for &slot in &section.entered {
         let Some(id) = slots.id_of(slot) else {
+            resolved = false;
             continue;
         };
         if mirror.insert(id) {
             events.push((peer, id, true));
         }
     }
+    resolved
 }
 
 /// Drop every mirrored entity the slot table no longer names, queuing a leave for each.
@@ -7283,9 +7546,17 @@ fn admit_input_blocks(
     let start = rotor % lengths.len();
     let mut payload = 0usize;
     let mut refused: Option<usize> = None;
+    // TWO CAPS, AND THE COUNT ONE IS NOT REDUNDANT. The server refuses past
+    // `MAX_INPUT_BLOCKS_PER_TICK` blocks from one peer in one tick, and the byte budget alone does
+    // not keep a frame under it: a one-property input schema packs a block into 9 bytes, so a
+    // hundred owned bodies fit inside `MAX_FRAME_PAYLOAD` and nothing here refuses any of them. The
+    // frame then carried the same ascending run every tick and the server truncated at the same
+    // index every tick, so every body past it was never driven at all. Refusing here instead is
+    // what puts the tail into the rota — `refused` is the next tick's start.
+    let cap = MAX_INPUT_BLOCKS_PER_TICK as usize;
     for step in 0..lengths.len() {
         let index = (start + step) % lengths.len();
-        if payload + lengths[index] <= budget {
+        if out.len() < cap && payload + lengths[index] <= budget {
             payload += lengths[index];
             out.push(index);
         } else if refused.is_none() {
@@ -7609,7 +7880,9 @@ enum ResumeGrant {
 /// owned the identity.
 ///
 /// **What it does not close is an on-path observer**, who reads the welcome and can quote the token
-/// verbatim. That is the same boundary the session key already has, and closing it needs a key exchange.
+/// verbatim. That is the same boundary the session key already has, and it closes the same way — a shared
+/// session secret. Under one, that observer can still copy the token but cannot authenticate the handshake
+/// that quotes it.
 ///
 /// **`token_on_record` of `0` grants on the identity alone**, which is what a server that has minted no
 /// token for that identity yet has. That is a first-time join, and refusing it would refuse everybody.
@@ -7844,11 +8117,12 @@ mod tests {
         PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
         ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
         StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
-        FULL_STATE_INTERVAL, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
-        MAX_FRAME_PAYLOAD, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS,
-        RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS,
-        RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY,
-        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        FULL_STATE_INTERVAL, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
+        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
+        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
+        UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -9404,6 +9678,197 @@ mod tests {
         (carries, left, entered)
     }
 
+    // ------------------------------------------------------------------
+    // The resync: three ways a connection is owed the whole set, and the two gates on the client.
+    // ------------------------------------------------------------------
+
+    /// **CAUSE 1: THE PENDING HALF OVERFLOWED.** The cap was written as a backstop for a peer that
+    /// never acks, but a first update in a world of more than `INTEREST_DELTA_PENDING_MAX` filtered
+    /// entities reaches it on a healthy link. What was dropped never reached the wire and nothing
+    /// downstream could reconstruct it, so the client stayed permanently short of those entities
+    /// while their rows kept arriving.
+    #[test]
+    fn an_overflowing_pending_half_owes_the_whole_set() {
+        let mut peer = PeerState::default();
+        for id in 1..=(INTEREST_DELTA_PENDING_MAX as u64) {
+            peer.note_interest_enter(id);
+        }
+        assert!(
+            !peer.interest_full_due,
+            "filling the half exactly is not an overflow"
+        );
+        assert_eq!(
+            peer.interest_pending.enters.len(),
+            INTEREST_DELTA_PENDING_MAX
+        );
+
+        peer.note_interest_enter(9_999);
+        assert!(
+            peer.interest_full_due,
+            "the entry that pushed the oldest out owes this peer a whole set"
+        );
+    }
+
+    /// **CAUSE 2: A PREFIX GIVEN UP ON.** The prefix is still dropped rather than re-queued — that
+    /// is what stops one unreachable peer accumulating for ever — but the two ends now disagree
+    /// about what was sent, and only a whole set settles that. An ACKNOWLEDGED prefix owes nothing.
+    #[test]
+    fn a_prefix_given_up_on_owes_the_whole_set_and_an_acked_one_does_not() {
+        let mut peer = peer_holding(7);
+        peer.note_interest_enter(7);
+        peer.interest_delta_tick = Some(100);
+        peer.interest_delta_entered_sent = 1;
+        peer.retire_interest_delta(100 + INTEREST_DELTA_RETRY_TICKS);
+        assert!(peer.interest_full_due, "given up on unacknowledged");
+
+        let mut acked = peer_holding(7);
+        acked.note_interest_enter(7);
+        acked.interest_delta_tick = Some(100);
+        acked.interest_delta_entered_sent = 1;
+        acked.newest_ack = 100;
+        acked.retire_interest_delta(101);
+        assert!(
+            !acked.interest_full_due,
+            "an acknowledged prefix is the ordinary path and owes nothing"
+        );
+    }
+
+    /// **CAUSE 3, AND THE ONE ONLY A CLIENT SEES: an enter naming a slot the manifest has not bound.**
+    ///
+    /// The section rides an UNRELIABLE snapshot; the manifest binding its slots rides a RELIABLE
+    /// channel, and the two have no ordering relationship. So a snapshot can arrive naming a slot
+    /// whose binding is still in ENet's retransmit queue. Dropping it in silence, which is what this
+    /// used to do, left the server free to retire the enter on that frame's ack — and the entity was
+    /// never announced again while its rows kept arriving.
+    ///
+    /// An unresolvable LEAVE is deliberately NOT reported: the id is not in the mirror to remove,
+    /// and the manifest rebuild emits that leave itself.
+    #[test]
+    fn an_enter_naming_an_unbound_slot_is_reported_and_a_leave_is_not() {
+        let slots = table_naming(&[11]);
+        let mut mirror = std::collections::HashSet::new();
+        let mut events = Vec::new();
+
+        let unbound_enter = InterestDeltaSection {
+            generation: 0,
+            left: Vec::new(),
+            entered: vec![9],
+        };
+        assert!(
+            !apply_interest_section(&slots, &mut mirror, &mut events, 4, &unbound_enter),
+            "an enter this peer cannot name is what raises FLAG_WANT_INTEREST"
+        );
+        assert!(mirror.is_empty());
+        assert!(events.is_empty(), "and it announces nothing meanwhile");
+
+        let unbound_leave = InterestDeltaSection {
+            generation: 0,
+            left: vec![9],
+            entered: Vec::new(),
+        };
+        assert!(
+            apply_interest_section(&slots, &mut mirror, &mut events, 4, &unbound_leave),
+            "an unresolvable leave asks for nothing -- the manifest rebuild emits it"
+        );
+    }
+
+    /// The whole set is sent to the peers that are owed one and to nobody else, and sending it
+    /// clears the pending halves: every entry in them is a transition into or out of the set the
+    /// frame states outright.
+    #[test]
+    fn the_whole_set_clears_what_it_supersedes_and_bumps_the_generation() {
+        let mut peer = peer_holding(7);
+        peer.note_interest_enter(7);
+        peer.interest_delta_tick = Some(100);
+        peer.interest_delta_entered_sent = 1;
+        peer.interest_full_due = true;
+        let before = peer.interest_generation;
+
+        // What `send_interest_tables` does per peer, as the sequence a test can assert.
+        peer.interest_generation = peer.interest_generation.saturating_add(1);
+        peer.interest_pending.leaves.clear();
+        peer.interest_pending.enters.clear();
+        peer.interest_delta_left_sent = 0;
+        peer.interest_delta_entered_sent = 0;
+        peer.interest_delta_tick = None;
+        peer.interest_seeded = true;
+        peer.interest_full_due = false;
+
+        assert_eq!(peer.interest_generation, before + 1);
+        assert!(peer.interest_pending.enters.is_empty());
+        assert!(peer.interest_delta_tick.is_none());
+        assert!(
+            peer.interest_seeded,
+            "a peer holding the whole set is seeded"
+        );
+        assert!(!peer.interest_full_due, "and is owed nothing further");
+    }
+
+    /// A veto is the second leave that happens between updates, and the rule stated above
+    /// `update_interest` is that each queues its own event. The despawn sweep did; this did not, so
+    /// a server saw no `entity_left_interest` for a veto while a retraction still produced an
+    /// `entity_entered_interest` — an unpaired enter in any handler mirroring the two.
+    #[test]
+    fn a_veto_reports_the_leave_it_queued() {
+        let mut peer = peer_holding(7);
+        assert!(
+            peer.set_entity_hidden(7, true),
+            "vetoing an entity this connection held is a leave to announce"
+        );
+        assert!(
+            !peer.set_entity_hidden(7, true),
+            "and vetoing it again announces nothing -- it is already out of the set"
+        );
+        let mut stranger = peer_holding(7);
+        assert!(
+            !stranger.set_entity_hidden(9, true),
+            "nor does vetoing one this connection never held"
+        );
+        assert!(
+            !peer.set_entity_hidden(7, false),
+            "a retraction announces nothing either -- the next update reports the re-entry"
+        );
+    }
+
+    /// **THE COUNT CAP IS NOT REDUNDANT WITH THE BYTE BUDGET.** A narrow input schema packs a block
+    /// into a handful of bytes, so a fleet of owned bodies fits inside one datagram and the byte
+    /// budget refuses none of them — while the server refuses everything past
+    /// `MAX_INPUT_BLOCKS_PER_TICK` and truncated at the same index every tick, so the bodies past it
+    /// were never driven at all. Refusing here is what puts them in the rota instead.
+    #[test]
+    fn a_narrow_input_schema_still_rotates_past_the_block_cap() {
+        let cap = MAX_INPUT_BLOCKS_PER_TICK as usize;
+        let count = cap + 36;
+        // 9 bytes each: the whole fleet is far inside one frame, so only the count cap can refuse.
+        let lengths = vec![9usize; count];
+        let budget = MAX_FRAME_PAYLOAD;
+        assert!(
+            lengths.iter().sum::<usize>() <= budget,
+            "the fixture has to fit, or the byte budget would be doing the refusing"
+        );
+
+        let mut out = Vec::new();
+        let rotor = admit_input_blocks(&lengths, 0, budget, &mut out);
+        assert_eq!(out.len(), cap, "one frame carries at most the cap");
+        assert_eq!(
+            rotor, cap,
+            "and the first refusal is where the next tick starts"
+        );
+
+        // The tail rides next tick, which is the property the truncation denied it.
+        let mut second = Vec::new();
+        let _ = admit_input_blocks(&lengths, rotor, budget, &mut second);
+        assert!(
+            second.contains(&(count - 1)),
+            "the last body must get a turn; it never did before"
+        );
+
+        // Every body is offered within the two ticks it takes to walk the fleet.
+        let mut seen: std::collections::HashSet<usize> = out.iter().copied().collect();
+        seen.extend(second.iter().copied());
+        assert_eq!(seen.len(), count, "and the rota covers the whole fleet");
+    }
+
     /// A veto is a leave that happens between updates, so it has to be queued where it is declared.
     /// Exactly one, and only for an entity this connection actually held — vetoing something it was
     /// never sent announces a departure that never happened.
@@ -9660,14 +10125,14 @@ mod tests {
         let left: Vec<u16> = (0..INTEREST_DELTA_PER_FRAME as u16).collect();
         let entered: Vec<u16> = (1000..1000 + INTEREST_DELTA_PER_FRAME as u16).collect();
         let reserve = interest_delta_reserve(left.len() + entered.len());
-        assert_eq!(reserve, 3 + 2 * 2 * INTEREST_DELTA_PER_FRAME);
+        assert_eq!(reserve, 13 + 2 * 2 * INTEREST_DELTA_PER_FRAME);
 
         // The admit loop spends every byte it is allowed to, and the last block lands exactly on
         // the line.
         let mut body = Writer::with_capacity(budget);
         body.bytes(&vec![0u8; budget - reserve]);
         assert_eq!(body.len(), budget - reserve);
-        encode_interest_delta(&left, &entered, &mut body);
+        encode_interest_delta(u64::MAX, &left, &entered, &mut body);
         assert!(
             body.len() <= budget,
             "a full frame plus its section overran the budget by {}",
@@ -9679,7 +10144,9 @@ mod tests {
         for count in 0..=(2 * INTEREST_DELTA_PER_FRAME) {
             let slots: Vec<u16> = (0..count as u16).collect();
             let mut writer = Writer::new();
-            encode_interest_delta(&slots, &[], &mut writer);
+            // `u64::MAX` is the widest varint the generation can be, which is what the
+            // reserve claims to cover.
+            encode_interest_delta(u64::MAX, &slots, &[], &mut writer);
             assert!(
                 writer.len() <= interest_delta_reserve(count.max(1)),
                 "the reserve underestimated a section of {count} slots"
@@ -9701,10 +10168,11 @@ mod tests {
     impl Mirror {
         fn apply(&mut self, slots: &SlotTable, left: &[u16], entered: &[u16]) {
             let section = InterestDeltaSection {
+                generation: 0,
                 left: left.to_vec(),
                 entered: entered.to_vec(),
             };
-            apply_interest_section(slots, &mut self.held, &mut self.events, 4, &section);
+            let _ = apply_interest_section(slots, &mut self.held, &mut self.events, 4, &section);
         }
 
         fn rebuild(&mut self, slots: &SlotTable) {

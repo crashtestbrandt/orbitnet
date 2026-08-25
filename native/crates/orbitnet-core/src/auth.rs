@@ -533,8 +533,12 @@ fn tag_over(key: &[u8; KEY_LEN], signed: &[u8], direction: Direction) -> u64 {
 
 /// Input blocks one peer may make the server resolve in one tick.
 ///
-/// Generous against any honest client: a connection sends one block per owned body per tick, and the
-/// send path already caps a frame at one datagram. It is a bound on a peer that ignores both.
+/// A connection sends one block per owned body per tick, and the send path caps a frame at one
+/// datagram — but **the datagram cap alone does not keep a frame under this one**. A one-property
+/// input schema packs a block into 9 bytes, so a hundred owned bodies fit inside a single frame and
+/// the byte budget refuses none of them. `admit_input_blocks` therefore enforces this count as a
+/// second cap and rotates what it refuses, so the tail rides the next tick rather than being
+/// truncated at the same index for ever.
 pub const MAX_INPUT_BLOCKS_PER_TICK: u32 = 64;
 
 /// Blocks naming an entity the sender does not own, per peer per tick, before the rest of that frame

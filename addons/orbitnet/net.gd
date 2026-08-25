@@ -586,8 +586,9 @@ func is_session_held(session_id: int) -> bool:
 ## kill feed, a log line, a screenshot -- can no longer take that player's body.
 ##
 ## WHAT IT DOES NOT CLOSE: an on-path observer, who reads the join reply and can then quote the token
-## verbatim. That is the same boundary [method session_id]'s own session key already has, and closing it needs
-## a key exchange.
+## verbatim. That is the same boundary [method session_id]'s own session key already has, and it closes the
+## same way -- [method set_session_secret]. Under a secret that observer can still copy the token but cannot
+## authenticate the handshake quoting it, so the claim never reaches the resume decision.
 ##
 ## ONE TOKEN PER CLIENT, NAMING WHICHEVER SERVER LAST ISSUED ONE. A token is minted per server per identity, so
 ## joining a second server under the same identity replaces the stored value and forfeits the resume on the
@@ -1194,6 +1195,10 @@ func seat_entities(peer: int, seat: int) -> PackedInt64Array:
 ## its delta bookkeeping, so a later retraction sends a full block rather than a delta against a base the peer
 ## dropped.
 ##
+## IT NEEDS NO OTHER FILTER CONFIGURED. A standing veto turns the interest pass on by itself, so a session with
+## no radius and no declared membership -- the one where a per-peer refusal is the only lever there is -- gets
+## the behavior described here. It used to do nothing at all in that configuration.
+##
 ## THE CLIENT-SIDE CONTRACT, STATED PLAINLY: A VETO STOPS THE ROWS AND NOTHING ELSE. No despawn is sent, the
 ## client's node is not removed, and the entity id stays session-global. What the client sees is
 ## `get_last_known_state()` ceasing to advance -- exactly what a distance cull looks like -- and what to do with
@@ -1315,80 +1320,6 @@ func perf_metrics() -> Dictionary[String, float]:
 		"record_ms": record_ms,
 	}
 
-## Diagnostic: the SEND PATH's bandwidth and fairness accounting, windowed to per-second figures once a
-## second by the backend. Zeros OFFLINE. Deliberately a SEPARATE dictionary from perf_metrics(), whose exact
-## shape bench_metrics.gd and the perf probe read -- widening a dictionary two harnesses index into is how a
-## measurement change becomes a gate failure.
-##
-##   tx_bytes_s / rx_bytes_s        -- OrbitNet PAYLOAD, in and out. Not what the link carries.
-##   tx_datagrams_s / rx_datagrams_s -- datagram counts, published so the wire figure can be CHECKED not trusted
-##   tx_wire_bytes_s                -- payload + 41 B/datagram (28 IPv4+UDP, 12 ENet, 1 Godot RAW tag). On a full
-##                                     1200 B frame that is 3%; on a 90 B one it is over 40%.
-##   tx_peak_peer_bytes_s           -- the busiest single peer's payload: the figure an AOI A/B has to move
-##   blocks_admitted_s              -- entity blocks that made it into a frame
-##   blocks_deferred_s              -- blocks that wanted to go out and did not fit. BUDGET PRESSURE.
-##   blocks_culled_s                -- blocks intentionally withheld (out of interest, or rate-tiered). DELIBERATE.
-##                                     Kept apart from deferred because conflating them hides the failure.
-##   want_full_nacks_s              -- WANT_FULL NACKs received. SERVER-SIDE ONLY: it is counted where a
-##                                     client's INPUT frame is decoded, so a client reads a structural 0.00.
-##   unproven_acks_s                -- acks discarded because the frame token quoted was not the one this
-##                                     server minted for the tick the ack named, so the peer cannot have
-##                                     received the frame it claimed. SERVER-SIDE ONLY, same reason. An
-##                                     honest client cannot produce one. A sustained reading is a peer
-##                                     sending acks it cannot substantiate, and that peer pays for it in
-##                                     the next column: its acked_base never advances, so blocks_full_s
-##                                     climbs toward blocks_admitted_s.
-##   blocks_full_s                  -- blocks sent as full rows rather than masked deltas: the send lane's
-##                                     composition, and what the keyframe interval costs. Floor is about
-##                                     blocks_admitted_s / 16, since every entity owes one keyframe per
-##                                     interval. Near blocks_admitted_s means almost nothing is being deltaed,
-##                                     which on a server indicates a want_full storm -- read it beside
-##                                     want_full_nacks_s.
-##   blocks_oversize_s              -- blocks admitted even though one of them exceeded the WHOLE byte budget, so
-##                                     that frame went out over the MTU and fragmented. Non-zero means one
-##                                     entity's full state does not fit in a datagram, which is a schema fact.
-##                                     Not a deferral: deferring the FIRST block of a frame sends no frame at
-##                                     all, and a never-sent entity sorts first again next tick, so it would
-##                                     end that peer's snapshot stream for the session.
-##   stale_blocks_s                 -- state blocks discarded because a NEWER row for that entity had already
-##                                     landed: reordering and duplication, which is what a real link does.
-##                                     CLIENT-SIDE ONLY, for the mirror reason -- it is counted where a received
-##                                     SNAPSHOT is integrated, which a server never does.
-##
-##   THE NACK/STALE PAIR SPANS TWO PROCESSES. They are the diagnosis together and either alone is not, and they
-##   live on opposite peers -- so pairing them means pairing a CLIENT's stale_blocks_s with a SERVER's
-##   want_full_nacks_s. Inside one net.perf they can never both be non-zero, and "want_full 0.00" read off a
-##   client is not evidence about a storm; it is evidence that the reader was on a client.
-##   starve_ticks_max               -- worst age in ticks of an in-interest entity that HAS been sent at least once
-##   unsent_backlog_max             -- worst count of in-interest entities never yet sent to a peer (the re-entry
-##                                     storm gauge, which starve_ticks_max cannot see: a never-sent entity has no age)
-##   interest_ms                    -- ms/tick in the interest pass. The cost of whichever path ran, and the
-##                                     column to watch when a host overruns its net tick.
-##   interest_grid                  -- fraction of the window's ticks whose interest pass ran through the SPATIAL
-##                                     INDEX rather than the flat scan: 0.0 all-scan, 1.0 all-grid, in between
-##                                     while the session crosses the threshold. THE VERDICT, REPORTED -- there is
-##                                     no setter, and there is deliberately none: the session picks its path from
-##                                     its own occupancy each tick, and a wrong pick costs time and nothing else,
-##                                     because the two paths are proven to compute identical members, identical
-##                                     per-member distances and identical leaves. Read it BESIDE interest_ms and
-##                                     nowhere else -- it can never explain a behavior difference, only which
-##                                     cost interest_ms is the cost of. A whole window at a fraction strictly
-##                                     between 0.0 and 1.0 means the occupancy is hovering in the selector's
-##                                     hysteresis band, which describes the arena rather than a fault. A session
-##                                     with no aoi_radius reads 0.00 always: there is no distance to index.
-##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded
-##                                     before rate tiering may be enabled.
-##   peers / interest_entities      -- peers synced, and the mean size of ONE peer's interest set
-##   rtt_at_ceiling_peers           -- connected peers whose RAW round trip is above
-##                                     [method rtt_believed_max_ms], so peer_rtt_ms reports the ceiling for them
-##                                     rather than what was measured. A GAUGE like starve_ticks_max, not a
-##                                     per-second rate: the standing count as of the publish. A subset of
-##                                     `peers`, so read it against that one -- 3 of 4 says the ceiling is the
-##                                     session's policy for nearly everybody, 3 of 40 says three players are
-##                                     having a bad time. Persistently large is the reading that says the
-##                                     ceiling is set too low for the population actually playing. Non-zero is
-##                                     not an accusation: a peer above the ceiling is either lagging its acks
-##                                     deliberately or genuinely that far away, and nothing can tell those apart.
 ## The POOLED mean ticks between admissions across every band -- the one figure from
 ## [method bandwidth_metrics] that is read EVERY NET TICK on the authority rather than at human rates.
 ##
@@ -1510,6 +1441,80 @@ func _backend_has(method: StringName) -> bool:
 	_backend_methods[method] = present
 	return present
 
+## Diagnostic: the SEND PATH's bandwidth and fairness accounting, windowed to per-second figures once a
+## second by the backend. Zeros OFFLINE. Deliberately a SEPARATE dictionary from perf_metrics(), whose exact
+## shape bench_metrics.gd and the perf probe read -- widening a dictionary two harnesses index into is how a
+## measurement change becomes a gate failure.
+##
+##   tx_bytes_s / rx_bytes_s        -- OrbitNet PAYLOAD, in and out. Not what the link carries.
+##   tx_datagrams_s / rx_datagrams_s -- datagram counts, published so the wire figure can be CHECKED not trusted
+##   tx_wire_bytes_s                -- payload + 41 B/datagram (28 IPv4+UDP, 12 ENet, 1 Godot RAW tag). On a full
+##                                     1200 B frame that is 3%; on a 90 B one it is over 40%.
+##   tx_peak_peer_bytes_s           -- the busiest single peer's payload: the figure an AOI A/B has to move
+##   blocks_admitted_s              -- entity blocks that made it into a frame
+##   blocks_deferred_s              -- blocks that wanted to go out and did not fit. BUDGET PRESSURE.
+##   blocks_culled_s                -- blocks intentionally withheld (out of interest, or rate-tiered). DELIBERATE.
+##                                     Kept apart from deferred because conflating them hides the failure.
+##   want_full_nacks_s              -- WANT_FULL NACKs received. SERVER-SIDE ONLY: it is counted where a
+##                                     client's INPUT frame is decoded, so a client reads a structural 0.00.
+##   unproven_acks_s                -- acks discarded because the frame token quoted was not the one this
+##                                     server minted for the tick the ack named, so the peer cannot have
+##                                     received the frame it claimed. SERVER-SIDE ONLY, same reason. An
+##                                     honest client cannot produce one. A sustained reading is a peer
+##                                     sending acks it cannot substantiate, and that peer pays for it in
+##                                     the next column: its acked_base never advances, so blocks_full_s
+##                                     climbs toward blocks_admitted_s.
+##   blocks_full_s                  -- blocks sent as full rows rather than masked deltas: the send lane's
+##                                     composition, and what the keyframe interval costs. Floor is about
+##                                     blocks_admitted_s / 16, since every entity owes one keyframe per
+##                                     interval. Near blocks_admitted_s means almost nothing is being deltaed,
+##                                     which on a server indicates a want_full storm -- read it beside
+##                                     want_full_nacks_s.
+##   blocks_oversize_s              -- blocks admitted even though one of them exceeded the WHOLE byte budget, so
+##                                     that frame went out over the MTU and fragmented. Non-zero means one
+##                                     entity's full state does not fit in a datagram, which is a schema fact.
+##                                     Not a deferral: deferring the FIRST block of a frame sends no frame at
+##                                     all, and a never-sent entity sorts first again next tick, so it would
+##                                     end that peer's snapshot stream for the session.
+##   stale_blocks_s                 -- state blocks discarded because a NEWER row for that entity had already
+##                                     landed: reordering and duplication, which is what a real link does.
+##                                     CLIENT-SIDE ONLY, for the mirror reason -- it is counted where a received
+##                                     SNAPSHOT is integrated, which a server never does.
+##
+##   THE NACK/STALE PAIR SPANS TWO PROCESSES. They are the diagnosis together and either alone is not, and they
+##   live on opposite peers -- so pairing them means pairing a CLIENT's stale_blocks_s with a SERVER's
+##   want_full_nacks_s. Inside one net.perf they can never both be non-zero, and "want_full 0.00" read off a
+##   client is not evidence about a storm; it is evidence that the reader was on a client.
+##   starve_ticks_max               -- worst age in ticks of an in-interest entity that HAS been sent at least once
+##   unsent_backlog_max             -- worst count of in-interest entities never yet sent to a peer (the re-entry
+##                                     storm gauge, which starve_ticks_max cannot see: a never-sent entity has no age)
+##   interest_ms                    -- ms/tick in the interest pass. The cost of whichever path ran, and the
+##                                     column to watch when a host overruns its net tick.
+##   interest_grid                  -- fraction of the window's ticks whose interest pass ran through the SPATIAL
+##                                     INDEX rather than the flat scan: 0.0 all-scan, 1.0 all-grid, in between
+##                                     while the session crosses the threshold. THE VERDICT, REPORTED -- there is
+##                                     no setter, and there is deliberately none: the session picks its path from
+##                                     its own occupancy each tick, and a wrong pick costs time and nothing else,
+##                                     because the two paths are proven to compute identical members, identical
+##                                     per-member distances and identical leaves. Read it BESIDE interest_ms and
+##                                     nowhere else -- it can never explain a behavior difference, only which
+##                                     cost interest_ms is the cost of. A whole window at a fraction strictly
+##                                     between 0.0 and 1.0 means the occupancy is hovering in the selector's
+##                                     hysteresis band, which describes the arena rather than a fault. A session
+##                                     with no aoi_radius reads 0.00 always: there is no distance to index.
+##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded
+##                                     before rate tiering may be enabled.
+##   peers / interest_entities      -- peers synced, and the mean size of ONE peer's interest set
+##   rtt_at_ceiling_peers           -- connected peers whose RAW round trip is above
+##                                     [method rtt_believed_max_ms], so peer_rtt_ms reports the ceiling for them
+##                                     rather than what was measured. A GAUGE like starve_ticks_max, not a
+##                                     per-second rate: the standing count as of the publish. A subset of
+##                                     `peers`, so read it against that one -- 3 of 4 says the ceiling is the
+##                                     session's policy for nearly everybody, 3 of 40 says three players are
+##                                     having a bad time. Persistently large is the reading that says the
+##                                     ceiling is set too low for the population actually playing. Non-zero is
+##                                     not an accusation: a peer above the ceiling is either lagging its acks
+##                                     deliberately or genuinely that far away, and nothing can tell those apart.
 func bandwidth_metrics() -> Dictionary[String, float]:
 	var out: Dictionary[String, float] = {
 		"tx_bytes_s": 0.0, "tx_datagrams_s": 0.0, "tx_wire_bytes_s": 0.0, "tx_peak_peer_bytes_s": 0.0,
