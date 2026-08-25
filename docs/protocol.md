@@ -319,13 +319,19 @@ recipient.
 kind 0x09 | varint generation | varint count | [slot (u16)]*
 ```
 
-Three things owe a connection one, and the server knows two of them without being told:
+Four things owe a connection one, and the server knows three of them without being told:
 
 | Cause | Noticed by |
 | --- | --- |
 | a pending half overflowed its cap | the server, queuing a transition |
 | a prefix was given up on unacknowledged | the server, retiring it |
-| a section named an `entered` slot the peer could not resolve | the client, via `WANT_INTEREST` |
+| a rekey on a live connection | the server, in the handshake |
+| a section it cannot name, cannot place, or never reached | the client, via `WANT_INTEREST` |
+
+The client's row is three cases: an `entered` slot its manifest has not bound, a section stamped at a
+generation it does not hold, and a frame it acknowledged but could not read to the end — the ack window slides
+before a block is parsed, so a snapshot that breaks partway is counted delivered whatever became of the
+section in it.
 
 - **A section is only built for a peer that holds its baseline.** The client echoes the generation it holds
   on the input frame it is already sending, and the server declines to build a section until the two agree.

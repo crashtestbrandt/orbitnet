@@ -756,6 +756,18 @@ struct PeerState {
     /// delta is not, so a delta built BEFORE the table can arrive after it and undo it. A receiver
     /// refuses a section stamped below the generation it holds.
     interest_generation: u64,
+    /// The interest generation this connection has told the server it holds.
+    ///
+    /// **THE FACT EVERY ORDERING RULE HERE USED TO GUESS AT.** A section states a change against one
+    /// baseline; sending one to a peer holding a different baseline is what let a reliable whole set
+    /// and the unreliable sections around it disagree. The client echoes this on the input frame it
+    /// is already sending, so the server can decline to build a section at all until the two agree,
+    /// rather than sending one and having the receiver work out whether it applies.
+    ///
+    /// Zero until the first echo, which matches a connection that has been sent no whole set — so an
+    /// ordinary session, which sends none, runs with this equal to `interest_generation` throughout
+    /// and pays nothing.
+    interest_generation_acked: u64,
     /// Whether this connection is owed a whole interest set rather than another delta.
     ///
     /// **FOUR THINGS SET IT, AND THE SERVER KNOWS THREE OF THEM ITSELF.** A pending half that
@@ -935,23 +947,32 @@ const INTEREST_DELTA_PER_FRAME: usize = 32;
 
 /// How many entries each half of a peer's pending interest delta holds before the OLDEST is dropped.
 ///
-/// The backstop for a session churning relevancy faster than the acknowledged prefix drains — a peer
-/// on a link that is up enough to be sent to and down enough never to ack, and a first update in a
-/// world of more than this many filtered entities. What is dropped is the oldest event, never the
-/// newest: the recent transitions are the ones a game is about to act on.
+/// Reaching it drops nothing. It is the point at which this connection is owed a WHOLE SET, and
+/// stating that set collapses the half — retiring every member the slot table could name and
+/// retaining exactly the ones it could not. See [`PeerState::push_pending`] for why no eviction here
+/// can be right, and [`INTEREST_DELTA_PENDING_HARD_MAX`] for the ceiling that does trim.
 ///
-/// **THE DROP IS REPORTED, NOT ABSORBED.** `entities_in_interest` was named here as the repair and
-/// could not be one: on a client it answers out of the mirror the drop had just made wrong. What
+/// Two things reach it: a peer on a link that is up enough to be sent to and down enough never to
+/// ack, and a first update in a world of more than this many filtered entities.
+///
+/// **THE OVERFLOW IS REPORTED, NOT ABSORBED.** `entities_in_interest` was named here as the repair
+/// and could not be one: on a client it answers out of the mirror the loss had just made wrong. What
 /// repairs it is [`OrbitNet::send_interest_tables`], which the overflow asks for.
 const INTEREST_DELTA_PENDING_MAX: usize = 256;
 
 /// The ceiling a pending half is actually trimmed at, as a backstop rather than a policy.
 ///
 /// Reaching [`INTEREST_DELTA_PENDING_MAX`] owes the connection a whole set, and stating that set
-/// collapses the half on the next flush — so in any session that sends one, this is unreachable.
-/// What it bounds is the connection that is never sent one, which is a peer that is not `synced`,
-/// and which therefore has no relevancy to accumulate in the first place. Four times the soft cap,
-/// because the number that matters is that it is finite.
+/// collapses the half on the next flush — so this is reached only by a connection that is never sent
+/// one (a peer that is not `synced`, which has no mirror to diverge), or by more transitions landing
+/// between one flush and the next than three times the soft cap.
+///
+/// **IT TRIMS FROM THE FRONT, WHICH IS WHERE THE UNRECOVERABLE ENTRIES ARE**, and that is a residual
+/// rather than a design: the front is where `state_whole_interest_set` parks the enter of a member no
+/// whole set could name. It also flags the connection as owed a set, so everything the slot table CAN
+/// name is restated — what a trim here can still lose is a slotless member, on a connection already
+/// three times past the point where a set was owed. Four times the soft cap, because the number that
+/// matters is that it is finite.
 const INTEREST_DELTA_PENDING_HARD_MAX: usize = INTEREST_DELTA_PENDING_MAX * 4;
 
 /// How many ticks a prefix rides unacknowledged before it is given up on.
@@ -1154,7 +1175,7 @@ impl PeerState {
             *sent = sent.saturating_sub(1);
         }
         list.push(id);
-        overflowed
+        overflowed // and the ceiling above owes a set too, by way of this same answer
     }
 
     /// Drop everything this connection holds about one entity that has left the registry, answering
@@ -5042,7 +5063,7 @@ impl OrbitNet {
     /// declaring.
     ///
     /// **A single block larger than the whole payload is refused every tick, and starves nobody
-    /// else.** The walk continues past it rather than stopping, and the rotor stays parked on it, so
+    /// else.** The walk continues past it rather than stopping, and the rotor passes over it, so
     /// the other seats are admitted normally. Such a block cannot be sent at all — no rota fixes an
     /// input row wider than a datagram — and the fix is the schema, not the send path.
     fn send_client_input(&mut self, current: u64) {
@@ -5101,6 +5122,9 @@ impl OrbitNet {
             entity_count: carried.len() as u32,
         };
         header.encode(&mut writer);
+        // BEFORE THE BLOCKS, because the block loop on the other end may stop early -- the receive
+        // budget refuses past a cap -- so anything written after them is not reliably reached.
+        writer.varint(self.interest_mirror_generation);
         for &index in &carried {
             writer.bytes(&blocks[index]);
         }
@@ -6766,6 +6790,13 @@ impl OrbitNet {
         let Ok(header) = FrameHeader::decode(reader) else {
             return;
         };
+        // The interest generation this client says it holds, which decides whether a section may be
+        // built for it at all. A frame that stops short of it is refused rather than read as zero:
+        // zero is a real generation, and misreading a truncated frame as one would have the server
+        // build sections against a baseline nobody claimed.
+        let Ok(echoed_interest) = reader.varint() else {
+            return;
+        };
         let current = self.accumulator.tick();
         // Read the tick period BEFORE the peer is borrowed mutably below, and stamp the
         // round-trip sample in milliseconds while it is still true.
@@ -6777,6 +6808,7 @@ impl OrbitNet {
             let Some(peer) = self.peers.get_mut(&sender) else {
                 return; // No handshake, no input.
             };
+            peer.interest_generation_acked = echoed_interest;
             // Consume the ack window: every snapshot frame the client PROVES it received promotes
             // the entity ticks that frame carried to `acked_base` — the only ticks a masked delta
             // may reference, because the client provably holds those rows. An ack that carries the
@@ -6965,6 +6997,8 @@ impl OrbitNet {
     }
 
     fn handle_snapshot(&mut self, reader: &mut Reader<'_>) {
+        // A header that will not decode carries no ack either — the window below never slid — so this
+        // frame is simply absent rather than acknowledged-but-unapplied, and owes nothing.
         let Ok(header) = FrameHeader::decode(reader) else {
             return;
         };
@@ -6995,6 +7029,7 @@ impl OrbitNet {
 
         for _ in 0..header.entity_count {
             let Ok(meta) = decode_state_block_meta(reader, frame_tick) else {
+                self.note_snapshot_break(header.flags);
                 return;
             };
             // A slot with no binding is the ordinary in-flight case — the manifest that binds it
@@ -7043,6 +7078,7 @@ impl OrbitNet {
                 );
             }
             if skip_state_block_body(reader, &meta).is_err() {
+                self.note_snapshot_break(header.flags);
                 return;
             }
         }
@@ -7050,9 +7086,19 @@ impl OrbitNet {
         // THE TRAILING SECTION, AFTER THE BLOCKS AND BEHIND ITS FLAG. Everything above reads exactly
         // `entity_count` blocks and stops, which is what lets these bytes exist at all: a build that
         // predates the flag never looks at them.
+        //
+        // A block that would not decode RETURNS above rather than reaching here, and the ack for this
+        // frame has already gone out — so the section it was carrying is lost the same way an
+        // undecodable one is. `note_snapshot_break` is what those paths call on the way out.
         if header.flags & FrameHeader::FLAG_INTEREST_DELTA != 0 {
-            if let Ok(section) = decode_interest_delta(reader) {
-                self.apply_interest_delta(&section);
+            match decode_interest_delta(reader) {
+                Ok(section) => self.apply_interest_delta(&section),
+                // **THE FRAME IS ALREADY ACKNOWLEDGED BY NOW.** The ack window slides before a single
+                // block is parsed, so the server retires this frame's interest prefix as delivered
+                // whatever became of the section in it. A section that will not decode is therefore
+                // a set of transitions nothing will ever restate — no later diff re-enters an id the
+                // server believes is already in the set — so it asks for the whole set instead.
+                Err(_) => self.want_interest = true,
             }
         }
     }
@@ -7096,6 +7142,21 @@ impl OrbitNet {
         // reliable channel, with no ordering between them. Dropping the enter and letting the
         // server retire it on this frame's ack is what left the mirror permanently short.
         if !resolved {
+            self.want_interest = true;
+        }
+    }
+
+    /// CLIENT: a snapshot this peer could not read to the end, which is a section it did not apply.
+    ///
+    /// The ack window slid before any block was parsed, so the server counts this frame delivered and
+    /// retires the interest prefix it carried. Asking for the whole set is what stops those
+    /// transitions being lost in silence — the same rule the undecodable-section arm follows, applied
+    /// to the frames that never reach it.
+    ///
+    /// Only when the frame claimed to carry one: a snapshot that broke while carrying no section owes
+    /// nothing, and asking on every decode failure would answer a link problem with a per-peer table.
+    fn note_snapshot_break(&mut self, flags: u8) {
+        if flags & FrameHeader::FLAG_INTEREST_DELTA != 0 {
             self.want_interest = true;
         }
     }
@@ -7464,6 +7525,16 @@ fn build_interest_section(
         return false;
     }
     peer.retire_interest_delta(current);
+    // **NO SECTION UNTIL THE CLIENT HOLDS THE BASELINE IT WOULD BE DIFFED AGAINST.** A whole set is
+    // reliable and a section is not, so a section built after a table could reach the client first
+    // and be applied against a set it was not computed from. Every earlier attempt at this tried to
+    // sort that out at the receiver -- by stamp comparison, then by exact match, then by muting the
+    // repair -- and each left a case where a transition was retired as delivered without ever being
+    // applied. Not sending one is the version with no such case: the pending halves hold, and they
+    // ride the first frame after the client says it has caught up.
+    if peer.interest_generation_acked != peer.interest_generation {
+        return false;
+    }
     if peer.interest_delta_tick.is_some() {
         // A re-send. An entry whose slot has gone since is simply absent from this copy; the counts
         // stay put so the ack retires the same range.
@@ -10088,6 +10159,59 @@ mod tests {
             !resolved,
             "an unnameable slot is a set this peer cannot hold in full"
         );
+    }
+
+    /// **A SECTION IS ONLY BUILT FOR A PEER THAT HOLDS ITS BASELINE.** A whole set is reliable and a
+    /// section is not, so a section built after a set could reach the client first and be applied
+    /// against a set it was not computed from. The client echoes the generation it holds and the
+    /// server declines to build a section until the two agree — so there is nothing to overtake.
+    ///
+    /// The pending halves hold meanwhile. They are not dropped, and they ride the first frame after
+    /// the client says it has caught up.
+    #[test]
+    fn a_section_waits_for_the_client_to_hold_the_baseline() {
+        let slots = table_naming(&[7]);
+        let mut peer = peer_holding(7);
+        peer.note_interest_enter(7);
+
+        // An ordinary session sends no whole set, so both ends sit at zero and nothing waits.
+        assert_eq!(peer.interest_generation, 0);
+        assert_eq!(peer.interest_generation_acked, 0);
+        let (carries, _, entered) = section_for(&slots, &mut peer, 100);
+        assert!(
+            carries && entered == vec![0u16],
+            "the ordinary path is untouched"
+        );
+
+        // A whole set moves the server on. Until the client says it caught up, no section rides.
+        peer.newest_ack = 100;
+        peer.retire_interest_delta(101);
+        peer.interest_full_due = true;
+        let _ = state_whole_interest_set(&slots, &mut peer);
+        assert_eq!(peer.interest_generation, 1);
+        assert_eq!(
+            peer.interest_generation_acked, 0,
+            "the client has not said so yet"
+        );
+
+        peer.note_interest_leave(7);
+        let (carries, left, _) = section_for(&slots, &mut peer, 102);
+        assert!(
+            !carries,
+            "no section while the two disagree about the baseline"
+        );
+        assert!(left.is_empty());
+        assert_eq!(
+            peer.interest_pending.leaves,
+            vec![7],
+            "and the transition is held rather than dropped"
+        );
+
+        // The echo lands, and what waited rides the next frame.
+        peer.interest_generation_acked = 1;
+        let (carries, left, _) = section_for(&slots, &mut peer, 103);
+        assert!(carries, "the two agree now");
+        assert_eq!(left, vec![0u16], "and what waited is what rides");
     }
 
     /// **CAUSE 1: THE PENDING HALF OVERFLOWED.** The cap was written as a backstop for a peer that

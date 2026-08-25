@@ -172,13 +172,31 @@ func _parse_args() -> void:
 	_profile.reorder = _arg_float(args, "--relay-reorder=", _profile.reorder)
 	_profile.reorder_ms = _arg_float(args, "--relay-reorder_ms=", _profile.reorder_ms)
 
+# `ADDR`, `ADDR:PORT`, or `[LITERAL]:PORT`.
+#
+# THE LAST COLON DOES NOT DECIDE IT. An IPv6 literal ends in digits, so a rule that split on the last
+# colon with a numeric suffix turned `--relay-target=::1` into host `:` on port 1 -- the same cut the
+# three demos' join targets carried until this release. Only a SINGLE bare colon introduces a port; a
+# target with more is an address in its own right, and naming a port beside one needs brackets.
 func _parse_target(spec: String) -> void:
-	var parts: PackedStringArray = spec.rsplit(":", false, 1)
-	if parts.size() == 2 and parts[1].is_valid_int():
-		_target_host = parts[0]
-		_target_port = parts[1].to_int()
-	elif parts.size() == 1 and parts[0] != "":
-		_target_host = parts[0]
+	var body: String = spec
+	var close: int = spec.rfind("]")
+	if close >= 0:
+		var after: int = spec.find(":", close)
+		if after > 0 and after < spec.length() - 1 and spec.substr(after + 1).is_valid_int():
+			_target_port = clampi(spec.substr(after + 1).to_int(), 1, 65535)
+			body = spec.substr(0, after)
+		if body.begins_with("[") and body.ends_with("]") and body.length() > 2:
+			_target_host = body.substr(1, body.length() - 2)
+		return
+	if spec.count(":") == 1:
+		var parts: PackedStringArray = spec.rsplit(":", false, 1)
+		if parts.size() == 2 and parts[1].is_valid_int():
+			_target_host = parts[0]
+			_target_port = clampi(parts[1].to_int(), 1, 65535)
+			return
+	if spec != "":
+		_target_host = spec
 
 func _arg_str(args: PackedStringArray, prefix: String, fallback: String) -> String:
 	for a: String in args:

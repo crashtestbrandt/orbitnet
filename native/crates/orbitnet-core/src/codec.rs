@@ -522,18 +522,24 @@ impl FrameHeader {
     /// established one bit down: a bit on an input frame the client is sending anyway, so the repair
     /// costs no frame kind on the way up.
     ///
-    /// A client raises it for the one case only it can see: an `entered` slot its manifest has not
-    /// bound yet. The interest delta rides an UNRELIABLE snapshot while the manifest that names its
+    /// A client raises it for the three cases only it can see: an `entered` slot its manifest has not
+    /// bound yet, a section stamped at a generation it does not hold, and a frame it acknowledged but
+    /// could not read to the end — the ack window slides before a block is parsed, so a snapshot that
+    /// breaks partway is counted delivered whatever became of the section in it. The interest delta rides an UNRELIABLE snapshot while the manifest that names its
     /// slots rides a RELIABLE channel, and the two have no ordering relationship — so a snapshot can
     /// arrive naming a slot whose binding is still in ENet's retransmit queue. Dropping that enter
     /// silently is what left a client's mirror permanently short of an entity whose rows kept
     /// arriving.
     ///
-    /// The server's own two cases — a pending queue that overflowed, and a prefix given up on
-    /// unacknowledged — need no bit, because the server is the side that knows.
+    /// The server's own three cases — a pending queue that overflowed, a prefix given up on
+    /// unacknowledged, and a rekey on a live connection — need no bit, because the server is the side
+    /// that knows.
     ///
-    /// **The raise is self-sustaining** for the same reason the manifest's is: the client refuses
-    /// the section it could not apply, so the next one that names the slot raises the bit again.
+    /// **The raise is LATCHED, not self-sustaining.** The manifest's clears when the frame carrying it
+    /// goes out and re-raises on the next delta it cannot apply; this one stays up until it is
+    /// ANSWERED, by a whole set the client could name in full. Clearing it on send made it a one-shot
+    /// NACK on an unreliable frame, with nothing to raise it again on a session quiet enough to send
+    /// no further sections.
     pub const FLAG_WANT_INTEREST: u8 = 1 << 3;
 
     /// Append this header to `writer`.

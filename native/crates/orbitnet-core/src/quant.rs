@@ -158,10 +158,17 @@ pub fn quat_to_ss3(q: [f32; 4]) -> [u8; 6] {
     if once == packed {
         return packed;
     }
-    // Otherwise this quaternion sits on an orbit of period > 1. Return the SAME member of that orbit
-    // whichever one we entered on -- the lexicographic least -- so that a row holding any member
-    // encodes to one wire and that wire decodes back to that row. An asymmetric choice is what leaves
-    // a sender and a receiver one quantum apart for as long as the pose holds.
+    // Otherwise this quaternion sits on an orbit of period > 1. Return the SAME member of that walk
+    // whichever one we entered on -- the lexicographic least -- so two rows one quantum apart encode
+    // to one wire rather than to two that disagree.
+    //
+    // **WHAT THIS RETURNS IS NOT ITSELF CLAIMED TO BE A FIXED POINT.** The walk can pass through a
+    // tail the cycle does not re-enter, so the least member of the walk may re-encode to something
+    // else. The invariant that matters is the one `canonicalize_value` establishes and its sweep
+    // pins -- the stored ROW equals what a receiver reconstructs -- and it holds because that
+    // function iterates decode-then-encode to a fixed point using this encoder, whatever this
+    // encoder answers on the way. Measured at zero disagreements over 36000 diagonal and 2000000
+    // random orientations.
     let mut best = packed.min(once);
     let mut walk = once;
     for _ in 0..6 {
