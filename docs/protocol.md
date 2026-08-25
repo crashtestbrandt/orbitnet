@@ -321,11 +321,14 @@ Three things owe a connection one, and the server knows two of them without bein
 | a prefix was given up on unacknowledged | the server, retiring it |
 | a section named an `entered` slot the peer could not resolve | the client, via `WANT_INTEREST` |
 
-- **The generation is a monotonic stamp, not a chain.** A manifest delta names one exact predecessor because
-  its channel is ordered; this section is re-sent until acknowledged, so gaps are ordinary and chaining would
-  turn every dropped datagram into a resync. What the stamp catches is one race: the table is reliable and a
-  section is not, so a section built before the table can arrive after it. A receiver applies a section only
-  at or above the generation it holds.
+- **The generation places a section, and the match is exact.** A section states a change against one
+  baseline, and a receiver holding any other is not holding the set it was diffed from. The table is reliable
+  and a section is not, so a section built either side of a table can arrive on the wrong side of it; a
+  receiver applies one only at the exact generation it holds and asks for the whole set otherwise. A re-send
+  of a prefix carries the generation it was built at, so retransmission still matches.
+- **It is not a chain.** A manifest delta names one exact predecessor and refuses a gap, because its channel
+  is ordered and a gap there is a fault. This generation moves only when a whole set is sent, so an ordinary
+  run of sections all carry the same one and a dropped datagram costs nothing.
 - **The receiver emits the diff, not the set.** A resync that announced every slot would re-announce every
   entity the peer already had.
 - **The manifest cannot carry this.** It is a session-wide table broadcast identically to every peer, so it

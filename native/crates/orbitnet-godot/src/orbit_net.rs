@@ -926,7 +926,7 @@ const SENT_LOG_DEPTH: usize = 64;
 /// How many entries of each half of a peer's pending interest delta ride one frame.
 ///
 /// **This is what bounds the reserve the send path takes off the byte budget.** The section costs
-/// [`interest_delta_reserve`] bytes, so 32 of each half is `3 + 2 × 64` = 131 B — about 11% of the
+/// [`interest_delta_reserve`] bytes, so 32 of each half is `13 + 2 × 64` = 141 B — about 12% of the
 /// default 1200 B budget, and only on a tick that has relevancy news. A joining peer, whose first
 /// update enters everything it can see, spreads that burst over consecutive frames rather than
 /// paying for it in one: nothing is dropped, it arrives a round trip later.
@@ -949,9 +949,9 @@ const INTEREST_DELTA_PENDING_MAX: usize = 256;
 /// **The same depth as [`SENT_LOG_DEPTH`]**, and for the same reason: past 64 frames an ack can no
 /// longer confirm the frame anyway, so holding the prefix past that reserves budget on every tick
 /// for a section nothing will ever retire. What is dropped is the prefix — those events are never
-/// announced to that peer, and its mirrored set stays wrong for those entities until one of them
-/// transitions again or the game resyncs from [`OrbitNet::entities_in_interest`]. The rest of the
-/// pending delta is unaffected and takes the next frame.
+/// announced to that peer, so the drop owes that connection a whole set
+/// ([`OrbitNet::send_interest_tables`]) rather than leaving its mirror wrong. The rest of the pending
+/// delta is unaffected and takes the next frame.
 const INTEREST_DELTA_RETRY_TICKS: u64 = SENT_LOG_DEPTH as u64;
 
 /// How many round-trip samples the per-peer rewind estimate keeps — about a second of
@@ -4977,7 +4977,6 @@ impl OrbitNet {
                 // Before the manifest, because the manifest is what publishes the table.
                 self.reconcile_slots(current);
                 self.send_manifest_if_dirty();
-                self.send_interest_tables();
                 self.send_snapshots(current);
             }
             _ => {}
@@ -5031,10 +5030,12 @@ impl OrbitNet {
                 blocks.push(bytes);
             }
         }
-        // A frame with no blocks still rides when either NACK is up: a client whose owned bodies
-        // have not been named yet is exactly the client whose manifest may have broken, and a NACK
-        // it cannot send is a session that never repairs.
-        if blocks.is_empty() && !self.want_full && !self.want_manifest {
+        if !input_frame_is_owed(
+            !blocks.is_empty(),
+            self.want_full,
+            self.want_manifest,
+            self.want_interest,
+        ) {
             return;
         }
 
@@ -5218,19 +5219,6 @@ impl OrbitNet {
         }
     }
 
-    /// Build and send one snapshot frame per synced peer.
-    ///
-    /// The shape, in order: **gather once, cull, order, admit.** Each step exists because the
-    /// step before it was the wrong place to pay:
-    ///
-    /// 1. [`Self::collect_entity_rows`] asks every entity for its owner and anchor **once per
-    ///    tick**, not once per entity per peer.
-    /// 2. [`Self::update_interest`] runs the hysteretic filter over both lanes and clears the delta
-    ///    bookkeeping of everything that left.
-    /// 3. The send order is built from the **surviving** set — so it is `O(peers · K log K)` in the
-    ///    interest size rather than `O(peers · N log N)` over the whole registry, which is where the
-    ///    real per-peer cost lived. Ordering ahead of the cull bought bandwidth and no CPU.
-    /// 4. Admission spends the byte budget down the ordered list.
     /// SERVER: send the whole interest set to every connection owed one, and bump its generation.
     ///
     /// **THE REPAIR PATH FOR RELEVANCY, AND THE MIRROR OF `send_manifest_if_dirty`.** Three things
@@ -5246,9 +5234,16 @@ impl OrbitNet {
     /// whose rows kept arriving, `entity_entered_interest` never fired for it, and the documented
     /// repair answered that client out of the same broken mirror.
     ///
-    /// **It runs BEFORE the snapshots**, so the manifest that binds these slots has already gone out
-    /// on the reliable channel this tick, and so this tick's own section — built after
-    /// `update_interest` — carries the bumped generation and patches the set rather than racing it.
+    /// **It runs AFTER the interest pass and before the frames**, which is what makes the set it
+    /// states the set this tick computed. The manifest binding these slots went out earlier in the
+    /// same flush, on the reliable channel this rides.
+    ///
+    /// **A SECTION IS PLACED EXACTLY, NOT APPROXIMATELY.** A table is reliable and a section is not,
+    /// so a section built after a table can reach the client first. It is stamped with the
+    /// generation it was built against and the client applies it only at that exact generation —
+    /// anything else is a section whose baseline the client is not holding, which it drops and asks
+    /// again for. Re-sends of a prefix carry the generation they were built at, so the
+    /// re-send-until-acked model is untouched.
     ///
     /// The pending halves are cleared rather than sent: every entry in them is a transition into or
     /// out of the set this frame states outright.
@@ -5295,6 +5290,19 @@ impl OrbitNet {
         }
     }
 
+    /// Build and send one snapshot frame per synced peer.
+    ///
+    /// The shape, in order: **gather once, cull, order, admit.** Each step exists because the
+    /// step before it was the wrong place to pay:
+    ///
+    /// 1. [`Self::collect_entity_rows`] asks every entity for its owner and anchor **once per
+    ///    tick**, not once per entity per peer.
+    /// 2. [`Self::update_interest`] runs the hysteretic filter over both lanes and clears the delta
+    ///    bookkeeping of everything that left.
+    /// 3. The send order is built from the **surviving** set — so it is `O(peers · K log K)` in the
+    ///    interest size rather than `O(peers · N log N)` over the whole registry, which is where the
+    ///    real per-peer cost lived. Ordering ahead of the cull bought bandwidth and no CPU.
+    /// 4. Admission spends the byte budget down the ordered list.
     fn send_snapshots(&mut self, current: u64) {
         let budget = self.effective_send_budget();
         let peer_ids: Vec<i32> = self
@@ -5355,12 +5363,26 @@ impl OrbitNet {
         // one case where a per-(peer, entity) refusal is the only lever a game has. It is a cheap
         // standing count rather than a scan, and a session that vetoes nothing pays one `bool` per
         // connection per flush and takes the same branch it always did.
+        // SYNCED ONLY. `set_entity_hidden` creates a connection's state on demand, because a veto
+        // may be declared before that peer finishes its handshake — and a veto declared for one that
+        // has already gone leaves a state nothing removes again. Counting only live connections is
+        // what stops such a record pinning the pass on for the rest of the session.
         let vetoing = self
             .peers
             .values()
-            .any(|peer| peer.interest.hidden_len() > 0);
-        let filtering =
-            culling || vetoing || rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL);
+            .any(|peer| peer.synced && peer.interest.hidden_len() > 0);
+        // ONCE A SESSION FILTERS IT KEEPS FILTERING. Every client that has received a section holds
+        // a mirrored set and answers `entities_in_interest` out of it; a session that switched the
+        // pass back off — by retracting its last veto, or by unregistering its last non-global row —
+        // would leave every one of those mirrors frozen at the last thing it was told while the
+        // server went back to answering "everything is in interest". The pass is cheap on a session
+        // with nothing to refuse; a mirror that silently stops tracking is not.
+        let filtering = session_is_filtering(
+            culling,
+            vetoing,
+            self.interest_ran,
+            rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL),
+        );
         if filtering {
             Self::collect_observers(&rows, &mut observers);
             self.warn_anchor_conflicts(&observers);
@@ -5372,6 +5394,14 @@ impl OrbitNet {
         self.interest_ran = filtering;
         self.acc_interest_us += interest_started.elapsed().as_micros() as u64;
         self.acc_interest_ticks += 1;
+        // AFTER THE PASS, so the set a table states is the set this tick actually computed. Built
+        // before it, a table described the previous tick while the section built later in this same
+        // flush carried the same generation — two frames disagreeing under one stamp, on channels
+        // with no ordering between them. It also clears the pending halves, so the peer it answers
+        // sends no section this tick: the table already says where every entity stands.
+        if filtering {
+            self.send_interest_tables();
+        }
 
         // The cull radius is applied by `update_interest` above, which is the only thing that
         // decides membership; nothing down here re-derives a band from it. See `priority::band_of`:
@@ -6579,6 +6609,7 @@ impl OrbitNet {
         // Under a session secret the key is derived rather than read off the wire, and the comparison
         // is unchanged because it was already derived above: a retried hello repeats its nonce, derives
         // the same key, and keeps its window.
+        let rekeyed = peer.auth.is_some_and(|auth| auth.key() != session_key);
         if peer.auth.is_none_or(|auth| auth.key() != session_key) {
             peer.auth = Some(SessionAuth::new(session_key));
             peer.budget = ReceiveBudget::new();
@@ -6599,9 +6630,14 @@ impl OrbitNet {
             peer.acked_base.clear();
             peer.last_full.clear();
             peer.last_sent.clear();
-            // The interest set went the same way, and the whole set is what re-seats it.
-            peer.interest_seeded = false;
-            peer.interest_full_due = true;
+            // The interest set went the same way, and the whole set is what re-seats it. Only on
+            // a true REKEY: a first hello has no set to have lost, and owing one there sent a table
+            // for an interest pass that had never run — an empty set, which a client then holds as
+            // the whole truth.
+            if rekeyed {
+                peer.interest_seeded = false;
+                peer.interest_full_due = true;
+            }
         }
         // The secret this connection's frame tokens are minted from. `get_or_insert_with`, not an
         // assignment: a hello is retried, and re-minting would strand every token the client already
@@ -7000,10 +7036,14 @@ impl OrbitNet {
     /// that names it. The leave is not lost — [`Self::apply_manifest_interest`] emits it from the
     /// rebuild — and the mirrored set is what makes the two produce exactly one event between them.
     fn apply_interest_delta(&mut self, section: &InterestDeltaSection) {
-        // A SECTION OLDER THAN THE SET THIS PEER HOLDS IS DROPPED. The whole set is reliable and a
-        // section is not, so a section built before the set can arrive after it; applying one would
-        // undo exactly the repair that set was sent to make.
+        // A SECTION THIS PEER CANNOT PLACE IS DROPPED, AND ASKED ABOUT. It states a change against
+        // one baseline, and this peer is holding another: below its own generation it is a section
+        // the whole set already superseded, above it one built against a set that has not arrived.
+        // Either way applying it would leave a mirror matching neither end, and the ask is what
+        // stops the drop being silent — the server retires a prefix on the frame's ack whether or
+        // not the section in it was integrated.
         if !section.applies_to(self.interest_mirror_generation) {
+            self.want_interest = true;
             return;
         }
         let peer = self.local_peer_id();
@@ -7314,7 +7354,7 @@ fn filter_connection(
 /// Zero for an empty section, because no flag is raised and no bytes are written.
 ///
 /// **It can leave less than one block's worth of budget**, at the 256 B floor
-/// [`OrbitNet::effective_send_budget`] clamps to: a maximal section there leaves 125 B. That does not
+/// [`OrbitNet::effective_send_budget`] clamps to: a maximal section there leaves 115 B. That does not
 /// wedge the peer — the admit loop sends an oversized first block anyway rather than end the stream —
 /// and the maximum is only reached on a tick with relevancy news to carry.
 #[must_use]
@@ -7559,12 +7599,51 @@ fn admit_input_blocks(
         if out.len() < cap && payload + lengths[index] <= budget {
             payload += lengths[index];
             out.push(index);
-        } else if refused.is_none() {
+        } else if refused.is_none() && lengths[index] <= budget {
+            // THE ROTOR PARKS ONLY ON A BLOCK THAT COULD RIDE AN EMPTY FRAME. One that cannot fit
+            // whatever else is admitted is refused every tick, so parking on it would hand it the
+            // front of the rota for ever and starve everything behind it — which the count cap made
+            // reachable, since a fleet can now be refused for its size rather than its bytes.
             refused = Some(index);
         }
     }
     out.sort_unstable();
     refused.unwrap_or(start)
+}
+
+/// Whether the interest pass runs this tick.
+///
+/// A free function so the rule the send path runs is the rule a test can call.
+///
+/// **ONCE A SESSION FILTERS IT KEEPS FILTERING**, which is what `ran` carries. Every client that has
+/// received a section holds a mirrored set and answers `entities_in_interest` out of it. A session
+/// that switched the pass back off — by retracting its last veto, or by unregistering its last
+/// non-global row — would leave every one of those mirrors frozen at the last thing it was told
+/// while the server went back to answering "everything is in interest". The flag is per session and
+/// clears with it, so a torn-down session starts on the fast path again.
+#[must_use]
+fn session_is_filtering(culling: bool, vetoing: bool, ran: bool, any_membership: bool) -> bool {
+    culling || vetoing || ran || any_membership
+}
+
+/// Whether a client owes the server an input frame this tick.
+///
+/// A free function so the rule the send path runs is the rule a test can call — the same shape as
+/// [`admit_input_blocks`].
+///
+/// **A FRAME WITH NO BLOCKS STILL RIDES WHEN ANY NACK IS UP.** A client whose owned bodies have not
+/// been named yet is exactly the client whose manifest may have broken, and a NACK it cannot send is
+/// a session that never repairs. An OBSERVER drives no body at all, so every frame it sends carries
+/// no blocks — and interest filtering is what an observer is for, which is why
+/// [`FrameHeader::FLAG_WANT_INTEREST`] most needed naming here.
+#[must_use]
+fn input_frame_is_owed(
+    has_blocks: bool,
+    want_full: bool,
+    want_manifest: bool,
+    want_interest: bool,
+) -> bool {
+    has_blocks || want_full || want_manifest || want_interest
 }
 
 /// The tick a block's oldest newly-landed input row starts a resim from, or `None` for no resim.
@@ -8109,20 +8188,20 @@ mod tests {
         build_interest_section, candidate_for_own_row, candidate_for_row, clamp_resume_policy,
         clamp_seat_release_policy, clamp_unanchored_policy, classify_rx, delta_reference,
         encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
-        interest_delta_reserve, is_located, manifest_owed, owned_rows_into, owned_rows_of,
-        queue_seat_release, resim_input_from, resolve_observer, resume_grant,
+        input_frame_is_owed, interest_delta_reserve, is_located, manifest_owed, owned_rows_into,
+        owned_rows_of, queue_seat_release, resim_input_from, resolve_observer, resume_grant,
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
-        session_key_from, AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed, OrbitNet,
-        PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
-        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
-        StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
-        FULL_STATE_INTERVAL, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
-        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
-        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
-        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
-        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
-        UNLOCATABLE_CENTER,
+        session_is_filtering, session_key_from, AckOutcome, EntityRow, FrameHeader, InterestPass,
+        ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
+        ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent,
+        SeatReleasePolicy, SlotTable, StateIntegration, Writer, ANCHOR_SOURCE_FIXED,
+        ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INTEREST_DELTA_PENDING_MAX,
+        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
+        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
+        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
+        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
+        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -9682,6 +9761,58 @@ mod tests {
     // The resync: three ways a connection is owed the whole set, and the two gates on the client.
     // ------------------------------------------------------------------
 
+    /// **A CLIENT THAT DRIVES NOTHING STILL HAS TO BE ABLE TO ASK.** The gate suppresses a frame
+    /// carrying no blocks, and an observer drives no body, so every frame it sends carries none. A
+    /// NACK that cannot leave is a session that never repairs, which is what the gate exists to
+    /// prevent — so each of the three has to be named in it.
+    #[test]
+    fn every_client_nack_keeps_an_empty_frame_alive() {
+        assert!(
+            !input_frame_is_owed(false, false, false, false),
+            "nothing to say, nothing to send"
+        );
+        assert!(
+            input_frame_is_owed(true, false, false, false),
+            "blocks are the ordinary reason"
+        );
+        assert!(
+            input_frame_is_owed(false, true, false, false),
+            "a broken delta base must reach the server"
+        );
+        assert!(
+            input_frame_is_owed(false, false, true, false),
+            "so must a broken manifest"
+        );
+        assert!(
+            input_frame_is_owed(false, false, false, true),
+            "and so must a broken interest set -- the observer case"
+        );
+    }
+
+    /// The pass does not switch back off under a game that retracts its last veto or unregisters its
+    /// last non-global row. A client that has been told anything answers out of a mirrored set, and a
+    /// server that stopped filtering would leave that mirror frozen while answering "everything".
+    #[test]
+    fn a_session_that_has_filtered_keeps_filtering() {
+        assert!(
+            !session_is_filtering(false, false, false, false),
+            "nothing to refuse"
+        );
+        assert!(session_is_filtering(true, false, false, false), "a radius");
+        assert!(
+            session_is_filtering(false, true, false, false),
+            "a standing veto on its own"
+        );
+        assert!(
+            session_is_filtering(false, false, false, true),
+            "a declared membership"
+        );
+        assert!(
+            session_is_filtering(false, false, true, false),
+            "and a session that has already filtered, whatever it holds now"
+        );
+    }
+
     /// **CAUSE 1: THE PENDING HALF OVERFLOWED.** The cap was written as a backstop for a peer that
     /// never acks, but a first update in a world of more than `INTEREST_DELTA_PENDING_MAX` filtered
     /// entities reaches it on a healthy link. What was dropped never reached the wire and nothing
@@ -9772,36 +9903,40 @@ mod tests {
         );
     }
 
-    /// The whole set is sent to the peers that are owed one and to nobody else, and sending it
-    /// clears the pending halves: every entry in them is a transition into or out of the set the
-    /// frame states outright.
+    /// A whole set supersedes every pending transition, so the halves are cleared rather than sent:
+    /// each entry in them is a move into or out of the set the frame states outright.
+    ///
+    /// Driven through `PeerState`'s own methods rather than by restating the send path's body, so a
+    /// change to that body can still fail this.
     #[test]
-    fn the_whole_set_clears_what_it_supersedes_and_bumps_the_generation() {
+    fn a_seeded_connection_owes_nothing_until_something_makes_it() {
         let mut peer = peer_holding(7);
         peer.note_interest_enter(7);
         peer.interest_delta_tick = Some(100);
         peer.interest_delta_entered_sent = 1;
-        peer.interest_full_due = true;
-        let before = peer.interest_generation;
-
-        // What `send_interest_tables` does per peer, as the sequence a test can assert.
-        peer.interest_generation = peer.interest_generation.saturating_add(1);
-        peer.interest_pending.leaves.clear();
-        peer.interest_pending.enters.clear();
-        peer.interest_delta_left_sent = 0;
-        peer.interest_delta_entered_sent = 0;
-        peer.interest_delta_tick = None;
-        peer.interest_seeded = true;
-        peer.interest_full_due = false;
-
-        assert_eq!(peer.interest_generation, before + 1);
-        assert!(peer.interest_pending.enters.is_empty());
-        assert!(peer.interest_delta_tick.is_none());
         assert!(
-            peer.interest_seeded,
-            "a peer holding the whole set is seeded"
+            !peer.interest_full_due,
+            "an ordinary tick owes no whole set"
         );
-        assert!(!peer.interest_full_due, "and is owed nothing further");
+
+        // The ack retires the prefix and seeds the connection, and still owes nothing.
+        peer.newest_ack = 100;
+        peer.retire_interest_delta(101);
+        assert!(peer.interest_seeded);
+        assert!(!peer.interest_full_due);
+        assert!(
+            peer.interest_pending.enters.is_empty(),
+            "the prefix is drained"
+        );
+
+        // Only a cause does. Overflow is the one a connection can reach on a healthy link.
+        for id in 1..=(INTEREST_DELTA_PENDING_MAX as u64 + 1) {
+            peer.note_interest_enter(id);
+        }
+        assert!(
+            peer.interest_full_due,
+            "and then a whole set is what it is owed"
+        );
     }
 
     /// A veto is the second leave that happens between updates, and the rule stated above
@@ -9867,6 +10002,22 @@ mod tests {
         let mut seen: std::collections::HashSet<usize> = out.iter().copied().collect();
         seen.extend(second.iter().copied());
         assert_eq!(seen.len(), count, "and the rota covers the whole fleet");
+
+        // AND A BLOCK THAT CAN NEVER FIT DOES NOT HOLD THE FRONT OF THE ROTA. Parking on it would
+        // refuse it again every tick and starve everything behind it -- which the count cap made
+        // reachable, since a fleet can now be refused for its size rather than its bytes.
+        let mut wedged = vec![9usize; count];
+        wedged[0] = budget + 1;
+        let mut third = Vec::new();
+        let parked = admit_input_blocks(&wedged, 0, budget, &mut third);
+        assert!(!third.contains(&0), "the oversized block cannot ride");
+        assert_ne!(parked, 0, "and the rota does not park on it");
+        let mut fourth = Vec::new();
+        let _ = admit_input_blocks(&wedged, parked, budget, &mut fourth);
+        assert!(
+            !fourth.is_empty() && fourth != third,
+            "so the blocks behind it keep making progress"
+        );
     }
 
     /// A veto is a leave that happens between updates, so it has to be queued where it is declared.

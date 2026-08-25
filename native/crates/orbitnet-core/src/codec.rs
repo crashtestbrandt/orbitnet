@@ -1556,12 +1556,17 @@ pub struct InterestDeltaSection {
 impl InterestDeltaSection {
     /// Whether a receiver holding `generation` may apply this section.
     ///
-    /// Greater-or-equal, deliberately: a re-send of the prefix carries the same generation it was
-    /// built at, and refusing an equal one would refuse every retransmission the reliability model
-    /// depends on.
+    /// **EXACT, DELIBERATELY.** A section states a change against one baseline, and a receiver
+    /// holding any other is not holding the set it was diffed from. Greater-or-equal would admit
+    /// the case this exists to refuse: a table is reliable and a section is not, so a section built
+    /// AFTER a table can arrive before it, and applying it early would have the table then undo it.
+    ///
+    /// A re-send of a prefix carries the generation it was built at, so retransmission — which the
+    /// whole reliability model rests on — still matches. A receiver that drops a section for this
+    /// reason asks for the whole set, exactly as it does for a slot it cannot name.
     #[must_use]
     pub fn applies_to(&self, generation: u64) -> bool {
-        self.generation >= generation
+        self.generation == generation
     }
 }
 
@@ -3313,25 +3318,29 @@ mod tests {
         }
     }
 
-    /// **GREATER-OR-EQUAL, NOT EQUAL.** A section is re-sent until it is acknowledged, carrying the
-    /// generation it was built at every time; an equality test would refuse every retransmission the
-    /// reliability model rests on. What it must refuse is only a section built BEFORE the whole set
-    /// the receiver has since adopted.
+    /// **EXACT, AND BOTH DIRECTIONS MATTER.** A whole set is reliable and a section is not, so a
+    /// section built either side of a table can arrive on the wrong side of it. Below the held
+    /// generation it is one the table already superseded; above it, one diffed against a set that
+    /// has not arrived — and applying that early would let the table then undo it. What the match
+    /// must still admit is a re-send, which carries the generation it was built at.
     #[test]
-    fn a_section_applies_at_or_above_the_generation_held() {
+    fn a_section_applies_only_at_the_generation_it_was_built_against() {
         let section = InterestDeltaSection {
             generation: 4,
             left: Vec::new(),
             entered: Vec::new(),
         };
-        assert!(section.applies_to(3), "a newer section applies");
         assert!(
             section.applies_to(4),
-            "and a re-send of the current one still does"
+            "the baseline it was diffed from, and every re-send of it"
+        );
+        assert!(
+            !section.applies_to(3),
+            "a section built against a set this peer has not adopted yet"
         );
         assert!(
             !section.applies_to(5),
-            "but one built before the set this peer now holds does not"
+            "and one the whole set it now holds has already superseded"
         );
     }
 
