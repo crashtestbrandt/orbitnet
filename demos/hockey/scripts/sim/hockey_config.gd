@@ -8,13 +8,13 @@ class_name HockeyConfig
 ## node's transform, so a puck's `position` is already its table-space coordinate and the view is a pure
 ## presentation layer over it.
 ##
-## Metres, at roughly regulation scale (a 2 m x 1 m playing surface). The scale is not arbitrary: `@half` on
+## Meters, at roughly regulation scale (a 2 m x 1 m playing surface). The scale is not arbitrary: `@half` on
 ## the wire is IEEE-754 binary16, whose spacing near a coordinate of 1.0 is about 1 mm, and this demo reports
-## its correction in millimetres. Ten times this table and the quantization floor would be the number.
+## its correction in millimeters. Ten times this table and the quantization floor would be the number.
 const HALF_WIDTH: float = 0.5
 const HALF_LENGTH: float = 1.0
 
-## Half-width of a goal mouth, centred on x = 0 at each end.
+## Half-width of a goal mouth, centered on x = 0 at each end.
 const GOAL_HALF_WIDTH: float = 0.13
 
 ## The puck.
@@ -42,11 +42,11 @@ const PUCK_SUBSTEPS: int = 4
 
 ## The mallets.
 const MALLET_RADIUS: float = 0.048
-## Metres per second a mallet may chase the pointer at. A finite speed is what gives the mallet a VELOCITY at
+## Meters per second a mallet may chase the pointer at. A finite speed is what gives the mallet a VELOCITY at
 ## all, and the mallet's velocity is what strikes the puck; a mallet that teleported onto the pointer would
 ## have no defined speed and could place the puck anywhere.
 const MALLET_MAX_SPEED: float = 3.6
-## Metres per second squared. High enough that the mallet feels attached to the pointer, finite so that a
+## Meters per second squared. High enough that the mallet feels attached to the pointer, finite so that a
 ## flick has a ramp the server and the client both simulate.
 const MALLET_ACCEL: float = 48.0
 ## Fraction of speed a coasting mallet keeps after one second. Only ever used on a peer that receives no input
@@ -99,7 +99,7 @@ const FRAMING_MARGIN: float = 0.10
 const FADE_START: float = 0.22
 const FADE_FLOOR: float = 0.12
 
-## Metres of disagreement below which a correction is not a correction.
+## Meters of disagreement below which a correction is not a correction.
 ##
 ## The view detects a correction by extrapolating the previous pose forward and comparing, and that
 ## extrapolation is a straight line while the simulation damps and substeps -- so EVERY tick disagrees by a
@@ -107,10 +107,10 @@ const FADE_FLOOR: float = 0.12
 ## offline where nothing is being corrected at all.
 ##
 ## Sized at the wire's own resolution: `net_pos` rides as binary16, whose spacing at this table's scale is
-## about a millimetre, so a disagreement below that is not distinguishable from quantization anyway.
+## about a millimeter, so a disagreement below that is not distinguishable from quantization anyway.
 const CORRECTION_DEADBAND_M: float = 0.0012
 
-## Metres of correction above which the puck's render position SNAPS instead of blending. Below it the view
+## Meters of correction above which the puck's render position SNAPS instead of blending. Below it the view
 ## absorbs the correction over CORRECTION_HALF_LIFE seconds and the player never sees a jump.
 const CORRECTION_SNAP_M: float = 0.09
 const CORRECTION_HALF_LIFE: float = 0.06
@@ -133,7 +133,7 @@ static func team_of_seat(seat: int) -> int:
 static func end_sign(team: int) -> float:
 	return -1.0 if team == 0 else 1.0
 
-## A team's colour, for the renderer and the HUD.
+## A team's color, for the renderer and the HUD.
 static func team_color(team: int) -> Color:
 	if team == 0:
 		return Color(0.35, 0.66, 1.0)

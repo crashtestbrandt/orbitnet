@@ -34,19 +34,71 @@ const VERB_ATTACK_MOVE: StringName = &"attack_move"
 const VERB_STOP: StringName = &"stop"
 const VERB_HOLD: StringName = &"hold"
 
+## Why an order was refused, as one number per rule.
+##
+## `OK` is 0 because that is what [NetCommand] reads as acceptance -- a validator that returns an int states
+## the reason, and 0 states that there is none. An enum starting at 1 would refuse every order it accepted.
+##
+## THE CODE CROSSES THE WIRE, THE SENTENCE DOES NOT. `Result.reason` names the ids and seats involved, which
+## is what a server log wants and what a client must never be handed: it is server-side knowledge about units
+## the asker may not own. The client is told the code and says its own sentence with [method describe].
+##
+## Two of these are decided by WorldDirector rather than here -- the rate limit and the wrong-channel check
+## both need session state a pure validator does not have -- but they are named in this one table so a HUD has
+## a single vocabulary to read.
+enum Code {
+	OK = 0,
+	NO_SEAT = 1,
+	UNKNOWN_VERB = 2,
+	MALFORMED_IDS = 3,
+	TOO_MANY_IDS = 4,
+	POINT_NOT_FINITE = 5,
+	ID_OUT_OF_RANGE = 6,
+	FOREIGN_ID = 7,
+	RATE_LIMITED = 8,
+	FOREIGN_CHANNEL = 9,
+}
+
+## One sentence per code, for a HUD. Static and pure, and it names no id and no seat -- a client that received
+## the code says the same thing whatever the server knew.
+static func describe(code: int) -> String:
+	match code:
+		Code.NO_SEAT:
+			return "the sender holds no seat"
+		Code.UNKNOWN_VERB:
+			return "unknown order"
+		Code.MALFORMED_IDS:
+			return "empty or malformed id list"
+		Code.TOO_MANY_IDS:
+			return "too many units in one order"
+		Code.POINT_NOT_FINITE:
+			return "the target point is not finite"
+		Code.ID_OUT_OF_RANGE:
+			return "an id is out of range"
+		Code.FOREIGN_ID:
+			return "an ordered unit is not yours"
+		Code.RATE_LIMITED:
+			return "you are ordering too fast"
+		Code.FOREIGN_CHANNEL:
+			return "that is not your channel"
+		_:
+			return ""
+
 ## The outcome. Carries the sanitized values, so a caller that got `accepted` never re-reads the raw payload
 ## -- which is what stops an unvalidated field sneaking through behind a validated one.
 class Result extends RefCounted:
 	var accepted: bool = false
-	var reason: String = ""            # human-readable, for the server log and the tests
+	var code: int = Code.OK            # what the requester is told
+	var reason: String = ""            # human-readable and detailed, for the server log and the tests
 	var verb: StringName = &""
 	var ids: PackedInt32Array = PackedInt32Array()   # owned, alive, de-duplicated, in payload order
 	var point: Vector3 = Vector3.ZERO
 	var dropped_dead: int = 0          # how many ids rule 2 removed (diagnostics; not an error)
 
-	func _init(ok: bool, why: String) -> void:
-		accepted = ok
-		reason = why
+	func _init(why: int, detail: String) -> void:
+		code = why
+		accepted = why == Code.OK
+		reason = detail
 
 ## Validate one order.
 ##
@@ -55,19 +107,20 @@ class Result extends RefCounted:
 static func validate(sender_seat: int, verb: StringName, payload: Dictionary,
 		alive: PackedByteArray) -> Result:
 	if sender_seat < 0 or sender_seat >= RtsConfig.SEATS:
-		return Result.new(false, "sender holds no seat")
+		return Result.new(Code.NO_SEAT, "sender holds no seat")
 	if not _is_known_verb(verb):
-		return Result.new(false, "unknown verb '%s'" % verb)
+		return Result.new(Code.UNKNOWN_VERB, "unknown verb '%s'" % verb)
 
 	var raw_ids: PackedInt32Array = _read_ids(payload)
 	if raw_ids.is_empty():
-		return Result.new(false, "empty or malformed id list")
+		return Result.new(Code.MALFORMED_IDS, "empty or malformed id list")
 	if raw_ids.size() > RtsConfig.MAX_ORDER_IDS:
-		return Result.new(false, "id list of %d exceeds the cap of %d" % [raw_ids.size(), RtsConfig.MAX_ORDER_IDS])
+		return Result.new(Code.TOO_MANY_IDS,
+			"id list of %d exceeds the cap of %d" % [raw_ids.size(), RtsConfig.MAX_ORDER_IDS])
 
 	var point: Vector3 = _read_point(payload)
 	if not UnitSteering.is_finite_vec(point):
-		return Result.new(false, "target point is not finite")
+		return Result.new(Code.POINT_NOT_FINITE, "target point is not finite")
 	# STOP and HOLD carry no destination, so a point is meaningless for them; normalize it away rather than
 	# leaving a value the caller might act on.
 	if verb == VERB_STOP or verb == VERB_HOLD:
@@ -81,9 +134,9 @@ static func validate(sender_seat: int, verb: StringName, payload: Dictionary,
 	for id: int in raw_ids:
 		if not RtsConfig.is_valid_id(id):
 			# Out of range is not a race -- no honest client can produce it. Rule 1.
-			return Result.new(false, "id %d is out of range" % id)
+			return Result.new(Code.ID_OUT_OF_RANGE, "id %d is out of range" % id)
 		if RtsConfig.seat_of(id) != sender_seat:
-			return Result.new(false, "id %d belongs to seat %d, sender holds seat %d"
+			return Result.new(Code.FOREIGN_ID, "id %d belongs to seat %d, sender holds seat %d"
 				% [id, RtsConfig.seat_of(id), sender_seat])
 		if seen.has(id):
 			continue   # a duplicate is harmless; collapse it rather than doing the work twice
@@ -93,7 +146,7 @@ static func validate(sender_seat: int, verb: StringName, payload: Dictionary,
 			continue
 		kept.push_back(id)
 
-	var result: Result = Result.new(true, "ok" if not kept.is_empty() else "every named unit is dead")
+	var result: Result = Result.new(Code.OK, "ok" if not kept.is_empty() else "every named unit is dead")
 	result.verb = verb
 	result.ids = kept
 	result.point = point

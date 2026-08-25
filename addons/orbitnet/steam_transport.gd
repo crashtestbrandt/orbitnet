@@ -101,7 +101,7 @@ const _CHAT_ROOM_ENTER_SUCCESS: int = 1
 # appear on our entry in a friend's list at all. One constant, both jobs, because they must agree.
 const _CONNECT_LOBBY_FLAG: String = "+connect_lobby"
 const _RICH_PRESENCE_CONNECT: String = "connect"
-# The rich-presence line the Steam friends list shows next to our name. `steam_display` is a localisation token
+# The rich-presence line the Steam friends list shows next to our name. `steam_display` is a localization token
 # resolved from your app's Steamworks rich-presence config -- register a `Status_InSession` token there, or
 # change this to a token you do register, or the friends list shows nothing next to your name.
 const _RICH_PRESENCE_DISPLAY: String = "steam_display"
@@ -213,7 +213,7 @@ func _process(_delta: float) -> void:
 
 # --- transport peers (delegated to from net_transport.gd's Kind.STEAM arm) -----------------------
 
-## Build a Steam listen-server host peer for a player-hosted (listen-server) session -- the Steam analogue of the
+## Build a Steam listen-server host peer for a player-hosted (listen-server) session -- the Steam analog of the
 ## ENET arm's ENetMultiplayerPeer.create_server. Requires a logged-in Steam user (client init). Returns null on
 ## any failure (GodotSteam absent, init failed, create_host failed) so the session layer's host path stays OFFLINE /
 ## surfaces the error exactly as it does for an ENet failure. `max_clients` is advisory on Steam (the relay does
@@ -247,7 +247,7 @@ func create_dedicated_host(_port: int, max_clients: int, friends_only: bool = fa
 	_advertise_friends_only = friends_only
 	return peer
 
-## Build a Steam client peer joining `target` -- the Steam analogue of the ENET arm's create_client. `target` is
+## Build a Steam client peer joining `target` -- the Steam analog of the ENET arm's create_client. `target` is
 ## the host's Steam ID (a 64-bit id as a decimal string; the SessionMenu "address" field carries it on a Steam
 ## build) rather than an IP. Requires a logged-in Steam user. Returns null on any failure.
 func create_client(target: String, _port: int) -> MultiplayerPeer:
@@ -343,7 +343,7 @@ func _ensure_game_server() -> bool:
 	# serverInitEx / gameServerInitEx(ip, game_port, query_port, server_mode, version_string) -> {status, verbal}.
 	# `ip` is a STRING on the vendored GodotSteam-Server ("0.0.0.0" == bind all interfaces); it used to be passed as
 	# the int 0, and Godot will not coerce int -> String through callv, so the call failed its argument check and
-	# the Steam dedicated server never initialised at all. Ports 0 let Steam pick. AuthenticationAndSecure enables
+	# the Steam dedicated server never initialized at all. Ports 0 let Steam pick. AuthenticationAndSecure enables
 	# VAC + the ownership auth used below. (GodotSteam-Server names these serverInit*; a combined build uses
 	# gameServerInit*.)
 	var result: Variant = _call_first(steam, [&"serverInitEx", &"gameServerInitEx", &"serverInit", &"gameServerInit"],
@@ -406,7 +406,7 @@ func _connect_auth_response(steam: Object) -> void:
 
 # GodotSteam emits validate_auth_ticket_response(auth_id: int, response: int, owner_id: int). response == 0
 # (k_EAuthSessionResponseOK) means the ticket holder owns the app; anything else is a reject (not owned / ticket
-# cancelled / VAC banned). Re-emit as the ownership verdict for the server's join gate, AND enforce it: on a
+# canceled / VAC banned). Re-emit as the ownership verdict for the server's join gate, AND enforce it: on a
 # negative verdict, kick the peer that claimed this Steam id (the dedicated-server trust boundary). auth_id is
 # the joining user's Steam id (GodotSteam's first arg), which is exactly the key _peer_steam is stored under.
 func _on_validate_auth_ticket_response(auth_id: int, response: int, _owner_id: int) -> void:
@@ -480,7 +480,7 @@ func _kick_peer(peer_id: int, reason: String) -> void:
 
 # THIS client's own 64-bit Steam id, to hand to the server alongside the ticket. begin_auth_session pairs the
 # ticket WITH this id, so a spoofed id simply fails validation (Steam rejects a ticket/id mismatch). 0 when the
-# Steam user id is unavailable (GodotSteam absent / not initialised), which suppresses the submit.
+# Steam user id is unavailable (GodotSteam absent / not initialized), which suppresses the submit.
 func _local_steam_id() -> int:
 	if _steam_obj == null:
 		return 0
@@ -764,7 +764,7 @@ func _on_lobby_joined(lobby_id: int, _permissions: int, _locked: bool, response:
 	_invite_lobby_awaiting_session = lobby_id
 	invite_accepted.emit(str(host_id))
 
-# Drop out of a staged invite lobby whose session never materialised (the join failed, or a newer invite replaced
+# Drop out of a staged invite lobby whose session never materialized (the join failed, or a newer invite replaced
 # it). Keeps the staging slot from silently pinning us to a lobby forever, since release_session() cannot see it.
 func _leave_lobby_awaiting_session() -> void:
 	if _invite_lobby_awaiting_session == 0:
@@ -777,7 +777,7 @@ func _leave_lobby_awaiting_session() -> void:
 func _on_connection_failed() -> void:
 	_leave_lobby_awaiting_session()
 
-## Release every Steam session artefact this process is holding: the lobby we advertise as host, a lobby we joined
+## Release every Steam session artifact this process is holding: the lobby we advertise as host, a lobby we joined
 ## as an invitee, and our rich presence. Called from the session-teardown path so a stopped session stops being
 ## advertised -- otherwise the lobby lingers in every browser as a ghost row, and re-hosting in the same process
 ## leaks a second lobby. Safe to call on any build, in any state.

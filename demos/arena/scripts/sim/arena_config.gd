@@ -4,21 +4,21 @@ class_name ArenaConfig
 ##
 ## THE ARENAS ARE REBASED, AND WHAT IS REPLICATED IS ARENA-LOCAL. Every fighter and every prop replicates a
 ## position in ITS OWN arena's frame, near that arena's origin, which is the arrangement membership exists
-## for: two fighters standing on the same spot in different arenas are ZERO metres apart, so no radius can
+## for: two fighters standing on the same spot in different arenas are ZERO meters apart, so no radius can
 ## separate them and the only thing that can is a declared world. The world-space spacing below is applied
 ## when a node is PLACED for rendering, and never reaches the wire or the interest pass.
 
 # --- arenas ----------------------------------------------------------------------------------------
 ## How many independent arenas one session hosts.
 const ARENAS: int = 3
-## Metres between one arena's origin and the next, IN WORLD SPACE ONLY.
+## Meters between one arena's origin and the next, IN WORLD SPACE ONLY.
 ##
 ## A presentation number. It decides where the renderer puts an arena and nothing else -- the interest pass
 ## sees arena-local coordinates, where all three arenas overlap exactly. Spacing them at all is so a human
 ## looking at the scene can see three arenas rather than one with three sets of fighters standing inside each
 ## other.
 const ARENA_SPACING_M: float = 1200.0
-## Half-extents of one arena's floor, metres.
+## Half-extents of one arena's floor, meters.
 const ARENA_HALF_X: float = 20.0
 const ARENA_HALF_Z: float = 20.0
 
@@ -38,7 +38,7 @@ const TEAMS: int = 2
 
 ## The most seats one CONNECTION may drive at once -- local split-screen.
 ##
-## TWO, AND THE SECOND ONE IS THE WHOLE FEATURE. A seat is a body with its own interest anchor, its own centre
+## TWO, AND THE SECOND ONE IS THE WHOLE FEATURE. A seat is a body with its own interest anchor, its own center
 ## and its own world; a connection receives the UNION of its seats' sets. One is the ordinary case and needs
 ## no declaration at all, because every body starts at seat 0.
 const MAX_SEATS_PER_PEER: int = 2
@@ -60,7 +60,7 @@ const FIGHTER_RADIUS: float = 0.35
 const FIGHTER_HEIGHT: float = 1.8
 
 # --- weapon ----------------------------------------------------------------------------------------
-## How far a shot reaches, metres. Deliberately longer than an arena's diagonal, so no shot is refused for
+## How far a shot reaches, meters. Deliberately longer than an arena's diagonal, so no shot is refused for
 ## range and every miss is a miss.
 const SHOT_RANGE_M: float = 64.0
 ## Damage per hit, as a fraction of full health.
@@ -95,11 +95,11 @@ const SHOT_MASK: int = LAYER_FIGHTER | LAYER_COVER
 const SHOT_DYNAMIC_MASK: int = LAYER_FIGHTER
 
 # --- interest --------------------------------------------------------------------------------------
-## The distance radius the session runs at, metres. Comfortably larger than an arena, so within one arena
+## The distance radius the session runs at, meters. Comfortably larger than an arena, so within one arena
 ## nothing is culled by distance and the filtering on show is MEMBERSHIP and the VETO. Turning it down is a
 ## keybound lever, and turning it down is how the third axis becomes visible.
 const AOI_RADIUS_M: float = 60.0
-## The scale the send path's priority bands are derived from, metres: edges at scale/3 and 2*scale/3. Sized to
+## The scale the send path's priority bands are derived from, meters: edges at scale/3 and 2*scale/3. Sized to
 ## an arena rather than to the session, because a value large enough to span three arenas would put every body
 ## in one band and the per-band rewind measurements would all read the same.
 const BAND_SCALE_M: float = 45.0

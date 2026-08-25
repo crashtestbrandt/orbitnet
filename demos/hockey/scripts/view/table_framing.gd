@@ -43,7 +43,7 @@ static func table_corners(team: int) -> PackedVector3Array:
 	return corners(HockeyConfig.HALF_WIDTH, HockeyConfig.HALF_LENGTH,
 		viewpoint_basis(team, deg_to_rad(HockeyConfig.TABLE_TILT_DEGREES)))
 
-## The camera-space height every point should be centred about, so the tilt's vertical asymmetry does not spend
+## The camera-space height every point should be centered about, so the tilt's vertical asymmetry does not spend
 ## half the frustum on empty space above the table.
 static func vertical_center(points: PackedVector3Array, pitch_rad: float) -> float:
 	if points.is_empty():
@@ -69,12 +69,12 @@ static func min_distance(points: PackedVector3Array, pitch_rad: float, fov_rad: 
 		return 1.0
 	var tan_v: float = tan(clampf(fov_rad, 0.05, PI - 0.05) * 0.5) * (1.0 - clampf(margin, 0.0, 0.9))
 	var tan_h: float = tan_v * maxf(0.05, aspect)
-	var centre: float = vertical_center(points, pitch_rad)
+	var center: float = vertical_center(points, pitch_rad)
 	var inverse: Basis = Basis(Vector3.RIGHT, -pitch_rad)
 	var distance: float = 0.0
 	for point: Vector3 in points:
 		var camera_space: Vector3 = inverse * point
-		distance = maxf(distance, camera_space.z + absf(camera_space.y - centre) / tan_v)
+		distance = maxf(distance, camera_space.z + absf(camera_space.y - center) / tan_v)
 		distance = maxf(distance, camera_space.z + absf(camera_space.x) / tan_h)
 	return distance
 
@@ -84,21 +84,21 @@ static func fits(points: PackedVector3Array, distance: float, pitch_rad: float, 
 		margin: float) -> bool:
 	var tan_v: float = tan(clampf(fov_rad, 0.05, PI - 0.05) * 0.5) * (1.0 - clampf(margin, 0.0, 0.9))
 	var tan_h: float = tan_v * maxf(0.05, aspect)
-	var centre: float = vertical_center(points, pitch_rad)
+	var center: float = vertical_center(points, pitch_rad)
 	var inverse: Basis = Basis(Vector3.RIGHT, -pitch_rad)
 	for point: Vector3 in points:
 		var camera_space: Vector3 = inverse * point
 		var depth: float = distance - camera_space.z
 		if depth <= 0.0:
 			return false
-		if absf(camera_space.y - centre) > tan_v * depth + 0.000001:
+		if absf(camera_space.y - center) > tan_v * depth + 0.000001:
 			return false
 		if absf(camera_space.x) > tan_h * depth + 0.000001:
 			return false
 	return true
 
 ## The camera's transform for a solved distance: pitched by `pitch_rad`, pulled back along its own forward
-## axis, and slid along its own up axis so the table is vertically centred.
+## axis, and slid along its own up axis so the table is vertically centered.
 static func camera_transform(distance: float, pitch_rad: float, vertical_offset: float) -> Transform3D:
 	var basis: Basis = Basis(Vector3.RIGHT, pitch_rad)
 	var forward: Vector3 = basis * Vector3(0.0, 0.0, -1.0)

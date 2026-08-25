@@ -22,7 +22,7 @@ class_name ScoutPolicy
 ## bookkeeping, so a retraction cannot send a delta against a base the peer dropped. Enter at
 ## `VISION_RADIUS_M`, leave at `VISION_EXIT_M`.
 
-## How far a unit sees, metres.
+## How far a unit sees, meters.
 const VISION_RADIUS_M: float = 26.0
 ## ...and how far a seen unit must get before it is lost. 1.25x the entry radius, matching the band the
 ## backend's own interest filter uses.

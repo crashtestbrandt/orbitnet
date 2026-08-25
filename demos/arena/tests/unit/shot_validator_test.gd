@@ -80,3 +80,22 @@ func test_every_verdict_has_a_description() -> void:
 	for verdict: int in ShotValidator.Verdict.values():
 		assert_true(ShotValidator.describe(verdict) != "unknown",
 			"a refusal a server logs without a reason is a refusal nobody can debug")
+
+# --- the code the refusal travels as ---------------------------------------------------------------
+#
+# The verdict is what `_apply_shot` RETURNS, and NetCommand reads an int verdict of 0 as acceptance and any
+# other value as a refusal carrying that value. So Verdict.OK being 0 is a wire contract rather than a style
+# choice, and it is now what carries the reason back to the client that pulled the trigger.
+
+func test_the_accepting_verdict_is_zero() -> void:
+	assert_eq(ShotValidator.Verdict.OK as int, 0,
+		"NetCommand reads 0 as applied, so an enum starting at 1 would refuse every shot it accepted")
+
+func test_every_refusal_is_non_zero_and_distinct() -> void:
+	var seen: Dictionary[int, bool] = {}
+	for verdict: int in ShotValidator.Verdict.values():
+		if verdict == ShotValidator.Verdict.OK:
+			continue
+		assert_true(verdict != 0, "a refusal that was 0 would be announced as an applied shot")
+		assert_false(seen.has(verdict), "two refusals sharing a code would read as one on the client")
+		seen[verdict] = true

@@ -19,12 +19,20 @@ const OFFLINE_SENDER: int = 0   # the sentinel NetCommand hands a handler offlin
 const VERB_MOVE: StringName = &"move"
 const VERB_UNKNOWN: StringName = &"scuttle"
 
+# A game's own reason codes, in the shape the lane expects: an enum whose OK member is 0, counting up. The
+# lane's own refusals are negative, so the two ranges cannot collide.
+const REASON_COOLING: int = 1
+const REASON_ODD: int = 2
+
 # What the handlers under test record. Reset by `_fresh()` at the top of every test.
 var _seen_senders: Array[int] = []
 var _seen_payloads: Array[Dictionary] = []
 var _announced: Array[StringName] = []
 var _announced_payloads: Array[Dictionary] = []
 var _applied_state: PackedStringArray = PackedStringArray()
+var _rejected_verbs: Array[StringName] = []
+var _rejected_codes: Array[int] = []
+var _rejected_tags: Array[int] = []
 
 # The server's own record of which seats it handed to which connection. A validator checks the payload's
 # CLAIMED seat against this, because the seat in a payload is the client's claim about itself and the sender
@@ -37,14 +45,23 @@ func _fresh() -> NetCommand:
 	_announced.clear()
 	_announced_payloads.clear()
 	_applied_state = PackedStringArray()
+	_rejected_verbs.clear()
+	_rejected_codes.clear()
+	_rejected_tags.clear()
 	_roster.clear()
 	var lane: NetCommand = NetCommand.new()
 	lane.applied.connect(_on_applied)
+	lane.rejected.connect(_on_rejected)
 	return lane
 
 func _on_applied(verb: StringName, payload: Dictionary) -> void:
 	_announced.push_back(verb)
 	_announced_payloads.push_back(payload)
+
+func _on_rejected(verb: StringName, code: int, tag: int) -> void:
+	_rejected_verbs.push_back(verb)
+	_rejected_codes.push_back(code)
+	_rejected_tags.push_back(tag)
 
 # Accepts anything, and records what it was handed.
 func _accept(sender_id: int, payload: Dictionary) -> bool:
@@ -58,6 +75,37 @@ func _refuse(sender_id: int, payload: Dictionary) -> bool:
 	_seen_senders.push_back(sender_id)
 	_seen_payloads.push_back(payload)
 	return false
+
+# Accepts, and says so as an INT rather than a bool -- the shape a game with reason codes uses.
+func _accept_with_code(sender_id: int, payload: Dictionary) -> int:
+	_seen_senders.push_back(sender_id)
+	_seen_payloads.push_back(payload)
+	_applied_state.push_back("applied")
+	return NetCommand.CODE_OK
+
+# Refuses with a reason the requester is meant to read.
+func _refuse_with_code(sender_id: int, payload: Dictionary) -> int:
+	_seen_senders.push_back(sender_id)
+	_seen_payloads.push_back(payload)
+	return REASON_COOLING
+
+# Accepts an even "n" and refuses an odd one, so one batch carries both outcomes.
+func _accept_even_n(sender_id: int, payload: Dictionary) -> int:
+	_seen_senders.push_back(sender_id)
+	_seen_payloads.push_back(payload)
+	var n_v: Variant = payload.get("n", 1)
+	if typeof(n_v) != TYPE_INT:
+		return REASON_ODD
+	var n: int = n_v
+	if n % 2 != 0:
+		return REASON_ODD
+	_applied_state.push_back("applied %d" % n)
+	return NetCommand.CODE_OK
+
+# A validator that states no verdict at all -- declared `-> void`, or one that fell off a branch.
+func _verdictless(sender_id: int, payload: Dictionary) -> void:
+	_seen_senders.push_back(sender_id)
+	_seen_payloads.push_back(payload)
 
 # The OWNERSHIP CHECK: the claimed seat must be one the SERVER assigned to this sender.
 func _move_if_owned(sender_id: int, payload: Dictionary) -> bool:
@@ -224,4 +272,150 @@ func test_each_sender_is_checked_against_its_own_row() -> void:
 	lane._apply(7, VERB_MOVE, {"seat": 2})   # its own
 	assert_eq(_applied_state.size(), 2, "both legitimate orders ran")
 	assert_eq(_announced.size(), 2, "and only those two were announced")
+	lane.free()
+
+# --- the verdict table ----------------------------------------------------------------------------
+#
+# The handler's return value decides the outcome AND whether the requester is told. `bool` keeps exactly the
+# meaning it had before `rejected` existed, which is what makes the signal additive rather than a migration;
+# `int` opts into feedback and carries the game's own reason. The two are separated by `typeof`, never by
+# truthiness, because a non-zero int is truthy and means the opposite of `true` here.
+
+func test_a_bool_false_refuses_silently_and_reports_no_code() -> void:
+	# TODAY'S BEHAVIOUR, PINNED. Every validator in this repository and in a consuming game is declared
+	# `-> bool`, so this is the row that must not move.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _refuse)
+	var code: int = lane._apply(5, VERB_MOVE, {}, 42)
+	assert_eq(code, NetCommand.CODE_OK, "a bool refusal carries nothing to reply with")
+	assert_eq(_rejected_codes.size(), 0, "and announces no refusal")
+	assert_eq(_announced.size(), 0, "and applies nothing")
+	lane.free()
+
+func test_an_int_verdict_of_zero_applies() -> void:
+	# CODE_OK is 0 because a game's reason enum has `OK = 0`. Reading the int as truthiness would invert this
+	# row and the next one at once.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept_with_code)
+	var code: int = lane._apply(5, VERB_MOVE, {}, 42)
+	assert_eq(code, NetCommand.CODE_OK, "zero is acceptance")
+	assert_eq(_announced.size(), 1, "so the command is announced as applied")
+	assert_eq(_rejected_codes.size(), 0, "and no refusal is announced")
+	lane.free()
+
+func test_a_nonzero_int_verdict_refuses_with_that_code() -> void:
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _refuse_with_code)
+	var code: int = lane._apply(5, VERB_MOVE, {}, 42)
+	assert_eq(code, REASON_COOLING, "the validator's own reason comes back verbatim")
+	assert_eq(_announced.size(), 0, "nothing was applied")
+	assert_eq(_rejected_codes.size(), 1, "and the refusal is announced on the applying peer")
+	assert_eq(_rejected_codes[0], REASON_COOLING, "carrying the reason")
+	assert_eq(_rejected_tags[0], 42, "and the tag that names the request")
+	lane.free()
+
+func test_a_handler_returning_nothing_refuses_rather_than_applying() -> void:
+	# A validator declared `-> void`, or one that fell off the end of a branch. `null` is not acceptance: the
+	# fail direction for an unrecognized verdict is refusal, because applying on a value nobody chose is how
+	# an unvalidated request reaches authoritative state.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _verdictless)
+	var code: int = lane._apply(5, VERB_MOVE, {}, 42)
+	assert_eq(code, NetCommand.CODE_OK, "there is no code to reply with")
+	assert_eq(_announced.size(), 0, "and nothing is applied")
+	lane.free()
+
+func test_a_tag_is_never_zero_and_never_negative() -> void:
+	# 0 is the sentinel `rejected` carries for a refusal no request() on this peer produced, so a real request
+	# must never mint it -- including at the wrap, where a counter that resets to 0 would hand one out.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept)
+	var first: int = lane.request(VERB_MOVE, {})
+	var second: int = lane.request(VERB_MOVE, {})
+	assert_true(first > 0, "the first tag is positive")
+	assert_eq(second, first + 1, "and they advance")
+	lane._next_tag = 0x7FFF_FFFE
+	assert_eq(lane.request(VERB_MOVE, {}), 0x7FFF_FFFF, "the last tag before the wrap")
+	assert_eq(lane.request(VERB_MOVE, {}), 1, "and the wrap lands on 1, never on 0")
+	lane.free()
+
+# --- batching -------------------------------------------------------------------------------------
+
+func test_a_batch_applies_each_payload_in_order() -> void:
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept)
+	var tags: PackedInt32Array = lane.request_batch(VERB_MOVE, [{"n": 1}, {"n": 2}, {"n": 3}])
+	assert_eq(tags.size(), 3, "one tag per payload")
+	assert_eq(_seen_payloads.size(), 3, "the handler ran once per entry")
+	assert_eq(_seen_payloads[0]["n"], 1, "in submission order")
+	assert_eq(_seen_payloads[2]["n"], 3, "to the last entry")
+	assert_eq(_announced.size(), 3, "and each acceptance is announced on its own")
+	lane.free()
+
+func test_a_mixed_batch_applies_the_accepted_and_refuses_only_the_rest() -> void:
+	# A batch is a coalescing optimization, NOT a transaction: an entry refused after an accepted one does not
+	# undo it. That is the property a caller must know before batching an inventory move.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept_even_n)
+	var tags: PackedInt32Array = lane.request_batch(VERB_MOVE, [{"n": 2}, {"n": 3}, {"n": 4}])
+	assert_eq(_announced.size(), 2, "the two legal entries applied")
+	assert_eq(_rejected_codes.size(), 1, "and exactly one refusal was announced")
+	assert_eq(_rejected_codes[0], REASON_ODD, "carrying the validator's reason")
+	assert_eq(_rejected_tags[0], tags[1], "against the tag of the entry that was refused")
+	lane.free()
+
+func test_a_batch_over_the_cap_is_refused_whole() -> void:
+	# Trimming to a legal prefix would apply requests the caller never separated out, and it is exactly the
+	# shape that makes a validator's bound unassertable.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept)
+	var payloads: Array = []
+	for i: int in NetCommand.MAX_BATCH + 1:
+		payloads.push_back({"n": i})
+	var tags: PackedInt32Array = lane.request_batch(VERB_MOVE, payloads)
+	assert_eq(_seen_payloads.size(), 0, "no entry was applied")
+	assert_eq(_rejected_codes.size(), tags.size(), "every entry was refused")
+	assert_eq(_rejected_codes[0], NetCommand.CODE_BATCH_TOO_LARGE, "under the lane's own reason code")
+	assert_true(NetCommand.CODE_BATCH_TOO_LARGE < 0, "which is negative so it cannot collide with a game's")
+	lane.free()
+
+func test_a_non_dictionary_entry_is_dropped_rather_than_erroring() -> void:
+	# A batch crosses the wire as a plain Array, so its entries are whatever the sender put there. A String
+	# where a payload was expected must be skipped, exactly as an unregistered verb is.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept)
+	lane.request_batch(VERB_MOVE, [{"n": 1}, "not a payload", {"n": 2}])
+	assert_eq(_seen_payloads.size(), 2, "the two real payloads still applied")
+	assert_eq(_announced.size(), 2, "and the junk entry announced nothing")
+	lane.free()
+
+func test_an_empty_batch_mints_nothing_and_does_nothing() -> void:
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept)
+	assert_eq(lane.request_batch(VERB_MOVE, []).size(), 0, "no tags for no payloads")
+	assert_eq(_seen_payloads.size(), 0, "and no handler ran")
+	lane.free()
+
+func test_a_refusal_outside_a_session_drives_nothing() -> void:
+	# `_refused` is what drives a client's UI, and it is guarded twice: the transfer mode restricts the caller
+	# to the server, and the sender is checked again so one client cannot tell another that its request failed.
+	# A lane outside the SceneTree has no MultiplayerAPI at all, which is the arm under test here -- the sender
+	# arm needs a live session and is exercised by the two-peer probe, which asserts the code that comes back.
+	var lane: NetCommand = _fresh()
+	assert_true(lane.multiplayer == null, "the case this asserts is a lane with no MultiplayerAPI")
+	lane._refused(VERB_MOVE, PackedInt32Array([REASON_COOLING]), PackedInt32Array([7]))
+	assert_eq(_rejected_codes.size(), 0, "a refusal reaching a lane outside a session drives nothing")
+	lane.free()
+
+func test_a_refusal_with_mismatched_lengths_is_ignored() -> void:
+	# The two arrays are read in lockstep. A frame whose halves disagree is corrupt or hostile, and reading
+	# past the shorter one is the bug it would cause. Driven through the ANNOUNCE half rather than through
+	# `_refused`, whose routing guards need a live MultiplayerAPI -- otherwise this test would return at the
+	# null guard and assert nothing about lengths at all.
+	var lane: NetCommand = _fresh()
+	lane._announce_refusals(VERB_MOVE, PackedInt32Array([1, 2]), PackedInt32Array([7]))
+	assert_eq(_rejected_codes.size(), 0, "mismatched halves announce nothing")
+	lane._announce_refusals(VERB_MOVE, PackedInt32Array([REASON_COOLING]), PackedInt32Array([7]))
+	assert_eq(_rejected_codes.size(), 1, "and matched halves do announce, so the guard is not a blanket refusal")
+	assert_eq(_rejected_tags[0], 7, "carrying the tag the server quoted back")
 	lane.free()

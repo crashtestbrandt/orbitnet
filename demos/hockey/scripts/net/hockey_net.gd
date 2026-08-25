@@ -14,7 +14,7 @@ class_name HockeyNet
 ##
 ##   2. set_remote_resim(true) IS APPLIED BEFORE bind_net_all(). It is a per-entity exemption the backend
 ##      applies at REGISTRATION from the facade's stored flag, and `set_remote_resim` also sweeps the entities
-##      that already exist -- so setting it first makes both paths agree. Setting it afterwards would leave any
+##      that already exist -- so setting it first makes both paths agree. Setting it afterward would leave any
 ##      body registered in between exempt, which for this demo means the puck stops being predicted and the
 ##      whole point of it goes quiet with nothing erroring.
 ##
@@ -50,7 +50,7 @@ class_name HockeyNet
 ## THE CONSERVATIVE RULE, AND WHY THIS DEMO TAKES IT WHERE THE RTS DEMO DOES NOT. `resumed_from` names a
 ## connection that MAY STILL BE UP, and a session identity is client-asserted and unauthenticated -- so a peer
 ## presenting an identity it watched someone else use takes that player's seat, and the original keeps its
-## connection with no error. This demo therefore honours a reclaim only for an identity it already saw
+## connection with no error. This demo therefore honors a reclaim only for an identity it already saw
 ## `Net.peer_dropped` report with `held = true`. The price is the one the facade names: a player whose old
 ## socket the transport has not yet noticed is gone comes back as a newcomer. On a 32-seat table that costs
 ## them their end of the rink, which is cheap; on the RTS's two-seat table it would cost them the game, which

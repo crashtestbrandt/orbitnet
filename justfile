@@ -232,8 +232,8 @@ arena-host PORT="47800":
 arena-join ADDR="127.0.0.1" SEATS="1":
     "{{godot}}" --path demos/arena -- --join={{ADDR}} --seats={{SEATS}}
 
-# A spectator: no seat, no fighter, and an interest centre AND ARENA declared for it by the server. Before
-# `Net.set_peer_anchor()` this peer had no centre, and a peer with no centre is filtered in nowhere.
+# A spectator: no seat, no fighter, and an interest center AND ARENA declared for it by the server. Before
+# `Net.set_peer_anchor()` this peer had no center, and a peer with no center is filtered in nowhere.
 arena-observe ADDR="127.0.0.1":
     "{{godot}}" --path demos/arena -- --join={{ADDR}} --observe
 
@@ -248,12 +248,22 @@ arena-stress SECONDS="60":
         --bench-duration={{SECONDS}} --quit-after={{SECONDS}}
 
 # Entity-slot pressure. A block names its entity by a 16-bit session slot, and the table binding slots to ids
-# is redistributed as a WHOLE TABLE each time it changes -- so a session with tens of thousands of entities
-# spends real reliable bandwidth restating bindings that did not move. PROPS is per arena; the session names
-# three times that plus the fighters and the scorecards. Past 65,536 the server refuses to replicate the
-# entity and says so, rather than wrapping an index onto a live one.
+# is distributed as a DELTA against a generation the receiver holds. PROPS is per arena; the session names
+# three times that plus the fighters and the scorecards. Past 65,536 the server refuses to replicate the entity
+# and says so, rather than wrapping an index onto a live one.
+#
+# WHAT --wire-log SHOWS, and it is the reason this recipe exists. At PROPS=8000 the session names 24,027
+# entities and one whole table is ~530 kB. A JOINING peer still costs that -- it holds no table to diff
+# against -- but every peer already in the session now costs a delta of the rows that actually moved. Measured
+# on this machine, a second client joining a session of one: 1,074 kB before the delta manifest, 557 kB after,
+# and the difference is the copy the peer that was already up to date used to be sent.
+#
+# It needs a second process to show anything: with no peer there is nobody to send a manifest to.
+#
+#   just arena-slots 8000 40 &
+#   sleep 12; godot --headless --path demos/arena -- --join=127.0.0.1 --props=8000 --quit-after=20
 arena-slots PROPS="8000" SECONDS="20":
-    "{{godot}}" --headless --path demos/arena -- --host --props={{PROPS}} --quit-after={{SECONDS}}
+    "{{godot}}" --headless --path demos/arena -- --host --props={{PROPS}} --wire-log --quit-after={{SECONDS}}
 
 arena-lint: (lint-project "demos/arena")
 
@@ -265,11 +275,21 @@ arena-lint: (lint-project "demos/arena")
 # on the machine. See docs/netbench.md.
 # =====================================================================================================
 
-netbench CLIENTS="4" PROFILE="congested_wifi" SECONDS="20" SEED="1" POLICY="strafe":
-    tools/netbench/bench.sh {{CLIENTS}} {{PROFILE}} {{SECONDS}} {{SEED}} {{POLICY}}
+# IT DRIVES A DEMO PROJECT. The repository root is not a Godot project, so every launch names demos/<DEMO>.
+# The default is `arena` -- decoupled at 30 Hz with a 128-tick ring, the configuration closest to a shooter,
+# and the only one that fills BenchSubject's hit-registration columns.
+#
+# SEAT COUNT BOUNDS THE FLEET. A client past the demo's seats is admitted as an OBSERVER, drives no body, and
+# fails its own gate for having no samples. arena seats 24, hockey 32, rts 2.
+#
+# NETBENCH_OUT=<dir> writes the artifacts somewhere stable instead of a temp directory, which is what makes a
+# before/after comparison possible: the same seed replays the same link, so two runs differ only by the change.
+netbench CLIENTS="4" PROFILE="congested_wifi" SECONDS="20" SEED="1" POLICY="strafe" DEMO="arena":
+    tools/netbench/bench.sh {{CLIENTS}} {{PROFILE}} {{SECONDS}} {{SEED}} {{POLICY}} {{DEMO}}
 
 # Multi-machine bench: one SSH controller drives a server host plus bot-client hosts. Needs real reachable
-# hosts, passwordless SSH and Godot on each. GAUNTLET_DRYRUN=1 prints the plan without running it.
+# hosts, passwordless SSH and Godot on each. GAUNTLET_DRYRUN=1 prints the plan without running it. DEMO=<name>
+# picks the demo project every host runs, and every host must run the same one.
 netbench-gauntlet:
     tools/netbench/gauntlet.sh
 
@@ -295,8 +315,8 @@ assetlib-zip VERSION="dev":
     out="build/orbitnet-{{VERSION}}.zip"
     mkdir -p build
     rm -f "$out"
-    # Include the licences: an addon installed from a zip carries no repository around with it, and a user
-    # who cannot find the licence terms inside the thing they installed will assume the worst.
+    # Include the licenses: an addon installed from a zip carries no repository around with it, and a user
+    # who cannot find the license terms inside the thing they installed will assume the worst.
     cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
     zip -qr "$out" addons/orbitnet addons/orbitnet_native
     rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md

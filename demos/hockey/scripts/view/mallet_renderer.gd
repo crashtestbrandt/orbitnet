@@ -67,15 +67,15 @@ func _process(_delta: float) -> void:
 		# property the wire actually writes.
 		var at: Vector3 = mallet.net_pos + Vector3(0.0, 0.024, 0.0)
 		multimesh.set_instance_transform(seat, Transform3D(Basis(), at))
-		var colour: Color = HockeyConfig.team_color(mallet.team())
+		var color: Color = HockeyConfig.team_color(mallet.team())
 		if seat == local_seat:
 			# Your own mallet is always solid, and lighter than your team-mates' so it is findable in a crowd.
-			colour = colour.lightened(0.28)
+			color = color.lightened(0.28)
 		elif have_mine and fade:
-			colour.a = fade_alpha(mallet.net_pos.distance_to(mine))
-		multimesh.set_instance_color(seat, colour)
+			color.a = fade_alpha(mallet.net_pos.distance_to(mine))
+		multimesh.set_instance_color(seat, color)
 
-## How opaque a mallet `distance` metres from the local player's own mallet should be drawn.
+## How opaque a mallet `distance` meters from the local player's own mallet should be drawn.
 ##
 ## Pure and static so the curve is unit-testable without a viewport. It never reaches zero: a mallet you cannot
 ## see at all is worse than one you can see through, because the puck still bounces off it.

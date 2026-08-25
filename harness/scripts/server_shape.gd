@@ -29,7 +29,7 @@ extends Node
 ## second, independent reading.
 ##
 ## THE ROLLBACK LANE IS HERE FOR THE SERVER'S SAKE, and it predicts on the client too. A seated peer's body
-## is what gives the server an OWNED row -- the row the send path reads a peer's interest centre off, and the
+## is what gives the server an OWNED row -- the row the send path reads a peer's interest center off, and the
 ## thing a listen server has one more of than a dedicated one. The client also predicts the seat it is given,
 ## which takes one non-obvious pair of calls (see `_bind_channels` and `_apply_owners`) because a client binds
 ## before it knows its seat. Both peers COUNT their rollback ticks and assert on the count: a client that
@@ -55,10 +55,10 @@ extends Node
 ## the entity ids -- are identical everywhere. Only who OWNS them differs.
 const SEATS: int = 2
 
-## Metres of interest radius. Nothing in this world gets more than a few metres from the origin, so this culls
+## Meters of interest radius. Nothing in this world gets more than a few meters from the origin, so this culls
 ## nothing; it is set only to make the per-peer interest pass run.
 const _AOI_RADIUS_M: float = 500.0
-## Metres of band scale. Sized with the radius for the same reason -- one band, no reordering, the pass runs.
+## Meters of band scale. Sized with the radius for the same reason -- one band, no reordering, the pass runs.
 const _AOI_BAND_M: float = 250.0
 
 ## Where each peer stops sampling and prints its verdict, in seconds after the session starts. A coupled 60 Hz
@@ -75,7 +75,7 @@ class SeatInput extends Node:
 	var nin_move: Vector3 = Vector3.ZERO
 
 ## One seat's body. The rollback lane, so a seated peer contributes an OWNED row: that row is what the send
-## path reads a peer's interest centre off, and holding one is the whole of what a listen server has and a
+## path reads a peer's interest center off, and holding one is the whole of what a listen server has and a
 ## dedicated server does not.
 class SeatBody extends Node3D:
 	var sim_pos: Vector3 = Vector3.ZERO
@@ -232,23 +232,21 @@ func _bind_channels() -> void:
 		# owner. Set before registration -- the backend reads the authority when it processes settings.
 		var owner_peer: int = _owners[seat] if _owners[seat] > 0 else 1
 		body.input.set_multiplayer_authority(owner_peer)
-		# `predict` UNCONDITIONALLY, and this is the subtle part of the file.
+		# `predict` FROM WHAT IS KNOWN NOW, WHICH ON A CLIENT IS NOTHING -- and that is the subtle part.
 		#
-		# The obvious form is `Net.is_server() or owner_peer == multiplayer.get_unique_id()`. On a CLIENT
-		# that is false for every seat, because this runs from _ready() and the roster has not arrived --
-		# `_owners` is still all zeros, so every `owner_peer` reads 1. And `predict = false` does not merely
-		# defer prediction, it EXEMPTS the body: net.gd sets `enable_prediction` here and nowhere else, and
-		# `set_input_authority()` re-resolves only who owns the lanes. So the seat the client is about to be
-		# given would sit out the rollback loop for the whole run, silently -- its received rows still land,
-		# so every reading in this file would look normal.
+		# This runs from _ready() and the roster has not arrived, so on a client `_owners` is still all zeros
+		# and every `owner_peer` reads 1: no seat predicts. That is the correct answer for the tick it is
+		# asked on, and it is the WRONG one a moment later, because `predict = false` does not merely defer
+		# prediction -- it EXEMPTS the body from the rollback loop entirely, and an exempt body still applies
+		# the rows it receives. The seat this client is about to be given would therefore move, look ordinary
+		# in every reading here, and be a full round trip behind its own input.
 		#
-		# Passing `true` is safe for a seat this peer does not own, because the backend gates simulation on
-		# `!exempt and (owns_state or (owns_input and enable_prediction))`: a client owns neither lane of a
-		# body it was not given, so it still does not simulate. What `true` buys is that the moment
-		# `set_input_authority()` points the input here, `owns_input` flips and the body starts predicting --
-		# no re-registration. `_apply_owners()` re-establishes the display exemption; see there.
+		# `NetRollbackHandle.set_predicted()` in `_apply_owners()` is what closes it, on the tick the roster
+		# lands. Nothing else re-resolves the switch: `set_input_authority()` re-resolves who owns which lane
+		# and leaves prediction where registration set it.
 		_body_handles.push_back(Net.register_rollback_body(
-			body, body.input, ["sim_pos"], ["nin_move"], true))
+			body, body.input, ["sim_pos"], ["nin_move"],
+			Net.is_server() or owner_peer == multiplayer.get_unique_id()))
 
 		var handle: NetStateHandle = Net.make_state(status)
 		handle.add_state(status, "status_value")
@@ -330,20 +328,16 @@ func _apply_owners() -> void:
 	var found: int = -1
 	for seat: int in SEATS:
 		if _body_handles.size() > seat:
-			_body_handles[seat].set_input_authority(_owners[seat] if _owners[seat] > 0 else 1)
+			var owner_peer: int = _owners[seat] if _owners[seat] > 0 else 1
+			_body_handles[seat].set_input_authority(owner_peer)
+			# THE OTHER HALF, AND IT MUST RUN AFTER THE AUTHORITY WRITE. `set_input_authority()` re-resolves
+			# who owns which lane; it does not touch the prediction switch, which `register_rollback_body()`
+			# set once and reads nowhere else. Without this, the seat this peer is about to be given stays
+			# exempt from the rollback loop for the whole session -- its rows still arrive and still apply, so
+			# the body moves and every reading here looks ordinary, while its own input is a round trip late.
+			_body_handles[seat].set_predicted(Net.is_server() or owner_peer == me)
 		if _owners[seat] == me:
 			found = seat
-	# THE OTHER HALF OF THE `predict = true` ABOVE, and it must run AFTER the authority calls.
-	#
-	# Registering every body as predicting leaves each one un-exempt, and an un-exempt body owning neither
-	# lane is what `net.remote_resim` turns on -- remote prediction, which this scenario does not want and
-	# which is off by default. Re-asserting the lever walks the bodies and exempts exactly those owning
-	# neither state nor input, which after the authority calls above is precisely the seats this peer was
-	# not given. The seat it WAS given owns its input and is left alone, so it predicts.
-	#
-	# Client-side only: a server owns every body's state, so the lever finds nothing to exempt there.
-	if not Net.is_server():
-		Net.set_remote_resim(false)
 	if found != _local_seat:
 		_local_seat = found
 		print("SHAPE-SEAT role=%s shape=%s seat=%d" % [_role, _shape, _local_seat])

@@ -14,20 +14,35 @@ const LANE_STATE: int = 0
 const LANE_INPUT: int = 1
 
 var _sync: Node = null   # the backend rollback synchronizer node (created + owned by orbitnet/net.gd), or null OFFLINE
+# Whether the loaded cdylib can answer the two receipt questions. Resolved ONCE, in _init: the answer cannot
+# change within a process, and [method is_receiving] is called once per replicated body per frame -- a
+# has_method() there is a ClassDB method-bind lookup, the per-frame engine chatter the facade exists to keep
+# out of the hot path. [NetStateHandle] resolves its own capability flags the same way, for the same reason.
+var _reports_last_received: bool = false
+var _reports_authors_state: bool = false
 
 func _init(sync: Node) -> void:
 	_sync = sync
+	_reports_last_received = sync != null and sync.has_method(&"get_last_received_state")
+	_reports_authors_state = sync != null and sync.has_method(&"authors_state")
 
 ## Whether a real synchronizer backs this handle (false OFFLINE / inert).
 func is_active() -> bool:
 	return _sync != null
 
 ## Register a synchronized STATE property (e.g. the fields of the body's serialized simulation state).
+##
+## `property` may carry an `@half` or `@ss3` wire-quantizer suffix, on both lanes and on cosmetics too. The
+## pairing table, the byte costs, and why a bare scalar cannot be narrowed at all are in the header of
+## [NetStateHandle]; a suffix that is not in force is reported and listed by [method quantizer_fallbacks].
 func add_state(node: Object, property: String) -> void:
 	if _sync != null:
 		_sync.add_state(node, property)
 
 ## Register a synchronized INPUT property (the per-tick input frame the owning client authored).
+##
+## Takes the same `@half` / `@ss3` suffix as [method add_state], and it pays off more here: an input frame is
+## sent every tick by the owning client, where a state row is sent on the server's rota.
 func add_input(node: Object, property: String) -> void:
 	if _sync != null:
 		_sync.add_input(node, property)
@@ -40,7 +55,7 @@ func add_input(node: Object, property: String) -> void:
 ##
 ## The problem it solves: several independent worlds inside one session, each rebased near its own coordinate
 ## origin, overlap in coordinates. Interest is a distance test, and two bodies at the same coordinates in
-## different worlds are zero metres apart, so a radius cannot separate them.
+## different worlds are zero meters apart, so a radius cannot separate them.
 ##
 ## THIS ALSO SETS THE OWNING SEAT'S OWN WORLD. A seat's world is read off the body that anchors its interest
 ## radius -- the lowest-id body whose input authority is that peer and which declares that seat. That body's
@@ -55,7 +70,7 @@ func add_input(node: Object, property: String) -> void:
 ## fail-open is per CONNECTION: a peer with no resolved seat at all still sees everything, which is what stops
 ## a joining player from arriving in an empty world.
 ##
-## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's centre and world directly, and
+## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's center and world directly, and
 ## a peer that used it reads neither off any body -- which is the way out when a peer drives bodies in more than
 ## one world, or drives none at all.
 ##
@@ -100,7 +115,7 @@ func membership() -> int:
 ## lowest-id one supplies it); every distinct value is one more interest set the server maintains for that
 ## connection. The numbers need not be contiguous.
 ##
-## What it costs to skip: with two bodies at the default 0, the connection gets ONE centre -- whichever body
+## What it costs to skip: with two bodies at the default 0, the connection gets ONE center -- whichever body
 ## the id hash sorts lowest -- and the other player's surroundings are culled around a position that player is
 ## nowhere near. Visible only with a cull radius set.
 ##
@@ -178,6 +193,55 @@ func process_authority() -> void:
 	if _sync != null:
 		_sync.process_authority()
 
+## Turn this peer's PREDICTION of this body on or off, after registration.
+##
+## THE ONE THING [method set_input_authority] DOES NOT RE-RESOLVE, and the reason it needs its own call.
+## `predict` is an argument to [method Net.register_rollback_body] and it is read nowhere else, so a body
+## registered before its owner was known stays at the answer that was true then. Re-pointing the input
+## re-resolves *who owns which lane*; it leaves the prediction switch alone.
+##
+## The failure that produces is silent and expensive. A body registered with `predict = false` is also
+## EXEMPTED from the rollback loop, so a seat handed to this connection afterward is simulated by nobody
+## here: its authoritative rows still arrive and still apply, so the body moves, the readouts look ordinary,
+## and every input the player gives it is a full round trip late. Nothing errors.
+##
+## THE RULE: a body registered before its owner is known -- which is every body in a session whose world is
+## built before the roster arrives -- calls this whenever ownership moves.
+##
+## [codeblock]
+##     func set_owner_peer(peer: int) -> void:
+##         handle.assign_seat(peer, seat)                       # the connection and the label
+##         handle.set_predicted(peer == multiplayer.get_unique_id() or Net.is_server())
+## [/codeblock]
+##
+## `on = false` returns the body to display-only and re-establishes the exemption, unless
+## [method Net.remote_resim] asked this client to carry remote bodies -- the same rule registration applies,
+## and the same one [method Net.set_remote_resim] re-applies live.
+##
+## NOT DERIVED AUTOMATICALLY FROM THE AUTHORITIES, deliberately. "This peer owns a lane of it" is the usual
+## answer but not the only correct one: a body every peer predicts with nobody owning its input -- a puck, a
+## ball, a shared physics prop -- is registered `predict = true` on peers that own neither lane, and deriving
+## the switch would turn that off the first time anything touched its authority.
+##
+## Local, like every authority write: nothing here replicates, and each peer decides for itself. No-op OFFLINE.
+func set_predicted(on: bool) -> void:
+	if _sync == null:
+		return
+	_sync.set(&"enable_prediction", on)
+	_sync.set(&"exempt", false if on else not Net.remote_resim())
+	_sync.process_authority()
+
+## Whether this peer is set to predict this body. False when inert, and false on a backend whose synchronizer
+## does not carry the switch.
+##
+## NOT the same question as [method is_predicting], which asks whether the owner is currently MISPREDICTING.
+## This one is the switch; that one is the reconciliation gate.
+func is_predicted() -> bool:
+	if _sync == null:
+		return false
+	var enabled: Variant = _sync.get(&"enable_prediction")
+	return typeof(enabled) == TYPE_BOOL and enabled
+
 ## Point this body's INPUT at `peer`, and re-resolve everything that reads the answer. The one call a roster
 ## makes when this body changes hands -- a player joining, leaving, or reconnecting. `1` hands the input back
 ## to the server, which is what an unclaimed body means.
@@ -218,9 +282,84 @@ func set_input_authority(peer: int) -> void:
 func is_predicting() -> bool:
 	return _sync != null and _sync.is_predicting()
 
-## The tick of the latest authoritative state this body has received (-1 when inert). For netcode diagnostics.
+## The tick of the newest authoritative state this body KNOWS, from either source (-1 when inert). For netcode
+## diagnostics.
+##
+## A FRONTIER OVER TWO SOURCES, and that is what makes it the wrong reading for "is this body still reaching
+## me": it is raised both by a row decoded off the wire and by this peer's own simulation, for every body whose
+## state this peer authors. On a server or a listen-server host it therefore rises every tick with no row in
+## sight. Ask [method is_receiving] instead -- a cull, a membership change or a per-peer veto stops the rows
+## and leaves this number climbing.
 func get_last_known_state() -> int:
 	return _sync.get_last_known_state() if _sync != null else -1
+
+## The tick of the newest authoritative row this peer RECEIVED for this body. -1 when inert, -1 before the
+## first row, and -1 for the whole session on the peer that authors this body's state, which receives none.
+##
+## One source, the wire, which is what separates it from [method get_last_known_state]. It counts a row the
+## rollback ring then discarded as too old and it counts a duplicate: both prove the body is still being sent
+## here, which is the question being asked.
+##
+## -1 IS A SENTINEL, NOT A FAIL-OPEN. A backend too old to answer reports -1 and says so through
+## [method reports_last_received_state]; it does not report the present the way
+## [method NetStateHandle.last_known_state] does. The fail-open lives one level up, in [method is_receiving].
+## The sentinel and the fail-open are deliberately different answers to the same unknown -- a staleness rule
+## degrades rather than blanking the world, while a caller quoting the tick is handed -1 rather than a number
+## nothing measured.
+func last_received_state() -> int:
+	if _sync == null or not _reports_last_received:
+		return -1
+	return _sync.get_last_received_state()
+
+## Whether THIS PEER AUTHORS this body's state, and therefore receives no rows for it. False when inert, and
+## false on a backend too old to answer.
+##
+## The disambiguator for [method last_received_state]: on the authoring peer that reading is -1 for the whole
+## session, which on its own is indistinguishable from "withheld since it spawned".
+## [method is_receiving] checks this first for exactly that reason.
+func authors_state() -> bool:
+	if _sync == null or not _reports_authors_state:
+		return false
+	return _sync.authors_state()
+
+## Whether [method last_received_state] reports a MEASURED tick rather than the sentinel a backend too old to
+## answer produces. False when inert, and false on that older backend.
+##
+## Resolved once at construction. Check it wherever the reading is used as EVIDENCE -- a probe asserting that
+## rows reach a client, a HUD claiming a body is live, a bug report quoting a tick -- because -1 alone cannot
+## say which of "no row yet" and "cannot measure" produced it.
+func reports_last_received_state() -> bool:
+	return _reports_last_received
+
+## Whether rows for this body are still arriving, within `within_ticks` of the current tick. THE CALL A GAME
+## MAKES; the three reads above are the parts it is built from, and [NetStateHandle] carries the same four so
+## one helper spans both lanes.
+##
+## IT FAILS OPEN -- true in every case where the answer is not known to be no:
+##
+## | Case | Answer |
+## | --- | --- |
+## | inert (OFFLINE) | true -- there is no wire to stop |
+## | [method authors_state] | true -- the authority receives nothing and never will |
+## | a backend too old to answer | true -- a binary mismatch degrades a rule, it never blanks the world |
+## | `Net.current_tick() - last_received_state() <= within_ticks` | true -- a row landed recently enough |
+## | a measuring peer that has never received a row | false -- the only known no |
+##
+## `within_ticks` IS A QUESTION ABOUT THE SEND ROTA, NOT ABOUT THE NETWORK. Entities are served stalest-first
+## inside a per-tick byte budget, so a body far down a busy rota waits several ticks between rows with nothing
+## wrong anywhere. Size the window against that rota -- the default 24 ticks is about half a second at 50 Hz --
+## rather than against a round trip.
+func is_receiving(within_ticks: int = 24) -> bool:
+	if _sync == null:
+		return true
+	if authors_state():
+		return true
+	if not _reports_last_received:
+		return true
+	var tick: int = last_received_state()
+	if tick < 0:
+		return false
+	return Net.current_tick() - tick <= within_ticks
 
 ## The tick of the newest input row in this body's ring (-1 when inert, or before any row arrives).
 ## On the authority for a wire-driven body this is the input lane's frontier: `tick - last_known_input()`
@@ -280,13 +419,52 @@ func set_bulk_capture(method: String) -> void:
 ## so they are absent here and present there. Read [method bulk_restore_order], not the capture order, and a
 ## body that declares no cosmetics sees identical lists.
 ##
-## It covers the rollback loop only. Applying a RECEIVED row still walks the properties: that runs once per
-## received block rather than once per replayed tick, and it is the one apply that must land cosmetics too.
+## It covers the rollback loop only. The receive apply and the quantized write-back have a direction of their
+## own -- [method set_bulk_apply], whose order is the CAPTURE order.
 ##
 ## Call BEFORE process_settings().
 func set_bulk_restore(method: String) -> void:
 	if _sync != null:
 		_sync.set(&"bulk_restore_method", method)
+
+## Declare the game method that APPLIES a whole lane's values in one call -- the received row, and the
+## quantized write-back.
+##
+## THE APPLY ORDER IS THE CAPTURE ORDER, NOT THE RESTORE ORDER. The two differ by exactly this body's COSMETIC
+## entries, which are captured and replicated but never restored. Pass your existing restore method here on a
+## body that declares cosmetics and it reads shifted slots and writes wrong values, with nothing erroring
+## anywhere. Read [method bulk_apply_order]. A body that declares no cosmetics has identical lists and cannot
+## hit this.
+##
+## Signature: `func <method>(lane: int, values: Array) -> void`, declared on the body's ROOT, reading the slots
+## and writing your own fields -- the same direction [method set_bulk_restore] runs in. Do not resize the array:
+## a wrong-length one drops the lane back to the walk and reports it once.
+##
+## WHAT IT SAVES, HONESTLY. It covers two walks and they are worth different amounts:
+##
+## | Walk | Crossings without / with | What multiplies it |
+## | --- | --- | --- |
+## | applying a RECEIVED row | `S + C` / 1 | delivered blocks this tick -- NO replay multiplier |
+## | the quantized WRITE-BACK | `Q` / 1 | replayed ticks x planned bodies |
+##
+## The receive apply runs once per delivered block rather than once per replayed tick, so below roughly twenty
+## delivered blocks a tick it is noise. What makes it worth declaring is the peer it runs on: a peer that
+## SIMULATES NOTHING plans no bodies, its rollback loop returns on an empty plan, and this walk is then its
+## entire per-tick crossing count with no other hook reaching it.
+##
+## The write-back does carry the multiplier. A body of 41 props with 8 quantized among them, replaying 12
+## ticks, pays 96 property writes a frame on the walk and 12 calls through the hook. It is GATED: the hook takes
+## the write-back only when the lane carries two or more quantized properties, so a lane with zero or one keeps
+## the cheaper targeted walk. [method uses_bulk_apply] reports the DECLARATION, not which of the two paths ran.
+##
+## Only the STATE lane runs an apply hook today. The input lane resolves and publishes one so a single method
+## can serve every lane, but a received input row lands in the ring and reaches the game through the restore
+## direction, and that lane has no write-back.
+##
+## Call BEFORE process_settings().
+func set_bulk_apply(method: String) -> void:
+	if _sync != null:
+		_sync.set(&"bulk_apply_method", method)
 
 ## The declared entries a bulk CAPTURE hook marshals for `lane`, in the order its array carries them.
 ##
@@ -324,3 +502,46 @@ func uses_bulk_restore(lane: int) -> bool:
 	if _sync == null or not _sync.has_method(&"uses_bulk_restore"):
 		return false
 	return _sync.uses_bulk_restore(lane)
+
+## The declared entries a bulk APPLY hook marshals for `lane`, in array order -- THE CAPTURE ORDER, cosmetics
+## included, because a received row lands every entry. Assert against this and never against
+## [method bulk_restore_order]: the two differ by exactly the cosmetics, and reading the wrong one shifts every
+## slot after the first cosmetic entry. Empty when the lane has no hook, when the handle is inert, or on a
+## backend too old to answer.
+func bulk_apply_order(lane: int) -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"bulk_apply_order"):
+		return PackedStringArray()
+	var order: PackedStringArray = _sync.bulk_apply_order(lane)
+	return order
+
+## Whether `lane` DECLARES an apply hook. See [method uses_bulk_capture] for why to check it.
+##
+## It reports the declaration, not which path ran: the state lane's write-back is additionally gated on
+## carrying two or more quantized properties, so a lane can answer true here and still canonicalize through the
+## targeted walk while its receive apply, which is ungated, goes through the hook.
+func uses_bulk_apply(lane: int) -> bool:
+	if _sync == null or not _sync.has_method(&"uses_bulk_apply"):
+		return false
+	return _sync.uses_bulk_apply(lane)
+
+## Every declared entry on EITHER LANE whose `@` quantizer suffix is NOT IN FORCE, verbatim. Empty is the
+## healthy answer.
+##
+## Three ways an entry lands here, and all three ship the property wider than the entry claims: a suffix that
+## is neither `@half` nor `@ss3`, a pairing the resolved type does not support (`"hp@half"` on a GDScript
+## float, which is an f64), and an entry that did not resolve at all. The full pairing table and the byte
+## costs are in the header of [NetStateHandle].
+##
+## ONE LIST FOR THE WHOLE BODY -- state, cosmetic and input entries together -- because the reading is a
+## property of the body rather than of a lane, and a boot check wants the body's whole story in one call.
+##
+## ASSERT ON IT RATHER THAN READING THE LOG. Each of these also raises a diagnostic, but a dropped suffix is
+## a BANDWIDTH bug: the game runs, the frames decode, and the only symptom is a wire wider than the property
+## list says. Empty when the handle is inert, and empty on a backend too old to answer, so a boot check
+## written against a newer addon than the loaded cdylib passes rather than blocking a bisect.
+func quantizer_fallbacks() -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"quantizer_fallbacks"):
+		return PackedStringArray()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant.
+	var dropped: PackedStringArray = _sync.quantizer_fallbacks()
+	return dropped

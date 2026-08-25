@@ -35,13 +35,13 @@ func test_a_stationary_observer_is_refreshed_on_the_interval() -> void:
 
 # --- the arena axis, which is the half that cannot be inferred -----------------------------------------
 func test_changing_arena_is_due_even_without_moving() -> void:
-	# An observer that walked its centre from one arena to the SAME LOCAL POINT in the next moved zero metres
+	# An observer that walked its center from one arena to the SAME LOCAL POINT in the next moved zero meters
 	# and changed everything it can see. A distance threshold alone would never send it.
 	var desk: ObserverDesk = ObserverDesk.new()
 	desk.watch_point(Vector3.ZERO, ARENA_A)
 	desk.mark_sent(0.0)
 	desk.watch_point(Vector3.ZERO, ARENA_B)
-	assert_true(desk.due(0.0), "a different world is a different declaration, at zero metres")
+	assert_true(desk.due(0.0), "a different world is a different declaration, at zero meters")
 
 func test_the_arena_is_carried_on_both_modes() -> void:
 	var desk: ObserverDesk = ObserverDesk.new()
@@ -77,7 +77,7 @@ func test_entity_zero_is_refused() -> void:
 	var desk: ObserverDesk = ObserverDesk.new()
 	desk.watch_point(Vector3(5.0, 0.0, 5.0), ARENA_B)
 	assert_false(desk.watch_entity(0, ARENA_A),
-		"0 is the facade's RETRACTION value, so tracking it would declare a centre and withdraw it forever")
+		"0 is the facade's RETRACTION value, so tracking it would declare a center and withdraw it forever")
 	assert_eq(desk.mode(), ObserverDesk.Mode.FIXED, "and the desk is left as it was")
 	assert_eq(desk.arena(), ARENA_B, "including the arena it was watching")
 

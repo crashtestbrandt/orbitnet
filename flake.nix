@@ -156,7 +156,7 @@
 
               # Rust, for the native GDExtension in native/.
               # `rustup` rather than nixpkgs' rustc/cargo deliberately: the workspace pins an exact
-              # toolchain in native/rust-toolchain.toml (gdext requires >= 1.94), and rustup honours
+              # toolchain in native/rust-toolchain.toml (gdext requires >= 1.94), and rustup honors
               # that pin automatically, whereas nixpkgs' Rust floats with the unstable channel and
               # would silently drift off it. The trade-off is that rustup fetches the toolchain on
               # first use instead of it being pure.

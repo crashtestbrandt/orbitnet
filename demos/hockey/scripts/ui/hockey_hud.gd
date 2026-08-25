@@ -8,14 +8,15 @@ class_name HockeyHud
 ## moves is on screen next to it.
 ##
 ## THE CORRECTION IS REPORTED WITH ITS FLOOR. `net_pos` rides the wire as three IEEE-754 binary16s, whose
-## spacing near a table coordinate of 1 m is about a millimetre, and the backend writes the quantized value
+## spacing near a table coordinate of 1 m is about a millimeter, and the backend writes the quantized value
 ## back after every record so that every peer replays from the same canonical basis. A correction cannot be
 ## measured below that spacing, so the floor is printed beside the number rather than left for a reader to
 ## mistake for noise.
 ##
-## THE REJECTION LINE IS HONEST ABOUT WHERE IT WORKS. `RinkDirector.serve_rejected` fires on the peer that
-## APPLIED the command -- the server -- because the library carries no rejected-command feedback back to the
-## requester. On a client the line says so instead of staying suspiciously empty.
+## THE REJECTION LINE WORKS ON THE PEER THAT ASKED. [signal NetCommand.rejected] fires on the peer that refused
+## the command and on the client that requested it, so a client pressing SPACE at a live puck reads the reason
+## rather than watching a dead key. The reason is derived on the client from the [ServeValidator.Code] the
+## refusal carried: the code crosses the wire, the sentence does not.
 
 const SPARK_SAMPLES: int = 160
 const PANEL_WIDTH: float = 470.0
@@ -64,8 +65,10 @@ func build(session: HockeyNet, director: RinkDirector, input: MalletController, 
 	add_child(_label)
 
 	if rink != null:
-		rink.serve_rejected.connect(_on_serve_rejected)
 		rink.goal_scored.connect(_on_goal)
+		var serves: NetCommand = rink.serve_channel()
+		if serves != null:
+			serves.rejected.connect(_on_serve_rejected)
 
 func _process(_delta: float) -> void:
 	if net == null:
@@ -134,6 +137,7 @@ func _compose() -> String:
 		restore_ms, sim_ms, record_ms])
 	lines.push_back(_wire_line())
 	lines.push_back(_marshal_line())
+	lines.push_back(_predicted_line())
 	lines.push_back("")
 
 	lines.push_back(_lane_line())
@@ -158,7 +162,7 @@ func _compose() -> String:
 ## The wire, per second.
 ##
 ## `unproven acks` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret
-## it never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot claim a
+## it never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot claim a
 ## frame that never reached it. A clean session sits at 0.
 func _wire_line() -> String:
 	var wire: Dictionary[String, float] = Net.bandwidth_metrics()
@@ -212,11 +216,28 @@ func _score_line() -> String:
 	return "SCORE   team0 %d  -  %d team1      puck: %s%s" % [
 		rink.scoreboard.goals(0), rink.scoreboard.goals(1), state, _last_goal]
 
+## Whether this peer's own mallet is in its rollback loop at all.
+##
+## THE SILENT ONE. A mallet the loop skips still applies the rows it receives, so it moves, and every other
+## number on this panel reads normally while the player's own mouse takes a full round trip to reach it. The
+## rink builds its 32 mallets before the roster arrives, so on a client every one of them registers as
+## unpredicted; `MalletBody.set_owner_peer()` is what re-declares it on the tick a seat is handed over. This
+## line is here so the flag is visible rather than inferred from how the mallet feels.
+func _predicted_line() -> String:
+	if rink == null or net == null:
+		return "PREDICT no rink"
+	var seat: int = net.local_seat()
+	if seat < 0 or seat >= rink.mallets.size():
+		return "PREDICT this peer holds no seat, so it predicts no mallet"
+	var mine: MalletBody = rink.mallets[seat]
+	if mine == null:
+		return "PREDICT no mallet at seat %d" % seat
+	return "PREDICT own mallet seat %d: %s   (the puck is predicted on every peer)" % [
+		seat, "in the rollback loop" if mine.is_predicted() else "NOT PREDICTED -- a round trip behind"]
+
 func _serve_line() -> String:
 	if _last_rejection != "":
 		return "SERVE   refused: %s" % _last_rejection
-	if Net.is_client() and not Net.is_server():
-		return "SERVE   refusals are only visible on the host -- the library carries no rejected-command reply"
 	return "SERVE   press SPACE while the puck is dead; a live puck refuses the request"
 
 func _meter() -> ReconcileMeter:
@@ -228,13 +249,16 @@ func _tick_seconds() -> float:
 	var dt: float = Net.net_tick_dt()
 	return dt if dt > 0.0 else 1.0 / float(HockeyConfig.NET_TICK_HZ)
 
-func _on_serve_rejected(seat: int, reason: String) -> void:
-	_last_rejection = "%s (seat %d)" % [reason, seat]
+# The refusal arrives as a code, not a sentence. `tag` names the request that was refused, which this demo has
+# no use for -- one serve is in flight at a time -- but a game with several requests outstanding cancels
+# exactly the one that failed instead of guessing by verb.
+func _on_serve_rejected(_verb: StringName, code: int, _tag: int) -> void:
+	_last_rejection = ServeValidator.describe(code)
 
 func _on_goal(team: int, sequence: int) -> void:
 	_last_goal = "   goal #%d to team %d" % [sequence, team]
 
-## The spacing between adjacent IEEE-754 binary16 values near `value`, in millimetres -- the floor under any
+## The spacing between adjacent IEEE-754 binary16 values near `value`, in millimeters -- the floor under any
 ## correction this demo can measure. Static and pure so the arithmetic is unit-testable.
 ##
 ## binary16 carries a 10-bit significand, so the spacing at a magnitude in [2^e, 2^(e+1)) is 2^(e-10).
@@ -303,12 +327,12 @@ func _spark_top() -> float:
 
 # A polyline in _draw rather than a Line2D node: identical output, and it keeps the whole HUD one Control
 # instead of a CanvasLayer with Node2D children whose coordinates would need keeping in step with it.
-func _draw_spark(history: PackedFloat32Array, rect: Rect2, colour: Color, caption: String) -> void:
+func _draw_spark(history: PackedFloat32Array, rect: Rect2, color: Color, caption: String) -> void:
 	draw_rect(rect, Color(0.0, 0.0, 0.0, 0.35), true)
 	var font: Font = get_theme_default_font()
 	if font != null:
 		draw_string(font, rect.position + Vector2(4.0, -3.0), caption,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, colour)
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, color)
 	if history.size() < 2:
 		return
 	var peak: float = 1.0
@@ -320,7 +344,7 @@ func _draw_spark(history: PackedFloat32Array, rect: Rect2, colour: Color, captio
 		var x: float = rect.position.x + step * float(index)
 		var y: float = rect.position.y + rect.size.y * (1.0 - clampf(history[index] / peak, 0.0, 1.0))
 		points.push_back(Vector2(x, y))
-	draw_polyline(points, colour, 1.5)
+	draw_polyline(points, color, 1.5)
 	if font != null:
 		draw_string(font, rect.position + Vector2(rect.size.x - 62.0, 12.0), "peak %.1f" % peak,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, colour.darkened(0.15))
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, color.darkened(0.15))

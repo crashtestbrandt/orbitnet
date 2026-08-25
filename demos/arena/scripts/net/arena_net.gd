@@ -28,14 +28,14 @@ class_name ArenaNet
 ## it. Two refreshes per tick on the authority -- the per-peer cadence and the per-band one -- and both are
 ## what turns a flat rewind window into a per-shooter, per-target one.
 ##
-## OBSERVERS DECLARE WHERE THEY WATCH FROM. A peer with no seat has no body to infer an interest centre from,
-## and a peer with no centre is filtered in nowhere -- the backend falls open and sends it everything. So a
-## seatless peer here is given a centre and a world with `Net.set_peer_anchor()`, which also fixes WHICH ARENA
+## OBSERVERS DECLARE WHERE THEY WATCH FROM. A peer with no seat has no body to infer an interest center from,
+## and a peer with no center is filtered in nowhere -- the backend falls open and sends it everything. So a
+## seatless peer here is given a center and a world with `Net.set_peer_anchor()`, which also fixes WHICH ARENA
 ## it is watching: an observer without one would be in every arena at once.
 ##
 ## THE CONSERVATIVE RESUME RULE. `resumed_from` names a connection that may still be up, and a session
 ## identity is client-asserted and unauthenticated -- so a peer presenting an identity it watched someone else
-## use takes that player's seats, and the original keeps its connection with no error. This demo honours a
+## use takes that player's seats, and the original keeps its connection with no error. This demo honors a
 ## reclaim only for an identity it already saw `Net.peer_dropped` report with `held = true`. The price is the
 ## one the facade names: a player whose old socket the transport has not yet noticed is gone comes back as a
 ## newcomer.
@@ -49,6 +49,9 @@ var world: MatchDirector = null
 var roster: SeatRoster = SeatRoster.new()
 ## THIS peer's view of where it is watching from, when it is observing.
 var observer: ObserverDesk = ObserverDesk.new()
+## The client half of interest filtering as EVENTS. Held here rather than in a view, because it is a fact about
+## the SESSION -- what this connection is being sent -- and every view that wants it wants the same answer.
+var interest_log: InterestLog = InterestLog.new()
 
 ## How many seats this peer asks for, and whether it wants them in different arenas. Read at join time.
 var wanted_seats: int = 1
@@ -128,6 +131,9 @@ func _host(port: int, dedicated: bool) -> bool:
 	Net.set_mode(Net.Mode.SERVER if dedicated else Net.Mode.HOST)
 	_apply_interest_settings()
 	world.bind_net_all()                                  # RULE 1, second half
+	# AFTER bind_net_all(), so the seed reads a session that already holds its entities. Attaching before them
+	# would seed an empty set and then report every one of them arriving, which is churn that did not happen.
+	interest_log.attach(multiplayer.get_unique_id())
 	_set_state(State.PLAYING)
 	local_seats_changed.emit(_local_seats)
 	_broadcast_roster()
@@ -150,6 +156,7 @@ func join(target: String) -> bool:
 	_connect_peer_signals()
 	Net.set_mode(Net.Mode.CLIENT)
 	world.bind_net_all()                                  # RULE 1, second half
+	interest_log.attach(multiplayer.get_unique_id())
 	_set_state(State.CONNECTING)
 	print("ARENA: joining %s:%d (%s)" % [
 		_address_of(target), _port_of(target), NetTransport.preferred_kind_name()])
@@ -162,6 +169,9 @@ func leave() -> void:
 		multiplayer.multiplayer_peer = null
 	Net.set_mode(Net.Mode.OFFLINE)
 	Net.set_net_tick_coupled()   # RULE 3
+	# An entity id is session-global, so a set carried across sessions would report the next session's first
+	# admissions as entities that had been absent.
+	interest_log.reset()
 	roster.clear()
 	_observers.clear()
 	_held_sessions.clear()
@@ -187,7 +197,7 @@ func _apply_interest_settings() -> void:
 
 # --- the authoritative step --------------------------------------------------------------------------
 ## BEFORE the rollback loop. The veto pass has to run here: a cloak is applied inside the loop, from the same
-## values this tick's rows are built from, so a pass that ran afterwards would first see the flag on the tick
+## values this tick's rows are built from, so a pass that ran afterward would first see the flag on the tick
 ## whose row already carried it. See MatchDirector.pre_tick().
 func _on_pre_tick(_tick: int) -> void:
 	if world != null and Net.is_server():
@@ -242,8 +252,8 @@ func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	var seats: PackedInt32Array = roster.assign(peer, ArenaConfig.MAX_SEATS_PER_PEER, reclaim, true)
 	if seats.is_empty():
 		# Every seat taken -- so this peer OBSERVES. Refusing used to be the only honest answer to a seatless
-		# peer, because it had no body, therefore no interest centre, therefore no filter. Declaring its
-		# centre and its arena is what changed.
+		# peer, because it had no body, therefore no interest center, therefore no filter. Declaring its
+		# center and its arena is what changed.
 		print("ARENA: peer %d admitted as an observer -- every seat is taken" % peer)
 		_apply_observe(peer, true, 0, Vector3.ZERO, ArenaConfig.FIRST_ARENA_ID)
 		return
@@ -316,7 +326,7 @@ func observer_count() -> int:
 ## Ask the server to hand this peer's seats back and watch instead, or to seat it again.
 ##
 ## A REQUEST, NOT A SETTING. The server owns seating and owns every anchor declaration -- a client that could
-## set its own interest centre could set it anywhere, which is why the call is server-side in the facade.
+## set its own interest center could set it anywhere, which is why the call is server-side in the facade.
 func request_observe(on: bool) -> void:
 	if Net.is_offline() or _observing == on:
 		return
@@ -366,12 +376,12 @@ func _observe_request(on: bool, entity_id: int, point: Vector3, arena_id: int) -
 
 ## SERVER-SIDE. The only place in this demo that declares an anchor.
 ##
-## A DECLARATION REPLACES INFERENCE ON BOTH AXES AT ONCE -- the centre AND the world. That is what makes it
+## A DECLARATION REPLACES INFERENCE ON BOTH AXES AT ONCE -- the center AND the world. That is what makes it
 ## the right call for an observer here rather than a nice-to-have: an observer has no body, so it has no
 ## inferred arena either, and a peer in no arena is in every arena.
 ##
 ## THE ORDER MATTERS BOTH WAYS. Starting to observe releases the seats FIRST and then declares, so the roster
-## broadcast that parks the fighters does not race a centre about to be replaced. Stopping retracts FIRST and
+## broadcast that parks the fighters does not race a center about to be replaced. Stopping retracts FIRST and
 ## then seats, because `clear_peer_anchor()` hands both axes back to inference and inference needs a body.
 func _apply_observe(peer: int, on: bool, entity_id: int, point: Vector3, arena_id: int) -> void:
 	if not on:

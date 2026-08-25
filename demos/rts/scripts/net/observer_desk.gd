@@ -4,7 +4,7 @@ class_name ObserverDesk
 ##
 ## PURE. No tree, no `Net` calls, no signals -- this decides, and the session layer declares. That split is
 ## what makes the throttle testable at all, and the throttle is not optional: an observer pans continuously,
-## and one anchor message per frame would spend reliable bandwidth restating a centre that moved 20 cm.
+## and one anchor message per frame would spend reliable bandwidth restating a center that moved 20 cm.
 ##
 ## TWO MODES, BECAUSE THE FACADE OFFERS TWO CALLS.
 ##
@@ -15,7 +15,7 @@ class_name ObserverDesk
 ##
 ## A TRACKED ENTITY THAT DESPAWNS LEAVES THE PEER WHERE IT LAST WAS, and the desk keeps reporting TRACKED
 ## until the game says otherwise. That is the facade's rule rather than a choice made here: a membership is a
-## declaration and did not fail, while a centre is a measurement and did.
+## declaration and did not fail, while a center is a measurement and did.
 ##
 ## THE DESK NEVER CLEARS THE DECLARATION. Retracting is `Net.clear_peer_anchor()` and it is a different
 ## decision -- it hands the peer back to inference off its own driven body, which an observer does not have.
@@ -28,7 +28,7 @@ enum Mode {
 	TRACKED,
 }
 
-## Metres the fixed point must move before a fresh declaration earns a reliable message.
+## Meters the fixed point must move before a fresh declaration earns a reliable message.
 const RESEND_DISTANCE_M: float = 4.0
 ## The longest a declaration may go unrefreshed regardless of movement, so an observer that panned once and
 ## stopped is still corrected if the message that carried it was lost.
@@ -54,7 +54,7 @@ func watch_point(point: Vector3) -> void:
 
 ## Watch an entity, by the id `entity_id()` returns on a rollback or state handle. `0` is the facade's
 ## retraction value and is refused here rather than passed on: a desk in TRACKED mode with no entity would
-## declare a centre and immediately retract it, once per resend interval, forever.
+## declare a center and immediately retract it, once per resend interval, forever.
 func watch_entity(entity_id: int) -> bool:
 	if entity_id == 0:
 		return false
@@ -75,7 +75,7 @@ func tracked_entity() -> int:
 ## Whether the current declaration differs from the one last sent by enough to be worth resending.
 ##
 ## A MODE CHANGE IS ALWAYS DUE, whatever the distance or the clock says. The two modes are different facade
-## calls, so a switch from TRACKED to a FIXED point four centimetres from the tracked body is still a switch
+## calls, so a switch from TRACKED to a FIXED point four centimeters from the tracked body is still a switch
 ## and still has to cross the wire.
 func due(now_s: float) -> bool:
 	if not _sent:

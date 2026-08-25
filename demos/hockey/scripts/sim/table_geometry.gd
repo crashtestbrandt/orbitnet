@@ -30,15 +30,15 @@ static func clamp_to_table(point: Vector3, radius: float) -> Vector3:
 	return Vector3(clampf(point.x, -limit_x, limit_x), 0.0, clampf(point.z, -limit_z, limit_z))
 
 ## Clamp a mallet of `radius` inside the half `seat` defends: the FULL width of the table, and from its own end
-## rail up to the centre line.
+## rail up to the center line.
 ##
 ## THIS IS THE VALIDATION MOMENT. It runs inside `_rollback_tick`, which the server runs for every mallet from
 ## the client's own requested point -- so a client that writes a target on the far side of the table gets a
-## mallet on the centre line, on every peer, including its own after reconciliation. There is no separate
+## mallet on the center line, on every peer, including its own after reconciliation. There is no separate
 ## server-side check to keep in step with the client's, because the clamp IS the simulation.
 static func clamp_to_half(point: Vector3, seat: int, radius: float) -> Vector3:
 	var limit_x: float = maxf(0.0, HockeyConfig.HALF_WIDTH - radius)
-	var near: float = maxf(0.0, radius)                                       # the centre-line side
+	var near: float = maxf(0.0, radius)                                       # the center-line side
 	var far: float = maxf(near, HockeyConfig.HALF_LENGTH - radius)            # the own-goal side
 	var sign_z: float = HockeyConfig.end_sign(HockeyConfig.team_of_seat(seat))
 	var z: float = clampf(point.z * sign_z, near, far) * sign_z
@@ -46,7 +46,7 @@ static func clamp_to_half(point: Vector3, seat: int, radius: float) -> Vector3:
 
 ## Where a mallet stands when its seat is empty, and where it appears when someone takes the seat.
 ##
-## Team-mates are spread centre-outwards across their end so the first players to join stand nearest the middle
+## Team-mates are spread center-outwards across their end so the first players to join stand nearest the middle
 ## rather than in a corner, and no two seats share a slot. Deterministic, because every peer builds this pool
 ## and a random scatter would make the initial positions differ until the first state row arrived.
 static func home_point(seat: int) -> Vector3:
@@ -70,7 +70,7 @@ static func is_in_goal_mouth(x: float) -> bool:
 static func goal_line_z(team: int) -> float:
 	return HockeyConfig.end_sign(team) * HockeyConfig.HALF_LENGTH
 
-## The team that SCORES when a puck centre reaches `z` through a mouth, or -1 when `z` is short of either line.
+## The team that SCORES when a puck center reaches `z` through a mouth, or -1 when `z` is short of either line.
 ## Crossing the -z line is conceded by team 0, so team 1 scores.
 static func scoring_team_at(z: float) -> int:
 	if z <= -HockeyConfig.HALF_LENGTH:
@@ -79,6 +79,6 @@ static func scoring_team_at(z: float) -> int:
 		return 0
 	return -1
 
-## Where the puck is placed for a face-off: the centre of the table.
-static func centre_spot() -> Vector3:
+## Where the puck is placed for a face-off: the center of the table.
+static func center_spot() -> Vector3:
 	return Vector3.ZERO

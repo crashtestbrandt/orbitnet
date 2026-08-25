@@ -43,7 +43,7 @@ var _seat_of_session: Dictionary[int, int] = {}
 ## caller reaches that only if the two are ever allowed to disagree.
 ##
 ## `session_id` is the identity to reclaim a HELD seat with; `NO_SESSION` (0) takes a free one as a newcomer.
-## The caller decides whether a presented identity is worth honouring -- see HockeyNet, which honours it only
+## The caller decides whether a presented identity is worth honoring -- see HockeyNet, which honors it only
 ## for a session it already saw drop.
 func assign(peer: int, session_id: int = NO_SESSION) -> int:
 	if _seat_of_peer.has(peer):

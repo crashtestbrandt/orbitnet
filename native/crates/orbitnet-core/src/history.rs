@@ -9,8 +9,8 @@
 //! that all bodies then paid (issue #318).
 //!
 //! Here each body carries its own [`DirtyWindow`], so a late body replays deeply while its
-//! well-behaved neighbours replay one tick. [`ResimPlanner::global_window`] computes the old
-//! behaviour alongside, which is what lets the cost difference be asserted in tests and reported as
+//! well-behaved neighbors replay one tick. [`ResimPlanner::global_window`] computes the old
+//! behavior alongside, which is what lets the cost difference be asserted in tests and reported as
 //! a live metric rather than merely claimed.
 
 use std::collections::BTreeMap;

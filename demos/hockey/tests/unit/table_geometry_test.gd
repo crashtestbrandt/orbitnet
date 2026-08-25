@@ -12,15 +12,15 @@ func test_a_mallet_gets_the_full_width_of_its_own_half() -> void:
 		assert_almost_eq(left.x, -limit, 0.0001, "seat %d reaches the left rail" % seat)
 		assert_almost_eq(right.x, limit, 0.0001, "seat %d reaches the right rail" % seat)
 
-func test_no_mallet_crosses_the_centre_line() -> void:
+func test_no_mallet_crosses_the_center_line() -> void:
 	# The clamp is the VALIDATION MOMENT: it runs on the server inside _rollback_tick, from the client's own
-	# requested point. A client asking for the far end must get the centre line, not the far end.
+	# requested point. A client asking for the far end must get the center line, not the far end.
 	for seat: int in [0, 1, 2, 3]:
 		var sign_z: float = HockeyConfig.end_sign(HockeyConfig.team_of_seat(seat))
 		var far_side: Vector3 = Vector3(0.0, 0.0, -sign_z * HockeyConfig.HALF_LENGTH * 2.0)
 		var clamped: Vector3 = TableGeometry.clamp_to_half(far_side, seat, HockeyConfig.MALLET_RADIUS)
 		assert_true(clamped.z * sign_z >= HockeyConfig.MALLET_RADIUS - 0.0001,
-			"seat %d cannot reach past the centre line, even by asking" % seat)
+			"seat %d cannot reach past the center line, even by asking" % seat)
 		assert_true(absf(clamped.z) <= HockeyConfig.HALF_LENGTH,
 			"seat %d cannot be pushed through its own end rail either" % seat)
 
@@ -42,14 +42,14 @@ func test_home_spots_are_distinct_and_inside_their_own_half() -> void:
 		assert_vec_almost_eq(clamped, home, 0.0001, "seat %d's home spot is already legal" % seat)
 
 func test_the_first_seats_stand_nearest_the_middle() -> void:
-	# Centre-out ordering, so a two-player game does not start with both mallets in opposite corners.
+	# Center-out ordering, so a two-player game does not start with both mallets in opposite corners.
 	assert_almost_eq(TableGeometry.home_point(0).x, 0.0, 0.0001, "the first seat on team 0 is central")
 	assert_almost_eq(TableGeometry.home_point(1).x, 0.0, 0.0001, "and the first on team 1")
 	assert_true(absf(TableGeometry.home_point(2).x) > absf(TableGeometry.home_point(0).x),
 		"the second player on an end stands wider than the first")
 
 func test_the_goal_mouth_is_the_only_gap_in_an_end_rail() -> void:
-	assert_true(TableGeometry.is_in_goal_mouth(0.0), "dead centre is a goal")
+	assert_true(TableGeometry.is_in_goal_mouth(0.0), "dead center is a goal")
 	assert_true(TableGeometry.is_in_goal_mouth(HockeyConfig.GOAL_HALF_WIDTH - 0.001), "just inside a post")
 	assert_false(TableGeometry.is_in_goal_mouth(HockeyConfig.GOAL_HALF_WIDTH + 0.001), "just outside one")
 	assert_false(TableGeometry.is_in_goal_mouth(HockeyConfig.HALF_WIDTH), "the corner is solid rail")

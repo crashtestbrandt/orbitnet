@@ -28,7 +28,7 @@ signal world_built()
 ## ticks later has already let the cloak reach the peer it exists to hide it from. On the rollback lane that
 ## row carries the cloak FLAG, so the peer does not merely see a stale pose: it learns the fighter cloaked.
 const VETO_REFRESH_TICKS: int = 12
-## How close a fighter must be to the cloak spot to take it, metres.
+## How close a fighter must be to the cloak spot to take it, meters.
 const CLOAK_PICKUP_M: float = 1.6
 
 var fighters: Array[FighterBody] = []
@@ -64,6 +64,9 @@ var _offline_tick: int = 0
 ## The last shot resolved on this peer, for the readout. Server-side; a client learns about shots from the
 ## replicated shot sequence instead.
 var _last_shot: HitResolver.Shot = null
+# What batching has actually saved on this peer, for the HUD. Requests coalesced, and the packets they went in.
+var _batched_requests: int = 0
+var _batched_packets: int = 0
 
 func _init() -> void:
 	# The name is set at CONSTRUCTION, before this node is ever added to a tree. Every entity id under it is a
@@ -406,14 +409,50 @@ func forget_peer(peer: int) -> void:
 	_hidden_of_peer.erase(peer)
 
 # --- shots -------------------------------------------------------------------------------------------
-## Ask to fire. Called on the peer holding `seat`; the server adjudicates.
+## Ask to fire one seat. Called on the peer holding `seat`; the server adjudicates.
 func request_shot(seat: int) -> void:
 	if _shots == null:
 		return
-	_shots.request(&"fire", {
+	_shots.request(&"fire", _shot_payload(seat))
+
+## Ask to fire several seats in ONE reliable packet.
+##
+## THIS IS WHY A SPLIT-SCREEN CONNECTION COSTS ONE PACKET AND NOT TWO. Both fighters behind one connection
+## fire in the same frame on the same channel, so sending them separately spends two lots of RPC framing,
+## reliable-command headers, acks and retransmit state to carry two 24-byte payloads. A batch is a coalescing
+## optimization and NOT a transaction: each seat is validated on its own, so seat 0 can be admitted in the
+## same packet that refuses seat 1 for cooling, and the refusals come back together.
+func request_shots(seats: PackedInt32Array) -> void:
+	if _shots == null or seats.is_empty():
+		return
+	if seats.size() == 1:
+		_shots.request(&"fire", _shot_payload(seats[0]))
+		return
+	var payloads: Array = []
+	for seat: int in seats:
+		payloads.push_back(_shot_payload(seat))
+	_shots.request_batch(&"fire", payloads)
+	_batched_requests += payloads.size()
+	_batched_packets += 1
+
+func _shot_payload(seat: int) -> Dictionary:
+	return {
 		ShotValidator.KEY_SEAT: seat,
 		ShotValidator.KEY_TICK: current_tick(),
-	})
+	}
+
+## How many shot requests this peer has coalesced, and into how many packets. Both 0 on a connection driving
+## one seat, which is the honest reading: there is nothing to coalesce.
+func batched_requests() -> int:
+	return _batched_requests
+
+func batched_packets() -> int:
+	return _batched_packets
+
+## The shot channel, so a HUD can hear its refusals. [signal NetCommand.rejected] fires on the peer that
+## refused the shot AND on the client that asked, which is what turns a dead trigger into a stated reason.
+func shot_channel() -> NetCommand:
+	return _shots
 
 ## The server-side validator AND applier for a shot, in one place, so an unvalidated request can never reach
 ## the state.
@@ -422,7 +461,7 @@ func request_shot(seat: int) -> void:
 ## cannot author, and a connection here may drive two fighters -- so the seat has to travel in the payload and
 ## has to be checked against the seats the SERVER assigned to that sender. That check is the whole security
 ## model of this lane.
-func _apply_shot(sender_id: int, payload: Dictionary) -> bool:
+func _apply_shot(sender_id: int, payload: Dictionary) -> int:
 	# Read through typed locals: a payload crosses the RPC boundary as a plain Dictionary, so its values are
 	# Variants, and assigning is the conversion this project allows where a cast is not.
 	var seat_value: Variant = payload.get(ShotValidator.KEY_SEAT, -1)
@@ -437,7 +476,10 @@ func _apply_shot(sender_id: int, payload: Dictionary) -> bool:
 		fighter.last_shot_tick() if fighter != null else -1,
 		present)
 	if verdict != ShotValidator.Verdict.OK:
-		return false
+		# Returning the verdict rather than `false` is what carries the reason back to the peer that asked:
+		# NetCommand replies with an int verdict and announces nothing for a bool. `Verdict.OK` is 0, so the
+		# acceptance path below reads exactly as it did.
+		return verdict as int
 
 	fighter.queue_shot(present)
 	var at_tick: int = ShotValidator.clamp_command_tick(
@@ -446,7 +488,7 @@ func _apply_shot(sender_id: int, payload: Dictionary) -> bool:
 		at_tick = present
 	var space: PhysicsDirectSpaceState3D = _space_state()
 	if space == null:
-		return false
+		return ShotValidator.Verdict.OK as int
 	var is_authority_shooter: bool = sender_id <= SeatRoster.SERVER_PEER
 	var rtt_ms: float = -1.0 if is_authority_shooter else Net.peer_rtt_ms(sender_id)
 	var shot: HitResolver.Shot = resolver.resolve(space, fighter, sender_id, rtt_ms, present,
@@ -454,15 +496,15 @@ func _apply_shot(sender_id: int, payload: Dictionary) -> bool:
 	_last_shot = shot
 	rewind.note(shot, present)
 	if shot.hit_seat < 0:
-		return true
+		return ShotValidator.Verdict.OK as int
 	var struck: FighterBody = fighters[shot.hit_seat]
 	if struck == null or struck.team == fighter.team:
-		return true
+		return ShotValidator.Verdict.OK as int
 	# QUEUED, NOT WRITTEN. This handler runs OUTSIDE the tick, and the health it would write lives on the
 	# ROLLBACK lane -- the next restore would put it back and the fighter would never die. Whether the hit is
-	# fatal is therefore decided inside the tick, and `_credit_kills()` reads the answer afterwards.
+	# fatal is therefore decided inside the tick, and `_credit_kills()` reads the answer afterward.
 	struck.queue_damage(ArenaConfig.SHOT_DAMAGE, fighter.seat)
-	return true
+	return ShotValidator.Verdict.OK as int
 
 func _space_state() -> PhysicsDirectSpaceState3D:
 	var world: World3D = get_world_3d()

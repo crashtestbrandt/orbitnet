@@ -6,7 +6,7 @@ const SEAT_B: int = 1
 
 ## Two seat-0 units and one seat-1 unit, refreshed from seat 0. `range_m` is the distance from the FORWARD
 ## eye, which is the one that decides -- vision is the nearest eye's answer, so measuring from the origin
-## would silently understate every distance by the two metres the second friendly unit stands ahead.
+## would silently understate every distance by the two meters the second friendly unit stands ahead.
 ##
 ## Typed locals throughout rather than an Array of arrays: `Array` indexing yields a Variant, and this project
 ## promotes every Variant that reaches a typed parameter to an error.
@@ -91,7 +91,7 @@ func test_a_seat_with_nothing_alive_sees_no_enemy() -> void:
 	var seats: PackedInt32Array = PackedInt32Array([SEAT_A, SEAT_B])
 	var positions: PackedVector3Array = PackedVector3Array([Vector3.ZERO, Vector3(1.0, 0.0, 0.0)])
 	policy.refresh(SEAT_A, seats, positions, PackedByteArray([1, 1]))
-	assert_true(policy.is_visible(1), "an enemy a metre away is seen")
+	assert_true(policy.is_visible(1), "an enemy a meter away is seen")
 	policy.refresh(SEAT_A, seats, positions, PackedByteArray([0, 1]))
 	assert_false(policy.is_visible(1),
 		"with its last eye dead the seat sees nothing, however close the enemy is standing")

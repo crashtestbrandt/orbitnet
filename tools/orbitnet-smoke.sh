@@ -20,15 +20,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/addons/orbitnet_native/bin"
 GODOT="${GODOT:-$ROOT/tools/godot-quiet.sh}"
 
+# THE HOST'S TARGET, NOT A HARDCODED ONE. The smoke test loads the binary Godot will load, which is this
+# machine's; naming `linux` on a macOS or Windows host asks cargo to cross-compile, and it answers by
+# producing nothing at the path this script then looks in. `build-native.sh host` is the same detection
+# `just native-build` uses, so the two stage the same files.
+HOST="$("$ROOT/tools/build-native.sh" host)"
+
 if [ "${1:-}" != "--skip-build" ]; then
-	printf 'orbitnet-smoke: building both descriptor profiles\n'
-	"$ROOT/tools/build-native.sh" build linux "$BIN"
+	printf 'orbitnet-smoke: building both descriptor profiles for %s\n' "$HOST"
+	"$ROOT/tools/build-native.sh" build "$HOST" "$BIN"
 fi
 
 # Every name this platform's descriptor entries resolve to. Checking the SET rather than one file is
 # what catches a profile that failed to stage: the throwaway project runs from source and loads only
 # `template_debug`, so a missing `template_release` would pass here and fail one export later.
-NAMES="$("$ROOT/tools/build-native.sh" names linux)"
+NAMES="$("$ROOT/tools/build-native.sh" names "$HOST")"
 missing=""
 for name in $NAMES; do
 	[ -s "$BIN/$name" ] || missing="$missing $name"
@@ -49,10 +55,32 @@ for name in $NAMES; do
 	fi
 	# The entry symbol the .gdextension names. If this is absent the library will load and then do
 	# nothing, which presents as "class not found" far from the real cause.
+	#
+	# TWO SPELLINGS, BECAUSE `nm` IS NOT ONE TOOL. GNU binutils wants `-D` for an ELF's dynamic symbols;
+	# Apple's refuses `-D` and, on a UNIVERSAL dylib, refuses a plain read too ("File format has no dynamic
+	# symbol table") because a fat file holds one table per architecture rather than one overall. `-arch all`
+	# is what asks it for every slice. Neither flag is portable, so both are tried and the check only fails
+	# when a reader that WORKED found no symbol -- a `nm` that cannot read the file at all is not evidence
+	# that the file is wrong.
 	if command -v nm >/dev/null 2>&1; then
-		if ! nm -D "$lib" | grep -q 'gdext_rust_init'; then
+		# EVERY SPELLING IS TRIED SEPARATELY, and one that errors is not allowed to end the search. Grouping
+		# them into one pipeline does not work under `set -e`: the first reader that exits non-zero aborts the
+		# whole group, so the spelling that would have worked is never reached.
+		read_ok=0
+		found=0
+		for reader in "-D" "-arch all" ""; do
+			# shellcheck disable=SC2086 -- `reader` is a deliberate word split of a fixed flag list.
+			out="$(nm $reader "$lib" 2>/dev/null || true)"
+			[ -z "$out" ] && continue
+			read_ok=1
+			printf '%s' "$out" | grep -q 'gdext_rust_init' && found=1 && break
+		done
+		if [ "$read_ok" = "1" ] && [ "$found" != "1" ]; then
 			printf 'orbitnet-smoke FAILED: %s exports no gdext_rust_init symbol.\n' "$lib" >&2
 			exit 1
+		fi
+		if [ "$read_ok" != "1" ]; then
+			printf 'orbitnet-smoke: no nm on this host could read %s; skipping the symbol check\n' "$lib"
 		fi
 	fi
 done
@@ -133,7 +161,7 @@ func _initialize() -> void:
 
 	# The per-peer observer declaration binds and round-trips. It is a `#[func]` quartet plus the entity-id
 	# token it consumes, and nothing else in the tree would notice one of them failing to register: a peer
-	# declared into a world would silently fall back to inferring both its centre and its world from the body
+	# declared into a world would silently fall back to inferring both its center and its world from the body
 	# it drives, which is the inference this declaration exists to replace.
 	if not sync.has_method("get_entity_id"):
 		printerr("ORBIT-SMOKE FAIL: the entity id the anchor declaration names is not published")
@@ -279,7 +307,7 @@ func _process(_delta: float) -> bool:
 		5:
 			# The loop must keep ticking WITH the frees behind it. A freed-handle panic unwinds out of
 			# process/physics_process, so it eats the whole frame -- a stalled counter here is that
-			# showing up as behaviour rather than as a log line, and the frame watchdog above turns a
+			# showing up as behavior rather than as a log line, and the frame watchdog above turns a
 			# permanent stall into a failure instead of a hang. Baselined on stage entry (above), so the
 			# comparison spans calls rather than reading the same value on both sides.
 			if _ticks < _ticks_after_frees + 5:

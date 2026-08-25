@@ -39,7 +39,7 @@ func is_active() -> bool:
 ##
 ## Only value types the backend knows how to blend are smoothed -- float, Vector2/3, Quaternion,
 ## Transform3D. Anything else (an int, a bool, a PackedArray) is applied as a step function at the tick
-## boundary, which is the correct behaviour for a discrete value and is NOT an error.
+## boundary, which is the correct behavior for a discrete value and is NOT an error.
 func add_property(node: Object, property: String) -> void:
 	if _interp != null:
 		_interp.add_property(node, property)

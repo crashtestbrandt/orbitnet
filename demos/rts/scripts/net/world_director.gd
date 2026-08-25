@@ -3,7 +3,7 @@ class_name WorldDirector
 ## Builds the world, owns the unit pool, runs the authoritative step, and adjudicates every order.
 ##
 ## A STATIC UNIT POOL, NOT SPAWN/DESPAWN. Every peer creates all RtsConfig.UNIT_COUNT unit nodes at world
-## build, with identical names, and the node set NEVER changes afterwards. Death sets a replicated liveness
+## build, with identical names, and the node set NEVER changes afterward. Death sets a replicated liveness
 ## bit; the respawn drip clears it. That is a deliberate departure from "the server queue_free()s a dead
 ## unit", and the reason is entity identity:
 ##
@@ -26,9 +26,6 @@ signal world_built()
 
 ## Emitted on the server when an order is accepted, for the HUD's order log.
 signal order_applied(seat: int, verb: StringName, count: int, sequence: int)
-## Emitted on the server when an order is refused, with the validator's reason. Rejections are the interesting
-## half: a demo that never shows you a refused order has not shown you the security model.
-signal order_rejected(seat: int, verb: StringName, reason: String)
 
 var units: Array[UnitBody] = []
 var commanders: Array[CommanderAvatar] = []
@@ -152,6 +149,18 @@ func bind_net_all() -> void:
 			commander.bind_net()
 	print("RTS world bound to the %s lane set (%d entities)" % [
 		Net.mode_name(Net.current_mode()), units.size() + commanders.size()])
+	# ASKED OF THE BACKEND, NOT ECHOED. A hook is resolved by name on the channel's root, and a name that did
+	# not resolve leaves the channel on the per-property walk while the call site reports nothing.
+	print("RTS-MARSHAL units=%d/%d (one crossing per row in each direction, %d props)" % [
+		bulk_units(), units.size(), 3])
+
+## How many unit channels are actually marshalling in bulk, asked of the backend.
+func bulk_units() -> int:
+	var count: int = 0
+	for unit: UnitBody in units:
+		if unit != null and unit.uses_bulk_marshalling():
+			count += 1
+	return count
 
 ## Re-point a seat's commander at a new owning peer, and re-evaluate prediction. Called on every peer when the
 ## roster changes, so authority agrees everywhere.
@@ -196,7 +205,7 @@ static func build_obstacles() -> Array[AABB]:
 	out.push_back(AABB(Vector3(40.0, 0.0, -32.0), Vector3(6.0, 3.0, 14.0)))
 	return out
 
-## Where unit `id` starts and respawns. A deterministic scatter around its seat's spawn centre -- deterministic
+## Where unit `id` starts and respawns. A deterministic scatter around its seat's spawn center -- deterministic
 ## because both peers build the world, and a random scatter would make the initial positions differ until the
 ## first state packet arrived (a visible pop on every join).
 static func spawn_position(id: int) -> Vector3:
@@ -206,8 +215,8 @@ static func spawn_position(id: int) -> Vector3:
 	var golden_angle: float = 2.39996323
 	var angle: float = float(index) * golden_angle
 	var radius: float = RtsConfig.SPAWN_SPREAD * sqrt(float(index) / float(maxi(1, RtsConfig.UNITS_PER_SEAT)))
-	var centre: Vector3 = RtsConfig.spawn_center(seat)
-	var at: Vector3 = centre + Vector3(cos(angle) * radius, 0.0, sin(angle) * radius)
+	var center: Vector3 = RtsConfig.spawn_center(seat)
+	var at: Vector3 = center + Vector3(cos(angle) * radius, 0.0, sin(angle) * radius)
 	return UnitSteering.clamp_to_field(at, 1.0)
 
 ## Which way a unit faces at spawn: toward the middle of the map, i.e. toward the other seat.
@@ -403,24 +412,44 @@ func _build_order_channel(seat: int) -> NetCommand:
 		channel.register(verb, _apply_order.bind(seat, verb))
 	return channel
 
-## Submit an order on `seat`'s channel. Called by the local player's controller; on a client this becomes a
-## reliable RPC to the server, on a host/offline it applies immediately through the same path.
-func submit_order(seat: int, verb: StringName, ids: PackedInt32Array, point: Vector3) -> void:
+## Submit an order on `seat`'s channel, and answer the TAG that names it in [signal NetCommand.rejected].
+## Called by the local player's controller; on a client this becomes a reliable RPC to the server, on a
+## host/offline it applies immediately through the same path. `0` means nothing was sent.
+func submit_order(seat: int, verb: StringName, ids: PackedInt32Array, point: Vector3) -> int:
 	if seat < 0 or seat >= _order_channels.size():
-		return
+		return 0
 	var channel: NetCommand = _order_channels[seat]
 	if channel == null:
-		return
-	channel.request(verb, {"ids": ids, "point": point})
+		return 0
+	return channel.request(verb, {"ids": ids, "point": point})
+
+## One seat's order channel, so the local player's controller can hear its own refusals. Null for a seat with
+## no channel, and null before the world is built.
+##
+## [signal NetCommand.rejected] fires on the peer that refused the order AND on the client that asked for it,
+## which is what lets the RTT measurement cancel a refused order the tick it is refused instead of timing out.
+func order_channel(seat: int) -> NetCommand:
+	if seat < 0 or seat >= _order_channels.size():
+		return null
+	return _order_channels[seat]
 
 # The server-side validator+applier for one order. Runs ONLY on the applying peer (server, or the local peer
 # offline). Everything a client sent is suspect until this returns.
-func _apply_order(sender_id: int, payload: Dictionary, channel_seat: int, verb: StringName) -> bool:
+#
+# Returns an [OrderValidator.Code] rather than a bool, and that is what carries the refusal back to the client
+# that asked: NetCommand replies with an int verdict and announces nothing for a `false`. `OK` is 0, so the
+# acceptance path reads exactly as it did.
+#
+# THE RATE-LIMIT BRANCH REPLIES TOO, and the alternative is worth stating. A refusal is one reliable packet
+# per request, so replying to a throttled client is strictly 1:1 with what that client already sent -- it
+# amplifies nothing. Returning `false` there instead would make the refusal silent, which is the right choice
+# for a channel where a client can ask far faster than it can be answered; this one is capped at ten requests
+# a second per sender, and a player being throttled is a player who should be told.
+func _apply_order(sender_id: int, payload: Dictionary, channel_seat: int, verb: StringName) -> int:
 	# 1. Rate limit FIRST -- it is the cheapest rejection, and it must run before any work proportional to
 	#    the payload size.
 	if not _throttle.allow(sender_id, Time.get_ticks_msec() / 1000.0):
-		order_rejected.emit(channel_seat, verb, "rate limited")
-		return false
+		return OrderValidator.Code.RATE_LIMITED
 
 	# 2. Resolve WHO is asking from the sender id, never from the payload.
 	var sender_seat: int = roster.seat_for_sender(sender_id)
@@ -429,17 +458,19 @@ func _apply_order(sender_id: int, payload: Dictionary, channel_seat: int, verb: 
 	#    worth having: submitting on someone else's channel is unambiguous forgery, catchable before the
 	#    payload is even parsed.
 	if sender_seat != channel_seat:
-		order_rejected.emit(channel_seat, verb,
-			"peer %d holds seat %d but submitted on seat %d's channel" % [sender_id, sender_seat, channel_seat])
-		return false
+		push_warning("RTS: peer %d holds seat %d but submitted on seat %d's channel"
+			% [sender_id, sender_seat, channel_seat])
+		return OrderValidator.Code.FOREIGN_CHANNEL
 
 	# 4. Validate the payload itself (ownership of every named id, liveness, cardinality, finiteness).
 	var result: OrderValidator.Result = OrderValidator.validate(sender_seat, verb, payload, _alive)
 	if not result.accepted:
-		order_rejected.emit(channel_seat, verb, result.reason)
-		return false
+		# The detailed reason names ids and seats, so it stays on the server; the client is told the code.
+		push_warning("RTS: order refused on seat %d: %s" % [channel_seat, result.reason])
+		return result.code
 	if result.ids.is_empty():
-		return false   # every named unit died in flight; nothing to do, and not an error
+		# Every named unit died in flight. An ordinary race, not an error and not a refusal -- see rule 2.
+		return OrderValidator.Code.OK
 
 	# 5. Apply. One sequence number per ORDER, stamped onto every unit it names -- so a client can measure
 	#    click-to-adjudicate latency by watching any one of them change.
@@ -454,4 +485,4 @@ func _apply_order(sender_id: int, payload: Dictionary, channel_seat: int, verb: 
 		var goal: Vector3 = Formation.goal_for(index, count, result.point)
 		unit.apply_order(result.verb, goal, _next_sequence)
 	order_applied.emit(channel_seat, verb, count, _next_sequence)
-	return true
+	return OrderValidator.Code.OK

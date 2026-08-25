@@ -14,6 +14,14 @@ class_name InterestMeter
 ## culled fighter faded and keeps drawing it, because a shooter that deleted opponents at the AOI edge would
 ## be a shooter where cover is a render distance.
 ##
+## IT ASKS `is_receiving()`, NOT A TICK THRESHOLD, and the difference is what happens when the backend cannot
+## answer. `last_known_state()` is the newer of "a row arrived" and "this peer authored a tick", so it rises
+## every tick on a peer that authors state and answers a different question there; the receipt reading has one
+## writer, on the receive path, so it means the same thing on every peer. But thresholding EITHER tick yourself
+## fails CLOSED: a binary too old to report a receipt answers -1 for every body, and the whole world then reads
+## as culled. `is_receiving()` folds in both short-circuits -- the authority, and the backend that cannot say --
+## and answers true for each, which is the direction a diagnostic must fail in.
+##
 ## THE THRESHOLD IS IN TICKS, NOT SECONDS, so the reading is the same on a fast desktop and a loaded runner.
 
 ## How many ticks of silence count as "not being sent this". Generous rather than tight: a body at the far
@@ -49,8 +57,14 @@ static func is_fresh(last_tick: int, now_tick: int) -> bool:
 		return false
 	return now_tick - last_tick <= STALE_TICKS
 
-## Read the whole world. `now_tick` is the session's present.
+## Read the whole world.
+##
+## `now_tick` is the session's present. It is accepted and no longer read: each body answers `is_receiving()`
+## against the facade's own clock, which is the same tick and is the only place the two short-circuits (the
+## authority, and a backend that cannot report a receipt) are applied. The parameter stays so every caller and
+## the suite keep their shape.
 static func read(world: MatchDirector, now_tick: int) -> Reading:
+	var _present: int = now_tick
 	var out: Reading = Reading.new()
 	out.fighters_by_arena.resize(ArenaConfig.ARENAS)
 	if world == null:
@@ -59,7 +73,7 @@ static func read(world: MatchDirector, now_tick: int) -> Reading:
 		if fighter == null:
 			continue
 		out.fighters_total += 1
-		if not is_fresh(fighter.last_known_state(), now_tick):
+		if not fighter.is_receiving(STALE_TICKS):
 			continue
 		out.fighters_fresh += 1
 		var slot: int = fighter.arena_id - ArenaConfig.FIRST_ARENA_ID
@@ -69,12 +83,12 @@ static func read(world: MatchDirector, now_tick: int) -> Reading:
 		if prop == null:
 			continue
 		out.props_total += 1
-		if is_fresh(prop.last_known_state(), now_tick):
+		if prop.is_receiving(STALE_TICKS):
 			out.props_fresh += 1
 	for card: Scorecard in world.scorecards:
 		if card == null:
 			continue
 		out.cards_total += 1
-		if is_fresh(card.last_known_state(), now_tick):
+		if card.is_receiving(STALE_TICKS):
 			out.cards_fresh += 1
 	return out

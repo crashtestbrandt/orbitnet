@@ -40,7 +40,7 @@ class Shot extends RefCounted:
 	var target_rewind_ticks: int = -1
 	## WHETHER THE HIT WAS FATAL IS NOT ANSWERED HERE, and that is a consequence of the lane rather than an
 	## omission. Damage is queued and applied inside the tick, so at resolve time nobody knows yet -- the
-	## director reads the answer off the fighters afterwards. See FighterBody._drain_pending().
+	## director reads the answer off the fighters afterward. See FighterBody._drain_pending().
 
 var lag: NetLagComp = NetLagComp.new()
 

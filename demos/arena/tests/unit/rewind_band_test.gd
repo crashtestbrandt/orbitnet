@@ -38,7 +38,7 @@ func test_the_configured_scale_bands_an_arena_meaningfully() -> void:
 	assert_eq(NetLagComp.band_for(Vector3.ZERO, across, scale), NetLagComp.Band.FAR,
 		"a shot across the whole arena is a FAR shot")
 	assert_eq(NetLagComp.band_for(Vector3.ZERO, Vector3(2.0, 0.0, 0.0), scale), NetLagComp.Band.NEAR,
-		"and one at two metres is NEAR")
+		"and one at two meters is NEAR")
 
 # --- the window ------------------------------------------------------------------------------------------
 func test_the_authority_rewinds_nothing() -> void:

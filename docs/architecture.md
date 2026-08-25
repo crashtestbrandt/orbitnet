@@ -65,12 +65,22 @@ tick per entity, so a body with `S` state props replaying `D` ticks pays `S × D
 in one frame — the same walk the state lane pays once. `restore_ms` / `sim_ms` / `record_ms` report the three
 phases apart, and `resim_force` fixes `D`, so the effect of a change here is measured rather than asserted.
 
-Two paths keep the per-property walk unconditionally:
+Three directions, and each covers a different walk:
 
-| | Why |
-|---|---|
-| Applying a **received** row | Runs once per received block, not once per replayed tick, and it is the one apply that must land `Cosmetic` values too. |
-| The **quantized write-back** | Writes only the props that carry a quantizer, which is zero for most schemas. A bulk write-back would fire every setter in the lane to canonicalize the few that changed. |
+| direction | the walk it replaces | multiplier |
+|---|---|---|
+| `capture` | reading the game's values into a row | replayed ticks x planned entities |
+| `restore` | writing a recorded row back before a replayed tick | replayed ticks x planned entities |
+| `apply` | landing a **received** row, and the **quantized write-back** after a record | delivered blocks for the first (no replay multiplier), replayed ticks for the second |
+
+`apply` earns its place for a reason the multiplier does not show: **a peer that simulates nothing plans no
+entities**, so the rollback loop returns on an empty plan and the receive walk is that peer's entire per-tick
+crossing count. Neither other hook reaches it.
+
+**Its slot list is the CAPTURE list, not the restore list** — they differ by the lane's `Cosmetic` entries,
+which are replicated and never restored, and a received row must land those too. The write-back routes through
+the hook only when the lane carries at least two quantized properties; below that the targeted walk is cheaper
+and is what runs.
 
 Two non-negotiable rules:
 
@@ -112,14 +122,14 @@ sends because it is **slower** at the arena extents a session runs at. It overta
 ±600 m of occupancy and is about twice as fast past ±1200 m; the shipped arenas are ±74 m. A high world count
 looked like a grid win and was not — what the grid saved there was the per-peer candidate rebuild, and that is
 now dropped without a grid: **one candidate list per tick**, with the rows a peer drives patched in around its
-call and "this peer cannot be located" said in the centre rather than by reshaping every row. Worth 2.35× of
+call and "this peer cannot be located" said in the center rather than by reshaping every row. Worth 2.35× of
 the interest pass in a 32-world session, and it removes the only reading under which the grid won one. The
 measured tables and the decision are in that module's header, and `net.perf`'s `interest_ms` is the live number
 that would reopen it.
 
 **Membership is the second axis.** A radius cannot separate several independent worlds inside one session, each
 rebased near its own coordinate origin: two entities at the same coordinates in different worlds are zero
-metres apart. Every candidate and every observer carries a membership id, and a candidate whose id differs from
+meters apart. Every candidate and every observer carries a membership id, and a candidate whose id differs from
 the observer's is refused before any distance is computed. `0` is the default on both sides and matches every
 world, so a game that declares none is filtered on distance alone.
 
@@ -138,19 +148,25 @@ the three delta entries a leave clears, because no `leaves` list will ever name 
 updates. The shared candidate list is untouched by any of it, so the veto costs the per-tick pass nothing.
 
 The veto stops the rows and nothing else. That is the client-side contract a distance cull already has, and it
-inherits the same limit — nothing despawns, so the withheld entity's node stays where it was. Ids stay
-session-global either way: the entity manifest goes to every synced peer whatever any one of them receives.
+inherits the same rule — **nothing despawns**, so the withheld entity's node stays where it was. What the client
+is now told is *which* entities stopped: the per-peer diff the send path already computed to clear its own
+delta bookkeeping rides the snapshot as a flag-guarded trailing section, and `Net.entity_left_interest` /
+`Net.entity_entered_interest` publish it. Two bytes per changed entity, on the ticks the set changed, and
+nothing at rest. The addon still frees nothing; the game decides what a leave means. Ids stay session-global
+either way: the entity manifest goes to every synced peer whatever any one of them receives.
 
-**A seat's centre and its world both come from one body**: the lowest-id entity whose *input* authority is that
+**A seat's center and its world both come from one body**: the lowest-id entity whose *input* authority is that
 peer, which declares that seat, and which resolved an anchor. A connection with no such body on any seat has
-neither, and the backend correctly falls back to "everything is in interest" — every world, at every distance.
-This is the limitation most likely to surprise you — see
-[api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
+neither, and the backend falls back to "everything is in interest" — every world, at every distance, and not
+bounded by the nearest-N cap either, because an entity with no distance is kept as uncullable and an uncullable
+entity occupies no slot in it. This is the behavior most likely to surprise you. `Net.peer_anchor()` reports
+which case a connection is actually in, and `Net.set_unanchored_policy(CLOSED)` makes the fallback "receive
+nothing" instead — see [api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
 
 **A connection may hold several seats, and the filter runs once per seat.** A seat is one owned, predicted body
 behind one transport peer; local split-screen is two or more, and the sentence above is per seat: the anchor is
 the lowest-id entity whose input authority is that peer AND which declares that seat. Relevancy is a property of
-a viewpoint, so each seat gets its own centre, world, hysteresis band and cap — while the delta base, the ack
+a viewpoint, so each seat gets its own center, world, hysteresis band and cap — while the delta base, the ack
 window, the veto and the byte budget stay per connection, because those are properties of a datagram. What the
 datagram carries is the **union** of the connection's seats, holding the **nearest** seat's distance per entity,
 and an entity leaves only when every seat has let go of it. Every body is on seat `0` until
@@ -173,9 +189,9 @@ two events one manifest later.
 **That inference is a fallback, and `Net.set_peer_anchor()` replaces it.** What a peer observes is a different
 question from what its input drives — a spectator drives nothing, and a peer with a body in each of two worlds
 observes one of them — and the inferred world is read off whichever body sorts lowest by FNV hash, which makes
-a peer driving two bodies in different worlds undefined. The declaration states the centre and the world
+a peer driving two bodies in different worlds undefined. The declaration states the center and the world
 together and is authoritative for both. Its two axes fail separately: a tracked entity that has not spawned
-gives no centre, so nothing is distance-culled, while the peer stays in the world it was declared into, because
+gives no center, so nothing is distance-culled, while the peer stays in the world it was declared into, because
 a membership is a declaration and did not fail.
 
 Tick tiers are assigned statically per synchronizer and dynamically by distance band, phase-offset by entity id

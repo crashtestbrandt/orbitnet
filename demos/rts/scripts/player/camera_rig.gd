@@ -12,7 +12,7 @@ class_name CameraRig
 ## project.godot, and it would be the single most likely thing to break when this project is opened in a
 ## different Godot version. A real game should use one.
 
-## Metres per second of pan at the default zoom. Pan speed scales with height, so the camera covers the same
+## Meters per second of pan at the default zoom. Pan speed scales with height, so the camera covers the same
 ## fraction of the visible field per second whether zoomed in or out -- panning that feels fast up close and
 ## glacial when zoomed out is the classic RTS camera mistake.
 const PAN_SPEED: float = 34.0

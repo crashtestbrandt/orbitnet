@@ -11,7 +11,7 @@ class_name ArenaGeometry
 ##
 ## THE REBASING IS ALONG ONE AXIS on purpose. Laid out on a grid the arenas would be at varying distances from
 ## each other, and a reader checking whether a cull was distance or membership would have to do arithmetic. On
-## a line every arena is `ARENA_SPACING_M` from its neighbour and no further reasoning is needed.
+## a line every arena is `ARENA_SPACING_M` from its neighbor and no further reasoning is needed.
 
 ## The world-space origin of `arena_id`.
 static func origin_of(arena_id: int) -> Vector3:

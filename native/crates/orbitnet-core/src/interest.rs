@@ -17,7 +17,7 @@
 //!
 //! ## Seats
 //!
-//! A [`PeerInterest`] is one **seat's** set: one viewpoint, with one centre and one world. A
+//! A [`PeerInterest`] is one **seat's** set: one viewpoint, with one center and one world. A
 //! connection may carry several — local split-screen is two or more locally-owned bodies behind a
 //! single transport peer — and [`ConnectionInterest`] is the level above: one `PeerInterest` per
 //! seat, unioned into the set the datagram carries, with the nearest seat's distance kept per
@@ -73,17 +73,19 @@
 //!
 //! ## Grid or scan
 //!
-//! [`PeerInterest`] has two update paths and the backend ships the *linear* one.
+//! [`PeerInterest`] has two update paths, and which one a session runs is decided from that
+//! session's own occupancy rather than declared by the game — [`PathSelector`] is the rule and the
+//! two tables below are the evidence for it.
 //! [`PeerInterest::update_grid_into`] and [`PeerInterest::update_linear_into`] apply the same rules
 //! to the same [`InterestCandidate`]s and report the same leaves — the suite asserts both over a
-//! randomised walk — so the choice between them is a cost decision, and it is the measurements
+//! randomized walk — so the choice between them is a cost decision, and it is the measurements
 //! below rather than an argument.
 //!
 //! Each row times three variants over one session (`tests/interest_bench.rs`, 240 ticks, radius
 //! 256 m, release, one unowned row in eight positionless):
 //!
-//! * **scan/shared** — what `orbit_net.rs` runs. One candidate list per tick, the rows a peer drives
-//!   patched in and out around that peer's call.
+//! * **scan/shared** — the flat pass, and what a session below the threshold runs. One candidate
+//!   list per tick, the rows a peer drives patched in and out around that peer's call.
 //! * **scan/peer** — the shape it ran before: a fresh list per peer, O(P·N) per tick on top of the
 //!   filter. Kept because the gap between the two columns is what deleting it bought.
 //! * **grid** — one [`InterestGrid::rebuild`] per tick, the own body passed as the `also` override.
@@ -129,13 +131,46 @@
 //! world costs a scan one integer comparison per candidate, which is already less than binning that
 //! candidate costs the grid.
 //!
-//! So [`PeerInterest::update_linear_into`] is what `orbit_net.rs` calls, and the grid is retained
-//! and tested rather than adopted. What changed is that it is now *adoptable*: it reports the leaves
-//! the send path clears its delta bookkeeping from, it carries the always-set and the worlds, and
-//! the only thing an adopting caller adds is one [`InterestGrid::rebuild`] per tick before the
-//! per-peer loop. **An arena past about ±600 m of occupancy is what would justify making that
-//! switch**, and `net.perf`'s `interest_ms` is the live number to watch. A high world count is not.
+//! ## The session picks its own path
+//!
+//! Neither table is a question a game should be asked to answer, so it is not asked. Each tick the
+//! caller measures the candidate list it already holds with [`InterestOccupancy::measure`], hands
+//! the result to [`PathSelector::select`], and runs the [`InterestPath`] that comes back:
+//! `update_linear_into` for [`InterestPath::Linear`], or one [`InterestGrid::rebuild`] plus
+//! `update_grid_into` for [`InterestPath::Grid`]. **The choice is automatic and the game declares
+//! nothing.**
+//!
+//! What the rule compares is the **occupied cells of the widest world against the cells one query
+//! rectangle covers**, because that ratio is exactly what [`InterestGrid::query_within`]'s own guard
+//! tests: a query whose rectangle is larger than the world's occupancy scans every bucket, which is
+//! the flat pass plus a rebuild. In shipped terms — radius 256 m, `cell_size` 64 m, `exit_factor`
+//! 1.25, so a 640 m query rectangle 11 cells on a side and 121 cells in it:
+//!
+//! * **Enter [`InterestPath::Grid`]** at [`GRID_ENTER_SPANS`] × 121 = 484 occupied cells: a world
+//!   spread over at least 22 cells a side — about ±700 m at a 64 m cell — *and* holding at least 484
+//!   binnable bodies to fill them, because the cell count is capped by the body count.
+//! * **Return to [`InterestPath::Linear`]** below [`GRID_LEAVE_SPANS`] × 121 = 242 cells: a world
+//!   spread over fewer than 16 cells a side, which at a 64 m cell is about **±480 m**. That is every
+//!   world count in the second table, and the ±300 m row of the first. ±600 m is 19 cells a side and
+//!   361 occupied, so it is already past this and sits in the band below.
+//! * **Hold** in between, so a session parked on the threshold cannot flap between two paths every
+//!   tick. The ±600 m row — the 1.05× one, where the two cost the same — falls inside that band, and
+//!   sizing the band to cover it is why the two constants are 4 and 2.
+//! * **Never the grid** when the enter radius is `0` (a membership-only session has no distance to
+//!   index at all) or when a connection carries more than [`GRID_MAX_OVERRIDES`] overrides (the
+//!   per-hit `also` scan costs more than the index saves past that).
+//!
+//! Switching path mid-session is free, and it has to be: both paths compute the same members and
+//! report the same [`InterestDelta`] — leaves AND enters — and
+//! `switching_path_mid_session_emits_no_leaves` pins that a flip reports neither. A spurious leave costs a full-state burst for every entity on that peer, which is the one
+//! thing an automatic switch must never do.
+//!
+//! **What a session reports, and what it cannot set.** `net.perf` publishes `interest_ms` — the cost
+//! — beside `interest_grid`, the fraction of the window's ticks that took the index. There is no
+//! setter for either, and the reason is the equivalence above: a wrong verdict costs time and
+//! nothing else, which is what licenses a cheap automatic rule in place of a knob.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::history::BodyId;
@@ -154,10 +189,10 @@ type WorldCells = HashMap<(i32, i32), CellBucket>;
 /// (no hysteresis band).
 #[derive(Debug, Clone, Copy)]
 pub struct AoiConfig {
-    /// Edge length of one grid cell in metres. Values that are non-finite or `<= 0` behave as the
+    /// Edge length of one grid cell in meters. Values that are non-finite or `<= 0` behave as the
     /// default `32.0`.
     pub cell_size: f32,
-    /// Radius in metres at which an entity enters a peer's interest set. A negative radius
+    /// Radius in meters at which an entity enters a peer's interest set. A negative radius
     /// behaves as `0.0`.
     ///
     /// The default of `256.0` covers the demo arena with margin: the 2fort CTF forts sit at
@@ -220,7 +255,7 @@ impl AoiConfig {
 /// The grid cell a coordinate falls in along one axis.
 ///
 /// The `as` cast saturates, so an absurd but finite coordinate lands in the outermost cell
-/// instead of invoking undefined behaviour.
+/// instead of invoking undefined behavior.
 fn cell_coord(value: f32, cell_size: f32) -> i32 {
     (value / cell_size).floor() as i32
 }
@@ -369,7 +404,7 @@ impl InterestGrid {
     /// Every entity `observer` may see at **any** distance: the binned ones plus
     /// [`Self::uncullable_for`]. Order is unspecified.
     ///
-    /// This is what an observer with no usable centre sees. A non-finite centre is a measurement
+    /// This is what an observer with no usable center sees. A non-finite center is a measurement
     /// that failed, and the filter fails open on it rather than blanking that peer's world.
     pub fn visible_to(&self, observer: MembershipId) -> impl Iterator<Item = BodyId> + '_ {
         self.worlds
@@ -493,6 +528,351 @@ impl InterestCandidate {
     }
 }
 
+/// How many cells of edge `cell_size` a span of `meters` covers along one axis.
+///
+/// The **alignment-independent** count: a span that straddles a cell boundary covers one more cell
+/// than this, so this is the low answer of the two the real rectangle can have. Both thresholds are
+/// whole multiples of it and the smaller multiple is 2, so a one-cell difference on an 11-cell
+/// rectangle cannot move a decision.
+///
+/// Saturating throughout. `meters` may be a finite but absurd coordinate range, and the caller
+/// squares the result, so the value is clamped to `u32::MAX` — whose square is still inside `u64`.
+fn cells_across(meters: f64, cell_size: f64) -> u64 {
+    let across = (meters / cell_size).floor() + 1.0;
+    if across.is_finite() {
+        across.clamp(1.0, f64::from(u32::MAX)) as u64
+    } else {
+        u64::from(u32::MAX)
+    }
+}
+
+/// One world's XZ bounds and binnable body count, accumulated by [`InterestOccupancy::measure`].
+#[derive(Debug, Clone, Copy)]
+struct WorldBounds {
+    min_x: f32,
+    max_x: f32,
+    min_z: f32,
+    max_z: f32,
+    anchored: usize,
+}
+
+impl WorldBounds {
+    /// Bounds no coordinate has reached yet. Every field is replaced by the first candidate that
+    /// lands here, so the inverted infinities never survive into a measurement.
+    const EMPTY: Self = Self {
+        min_x: f32::INFINITY,
+        max_x: f32::NEG_INFINITY,
+        min_z: f32::INFINITY,
+        max_z: f32::NEG_INFINITY,
+        anchored: 0,
+    };
+
+    /// Widen to include `pos`, which the caller has already checked is finite.
+    fn extend_to(&mut self, pos: [f32; 3]) {
+        self.min_x = self.min_x.min(pos[0]);
+        self.max_x = self.max_x.max(pos[0]);
+        self.min_z = self.min_z.min(pos[2]);
+        self.max_z = self.max_z.max(pos[2]);
+        self.anchored = self.anchored.saturating_add(1);
+    }
+
+    /// The longer of the two XZ sides, in meters.
+    ///
+    /// Subtracting two finite coordinates can still overflow to infinity at the extremes of `f32`.
+    /// [`InterestOccupancy::occupied_cells`] reads that as "wider than any rectangle" and falls back
+    /// on the body count, which is the answer a world that large deserves anyway.
+    fn longer_xz_side(&self) -> f32 {
+        (self.max_x - self.min_x).max(self.max_z - self.min_z)
+    }
+}
+
+/// Caller-owned working storage for [`InterestOccupancy::measure`]: one bounds accumulator per
+/// world, cleared and reused, so a warm call allocates nothing.
+///
+/// One per caller, held beside the candidate list it measures. Clearing a `HashMap` keeps its
+/// buckets, so after the first tick a session that keeps its world count allocates nothing here
+/// however many candidates it measures.
+#[derive(Debug, Clone, Default)]
+pub struct OccupancyScratch {
+    worlds: HashMap<MembershipId, WorldBounds>,
+}
+
+/// How much space a session's widest world actually occupies, measured from one tick's candidates.
+///
+/// This is the input [`PathSelector`] decides on, and it is deliberately **per world** rather than
+/// per session. [`InterestGrid::rebuild`] bins each world separately and
+/// [`InterestGrid::query_within`]'s guard compares a scan rectangle against **one** world's occupied
+/// cell count, so a session-wide bound would describe a rectangle no query is ever measured against.
+/// Two worlds rebased on origins a hundred kilometers apart are two small worlds; measuring the
+/// session would read them as one enormous one and index a grid that buys nothing.
+///
+/// **The widest world decides**, and ties are broken by the fuller world and then by the lower
+/// [`MembershipId`], because a `HashMap` iterates in an unspecified order and a measurement that
+/// varied with it would make the path a session runs vary run to run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InterestOccupancy {
+    /// Half the longer XZ side of the widest world's axis-aligned bounds, in meters. `0.0` when
+    /// nothing was binnable — one body is a world of zero extent, and so is none.
+    pub half_extent: f32,
+    /// How many of that world's candidates [`InterestGrid::rebuild`] would put in a cell.
+    ///
+    /// It is the cap on [`Self::occupied_cells`]: a world cannot fill more cells than it has bodies,
+    /// and a sparse world spread over a huge area is exactly the case where a grid's rebuild buys
+    /// nothing back.
+    pub anchored: usize,
+}
+
+impl InterestOccupancy {
+    /// Measure `candidates` and report the widest world's bounds and binnable count.
+    ///
+    /// **Binnable means what [`InterestGrid::rebuild`] bins.** An [`InterestCandidate::always`] row
+    /// carries no position and a row with any non-finite component cannot be placed, so neither is
+    /// counted and neither moves the bounds. A single `NaN` folded into a running minimum would make
+    /// every bound `NaN` and the measurement useless — the same reason `rebuild` holds those rows
+    /// beside the cells instead of in them.
+    ///
+    /// `scratch` is cleared on entry, so a warm call allocates nothing.
+    #[must_use]
+    pub fn measure(candidates: &[InterestCandidate], scratch: &mut OccupancyScratch) -> Self {
+        scratch.worlds.clear();
+        for candidate in candidates {
+            let pos = candidate.pos;
+            if candidate.always || !(pos[0].is_finite() && pos[1].is_finite() && pos[2].is_finite())
+            {
+                continue;
+            }
+            scratch
+                .worlds
+                .entry(candidate.membership)
+                .or_insert(WorldBounds::EMPTY)
+                .extend_to(pos);
+        }
+        let mut widest: Option<(MembershipId, WorldBounds)> = None;
+        for (&membership, &bounds) in &scratch.worlds {
+            let better = match widest {
+                None => true,
+                Some((best_id, best)) => {
+                    match bounds.longer_xz_side().total_cmp(&best.longer_xz_side()) {
+                        Ordering::Greater => true,
+                        Ordering::Less => false,
+                        Ordering::Equal => {
+                            bounds.anchored > best.anchored
+                                || (bounds.anchored == best.anchored && membership < best_id)
+                        }
+                    }
+                }
+            };
+            if better {
+                widest = Some((membership, bounds));
+            }
+        }
+        match widest {
+            None => Self {
+                half_extent: 0.0,
+                anchored: 0,
+            },
+            Some((_, bounds)) => Self {
+                half_extent: bounds.longer_xz_side() * 0.5,
+                anchored: bounds.anchored,
+            },
+        }
+    }
+
+    /// How many cells that world fills at `cfg`, **capped by [`Self::anchored`]**.
+    ///
+    /// The geometric part is the bounding rectangle in cells; the cap is the count of bodies, since
+    /// one body occupies one cell. The cap is what stops a handful of bodies scattered over a
+    /// cislunar volume reading as dense occupancy: what the grid pays off against is the number of
+    /// buckets a query would otherwise walk, and empty space has no buckets.
+    ///
+    /// A `NaN` or negative `half_extent` — which [`Self::measure`] never produces, but the field is
+    /// public — answers `0`, so a failed measurement keeps the flat pass rather than betting the
+    /// tick on an index.
+    #[must_use]
+    pub fn occupied_cells(&self, cfg: &AoiConfig) -> u64 {
+        let half = f64::from(self.half_extent);
+        if half.is_nan() || half < 0.0 {
+            return 0;
+        }
+        let across = cells_across(half * 2.0, f64::from(cfg.effective_cell_size()));
+        across.saturating_mul(across).min(self.anchored as u64)
+    }
+}
+
+/// Which of the two update paths a session runs.
+///
+/// [`Self::Linear`] is the default and the answer for every arena the shipped demos build; see the
+/// module header for the measurements and [`PathSelector`] for the rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum InterestPath {
+    /// The flat pass: [`PeerInterest::update_linear_into`] or
+    /// [`ConnectionInterest::update_linear_into`], over the tick's candidate slice.
+    #[default]
+    Linear,
+    /// The spatial index: one [`InterestGrid::rebuild`] per tick, then
+    /// [`PeerInterest::update_grid_into`] or [`ConnectionInterest::update_grid_into`] per peer.
+    Grid,
+}
+
+/// Occupied cells per query rectangle at which a session **enters** [`InterestPath::Grid`].
+///
+/// Four rectangles' worth of occupancy. See [`PathSelector`] for the arithmetic that fixes it, and
+/// the module header for the measurements it reproduces.
+pub const GRID_ENTER_SPANS: u64 = 4;
+
+/// Occupied cells per query rectangle below which a session **returns** to [`InterestPath::Linear`].
+///
+/// Half of [`GRID_ENTER_SPANS`], and the gap between the two is the hysteresis band. A session
+/// between the two thresholds keeps whichever path it is on, which is what stops a world hovering on
+/// the threshold from rebuilding a grid every other tick.
+pub const GRID_LEAVE_SPANS: u64 = 2;
+
+/// How many per-connection overrides [`InterestPath::Grid`] tolerates before the flat pass wins
+/// whatever the occupancy says.
+///
+/// `also` is scanned once per grid hit — that is what lets a connection's own rows shadow the shared
+/// grid's — so its cost is `overrides × hits` on a path whose whole purpose is to cut the hits. Past
+/// a handful of overrides that scan costs more than the index saves, and the flat pass, which folds
+/// the same rows in for free, is the cheaper answer.
+pub const GRID_MAX_OVERRIDES: usize = 8;
+
+/// Which path a session runs, held across ticks so the answer has hysteresis.
+///
+/// The rule compares two cell counts, both taken at the caller's [`AoiConfig`]:
+///
+/// * [`Self::span_cells`] — the cells one query rectangle covers. The grid path queries at the
+///   **exit** radius, so the rectangle is `2 × enter_radius × exit_factor` meters on a side.
+/// * [`InterestOccupancy::occupied_cells`] — the cells the widest world fills, capped by its bodies.
+///
+/// Their ratio is what [`InterestGrid::query_within`]'s own guard tests. A rectangle larger than the
+/// occupancy makes that query scan every bucket in the world — the flat pass, plus a rebuild — so
+/// the grid can only pay when the world is several rectangles across.
+///
+/// ## What the constant reproduces
+///
+/// Worked at the parameters both tables in the module header were measured with: radius 256 m,
+/// `cell_size = enter_radius / 4` = 64 m, `exit_factor` 1.25. The rectangle is 640 m on a side and
+/// `640 / 64 = 10`, so it spans 11 cells either way and [`Self::span_cells`] is **121**. Enter at
+/// `GRID_ENTER_SPANS × 121 = 484`, return below `GRID_LEAVE_SPANS × 121 = 242`.
+///
+/// **Arena extent**, 708 of the 800 entities binnable in the single world (one unowned row in eight
+/// declares no anchor, so it is not binned):
+///
+/// | arena extent | cells a side | occupied cells | spans | selected | grid vs shipped |
+/// |---|---|---|---|---|---|
+/// | ±300 m   | 10  | 100          | 0.83 | Linear | 0.80× |
+/// | ±600 m   | 19  | 361          | 2.98 | hold   | 1.05× |
+/// | ±1200 m  | 38  | 708 (capped) | 5.85 | Grid   | 1.74× |
+/// | ±2500 m  | 79  | 708 (capped) | 5.85 | Grid   | 1.85× |
+/// | ±5000 m  | 157 | 708 (capped) | 5.85 | Grid   | 1.94× |
+/// | ±25000 m | 782 | 708 (capped) | 5.85 | Grid   | 1.95× |
+///
+/// **World count**, 1200 entities dealt round-robin across the worlds, every world a ±300 m arena
+/// rebased on its own origin. The geometry gives 10 cells a side — 100 cells — and the widest
+/// world's body count caps it below that from 16 worlds up:
+///
+/// | worlds | widest world's bodies | occupied cells | spans | selected | grid vs shipped |
+/// |---|---|---|---|---|---|
+/// | 1  | 1058 | 100 | 0.83 | Linear | 0.97× |
+/// | 2  | 600  | 100 | 0.83 | Linear | 0.72× |
+/// | 4  | 300  | 100 | 0.83 | Linear | 0.63× |
+/// | 8  | 150  | 100 | 0.83 | Linear | 0.56× |
+/// | 16 | 75   | 75  | 0.62 | Linear | 0.57× |
+/// | 32 | 38   | 38  | 0.31 | Linear | 0.60× |
+///
+/// Every row the grid loses answers `Linear`, every row it wins by 1.74× or more answers `Grid`, and
+/// the single row where the two cost the same is the one that lands in the band. **No false positive
+/// and no false negative on either table.** A high world count is not a reason to index: refusing
+/// another world costs the flat pass one integer comparison per candidate, which is already less
+/// than binning that candidate costs the grid.
+///
+/// ## Why 4 and 2
+///
+/// The break-even row fixes both constants. ±600 m is 2.98 spans and costs the same on either path,
+/// so the enter threshold must sit above 2.98 and the leave threshold below it; ±300 m is 0.83 spans
+/// and the grid loses it by 20%, so the leave threshold must sit above 0.83. `4` and `2` are the
+/// whole numbers that bracket 2.98 with the most room on both sides, and they leave the break-even
+/// row **held** on whichever path it is already running — the one row where holding is free, because
+/// the two paths cost the same there.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PathSelector {
+    path: InterestPath,
+}
+
+impl PathSelector {
+    /// A selector on [`InterestPath::Linear`], the path a session that never measures anything runs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many cells the query rectangle covers at `cfg` — the unit both thresholds are counted in.
+    ///
+    /// This is [`InterestGrid::query_within`]'s `span_x × span_z` for a query at the **exit** radius,
+    /// which is the radius [`PeerInterest::update_grid_into`] actually issues: one query serves both
+    /// hysteresis bands, so the rectangle a grid tick pays for is the exit one and not the enter one.
+    ///
+    /// A non-finite exit radius answers `u64::MAX`. An infinite radius really does cover the whole
+    /// coordinate range, which is the branch the guard takes as a full scan, and no occupancy can be
+    /// four of those — so the rule answers `Linear` and the caller runs the flat pass rather than a
+    /// flat pass with a rebuild in front of it.
+    #[must_use]
+    pub fn span_cells(cfg: &AoiConfig) -> u64 {
+        let exit_radius = cfg.effective_enter_radius() * cfg.effective_exit_factor();
+        if !exit_radius.is_finite() {
+            return u64::MAX;
+        }
+        let across = cells_across(
+            f64::from(exit_radius) * 2.0,
+            f64::from(cfg.effective_cell_size()),
+        );
+        across.saturating_mul(across)
+    }
+
+    /// Answer which path to run this tick, and remember it.
+    ///
+    /// `overrides` is how many per-connection rows the caller will hand the update as `also` — the
+    /// facts a grid shared by every peer cannot hold, of which the send path has one per seat.
+    ///
+    /// Two refusals come before the occupancy, and neither has hysteresis because neither is a
+    /// measurement that can hover:
+    ///
+    /// * **No enter radius** — `<= 0`, or the `NaN` a config decoded from a cvar or the wire can
+    ///   carry. A membership-only session has no distance to index, so a spatial index buys nothing
+    ///   and costs a rebuild.
+    /// * **More than [`GRID_MAX_OVERRIDES`] overrides**, whose per-hit scan outgrows what the index
+    ///   saves.
+    ///
+    /// Otherwise: enter [`InterestPath::Grid`] at [`GRID_ENTER_SPANS`] spans of occupancy, return to
+    /// [`InterestPath::Linear`] below [`GRID_LEAVE_SPANS`], and hold the current path in between.
+    pub fn select(
+        &mut self,
+        cfg: &AoiConfig,
+        occupancy: InterestOccupancy,
+        overrides: usize,
+    ) -> InterestPath {
+        let enter_radius = cfg.effective_enter_radius();
+        if enter_radius.is_nan() || enter_radius <= 0.0 || overrides > GRID_MAX_OVERRIDES {
+            self.path = InterestPath::Linear;
+            return self.path;
+        }
+        let span = Self::span_cells(cfg);
+        let occupied = occupancy.occupied_cells(cfg);
+        if occupied >= span.saturating_mul(GRID_ENTER_SPANS) {
+            self.path = InterestPath::Grid;
+        } else if occupied < span.saturating_mul(GRID_LEAVE_SPANS) {
+            self.path = InterestPath::Linear;
+        }
+        self.path
+    }
+
+    /// The path the last [`Self::select`] answered, or [`InterestPath::Linear`] before the first.
+    #[must_use]
+    pub fn path(&self) -> InterestPath {
+        self.path
+    }
+}
+
 /// One peer's hysteretic interest set, and the entities vetoed out of it.
 ///
 /// Members are stored in a [`BTreeMap`] keyed by id (value: the distance squared observed on the
@@ -525,8 +905,8 @@ impl PeerInterest {
     ///
     /// These are [`Self::update_linear_into`]'s rules applied to the same candidates through a
     /// spatial index instead of a flat scan. The two paths are asserted to agree — members and
-    /// leaves alike — over a randomised walk in this module's suite, so choosing between them is a
-    /// cost decision and not a behaviour change. Part by part:
+    /// leaves alike — over a randomized walk in this module's suite, so choosing between them is a
+    /// cost decision and not a behavior change. Part by part:
     ///
     /// * Entities within `enter_radius` join; current members are retained until they exceed
     ///   `enter_radius * exit_factor`; members the query no longer returns (moved away, despawned,
@@ -535,7 +915,7 @@ impl PeerInterest {
     ///   separately and the query reads only the ones [`membership_matches`] admits, so an
     ///   overlapping world's entities never enter the set at any distance.
     /// * An entity [`Self::set_hidden`] vetoed for this peer is refused wherever it arrives from —
-    ///   the binned hits, the uncullable list, `also`, or the whole world an unlocatable centre
+    ///   the binned hits, the uncullable list, `also`, or the whole world an unlocatable center
     ///   admits.
     /// * [`InterestCandidate::always`] entities, and any whose position could not be binned, arrive
     ///   from [`InterestGrid::uncullable_for`] and bypass both the radius and the cap.
@@ -564,7 +944,7 @@ impl PeerInterest {
     ///
     /// `leaves` and `scratch` are both cleared on entry; `scratch` is caller-owned working storage
     /// so a warm per-peer update allocates nothing.
-    // The grid, the config, the observer's centre and world, that peer's overrides and the two
+    // The grid, the config, the observer's center and world, that peer's overrides and the two
     // caller-owned buffers. Bundling any pair of them into a struct would either allocate per peer
     // per tick or move the same arguments to a constructor.
     #[allow(clippy::too_many_arguments)]
@@ -632,8 +1012,9 @@ impl PeerInterest {
 
     /// Recompute the set from a flat candidate slice, reporting every id that **left**.
     ///
-    /// This is the path `orbit_net.rs` runs (see the module header for why the grid is not). The
-    /// hysteresis, cap, tie-breaking and leave rules are [`Self::update_grid_into`]'s; what differs
+    /// This is the path [`PathSelector`] answers [`InterestPath::Linear`] with, and the one every
+    /// session below the grid's occupancy threshold runs (see the module header). The hysteresis,
+    /// cap, tie-breaking and leave rules are [`Self::update_grid_into`]'s; what differs
     /// is only how candidates are found. Three of them are worth restating where the shipped caller
     /// will read them:
     ///
@@ -646,7 +1027,7 @@ impl PeerInterest {
     ///   dropped **before** the radius and before `always` is consulted, so an overlapping world's
     ///   entities never enter the set at any distance, and an always-relevant channel is bounded
     ///   to its own world. [`MEMBERSHIP_GLOBAL`] on either side matches, which is why a game that
-    ///   declares no memberships keeps the distance-only behaviour exactly.
+    ///   declares no memberships keeps the distance-only behavior exactly.
     /// * `leaves` receives every id that was a member and is not one now — radius exits, membership
     ///   refusals **and** cap evictions alike, because each is a real leave that must re-enter
     ///   through `enter_radius` like any newcomer. The caller uses this to clear its per-peer delta
@@ -862,8 +1243,10 @@ impl PeerInterest {
 /// Push every id `old` holds that `fresh` does not onto `leaves`.
 ///
 /// `fresh` must be sorted ascending by id, and `old` already is, so the diff is one linear merge.
-/// Shared by [`PeerInterest::commit`] and [`ConnectionInterest::update_linear_into`], so a seat's
-/// leave rule and a connection's are one rule applied to two sets rather than two copies of it.
+///
+/// **The per-SEAT half of the rule.** A connection's union takes [`push_delta`] instead, which is
+/// the same merge filling both halves: a seat reports leaves only, because a leave is a leave from
+/// the UNION and so is an enter, and a seat's own gain is not news the datagram carries.
 fn push_leaves(old: &BTreeMap<BodyId, f32>, fresh: &[(BodyId, f32)], leaves: &mut Vec<BodyId>) {
     let mut fresh = fresh.iter().peekable();
     for &id in old.keys() {
@@ -876,33 +1259,117 @@ fn push_leaves(old: &BTreeMap<BodyId, f32>, fresh: &[(BodyId, f32)], leaves: &mu
     }
 }
 
+/// What one CONNECTION's union gained and lost between two updates.
+///
+/// **The diff is symmetric because the consumers are not.** A leave is what clears a peer's
+/// per-entity delta bookkeeping, and that half has always been reported. An enter is what a game
+/// needs in order to know an entity became relevant again — the row arrives on the wire either way,
+/// but a client holding a node it froze at the last pose it received has nothing that says the body
+/// is being sent to it once more.
+///
+/// * **Both halves are ascending by id**, which is the order the union is held in and the order the
+///   wire carries.
+/// * **Both halves come out of ONE linear merge** over the old union and the fresh one
+///   ([`push_delta`]), rather than two walks over the same two sequences.
+/// * **An id appears in at most one half.** An entity that was a member and is one now is in
+///   neither, whatever moved in between — the diff compares two sets, not a history.
+///
+/// It is filled per CONNECTION and not per seat. A per-seat enter means nothing for the same reason
+/// a per-seat leave does: the datagram is shared, so what a seat gained is only news when the union
+/// gained it. [`PeerInterest`] therefore keeps its bare `leaves` out-parameter.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InterestDelta {
+    /// Every id that was in the union and is not now — a radius exit, a membership refusal, a cap
+    /// eviction, a veto, or a seat that went away.
+    pub leaves: Vec<BodyId>,
+    /// Every id that is in the union and was not — a radius entry, a cap admission, a veto
+    /// retracted and then re-admitted by the filter, or a seat that arrived.
+    pub enters: Vec<BodyId>,
+}
+
+impl InterestDelta {
+    /// Drop both halves, keeping their allocations. Called at the top of every update, so a caller
+    /// reusing one across ticks allocates nothing on a warm pass.
+    pub fn clear(&mut self) {
+        self.leaves.clear();
+        self.enters.clear();
+    }
+
+    /// Whether the update changed nothing — the ordinary case on a settled tick.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.leaves.is_empty() && self.enters.is_empty()
+    }
+}
+
+/// Fill both halves of `delta` from ONE merge over the two id-ascending sequences.
+///
+/// `old` is a `BTreeMap` and so is ascending by construction; `fresh` is sorted and deduplicated by
+/// [`ConnectionInterest::commit_union`] before it gets here. Walking them together visits each id
+/// once: an id only in `old` left, an id only in `fresh` entered, an id in both did neither. Two
+/// separate walks would cost the same ids twice and would leave two places for the leave rule and
+/// the enter rule to disagree.
+///
+/// `delta` is appended to rather than cleared, because the caller clears it once at the top of the
+/// update.
+fn push_delta(old: &BTreeMap<BodyId, f32>, fresh: &[(BodyId, f32)], delta: &mut InterestDelta) {
+    let mut old_ids = old.keys().copied().peekable();
+    let mut fresh_ids = fresh.iter().map(|&(id, _)| id).peekable();
+    loop {
+        match (old_ids.peek().copied(), fresh_ids.peek().copied()) {
+            (Some(was), Some(now)) if was < now => {
+                delta.leaves.push(was);
+                old_ids.next();
+            }
+            (Some(was), Some(now)) if now < was => {
+                delta.enters.push(now);
+                fresh_ids.next();
+            }
+            (Some(_), Some(_)) => {
+                old_ids.next();
+                fresh_ids.next();
+            }
+            (Some(was), None) => {
+                delta.leaves.push(was);
+                old_ids.next();
+            }
+            (None, Some(now)) => {
+                delta.enters.push(now);
+                fresh_ids.next();
+            }
+            (None, None) => break,
+        }
+    }
+}
+
 /// Where one **seat** observes from, and which world it observes in.
 ///
 /// A seat is one owned viewpoint on a connection. Local split-screen puts two or more behind a
-/// single transport peer, each with its own body, its own centre and its own world; a connection
+/// single transport peer, each with its own body, its own center and its own world; a connection
 /// with one seat — every connection in a game without split-screen — is the one-element case and is
 /// filtered exactly as it was before seats existed.
 ///
 /// The two fields fail independently, and [`ConnectionInterest::update_linear_into`] relies on it. A
 /// non-finite `center` means "this seat has no position to be culled by" and admits everything its
 /// world allows, while `membership` still refuses another world. A seat whose body has not spawned
-/// yet therefore keeps its own set open, rather than inheriting the centre of a seat it is nowhere
+/// yet therefore keeps its own set open, rather than inheriting the center of a seat it is nowhere
 /// near.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeatObserver {
-    /// The centre this seat's radius is measured from. Non-finite means no distance filter for
+    /// The center this seat's radius is measured from. Non-finite means no distance filter for
     /// this seat.
     pub center: [f32; 3],
     /// The world this seat is in, or [`MEMBERSHIP_GLOBAL`] for every world.
     pub membership: MembershipId,
 }
 
-/// Caller-owned working storage for [`ConnectionInterest::update_linear_into`].
+/// Caller-owned working storage for [`ConnectionInterest::update_linear_into`] and
+/// [`ConnectionInterest::update_grid_into`].
 ///
 /// One per caller, reused across ticks and connections, so a warm update allocates nothing. It
 /// holds the buffers the per-seat pass needs — the distance scratch each seat's own update clears,
-/// the per-seat leave list a connection does not publish, and the merged union — rather than taking
-/// three more `&mut Vec` parameters.
+/// the per-seat leave list a connection does not publish (see [`InterestDelta`]), and the merged
+/// union — rather than taking three more `&mut Vec` parameters.
 #[derive(Debug, Default, Clone)]
 pub struct SeatScratch {
     dist: Vec<(BodyId, f32)>,
@@ -913,7 +1380,7 @@ pub struct SeatScratch {
 /// One CONNECTION's interest: a hysteretic set per seat, unioned into the set the datagram carries.
 ///
 /// **The two levels exist because the two questions have different answers.** Relevancy is a
-/// property of a seat — a viewpoint, with its own centre and its own world — while a delta base, an
+/// property of a seat — a viewpoint, with its own center and its own world — while a delta base, an
 /// ack window and a byte budget are properties of the datagram, and a datagram is per connection.
 /// So each seat gets its own [`PeerInterest`] with its own hysteresis, and what the send path reads
 /// is their union.
@@ -922,9 +1389,10 @@ pub struct SeatScratch {
 ///
 /// * **Membership is the union.** An entity one seat can see is carried on the connection, whatever
 ///   the other seats say.
-/// * **A leave is a leave from the UNION.** Clearing `last_sent` / `acked_base` when an entity
-///   leaves one seat's set would break the delta chain of a body another seat is still watching —
-///   a full-state burst for a body that never went anywhere.
+/// * **A leave is a leave from the UNION, and so is an enter.** Clearing `last_sent` / `acked_base`
+///   when an entity leaves one seat's set would break the delta chain of a body another seat is
+///   still watching — a full-state burst for a body that never went anywhere. Both halves are
+///   reported together as an [`InterestDelta`].
 /// * **The stored distance is the NEAREST seat's.** The send rota reads it back as a band, so a
 ///   body in the second seat's face must not be scored at its distance from the first.
 /// * **The cap is per seat.** `AoiConfig::max_entities` bounds what one viewpoint needs; a second
@@ -932,6 +1400,10 @@ pub struct SeatScratch {
 /// * **Seats are positional.** `seats[i]` in the slice handed to the update is the same seat next
 ///   tick, because that index is what carries its hysteresis. A shorter slice truncates the tail,
 ///   and everything only the dropped seats held leaves the union on that tick.
+/// * **Both update paths are here.** [`Self::update_linear_into`] and [`Self::update_grid_into`]
+///   differ only in how each seat finds its candidates; the seat resize, the veto inheritance and
+///   the union are one body shared by both, so a session that switches path mid-flight cannot get
+///   two different answers out of them. [`PathSelector`] is what chooses.
 ///
 /// * **The veto is per connection**, and it is the one thing here that is not decided per seat. A
 ///   withheld entity is one this datagram may not carry, so [`Self::set_hidden`] is mirrored onto
@@ -940,7 +1412,8 @@ pub struct SeatScratch {
 ///   exactly what [`PeerInterest::set_hidden`] refuses at the candidate to avoid.
 ///
 /// A connection with exactly one seat is [`PeerInterest`] exactly — same members, same distances,
-/// same leaves — which `one_seat_matches_a_bare_peer_interest` asserts.
+/// same leaves — which `one_seat_matches_a_bare_peer_interest` asserts. The enters are the one thing
+/// the bare set does not report at all; see [`InterestDelta`].
 #[derive(Debug, Default, Clone)]
 pub struct ConnectionInterest {
     /// One hysteretic set per seat, positional and parallel to the observer slice.
@@ -961,38 +1434,26 @@ impl ConnectionInterest {
 
     /// Recompute every seat's set from `candidates`, union them, and report what left the union.
     ///
-    /// Each seat is filtered by [`PeerInterest::update_linear_into`] against its own centre and its
+    /// Each seat is filtered by [`PeerInterest::update_linear_into`] against its own center and its
     /// own world, so every rule that path documents — hysteresis, the always-set, the membership
-    /// refusal, the nearest-N cap, the non-finite-centre fail-open — holds per seat here.
+    /// refusal, the nearest-N cap, the non-finite-center fail-open — holds per seat here.
     ///
     /// `candidates` is the CONNECTION's list, not the seat's: a body the connection drives is
     /// `always` to every seat on it, because the datagram that would carry it is shared. Nothing
     /// here is per seat except where it is observed from.
     ///
-    /// `leaves` is cleared on entry and receives the union's leaves in ascending id order.
+    /// `delta` is cleared on entry and receives BOTH halves of the union's diff in ascending id
+    /// order. See [`InterestDelta`] for why the connection reports enters and a seat does not.
     pub fn update_linear_into(
         &mut self,
         cfg: &AoiConfig,
         seats: &[SeatObserver],
         candidates: &[InterestCandidate],
         scratch: &mut SeatScratch,
-        leaves: &mut Vec<BodyId>,
+        delta: &mut InterestDelta,
     ) {
-        leaves.clear();
-        // Grows for a new seat and TRUNCATES for a departed one, which is the whole of the
-        // seat-count rule: everything only the dropped seats held falls out of the union below and
-        // is reported as a leave.
-        let held = self.seats.len();
-        self.seats.resize_with(seats.len(), PeerInterest::new);
-        // A seat that just appeared starts with no vetoes of its own, and a veto is the
-        // CONNECTION's — so it inherits the standing declarations before it filters anything. Miss
-        // this and adding a seat hands that connection every entity it was being withheld from.
-        for seat in &mut self.seats[held.min(seats.len())..] {
-            for &id in &self.hidden {
-                seat.set_hidden(id, true);
-            }
-        }
-
+        delta.clear();
+        self.fit_seats(seats.len());
         scratch.merged.clear();
         for (set, observer) in self.seats.iter_mut().zip(seats) {
             set.update_linear_into(
@@ -1005,17 +1466,96 @@ impl ConnectionInterest {
             );
             scratch.merged.extend(set.iter_with_distance());
         }
+        self.commit_union(scratch, delta);
+    }
 
+    /// Recompute every seat's set from `grid`, union them, and report what left it and what joined.
+    ///
+    /// [`Self::update_linear_into`]'s rules, reached through a spatial index instead of a flat scan:
+    /// each seat is filtered by [`PeerInterest::update_grid_into`] against its own center and its own
+    /// world, and everything above about the union — membership is the union, a leave is a leave from
+    /// the union, the stored distance is the nearest seat's, the cap is per seat — holds here
+    /// unchanged. `connection_grid_agrees_with_connection_linear_over_a_pseudo_random_walk` asserts
+    /// the two agree on members *and* leaves, step for step, which is what licenses
+    /// [`PathSelector`] switching between them mid-session.
+    ///
+    /// The caller runs one [`InterestGrid::rebuild`] per tick before the per-connection loop, and
+    /// passes the same [`AoiConfig`] the rebuild used — the query derives its cell scan from the size
+    /// the entities were binned under.
+    ///
+    /// **`also` carries the rows this CONNECTION drives**, which is the one fact a grid shared by
+    /// every peer cannot hold: a body the connection owns is always-relevant to it and to no other.
+    /// It is applied per seat and identically to each, because what it feeds is one datagram. An id
+    /// named in `also` is answered by `also` alone and its binned entry is ignored, and the scan that
+    /// enforces that runs once per grid hit — which is why [`GRID_MAX_OVERRIDES`] bounds how many
+    /// overrides are worth taking this path with at all.
+    ///
+    /// `delta` is cleared on entry and receives both halves of the union's diff in ascending id
+    /// order, exactly as the flat path fills it.
+    pub fn update_grid_into(
+        &mut self,
+        grid: &InterestGrid,
+        cfg: &AoiConfig,
+        seats: &[SeatObserver],
+        also: &[InterestCandidate],
+        scratch: &mut SeatScratch,
+        delta: &mut InterestDelta,
+    ) {
+        delta.clear();
+        self.fit_seats(seats.len());
+        scratch.merged.clear();
+        for (set, observer) in self.seats.iter_mut().zip(seats) {
+            set.update_grid_into(
+                grid,
+                cfg,
+                observer.center,
+                observer.membership,
+                also,
+                &mut scratch.dist,
+                &mut scratch.leaves,
+            );
+            scratch.merged.extend(set.iter_with_distance());
+        }
+        self.commit_union(scratch, delta);
+    }
+
+    /// Match the per-seat sets to `count` seats, and hand the connection's standing vetoes to every
+    /// seat that just appeared.
+    ///
+    /// Shared by both update paths rather than copied into each, because the second half is the one
+    /// that fails silently. A seat that appears on a tick and does not inherit the vetoes is handed
+    /// an entity the game withheld — on the wire, in a datagram shared with the seats that are
+    /// correctly refusing it — and nothing downstream can tell that happened.
+    ///
+    /// The resize grows for a new seat and TRUNCATES for a departed one, which is the whole of the
+    /// seat-count rule: everything only the dropped seats held falls out of the union and is reported
+    /// as a leave.
+    fn fit_seats(&mut self, count: usize) {
+        let held = self.seats.len();
+        self.seats.resize_with(count, PeerInterest::new);
+        for seat in &mut self.seats[held.min(count)..] {
+            for &id in &self.hidden {
+                seat.set_hidden(id, true);
+            }
+        }
+    }
+
+    /// Merge the per-seat sets into the union, report its diff, then overwrite it.
+    ///
+    /// Also shared by both paths: what a connection publishes is the union and its
+    /// [`InterestDelta`], and the nearest-seat distance rule lives in the sort below. Two copies of
+    /// it would be two chances for one path to score a body at the wrong seat's distance.
+    fn commit_union(&mut self, scratch: &mut SeatScratch, delta: &mut InterestDelta) {
         // Ascending by id, then by distance, so the first entry for an id is the nearest seat's and
         // `dedup_by_key` — which keeps the FIRST of a run — is the whole of the nearest-seat rule.
-        // Every distance here is finite and non-negative: `PeerInterest` normalises the
+        // Every distance here is finite and non-negative: `PeerInterest` normalizes the
         // always-relevant `NEG_INFINITY` to `0.0` before storing it.
         scratch
             .merged
             .sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
         scratch.merged.dedup_by_key(|&mut (id, _)| id);
 
-        push_leaves(&self.members, &scratch.merged, leaves);
+        push_delta(&self.members, &scratch.merged, delta);
         self.members.clear();
         self.members.extend(scratch.merged.iter().copied());
     }
@@ -1418,7 +1958,7 @@ mod tests {
 
     #[test]
     fn a_target_at_the_longest_shot_in_the_game_stays_in_interest() {
-        // THE PLAYER-FACING GUARANTEE BEHIND THE SHIPPED RADIUS, stated as behaviour rather
+        // THE PLAYER-FACING GUARANTEE BEHIND THE SHIPPED RADIUS, stated as behavior rather
         // than as a number. `aoi_weapon_range_test.gd` checks that the shipped radius is >= the
         // longest projectile range; this checks that a body at that range is actually still in the
         // set, which is the thing a scoped sniper depends on.
@@ -1441,7 +1981,7 @@ mod tests {
         }
 
         // And the radius is what bounds it: past the hysteresis band the body does leave, which is
-        // the behaviour an arena larger than the sniper's reach is meant to get.
+        // the behavior an arena larger than the sniper's reach is meant to get.
         grid.rebuild(
             &cfg,
             &anchored(&[(1, [sniper_range * 1.25 + 1.0, 0.0, 0.0])]),
@@ -1519,7 +2059,7 @@ mod tests {
             &mut scratch,
             &mut leaves,
         );
-        // A radius of zero still admits a body at exactly the centre, which body 2 is.
+        // A radius of zero still admits a body at exactly the center, which body 2 is.
         assert_eq!(via_grid.iter().collect::<Vec<_>>(), vec![2]);
         assert_eq!(via_linear.iter().collect::<Vec<_>>(), vec![2]);
     }
@@ -1777,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_fails_open_on_a_non_finite_centre() {
+    fn grid_fails_open_on_a_non_finite_center() {
         let cfg = cfg(32.0, 100.0, 1.25, 1);
         let mut grid = InterestGrid::new();
         grid.rebuild(
@@ -1854,7 +2394,7 @@ mod tests {
         // measurement that chose between them was comparing different work. Everything that can
         // differ between them is varied here at once: three worlds at overlapping coordinates,
         // always-relevant channels, positions that go non-finite mid-walk, a cap that bites, an
-        // observer whose centre cannot be resolved, a per-peer override that shadows a binned body,
+        // observer whose center cannot be resolved, a per-peer override that shadows a binned body,
         // and a visibility veto that comes and goes. Members *and* leaves are compared every step,
         // because the send path's correctness rests on the leaves rather than on the set.
         let cfg = cfg(64.0, 100.0, 1.25, 12);
@@ -2121,7 +2661,7 @@ mod tests {
             "an unbinnable body stays replicated; only a binnable, distant one is culled"
         );
 
-        // A non-finite CENTRE (a peer whose own body has gone bad) must not blank the world.
+        // A non-finite CENTER (a peer whose own body has gone bad) must not blank the world.
         let mut wide = PeerInterest::new();
         wide.update_linear_into(
             &cfg,
@@ -2544,7 +3084,7 @@ mod tests {
     /// An unlocatable observer fails open on distance — it sees everything its world admits — and
     /// the veto is a declaration rather than a measurement, so it still holds there.
     #[test]
-    fn a_veto_survives_the_non_finite_centre_that_fails_distance_open() {
+    fn a_veto_survives_the_non_finite_center_that_fails_distance_open() {
         let cfg = cfg(32.0, 200.0, 1.25, 0);
         let candidates = [
             InterestCandidate::anchored(1, [10_000.0, 0.0, 0.0]),
@@ -2661,30 +3201,41 @@ mod tests {
         SeatObserver { center, membership }
     }
 
-    /// One connection update, returning the union's leaves.
+    /// One connection update, returning the whole diff.
+    fn update_connection_delta(
+        connection: &mut ConnectionInterest,
+        cfg: &AoiConfig,
+        seats: &[SeatObserver],
+        candidates: &[InterestCandidate],
+    ) -> InterestDelta {
+        let mut scratch = SeatScratch::default();
+        let mut delta = InterestDelta::default();
+        connection.update_linear_into(cfg, seats, candidates, &mut scratch, &mut delta);
+        delta
+    }
+
+    /// The same update, narrowed to the union's leaves — the half every test predating the enter
+    /// set asserts on.
     fn update_connection(
         connection: &mut ConnectionInterest,
         cfg: &AoiConfig,
         seats: &[SeatObserver],
         candidates: &[InterestCandidate],
     ) -> Vec<BodyId> {
-        let mut scratch = SeatScratch::default();
-        let mut leaves = Vec::new();
-        connection.update_linear_into(cfg, seats, candidates, &mut scratch, &mut leaves);
-        leaves
+        update_connection_delta(connection, cfg, seats, candidates).leaves
     }
 
     #[test]
     fn one_seat_matches_a_bare_peer_interest() {
         // The compatibility claim the whole two-level structure rests on: a connection with one
         // seat is the shape every connection had before seats existed. Walked over moving bodies
-        // and a moving centre, so hysteresis, the cap and the leave diff are all exercised.
+        // and a moving center, so hysteresis, the cap and the leave diff are all exercised.
         let cfg = cfg(32.0, 100.0, 1.25, 3);
         let mut state = 0x0BAD_5EA7u32;
         let mut connection = ConnectionInterest::new();
         let mut reference = PeerInterest::new();
         let (mut scratch, mut ref_scratch) = (SeatScratch::default(), Vec::new());
-        let (mut leaves, mut ref_leaves) = (Vec::new(), Vec::new());
+        let (mut delta, mut ref_leaves) = (InterestDelta::default(), Vec::new());
 
         for step in 0..64u32 {
             let candidates: Vec<InterestCandidate> = (0..24u64)
@@ -2704,7 +3255,7 @@ mod tests {
                 &[seat_at(center)],
                 &candidates,
                 &mut scratch,
-                &mut leaves,
+                &mut delta,
             );
             reference.update_linear_into(
                 &cfg,
@@ -2720,7 +3271,7 @@ mod tests {
                 reference.iter_with_distance().collect::<Vec<_>>(),
                 "members diverged at step {step}"
             );
-            assert_eq!(leaves, ref_leaves, "leaves diverged at step {step}");
+            assert_eq!(delta.leaves, ref_leaves, "leaves diverged at step {step}");
         }
     }
 
@@ -2797,10 +3348,120 @@ mod tests {
         assert!(!connection.contains(1));
     }
 
+    /// The whole diff table, written out rather than derived: what one update reports for an
+    /// entity in each of the four states it can be in across two ticks.
+    ///
+    /// | Was a member | Is a member | Reported as |
+    /// | --- | --- | --- |
+    /// | no | yes | an **enter** |
+    /// | yes | yes | nothing |
+    /// | yes | no | a **leave** |
+    /// | no | no | nothing |
     #[test]
-    fn a_seat_with_no_centre_keeps_its_own_set_relevant() {
+    fn the_diff_reports_each_of_the_four_transitions_once() {
+        let cfg = cfg(32.0, 100.0, 1.0, 0);
+        let seats = [seat_at([0.0; 3])];
+        let near = [0.0, 0.0, 0.0];
+        let far = [900.0, 0.0, 0.0];
+        let mut connection = ConnectionInterest::new();
+
+        // Tick 1: 1 and 2 near, 3 and 4 far. Two enters, no leaves — the union started empty.
+        let first = [
+            InterestCandidate::anchored(1, near),
+            InterestCandidate::anchored(2, near),
+            InterestCandidate::anchored(3, far),
+            InterestCandidate::anchored(4, far),
+        ];
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &first);
+        assert_eq!(delta.enters, vec![1, 2]);
+        assert!(delta.leaves.is_empty());
+
+        // Tick 2: 1 stays, 2 goes away, 3 arrives, 4 stays away.
+        let second = [
+            InterestCandidate::anchored(1, near),
+            InterestCandidate::anchored(2, far),
+            InterestCandidate::anchored(3, near),
+            InterestCandidate::anchored(4, far),
+        ];
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &second);
+        assert_eq!(delta.leaves, vec![2], "2 was a member and is not one now");
+        assert_eq!(delta.enters, vec![3], "3 is a member and was not one");
+        assert!(!delta.is_empty());
+
+        // Tick 3: nothing moved.
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &second);
+        assert!(
+            delta.is_empty(),
+            "a member that stayed and a stranger that stayed away are both silent"
+        );
+    }
+
+    /// Both halves come out in ascending id order, which is what lets the wire carry them as two
+    /// flat runs and what makes the two update paths comparable element for element.
+    #[test]
+    fn both_halves_of_the_diff_are_ascending_by_id() {
+        let cfg = cfg(32.0, 100.0, 1.0, 0);
+        let seats = [seat_at([0.0; 3])];
+        let near = [0.0, 0.0, 0.0];
+        let far = [900.0, 0.0, 0.0];
+        let mut connection = ConnectionInterest::new();
+
+        let ids = [9u64, 3, 7, 1, 5];
+        let first: Vec<InterestCandidate> = ids
+            .iter()
+            .map(|&id| InterestCandidate::anchored(id, near))
+            .collect();
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &first);
+        assert_eq!(delta.enters, vec![1, 3, 5, 7, 9]);
+
+        // The odd ids leave and a second, higher-numbered run enters on the same tick.
+        let mut second: Vec<InterestCandidate> = ids
+            .iter()
+            .map(|&id| InterestCandidate::anchored(id, far))
+            .collect();
+        for id in [20u64, 12, 16] {
+            second.push(InterestCandidate::anchored(id, near));
+        }
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &second);
+        assert_eq!(delta.leaves, vec![1, 3, 5, 7, 9]);
+        assert_eq!(delta.enters, vec![12, 16, 20]);
+    }
+
+    /// A veto is a leave and a retraction is not an enter: the entity re-enters through the filter
+    /// on the next update, and THAT update reports it. Pinned here because the backend's own
+    /// per-peer bookkeeping mirrors the rule.
+    #[test]
+    fn a_veto_leaves_the_union_and_a_retraction_enters_it_only_at_the_next_update() {
+        let cfg = cfg(32.0, 100.0, 1.25, 0);
+        let seats = [seat_at([0.0; 3])];
+        let candidates = [InterestCandidate::anchored(1, [0.0, 0.0, 0.0])];
+        let mut connection = ConnectionInterest::new();
+        assert_eq!(
+            update_connection_delta(&mut connection, &cfg, &seats, &candidates).enters,
+            vec![1]
+        );
+
+        // The veto drops it from the union in the call itself, so the NEXT update has nothing to
+        // report — it is diffing an already-shortened union.
+        connection.set_hidden(1, true);
+        assert!(!connection.contains(1));
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &candidates);
+        assert!(
+            delta.is_empty(),
+            "the veto already left; the update reports it again for nobody"
+        );
+
+        // Retracting re-admits through the enter radius, and the update that does it reports it.
+        connection.set_hidden(1, false);
+        let delta = update_connection_delta(&mut connection, &cfg, &seats, &candidates);
+        assert_eq!(delta.enters, vec![1]);
+        assert!(delta.leaves.is_empty());
+    }
+
+    #[test]
+    fn a_seat_with_no_center_keeps_its_own_set_relevant() {
         // The failure this replaces: culling switched on and off per CONNECTION, so a seat whose
-        // body had not spawned yet inherited the other seat's centre and had its surroundings
+        // body had not spawned yet inherited the other seat's center and had its surroundings
         // culled around a position it was nowhere near.
         let cfg = cfg(32.0, 10.0, 1.25, 0);
         let candidates = [
@@ -2979,7 +3640,7 @@ mod tests {
     fn a_connection_with_no_seats_holds_nothing() {
         // A connection whose seats have not been resolved yet is not a connection that sees
         // everything: the send path gives an unlocatable connection ONE seat with a non-finite
-        // centre, which is the fail-open. An empty slice is the different statement that there is
+        // center, which is the fail-open. An empty slice is the different statement that there is
         // no viewpoint at all, and it must not quietly become the first one.
         let cfg = cfg(32.0, 100.0, 1.25, 0);
         let candidates = [InterestCandidate::always(1)];
@@ -2987,5 +3648,711 @@ mod tests {
         update_connection(&mut connection, &cfg, &[], &candidates);
         assert!(connection.is_empty());
         assert_eq!(connection.seat_count(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Choosing a path: the occupancy measurement, the rule, and the walk that
+    // licenses running whichever answer it gives.
+    // ------------------------------------------------------------------
+
+    /// The scene both connection-level agreement walks run: one candidate list jittered over 120
+    /// steps, with everything that can differ between the two paths varied at once — several worlds
+    /// at overlapping coordinates, always-relevant channels, anchors that go non-finite, a seat
+    /// count that grows to three and falls to zero, a seat that cannot be located, per-connection
+    /// overrides, and a veto that comes and goes.
+    ///
+    /// A struct rather than a closure so the two tests walk the *same* sequence: one compares the
+    /// grid path against the linear one, the other compares whichever path the rule picked.
+    struct ConnectionWalk {
+        candidates: Vec<InterestCandidate>,
+        worlds: u64,
+        spread: f32,
+        state: u32,
+    }
+
+    /// What one step of a [`ConnectionWalk`] presents to the filter.
+    struct WalkTick {
+        /// The tick's candidate list — what a grid is rebuilt from, and what occupancy is measured
+        /// from.
+        candidates: Vec<InterestCandidate>,
+        /// The same list with each override substituted for the row it names. The linear path has no
+        /// separate override channel, so this is how it is told the same thing.
+        flat: Vec<InterestCandidate>,
+        /// The rows this connection drives.
+        also: Vec<InterestCandidate>,
+        /// Where each seat observes from, and in which world.
+        seats: Vec<SeatObserver>,
+        /// The entity vetoed on this step, if any.
+        vetoed: Option<BodyId>,
+    }
+
+    impl ConnectionWalk {
+        /// `bodies` entities dealt across `worlds` worlds, spread over ±`spread` meters. Body 1 is
+        /// always-relevant in every world, one body in eight is an always-relevant channel within
+        /// its own world, and the rest are anchored.
+        fn new(bodies: u64, worlds: u64, spread: f32) -> Self {
+            let mut state = 0x0bad_f00du32;
+            let candidates = (1..=bodies)
+                .map(|id| {
+                    let pos = [
+                        lcg_coord(&mut state) * spread / 200.0,
+                        lcg_coord(&mut state) * spread / 200.0,
+                        lcg_coord(&mut state) * spread / 200.0,
+                    ];
+                    if id == 1 {
+                        InterestCandidate::always(id)
+                    } else if id % 8 == 0 {
+                        InterestCandidate::always_in(id, id % worlds)
+                    } else {
+                        InterestCandidate::anchored_in(id, pos, id % worlds)
+                    }
+                })
+                .collect();
+            Self {
+                candidates,
+                worlds,
+                spread,
+                state,
+            }
+        }
+
+        /// Rescale every anchor so the widest XZ coordinate sits at ±`spread` — how the occupancy is
+        /// driven back and forth across the selector's band without changing anything else about the
+        /// scene.
+        ///
+        /// Normalizing rather than multiplying by the ratio between two blocks is what makes the
+        /// extent of a step exactly what the test asked for, instead of that plus however far the
+        /// previous block's jitter wandered.
+        fn rescale(&mut self, spread: f32) {
+            let mut widest = 0.0f32;
+            for candidate in &self.candidates {
+                widest = widest
+                    .max(candidate.pos[0].abs())
+                    .max(candidate.pos[2].abs());
+            }
+            if widest <= 0.0 {
+                return;
+            }
+            let ratio = spread / widest;
+            for candidate in &mut self.candidates {
+                for axis in &mut candidate.pos {
+                    *axis *= ratio;
+                }
+            }
+            self.spread = spread;
+        }
+
+        /// Advance one step, and describe what that tick presents.
+        fn tick(&mut self, step: u32) -> WalkTick {
+            let mut state = self.state;
+            let jitter = self.spread * 0.05 / 200.0;
+            for candidate in &mut self.candidates {
+                candidate.pos[0] += lcg_coord(&mut state) * jitter;
+                candidate.pos[2] += lcg_coord(&mut state) * jitter;
+            }
+            // One anchor in eight steps goes non-finite: the fail-open the two paths reach by
+            // opposite routes — the linear one classifies it, the grid holds it out of the cells
+            // entirely. Injected into the tick's copy, so the walk's own positions stay finite.
+            let mut candidates = self.candidates.clone();
+            if step % 8 == 3 {
+                let sick = (step as usize * 7) % candidates.len();
+                candidates[sick].pos[1] = f32::NAN;
+            }
+            // Seats resized 1 -> 3 -> 2 -> 0 -> 2 across the walk. The index carries a seat's
+            // hysteresis, so a shorter slice truncates the tail and a longer one appends.
+            let seat_count: u64 = match step / 24 {
+                0 => 1,
+                1 => 3,
+                2 => 2,
+                3 => 0,
+                _ => 2,
+            };
+            // One step in seven, exactly one seat cannot be located at all.
+            let blind = if step % 7 == 2 && seat_count > 0 {
+                Some(u64::from(step / 7) % seat_count)
+            } else {
+                None
+            };
+            let mut seats = Vec::new();
+            for index in 0..seat_count {
+                let center = if blind == Some(index) {
+                    [f32::INFINITY, 0.0, 0.0]
+                } else {
+                    [
+                        lcg_coord(&mut state) * self.spread / 400.0,
+                        0.0,
+                        lcg_coord(&mut state) * self.spread / 400.0,
+                    ]
+                };
+                seats.push(SeatObserver {
+                    center,
+                    membership: (u64::from(step) + index) % (self.worlds + 1),
+                });
+            }
+            self.state = state;
+            // Two overrides on one step in three: one shadows the anchored row 4, one shadows row 5
+            // and moves it to another world's origin.
+            let also: Vec<InterestCandidate> = if step.is_multiple_of(3) {
+                vec![
+                    InterestCandidate::always(4),
+                    InterestCandidate::anchored_in(5, [0.0; 3], 2),
+                ]
+            } else {
+                Vec::new()
+            };
+            let flat = candidates
+                .iter()
+                .map(|c| *also.iter().find(|o| o.id == c.id).unwrap_or(c))
+                .collect();
+            // At most one veto at a time, walked along the low ids so it covers an override (4, 5),
+            // the global always-row (1) and ordinary anchored bodies, and retracted on the steps the
+            // parity says, so both refusal and re-admission run.
+            let vetoed = (step % 10 < 5).then(|| u64::from(step % 11) + 1);
+            WalkTick {
+                candidates,
+                flat,
+                also,
+                seats,
+                vetoed,
+            }
+        }
+    }
+
+    /// A selector already standing on `path`, so a row that answers "hold" can be told apart from a
+    /// row that answers one path outright.
+    fn selector_on(path: InterestPath, cfg: &AoiConfig) -> PathSelector {
+        let mut selector = PathSelector::new();
+        let anchored = match path {
+            InterestPath::Linear => 0,
+            InterestPath::Grid => usize::MAX,
+        };
+        selector.select(
+            cfg,
+            InterestOccupancy {
+                half_extent: f32::MAX,
+                anchored,
+            },
+            0,
+        );
+        assert_eq!(selector.path(), path);
+        selector
+    }
+
+    #[test]
+    fn connection_grid_agrees_with_connection_linear_over_a_pseudo_random_walk() {
+        // THE SUITE THAT LICENSES ADOPTION. The per-seat walk above proves one viewpoint agrees;
+        // what the send path reads is the UNION, and the union has rules of its own — the nearest
+        // seat's distance, a leave only when every seat lets go, a veto inherited by a seat that
+        // appears mid-walk. Members and leaves are both compared every step, because a session that
+        // switched path mid-flight and reported a leave that did not happen would cost a full-state
+        // burst for every entity on that peer.
+        let cfg = cfg(64.0, 100.0, 1.25, 12);
+        let mut walk = ConnectionWalk::new(64, 3, 60.0);
+        let mut grid = InterestGrid::new();
+        let mut via_grid = ConnectionInterest::new();
+        let mut via_linear = ConnectionInterest::new();
+        let mut scratch = SeatScratch::default();
+        let (mut grid_delta, mut linear_delta) =
+            (InterestDelta::default(), InterestDelta::default());
+        let (mut veto_bites, mut admitted, mut seatless) = (0u32, 0u32, 0u32);
+
+        for step in 0..120u32 {
+            let tick = walk.tick(step);
+            for connection in [&mut via_grid, &mut via_linear] {
+                for id in 1..=11u64 {
+                    connection.set_hidden(id, tick.vetoed == Some(id));
+                }
+            }
+
+            grid.rebuild(&cfg, &tick.candidates);
+            via_grid.update_grid_into(
+                &grid,
+                &cfg,
+                &tick.seats,
+                &tick.also,
+                &mut scratch,
+                &mut grid_delta,
+            );
+            via_linear.update_linear_into(
+                &cfg,
+                &tick.seats,
+                &tick.flat,
+                &mut scratch,
+                &mut linear_delta,
+            );
+
+            assert_eq!(
+                via_grid.iter_with_distance().collect::<Vec<_>>(),
+                via_linear.iter_with_distance().collect::<Vec<_>>(),
+                "the two connection paths diverged on members at step {step}"
+            );
+            assert_eq!(
+                grid_delta.leaves, linear_delta.leaves,
+                "the two connection paths diverged on leaves at step {step}"
+            );
+            // THE ENTER SETS TOO. A spurious enter is a relevancy event a game acts on — a node
+            // unhidden, a body teleported to a pose it never left — so a path flip that invented
+            // one would be visible in the scene rather than only on the wire.
+            assert_eq!(
+                grid_delta.enters, linear_delta.enters,
+                "the two connection paths diverged on enters at step {step}"
+            );
+            // The diff is against the SAME union both paths just computed, so an id can never be
+            // reported as having done both.
+            for entered in &grid_delta.enters {
+                assert!(
+                    !grid_delta.leaves.contains(entered),
+                    "entity {entered} both left and entered at step {step}"
+                );
+            }
+            assert_eq!(via_grid.seat_count(), tick.seats.len());
+
+            // Entity 1 is `always` in MEMBERSHIP_GLOBAL: admitted by every seat at every distance,
+            // and never shadowed by an override. Both halves are asserted, so the walk proves the
+            // veto did something rather than that entity 1 was absent anyway.
+            if tick.seats.is_empty() {
+                assert!(via_grid.is_empty() && via_linear.is_empty());
+                seatless += 1;
+            } else if tick.vetoed == Some(1) {
+                assert!(
+                    !via_grid.contains(1) && !via_linear.contains(1),
+                    "an always-relevant entity survived its veto at step {step}"
+                );
+                veto_bites += 1;
+            } else {
+                assert!(
+                    via_grid.contains(1) && via_linear.contains(1),
+                    "an always-relevant entity went missing at step {step}"
+                );
+                admitted += 1;
+            }
+        }
+        // The walk has to exercise the rules it varies, or it proves the two paths agree about
+        // nothing.
+        assert!(
+            veto_bites > 0 && admitted > 0,
+            "the veto was never exercised against an entity the filter would otherwise admit"
+        );
+        assert!(seatless > 0, "the walk never dropped to zero seats");
+        assert_eq!(via_grid.seat_count(), 2);
+        assert!(!via_grid.is_empty());
+    }
+
+    #[test]
+    fn the_selected_path_agrees_with_the_linear_reference() {
+        // The walk above proves the two paths agree. This proves the path the RULE picks agrees,
+        // which is the one that would actually run: the occupancy is driven below the band, above
+        // it, back into it and below it again, on a scene that is otherwise the same walk.
+        //
+        // `cell_size` is half the enter radius here rather than a quarter of it, so the query
+        // rectangle is 6 cells a side and the band is reachable with a scene small enough to walk
+        // 120 times under `cargo test`. The rule applied is the one the shipped numbers go through.
+        let cfg = cfg(50.0, 100.0, 1.25, 12);
+        let span = PathSelector::span_cells(&cfg);
+        assert_eq!(span, 36);
+        let mut walk = ConnectionWalk::new(400, 2, 30.0);
+        let mut grid = InterestGrid::new();
+        let mut selected = ConnectionInterest::new();
+        let mut reference = ConnectionInterest::new();
+        let mut scratch = SeatScratch::default();
+        let mut occupancy_scratch = OccupancyScratch::default();
+        let mut selector = PathSelector::new();
+        let (mut selected_delta, mut reference_delta) =
+            (InterestDelta::default(), InterestDelta::default());
+        let (mut ran_linear, mut ran_grid) = (0u32, 0u32);
+        let (mut below, mut above, mut held) = (0u32, 0u32, 0u32);
+
+        for step in 0..120u32 {
+            // ±30 m is below the band, ±2000 m is above it, ±230 m is inside it.
+            let spread = match step / 30 {
+                0 => 30.0,
+                1 => 2_000.0,
+                2 => 230.0,
+                _ => 30.0,
+            };
+            walk.rescale(spread);
+            let tick = walk.tick(step);
+            for connection in [&mut selected, &mut reference] {
+                for id in 1..=11u64 {
+                    connection.set_hidden(id, tick.vetoed == Some(id));
+                }
+            }
+
+            let occupancy = InterestOccupancy::measure(&tick.candidates, &mut occupancy_scratch);
+            let occupied = occupancy.occupied_cells(&cfg);
+            let path = selector.select(&cfg, occupancy, tick.also.len());
+            match path {
+                InterestPath::Grid => {
+                    grid.rebuild(&cfg, &tick.candidates);
+                    selected.update_grid_into(
+                        &grid,
+                        &cfg,
+                        &tick.seats,
+                        &tick.also,
+                        &mut scratch,
+                        &mut selected_delta,
+                    );
+                    ran_grid += 1;
+                }
+                InterestPath::Linear => {
+                    selected.update_linear_into(
+                        &cfg,
+                        &tick.seats,
+                        &tick.flat,
+                        &mut scratch,
+                        &mut selected_delta,
+                    );
+                    ran_linear += 1;
+                }
+            }
+            reference.update_linear_into(
+                &cfg,
+                &tick.seats,
+                &tick.flat,
+                &mut scratch,
+                &mut reference_delta,
+            );
+
+            assert_eq!(
+                selected.iter_with_distance().collect::<Vec<_>>(),
+                reference.iter_with_distance().collect::<Vec<_>>(),
+                "the {path:?} path diverged on members at step {step}"
+            );
+            assert_eq!(
+                selected_delta.leaves, reference_delta.leaves,
+                "the {path:?} path diverged on leaves at step {step}"
+            );
+            assert_eq!(
+                selected_delta.enters, reference_delta.enters,
+                "the {path:?} path diverged on enters at step {step}"
+            );
+
+            // The rule restated against the running selector, so the walk pins which path ran and
+            // not only that whichever ran agreed.
+            if occupied < GRID_LEAVE_SPANS * span {
+                assert_eq!(path, InterestPath::Linear, "below the band at step {step}");
+                below += 1;
+            } else if occupied >= GRID_ENTER_SPANS * span {
+                assert_eq!(path, InterestPath::Grid, "above the band at step {step}");
+                above += 1;
+            } else {
+                // Inside the band the answer is the standing path and nothing else — which here is
+                // the grid the previous block entered, on an occupancy that would never have
+                // entered it from a standing start.
+                assert_eq!(path, InterestPath::Grid, "the band let go at step {step}");
+                held += 1;
+            }
+        }
+        assert!(
+            ran_linear > 0 && ran_grid > 0,
+            "the walk never ran one of the two paths"
+        );
+        assert!(
+            below > 0 && above > 0 && held > 0,
+            "the walk missed one of the three answers: {below} below, {above} above, {held} held"
+        );
+    }
+
+    #[test]
+    fn the_selector_reproduces_the_measured_tables() {
+        // The threshold is not a taste: it is the constant that reproduces both measured tables in
+        // the module header. Every row of both is replayed here with the occupancy that scene
+        // actually produces, and the rule must answer what the timings say — Linear where the grid
+        // loses, Grid where it wins, and a hold on the one row where the two cost the same.
+        //
+        // Parameters are the ones both sweeps ran at: radius 256 m, `cell_size = enter_radius / 4`,
+        // `exit_factor` 1.25. The query is issued at the exit radius, so the rectangle is 640 m on a
+        // side, 11 cells either way, 121 cells in it.
+        let cfg = cfg(64.0, 256.0, 1.25, 0);
+        assert_eq!(PathSelector::span_cells(&cfg), 121);
+        assert_eq!(GRID_ENTER_SPANS * 121, 484);
+        assert_eq!(GRID_LEAVE_SPANS * 121, 242);
+
+        // (arena extent, occupied cells, the answer — `None` is a hold, asserted from both paths).
+        // 800 entities with one unowned row in eight positionless, so 708 are binnable in the one
+        // world; the trailing comment is that row's `grid vs shipped` from the header.
+        const EXTENTS: &[(f32, u64, Option<InterestPath>)] = &[
+            (300.0, 100, Some(InterestPath::Linear)), // 0.80x - the grid loses this row
+            (600.0, 361, None),                       // 1.05x - break-even, so it is held
+            (1_200.0, 708, Some(InterestPath::Grid)), // 1.74x
+            (2_500.0, 708, Some(InterestPath::Grid)), // 1.85x
+            (5_000.0, 708, Some(InterestPath::Grid)), // 1.94x
+            (25_000.0, 708, Some(InterestPath::Grid)), // 1.95x
+        ];
+        for &(extent, cells, expected) in EXTENTS {
+            let occupancy = InterestOccupancy {
+                half_extent: extent,
+                anchored: 708,
+            };
+            assert_eq!(
+                occupancy.occupied_cells(&cfg),
+                cells,
+                "occupancy at +/-{extent} m"
+            );
+            for start in [InterestPath::Linear, InterestPath::Grid] {
+                let mut selector = selector_on(start, &cfg);
+                assert_eq!(
+                    selector.select(&cfg, occupancy, 1),
+                    expected.unwrap_or(start),
+                    "+/-{extent} m starting from {start:?}"
+                );
+            }
+        }
+
+        // (worlds, the widest world's binnable bodies, occupied cells). 1200 entities dealt
+        // round-robin, every world a ±300 m arena rebased on its own origin, so the geometry gives
+        // 100 cells and the body count caps it below that from 16 worlds up. The grid loses all six
+        // rows — 0.97x, 0.72x, 0.63x, 0.56x, 0.57x, 0.60x — and the rule answers Linear on all six.
+        const WORLDS: &[(u32, usize, u64)] = &[
+            (1, 1058, 100),
+            (2, 600, 100),
+            (4, 300, 100),
+            (8, 150, 100),
+            (16, 75, 75),
+            (32, 38, 38),
+        ];
+        for &(worlds, bodies, cells) in WORLDS {
+            let occupancy = InterestOccupancy {
+                half_extent: 300.0,
+                anchored: bodies,
+            };
+            assert_eq!(
+                occupancy.occupied_cells(&cfg),
+                cells,
+                "occupancy at {worlds} worlds"
+            );
+            for start in [InterestPath::Linear, InterestPath::Grid] {
+                let mut selector = selector_on(start, &cfg);
+                assert_eq!(
+                    selector.select(&cfg, occupancy, 1),
+                    InterestPath::Linear,
+                    "{worlds} worlds starting from {start:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_selector_does_not_flap_inside_the_band() {
+        // A session parked on the threshold must not rebuild a grid every other tick. Inside the
+        // band the answer is whichever path is already running, however many times it is asked.
+        let cfg = cfg(64.0, 256.0, 1.25, 0);
+        let span = PathSelector::span_cells(&cfg);
+        // A half-extent far past what the bodies can fill, so `anchored` sets the occupancy exactly.
+        let band = InterestOccupancy {
+            half_extent: 10_000.0,
+            anchored: 361,
+        };
+        assert_eq!(band.occupied_cells(&cfg), 361);
+        assert!(band.occupied_cells(&cfg) >= GRID_LEAVE_SPANS * span);
+        assert!(band.occupied_cells(&cfg) < GRID_ENTER_SPANS * span);
+
+        for start in [InterestPath::Linear, InterestPath::Grid] {
+            let mut selector = selector_on(start, &cfg);
+            for tick in 0..32u32 {
+                assert_eq!(
+                    selector.select(&cfg, band, 0),
+                    start,
+                    "the band moved the path on tick {tick}"
+                );
+            }
+        }
+
+        // The negative control: one cell below the leave threshold and the grid path does end, so
+        // what the loop above pins is a hold rather than a selector that never moves at all.
+        let below = InterestOccupancy {
+            half_extent: 10_000.0,
+            anchored: (GRID_LEAVE_SPANS * span - 1) as usize,
+        };
+        let mut selector = selector_on(InterestPath::Grid, &cfg);
+        assert_eq!(selector.select(&cfg, below, 0), InterestPath::Linear);
+    }
+
+    #[test]
+    fn a_zero_radius_never_selects_the_grid() {
+        // A membership-only session — state channels with no position to be culled by — has no
+        // distance for an index to accelerate, so the grid would buy a rebuild and nothing else.
+        // `NaN` lands here too: a radius that arrived off a cvar or the wire and is not a number is
+        // not a radius worth indexing for.
+        let dense = InterestOccupancy {
+            half_extent: 25_000.0,
+            anchored: 100_000,
+        };
+        let shipped = cfg(64.0, 256.0, 1.25, 0);
+        // The same occupancy on a usable radius is unambiguously Grid, which is what makes the
+        // refusals below about the radius and nothing else.
+        let mut control = PathSelector::new();
+        assert_eq!(control.select(&shipped, dense, 0), InterestPath::Grid);
+
+        for radius in [0.0f32, -256.0, f32::NAN] {
+            let degenerate = cfg(64.0, radius, 1.25, 0);
+            let mut selector = selector_on(InterestPath::Grid, &shipped);
+            assert_eq!(
+                selector.select(&degenerate, dense, 0),
+                InterestPath::Linear,
+                "a radius of {radius} selected the grid"
+            );
+            assert_eq!(selector.path(), InterestPath::Linear);
+        }
+    }
+
+    #[test]
+    fn many_overrides_keep_the_linear_path() {
+        // `also` is scanned once per grid hit, so its cost is `overrides x hits` on the path whose
+        // whole purpose is to cut the hits. Past a handful the flat pass, which folds the same rows
+        // in for free, is cheaper whatever the occupancy says.
+        let cfg = cfg(64.0, 256.0, 1.25, 0);
+        let dense = InterestOccupancy {
+            half_extent: 25_000.0,
+            anchored: 100_000,
+        };
+        let mut selector = PathSelector::new();
+        assert_eq!(
+            selector.select(&cfg, dense, GRID_MAX_OVERRIDES),
+            InterestPath::Grid,
+            "at the limit the index still wins"
+        );
+        // One past it, and the refusal has no hysteresis — it is a count, not a measurement that can
+        // hover — so it ends a grid path on the spot rather than holding inside a band.
+        assert_eq!(
+            selector.select(&cfg, dense, GRID_MAX_OVERRIDES + 1),
+            InterestPath::Linear
+        );
+        let mut fresh = PathSelector::new();
+        assert_eq!(
+            fresh.select(&cfg, dense, GRID_MAX_OVERRIDES + 1),
+            InterestPath::Linear
+        );
+    }
+
+    #[test]
+    fn switching_path_mid_session_emits_no_leaves() {
+        // The rule may change its answer mid-session, so a flip has to be invisible on the wire. A
+        // leave is what clears the caller's per-entity delta bookkeeping, and a spurious one costs a
+        // full-state burst for every entity on that peer.
+        let cfg = cfg(32.0, 100.0, 1.25, 4);
+        let seats = [seat_at([0.0; 3]), seat_in([300.0, 0.0, 0.0], 1)];
+        let mut connection = ConnectionInterest::new();
+        let mut scratch = SeatScratch::default();
+        let mut delta = InterestDelta::default();
+        let mut grid = InterestGrid::new();
+
+        // Body 1 enters at 90 m and then drifts to 110 m — inside the hysteresis band, where it is a
+        // member only because it already was one. That is the state a flip has to carry across.
+        let entering = [
+            InterestCandidate::anchored(1, [90.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [10.0, 0.0, 0.0]),
+            InterestCandidate::anchored(3, [20.0, 0.0, 0.0]),
+            InterestCandidate::anchored(4, [30.0, 0.0, 0.0]),
+            InterestCandidate::always_in(5, 1),
+            InterestCandidate::anchored_in(6, [310.0, 0.0, 0.0], 1),
+        ];
+        connection.update_linear_into(&cfg, &seats, &entering, &mut scratch, &mut delta);
+        assert!(connection.contains(1), "90 m is inside the enter radius");
+        assert_eq!(
+            delta.enters,
+            vec![1, 2, 3, 4, 5, 6],
+            "a connection's first update enters everything it holds — which is what seeds a \
+             joining peer's mirrored set"
+        );
+
+        let mut settled = entering;
+        settled[0].pos[0] = 110.0;
+        connection.update_linear_into(&cfg, &seats, &settled, &mut scratch, &mut delta);
+        assert!(delta.is_empty(), "a settled tick reports neither half");
+        let members: Vec<(BodyId, f32)> = connection.iter_with_distance().collect();
+        assert!(
+            connection.contains(1),
+            "the band retains a current member at 110 m"
+        );
+        assert_eq!(members.len(), 6, "both seats contributed to the union");
+
+        // The flip: the same scene, the same seats, the other path.
+        grid.rebuild(&cfg, &settled);
+        connection.update_grid_into(&grid, &cfg, &seats, &[], &mut scratch, &mut delta);
+        assert!(
+            delta.leaves.is_empty(),
+            "switching to the grid reported a leave"
+        );
+        assert!(delta.enters.is_empty(), "and it reported no enter either");
+        assert_eq!(connection.iter_with_distance().collect::<Vec<_>>(), members);
+
+        // And back.
+        connection.update_linear_into(&cfg, &seats, &settled, &mut scratch, &mut delta);
+        assert!(
+            delta.is_empty(),
+            "switching back to the flat pass reported a transition"
+        );
+        assert_eq!(connection.iter_with_distance().collect::<Vec<_>>(), members);
+    }
+
+    #[test]
+    fn occupancy_measures_the_widest_world_not_the_session() {
+        // The grid's own guard is per world, so the measurement has to be. Two worlds rebased a
+        // hundred kilometers apart are two small worlds; measuring the session's bounds would read
+        // them as one enormous one and index a grid that saves nothing.
+        let mut scratch = OccupancyScratch::default();
+        let candidates = [
+            InterestCandidate::anchored_in(1, [-10.0, 0.0, 0.0], 1),
+            InterestCandidate::anchored_in(2, [10.0, 0.0, 5.0], 1),
+            InterestCandidate::anchored_in(3, [99_950.0, 0.0, 100_000.0], 2),
+            InterestCandidate::anchored_in(4, [100_050.0, 0.0, 100_000.0], 2),
+            InterestCandidate::anchored_in(5, [100_000.0, 0.0, 100_020.0], 2),
+        ];
+        let occupancy = InterestOccupancy::measure(&candidates, &mut scratch);
+        assert_eq!(
+            occupancy.half_extent, 50.0,
+            "the widest world is the 100 m one, not the 20 m one"
+        );
+        assert_eq!(
+            occupancy.anchored, 3,
+            "and it is that world's bodies that cap its cells"
+        );
+
+        // The negative control: the session's own bounds are about 100 km across, three orders of
+        // magnitude wider than either world is.
+        let session_half = (100_050.0f32 + 10.0) * 0.5;
+        assert!(session_half > 50_000.0);
+        assert!(occupancy.half_extent < session_half / 1_000.0);
+    }
+
+    #[test]
+    fn occupancy_ignores_non_finite_positions() {
+        // A `NaN` folded into a running minimum makes every bound `NaN` and the whole measurement
+        // with it. `InterestGrid::rebuild` does not bin those rows either — nor the always-relevant
+        // ones, which carry no position at all — so they are not part of the occupancy a query
+        // would walk.
+        let mut scratch = OccupancyScratch::default();
+        let candidates = [
+            InterestCandidate::anchored(1, [-10.0, 0.0, 0.0]),
+            InterestCandidate::anchored(2, [10.0, 0.0, 0.0]),
+            InterestCandidate::anchored(3, [0.0, 0.0, 4.0]),
+            InterestCandidate::anchored(4, [f32::NAN, 0.0, 0.0]),
+            InterestCandidate::anchored(5, [0.0, f32::INFINITY, 0.0]),
+            InterestCandidate::anchored(6, [0.0, 0.0, f32::NEG_INFINITY]),
+            InterestCandidate::always(7),
+        ];
+        let occupancy = InterestOccupancy::measure(&candidates, &mut scratch);
+        assert!(
+            occupancy.half_extent.is_finite(),
+            "one unbinnable anchor poisoned the bounds"
+        );
+        assert_eq!(occupancy.half_extent, 10.0);
+        assert_eq!(occupancy.anchored, 3, "only the binnable rows are counted");
+
+        // A session of nothing but unbinnable rows measures nothing, and nothing keeps the flat
+        // pass — the fail-safe direction, since those rows reach every peer at any distance anyway.
+        let cfg = cfg(64.0, 256.0, 1.25, 0);
+        let none = InterestOccupancy::measure(&candidates[3..], &mut scratch);
+        assert_eq!(
+            none,
+            InterestOccupancy {
+                half_extent: 0.0,
+                anchored: 0
+            }
+        );
+        assert_eq!(none.occupied_cells(&cfg), 0);
+        let mut selector = selector_on(InterestPath::Grid, &cfg);
+        assert_eq!(selector.select(&cfg, none, 0), InterestPath::Linear);
     }
 }

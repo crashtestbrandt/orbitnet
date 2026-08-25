@@ -26,9 +26,10 @@ class_name UnitBody
 ##   net_meta        8 B   an i64 bitfield: alive | current target id | order sequence.
 ##
 ## FACING GOES AS A DIRECTION PAIR, NOT AN ANGLE, and this is the single most transferable trick in the demo.
-## A yaw scalar seems obvious and is wrong twice over: a GDScript `float` is an f64, so `"facing@half"` would
-## silently fall back to lossless and save nothing (@half is valid only for Vector3/Vector2/f32 -- an invalid
-## pairing degrades quietly rather than erroring); and interpolating an angle across the +/-pi wrap makes a
+## A yaw scalar seems obvious and is wrong twice over: a GDScript `float` is an f64, so `"facing@half"` falls
+## back to lossless and saves nothing (@half applies to Vector3 and Vector2 only -- an invalid pairing warns,
+## errors in a checked build, and is listed by `quantizer_fallbacks()`); and interpolating an angle across the
+## +/-pi wrap makes a
 ## unit spin the long way round through a full rotation whenever it faces roughly south. Sending (sin, cos)
 ## costs 4 bytes as halves, interpolates correctly through the wrap because it is a point on a circle, and
 ## rides along in a Vector3 that had a spare component anyway.
@@ -46,6 +47,12 @@ var arch: RtsConfig.Archetype = null
 var net_aux: Vector3 = Vector3(0.0, 1.0, 1.0)
 ## Bitfield: see pack_meta(). Carries liveness, the current target, and the order sequence.
 var net_meta: int = 0
+
+## The bulk-marshal hooks, named once. `bulk_capture_order()` is derived from the registration order in
+## `bind_net()`, so reordering those calls silently reorders what these must write -- and a hook writing the
+## right values into the wrong slots replicates wrong rather than erroring.
+const MARSHAL_OUT: String = "_net_marshal_out"
+const MARSHAL_IN: String = "_net_marshal_in"
 
 # --- server-only simulation state (NEVER replicated) ---------------------------------------------
 var _sim: UnitSteering.State = null
@@ -126,6 +133,16 @@ func bind_net() -> void:
 	# relevancy; it is not a wire entry, so it takes no quantization suffix and costs no bytes. That it happens
 	# to also be replicated here is a coincidence of this unit having a position worth sending.
 	_state_handle.set_anchor("position")
+	# ONE CROSSING PER ROW, IN BOTH DIRECTIONS. A receiving client lands every unit row with one `Object.set`
+	# per property, and this demo's own arithmetic says a peer receives up to 48 rows a tick -- 144 crossings
+	# for three properties, every tick, on the peer that has the least to spare. There is no replay multiplier
+	# on this lane and that is the point: the multiplier here is the ENTITY COUNT, which is what a state lane
+	# is for. The capture hook is the server's half of the same saving.
+	#
+	# THE APPLY ORDER IS THE CAPTURE ORDER. It matches the three `add_state` calls above, in that order, and
+	# `bulk_marshal_test.gd` asserts the correspondence rather than trusting this comment.
+	_state_handle.set_bulk_capture(MARSHAL_OUT)
+	_state_handle.set_bulk_apply(MARSHAL_IN)
 	_state_handle.process_settings()
 
 	# Interpolation is for peers that RECEIVE this unit. The server writes position every tick from its own
@@ -251,6 +268,42 @@ func note_liveness_for_interp() -> void:
 		_was_alive = now_alive
 		if now_alive and _interp != null and _interp.is_active():
 			_interp.teleport()
+
+# --- bulk marshalling ----------------------------------------------------------------------------
+## Capture this unit's whole row in ONE script-boundary crossing instead of one per property.
+##
+## FILL EVERY SLOT. The array is preallocated and reused, so a slot left alone silently keeps last tick's
+## value; there is no unset sentinel. Do not resize it -- a wrong-length array drops the channel back to the
+## per-property walk and says so once.
+##
+## `lane` is always [constant NetStateHandle.LANE_STATE] here: a state channel has one lane. The order is the
+## order `bind_net()` registered the entries in, which `bulk_capture_order()` publishes and the unit suite
+## asserts.
+func _net_marshal_out(_lane: int, values: Array) -> void:
+	values[0] = position
+	values[1] = net_aux
+	values[2] = net_meta
+
+## Land a received row in ONE crossing. The counterpart of `_net_marshal_out`, and it reads the SAME slots --
+## the apply order is the capture order, not the restore order, and this channel declares no cosmetics so the
+## two coincide here anyway.
+##
+## THIS IS THE HALF A RECEIVING PEER PAYS. The server captures 96 of these a tick; a client lands up to 48 of
+## them, and that walk is most of what a peer with nothing to simulate spends its per-tick crossings on.
+func _net_marshal_in(_lane: int, values: Array) -> void:
+	# Assigned through typed locals: the array's elements are Variants, and this project bans as-casting one.
+	var next_position: Vector3 = values[0]
+	var next_aux: Vector3 = values[1]
+	var next_meta: int = values[2]
+	position = next_position
+	net_aux = next_aux
+	net_meta = next_meta
+
+## Whether this unit's channel is actually marshalling in bulk, asked of the backend rather than of the call
+## site. A hook is resolved by NAME on the channel's root, and a name that does not resolve leaves the channel
+## on the walk while the call site reports nothing.
+func uses_bulk_marshalling() -> bool:
+	return _state_handle != null and _state_handle.uses_bulk_capture()
 
 ## Turn interpolation on/off (the HUD's F6 lever). No-op on the server, which has no interpolator.
 func set_interpolation(on: bool) -> void:

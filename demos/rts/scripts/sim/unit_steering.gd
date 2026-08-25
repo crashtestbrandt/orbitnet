@@ -96,7 +96,7 @@ static func step(state: State, goal: Vector3, obstacles: Array[AABB], arch: RtsC
 	return out
 
 ## Push `position` out of any obstacle it overlaps, along the shallowest axis. `radius` inflates each box so a
-## unit's body clears it rather than its centre point.
+## unit's body clears it rather than its center point.
 ##
 ## Shallowest-axis resolution is what makes a unit SLIDE along a wall instead of sticking to it: the component
 ## of motion into the wall is removed and the component along it survives. Boxes are resolved in list order;

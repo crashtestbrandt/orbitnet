@@ -1,6 +1,6 @@
 //! OrbitNet — the Godot 4 binding layer.
 //!
-//! This crate is deliberately thin relative to `orbitnet-core`: every algorithm with behaviour
+//! This crate is deliberately thin relative to `orbitnet-core`: every algorithm with behavior
 //! worth testing (tick pacing, clock discipline, resim planning, history storage, the wire
 //! codec, freshness, interest management) lives in the core crate with no Godot dependency and
 //! runs under plain `cargo test`. What lives here is the marshalling and orchestration shell:

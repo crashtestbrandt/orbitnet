@@ -44,6 +44,15 @@ func entity_id() -> int:
 func last_known_state() -> int:
 	return -1 if _handle == null else _handle.last_known_state()
 
+## The tick of the newest row this peer DECODED for this scorecard, or -1 if none ever arrived. The receipt,
+## which is what "is this peer still being sent it" asks. See FighterBody.last_received_state().
+func last_received_state() -> int:
+	return -1 if _handle == null else _handle.last_received_state()
+
+## Whether this peer is still being sent this scorecard's rows. Fails open -- see FighterBody.is_receiving().
+func is_receiving(within_ticks: int = InterestMeter.STALE_TICKS) -> bool:
+	return _handle == null or _handle.is_receiving(within_ticks)
+
 # --- scoring -------------------------------------------------------------------------------------------
 ## SERVER-SIDE. Credit `team` with a kill by `seat`.
 func credit(team: int, seat: int) -> void:

@@ -55,7 +55,7 @@ jobs:
       #
       # `cargo` is what the build invokes, and the rustup cargo shim points rustc at the toolchain itself,
       # so cargo resolving is the condition that matters. native/rust-toolchain.toml pins the version;
-      # rustup honours it from inside that directory with no help from CI.
+      # rustup honors it from inside that directory with no help from CI.
       - name: Check the Rust toolchain on this runner
         shell: bash
         run: |
@@ -227,7 +227,7 @@ jobs:
           if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
             version="${INPUT_VERSION#v}"
           fi
-          # The licences ride INSIDE the payload: an addon installed from a zip carries no repository
+          # The licenses ride INSIDE the payload: an addon installed from a zip carries no repository
           # with it, and a user who cannot find the terms will assume the worst.
           cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
           tools/make-assetlib-zip.py "$version"

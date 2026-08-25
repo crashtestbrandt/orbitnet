@@ -31,6 +31,32 @@
 //!   needs a key exchange and therefore a real asymmetric primitive, which is a dependency and a
 //!   larger change. It is recorded as a limit in `README.md` rather than hidden here.
 //!
+//! ## Deriving the key from a secret both ends already hold
+//!
+//! A game that already shares a secret with the peer — a lobby token, a matchmaker ticket, anything it
+//! authenticated before the join — does not have to mint the key on the client and send it. It can
+//! derive the key instead, with [`compress_secret`], [`derive_session_key`] and [`confirm_tag`]. The
+//! 16 bytes in the handshake stop being the key and become a **nonce**.
+//!
+//! | | Key minted by the client | Key derived from a shared secret |
+//! | --- | --- | --- |
+//! | What the handshake carries | the key itself | a nonce |
+//! | What an on-path observer learns | everything the client knows | the nonce, and nothing else |
+//! | What the scheme needs | nothing | a secret the game distributes out of band |
+//! | Who can join | anyone the transport accepts | anyone holding the secret |
+//!
+//! The secret is an **input** to the derivation and is never seated as the key itself;
+//! [`derive_session_key`] carries the reason, because seating it is the obvious wrong implementation.
+//!
+//! Three ceilings:
+//!
+//! - **It adds no strength beyond the secret's own entropy.** A secret a lobby prints on screen, or one
+//!   short enough to guess, derives a key worth exactly that much.
+//! - **The tag is still 64 bits and the key still 128.** Deriving the key changes who can forge a
+//!   datagram. It does not change how hard forging one is for somebody who cannot read the secret.
+//! - **None of this encrypts anything.** Every payload is still on the wire in the clear. A MAC says a
+//!   datagram was not written by someone outside the session, and says nothing else.
+//!
 //! ## The direction byte
 //!
 //! The two directions of a session share one key, so without domain separation an attacker could
@@ -201,6 +227,124 @@ impl SipHasher {
 pub fn siphash24(key: &[u8; KEY_LEN], msg: &[u8]) -> u64 {
     let mut hasher = SipHasher::new(key);
     hasher.write(msg);
+    hasher.finish()
+}
+
+// The domain labels below are part of the wire contract even though they never appear on the wire.
+// Every shipped client bakes them into the key it derives, so changing one changes every derived key,
+// every datagram fails its tag against a peer on the old label, and nothing in the failure says why.
+// They are public constants so that a refactor has to edit a documented item to change the derivation,
+// and so a port to another language has the exact bytes to reproduce.
+//
+// A label is a **key** where the hashed input is variable length — the secret has to be the message
+// then — and a **message prefix** where the key slot is already taken by the secret.
+
+/// Domain label keying the low half of [`compress_secret`]. Exactly [`KEY_LEN`] bytes, as a SipHash key.
+pub const SECRET_LABEL_LOW: [u8; KEY_LEN] = *b"orbitnet-fold-lo";
+
+/// Domain label keying the high half of [`compress_secret`]. Exactly [`KEY_LEN`] bytes, as a SipHash key.
+pub const SECRET_LABEL_HIGH: [u8; KEY_LEN] = *b"orbitnet-fold-hi";
+
+/// Domain label prefixing the low half of [`derive_session_key`].
+pub const SESSION_KEY_LABEL_LOW: &[u8] = b"orbitnet-session-key-lo";
+
+/// Domain label prefixing the high half of [`derive_session_key`].
+pub const SESSION_KEY_LABEL_HIGH: &[u8] = b"orbitnet-session-key-hi";
+
+/// Domain label prefixing [`confirm_tag`], which keeps a confirmation from being any other tag.
+pub const CONFIRM_LABEL: &[u8] = b"orbitnet-confirm";
+
+/// Two 64-bit halves as one 128-bit value: little-endian, low half first.
+///
+/// One function so that the byte order of every derived key is defined in one place.
+fn join_halves(low: u64, high: u64) -> [u8; KEY_LEN] {
+    let mut out = [0u8; KEY_LEN];
+    out[..8].copy_from_slice(&low.to_le_bytes());
+    out[8..].copy_from_slice(&high.to_le_bytes());
+    out
+}
+
+/// Fold a secret of any length to a 16-byte session secret.
+///
+/// The game supplies the secret out of band and it can be any shape: a lobby token, a matchmaker
+/// ticket, a passphrase a player typed. [`SipHasher`] keys on exactly [`KEY_LEN`] bytes, so something
+/// has to produce those 16, and this is it — two keyed passes over the secret, under
+/// [`SECRET_LABEL_LOW`] and [`SECRET_LABEL_HIGH`], joined low half first.
+///
+/// **A secret that is already [`KEY_LEN`] bytes long is folded too, never used verbatim.** One code
+/// path then produces the session secret whatever the caller supplied:
+///
+/// - A game that moves from a 40-character token to 16 raw bytes does not change derivations at the
+///   same time, and no caller has to know which of the two shapes it is holding.
+/// - The length is inside the hash, so `b"key"` and `b"key\0"` are different secrets. A fold that
+///   passed 16 bytes through and hashed everything else would make the boundary at 16 bytes a
+///   behavior change nobody can see.
+///
+/// The fold cannot add entropy, and takes essentially none away: it is a pseudo-random function of the
+/// whole secret, and the tag it eventually protects is 64 bits.
+#[must_use]
+pub fn compress_secret(secret: &[u8]) -> [u8; KEY_LEN] {
+    join_halves(
+        siphash24(&SECRET_LABEL_LOW, secret),
+        siphash24(&SECRET_LABEL_HIGH, secret),
+    )
+}
+
+/// The session key for one join, derived from the shared secret and the handshake nonce.
+///
+/// `secret` is the 16 bytes [`compress_secret`] folded out of whatever the game distributes. `nonce` is
+/// the 16 bytes the handshake carries, which under this scheme are no longer a key: the joining side
+/// mints them fresh per join, the accepting side reads them, and both run this function to arrive at
+/// the same key. An observer reading the handshake learns the nonce and nothing else.
+///
+/// **The secret is an input and is never seated as the key**, however much shorter that implementation
+/// looks. The reason is the sequence numbers:
+///
+/// - [`SessionAuth::new`] starts every session's counter at 1, and [`ReplayWindow`] only ever knows the
+///   session in front of it.
+/// - So under a key that does not change between joins, every datagram captured in one session is a
+///   valid, unreplayed datagram in the next. The replay defense would last exactly one session.
+/// - A fresh nonce per join is what keeps the key fresh per join, and that is the only reason the
+///   nonce exists. A caller that reuses a nonce under one secret gets the constant-key failure back.
+///
+/// A peer deriving from a different secret produces a different key, so its datagrams fail the tag
+/// check at the other end. That is how a peer without the secret is refused; [`confirm_tag`] moves the
+/// refusal forward into the handshake so it does not wait for the first datagram.
+#[must_use]
+pub fn derive_session_key(secret: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    let mut low = SipHasher::new(secret);
+    low.write(SESSION_KEY_LABEL_LOW);
+    low.write(nonce);
+    let mut high = SipHasher::new(secret);
+    high.write(SESSION_KEY_LABEL_HIGH);
+    high.write(nonce);
+    join_halves(low.finish(), high.finish())
+}
+
+/// Proof the sender holds `secret`: a tag over the nonce and the protocol version.
+///
+/// `key` is the output of [`derive_session_key`], so producing this tag requires the secret the key was
+/// derived from. The joining side sends it beside its nonce; the accepting side derives its own key from
+/// its own copy of the secret, recomputes the tag, and refuses the join when the two differ. Without it
+/// a peer that does not hold the secret is still refused, but only once it has sent a datagram whose tag
+/// fails — it occupies a session slot until then.
+///
+/// **The protocol version is inside the tag** so that a confirmation cannot be lifted out of a session
+/// of one protocol version and replayed into a session of another, where the fields it authorizes mean
+/// something else.
+///
+/// Two limits:
+///
+/// - **It proves possession of the secret, not identity.** Everyone the game handed the secret to can
+///   produce a valid tag over any nonce they like.
+/// - **Compare it without branching on its contents**, the way the receive path compares datagram tags.
+///   A byte-at-a-time comparison that returns early leaks how much of a guess was right.
+#[must_use]
+pub fn confirm_tag(key: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN], protocol_version: u32) -> u64 {
+    let mut hasher = SipHasher::new(key);
+    hasher.write(CONFIRM_LABEL);
+    hasher.write(nonce);
+    hasher.write(&protocol_version.to_le_bytes());
     hasher.finish()
 }
 
@@ -509,6 +653,194 @@ mod tests {
             hasher.write(&[*byte]);
         }
         assert_eq!(hasher.finish(), expected);
+    }
+
+    /// A secret of the shape a game actually supplies: not 16 bytes, and not a round number of words.
+    const PIN_SECRET: &[u8] = b"orbitnet shared secret";
+
+    /// A fixed stand-in for the 16 bytes a handshake carries.
+    const PIN_NONCE: [u8; KEY_LEN] = [
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae,
+        0xaf,
+    ];
+
+    /// A protocol version written out rather than read from the crate, so that bumping the real one
+    /// does not rewrite the pinned vectors below and hide a change to the derivation.
+    const PIN_VERSION: u32 = 0x0006_0000;
+
+    #[test]
+    fn derive_session_key_is_deterministic() {
+        // Both ends run these two lines independently and must land on the same key, or nothing
+        // either of them sends opens at the other.
+        let secret = compress_secret(PIN_SECRET);
+        assert_eq!(
+            derive_session_key(&secret, &PIN_NONCE),
+            derive_session_key(&secret, &PIN_NONCE)
+        );
+        assert_eq!(compress_secret(PIN_SECRET), secret);
+    }
+
+    #[test]
+    fn the_secret_is_never_seated_as_the_session_key() {
+        // Seating the secret is the shorter implementation and the wrong one: see
+        // `derive_session_key`. Two nonces, including the all-zero one a lazy caller would supply.
+        let secret = compress_secret(PIN_SECRET);
+        assert_ne!(derive_session_key(&secret, &PIN_NONCE), secret);
+        assert_ne!(derive_session_key(&secret, &[0u8; KEY_LEN]), secret);
+    }
+
+    #[test]
+    fn different_nonces_under_one_secret_give_different_keys() {
+        // The cross-session replay property, and the whole reason the nonce exists. Sequence numbers
+        // restart at 1 every session, so two joins under one shared secret landing on one key would
+        // make every datagram captured in the first join a valid, unreplayed datagram in the second.
+        let secret = compress_secret(PIN_SECRET);
+        let base = derive_session_key(&secret, &PIN_NONCE);
+        for index in 0..KEY_LEN {
+            let mut nonce = PIN_NONCE;
+            nonce[index] ^= 0x01;
+            assert_ne!(
+                derive_session_key(&secret, &nonce),
+                base,
+                "nonce byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn different_secrets_under_one_nonce_give_different_keys() {
+        let secret = compress_secret(PIN_SECRET);
+        let base = derive_session_key(&secret, &PIN_NONCE);
+        // A secret differing in one character, before the fold.
+        assert_ne!(
+            derive_session_key(&compress_secret(b"orbitnet shared secreT"), &PIN_NONCE),
+            base
+        );
+        // And every byte of the folded secret, after it.
+        for index in 0..KEY_LEN {
+            let mut altered = secret;
+            altered[index] ^= 0x80;
+            assert_ne!(
+                derive_session_key(&altered, &PIN_NONCE),
+                base,
+                "secret byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn compress_secret_is_length_sensitive() {
+        // Length alone separates two secrets: a trailing zero byte is a different secret.
+        assert_ne!(compress_secret(b"secret"), compress_secret(b"secret\0"));
+        assert_ne!(compress_secret(b""), compress_secret(b"\0"));
+        // The empty secret folds to a value like any other, and to the same one every time. Its bytes
+        // are pinned below with the rest.
+        assert_eq!(compress_secret(b""), compress_secret(&[]));
+        // A secret already KEY_LEN bytes long is folded rather than passed through, so one code path
+        // produces the session secret whatever the caller supplied.
+        assert_ne!(compress_secret(&REF_KEY), REF_KEY);
+    }
+
+    #[test]
+    fn confirm_tag_changes_with_every_input() {
+        let key = derive_session_key(&compress_secret(PIN_SECRET), &PIN_NONCE);
+        let base = confirm_tag(&key, &PIN_NONCE, PIN_VERSION);
+        // The negative control for the three sweeps below: the same three inputs give the same tag,
+        // so a difference is the input that changed and not a call that never repeats.
+        assert_eq!(confirm_tag(&key, &PIN_NONCE, PIN_VERSION), base);
+        for index in 0..KEY_LEN {
+            let mut nonce = PIN_NONCE;
+            nonce[index] ^= 0x01;
+            assert_ne!(
+                confirm_tag(&key, &nonce, PIN_VERSION),
+                base,
+                "nonce byte {index}"
+            );
+            let mut other = key;
+            other[index] ^= 0x01;
+            assert_ne!(
+                confirm_tag(&other, &PIN_NONCE, PIN_VERSION),
+                base,
+                "key byte {index}"
+            );
+        }
+        // The protocol version on its own, both a patch bump and a major one.
+        assert_ne!(confirm_tag(&key, &PIN_NONCE, PIN_VERSION + 1), base);
+        assert_ne!(
+            confirm_tag(&key, &PIN_NONCE, PIN_VERSION + 0x0001_0000),
+            base
+        );
+        assert_ne!(confirm_tag(&key, &PIN_NONCE, 0), base);
+    }
+
+    #[test]
+    fn the_derivation_matches_its_pinned_byte_vectors() {
+        // These bytes exist to make a refactor that changes the derivation fail here. The derivation
+        // is baked into every client that has shipped: change a domain label, the byte order of the
+        // halves, or which pass is the low one, and a new build derives a different key from the same
+        // secret and nonce, every datagram fails its tag against a peer on the old build, and nothing
+        // in the failure says why. A failure on this test is that change, and the fix is either to
+        // undo it or to treat it as a protocol version bump.
+        assert_eq!(
+            compress_secret(b""),
+            [
+                0x33, 0xf3, 0x45, 0x39, 0xec, 0x2d, 0x83, 0x69, 0x57, 0xe7, 0x79, 0x94, 0xcf, 0x9c,
+                0x78, 0xa4
+            ]
+        );
+        assert_eq!(
+            compress_secret(PIN_SECRET),
+            [
+                0x26, 0xed, 0x38, 0xf9, 0x98, 0xc9, 0xdb, 0x3b, 0xc1, 0xce, 0x13, 0xc0, 0x25, 0x6f,
+                0x59, 0x2d
+            ]
+        );
+        let secret = compress_secret(PIN_SECRET);
+        let key = derive_session_key(&secret, &PIN_NONCE);
+        assert_eq!(
+            key,
+            [
+                0xb4, 0x54, 0xfb, 0xd2, 0xd2, 0x7f, 0xfe, 0x30, 0x5e, 0x5d, 0x35, 0xb5, 0x94, 0x8d,
+                0xa1, 0x33
+            ]
+        );
+        assert_eq!(
+            confirm_tag(&key, &PIN_NONCE, PIN_VERSION),
+            0xcb13_d7c3_763b_61c6
+        );
+    }
+
+    #[test]
+    fn a_session_under_a_derived_key_carries_both_directions_and_no_other_derivation() {
+        let secret = compress_secret(PIN_SECRET);
+        let key = derive_session_key(&secret, &PIN_NONCE);
+        let mut client = SessionAuth::new(key);
+        let mut server = SessionAuth::new(key);
+        let mut up = b"input".to_vec();
+        client.seal(Direction::ToServer, &mut up).unwrap();
+        assert_eq!(server.open(Direction::ToServer, &up), Ok(&b"input"[..]));
+        let mut down = b"snapshot".to_vec();
+        server.seal(Direction::ToClient, &mut down).unwrap();
+        assert_eq!(
+            client.open(Direction::ToClient, &down),
+            Ok(&b"snapshot"[..])
+        );
+        // The next join under the same secret takes a fresh nonce, and the previous join's datagrams
+        // do not open under it.
+        let mut next_nonce = PIN_NONCE;
+        next_nonce[0] ^= 0x01;
+        let mut next_join = SessionAuth::new(derive_session_key(&secret, &next_nonce));
+        assert_eq!(
+            next_join.open(Direction::ToServer, &up),
+            Err(AuthError::BadTag)
+        );
+        // Nor does a peer deriving from a different secret over the same nonce open them.
+        let stranger_key = derive_session_key(&compress_secret(b"another secret"), &PIN_NONCE);
+        let mut stranger = SessionAuth::new(stranger_key);
+        assert_eq!(
+            stranger.open(Direction::ToServer, &up),
+            Err(AuthError::BadTag)
+        );
     }
 
     #[test]

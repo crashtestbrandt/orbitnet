@@ -30,7 +30,7 @@ func test_the_solve_is_tight() -> void:
 		corners, _pitch(), _fov(), 16.0 / 9.0, HockeyConfig.FRAMING_MARGIN)
 	assert_false(TableFraming.fits(corners, distance - 0.05, _pitch(), _fov(), 16.0 / 9.0,
 		HockeyConfig.FRAMING_MARGIN),
-		"five centimetres closer and a corner leaves the frustum")
+		"five centimeters closer and a corner leaves the frustum")
 
 func test_a_narrower_window_needs_more_distance() -> void:
 	# Godot's Camera3D defaults to KEEP_HEIGHT, so `fov` is VERTICAL and a narrow window has LESS horizontal
@@ -83,4 +83,4 @@ func test_an_empty_point_set_does_not_divide_by_anything() -> void:
 	var none: PackedVector3Array = PackedVector3Array()
 	assert_true(TableFraming.min_distance(none, _pitch(), _fov(), 1.0, 0.1) > 0.0,
 		"no points still yields a usable distance rather than a zero or a NAN")
-	assert_almost_eq(TableFraming.vertical_center(none, _pitch()), 0.0, 0.0001, "and a centre of zero")
+	assert_almost_eq(TableFraming.vertical_center(none, _pitch()), 0.0, 0.0001, "and a center of zero")

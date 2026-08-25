@@ -74,7 +74,7 @@ static func create_server(port: int = DEFAULT_PORT, max_clients: int = DEFAULT_M
 
 ## Build a client peer connecting to `address`:`port`. Returns null on failure. On a Steam build `address` carries
 ## the host's 64-bit Steam ID (a decimal string) rather than an IP -- the SessionMenu "Host address" field is
-## relabelled to a Steam ID there; steam_transport.gd resolves it over Steam's relay.
+## relabeled to a Steam ID there; steam_transport.gd resolves it over Steam's relay.
 static func create_client(address: String, port: int = DEFAULT_PORT) -> MultiplayerPeer:
 	match preferred_kind():
 		Kind.ENET:

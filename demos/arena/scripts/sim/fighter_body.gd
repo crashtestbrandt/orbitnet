@@ -14,7 +14,7 @@ class_name FighterBody
 ## `set_membership("arena_id")` is the only thing that can.
 ##
 ## THE ANCHOR IS `net_pos` BY POSITION, NOT BY NAME. A rollback body's interest anchor is its FIRST Vector3
-## state property, so the registration order below is load-bearing: putting velocity first would centre this
+## state property, so the registration order below is load-bearing: putting velocity first would center this
 ## peer's interest on a velocity.
 ##
 ## THE HITBOX IS NOT REPLICATED AND IS STILL PART OF THE CONTRACT. A lag-compensated shot reconstructs it from
@@ -83,7 +83,7 @@ var _pending_damage_from: int = -1
 var _pending_cloak: bool = false
 var _pending_shots: int = 0
 var _pending_shot_tick: int = -1
-## Set INSIDE the tick when a queued hit killed this fighter, and drained by the director afterwards. The
+## Set INSIDE the tick when a queued hit killed this fighter, and drained by the director afterward. The
 ## scorecard it credits is on the STATE lane, so writing that outside the tick is safe -- which is the whole
 ## reason the score lives there.
 var _kill_by_seat: int = -1
@@ -144,16 +144,24 @@ func bind_net() -> void:
 # --- seats ------------------------------------------------------------------------------------------
 ## Re-point this fighter's INPUT at `peer`, and say which of that connection's seats it is.
 ##
-## THE TWO ARE DIFFERENT AXES AND BOTH ARE NEEDED. `set_input_authority()` says WHICH CONNECTION authors this
-## body's input; `set_seat()` says which of that connection's owned bodies this one is, for interest. A
-## connection driving two fighters that both sat at seat 0 would have one interest centre for both, and the
-## second player's surroundings culled around where the first was standing.
+## THE TWO ARE DIFFERENT AXES AND BOTH ARE NEEDED. The connection says WHICH PEER authors this body's input;
+## the seat label says which of that connection's owned bodies this one is, for interest. A connection driving
+## two fighters that both sat at seat 0 would have one interest center for both, and the second player's
+## surroundings culled around where the first was standing.
+##
+## AND PREDICTION IS THE THIRD THING, which nothing else re-resolves. The world is built before the roster
+## arrives, so on a client every fighter registers with `predict = false` -- and that does not merely defer
+## prediction, it exempts the body from the rollback loop. Without the call below, the seat this connection is
+## about to be given would sit out the loop for the whole session: its rows would still land, so it would move
+## and every readout would look ordinary, while the player's own input took a full round trip to show up.
 func set_owner_peer(peer: int, seat_index: int) -> void:
 	owner_peer = peer
 	if _handle == null:
 		return
-	_handle.set_input_authority(peer if peer > 0 else 1)
-	_handle.set_seat(maxi(0, seat_index))
+	# ONE CALL FOR THE PAIR. The roster is derived from (connection, label), so writing them separately leaves a
+	# tick in which this body reads as (new peer, old label) -- a seat nobody assigned, announced and retracted.
+	_handle.assign_seat(peer if peer > 0 else 1, maxi(0, seat_index))
+	_handle.set_predicted(Net.is_server() or (peer > 0 and peer == multiplayer.get_unique_id()))
 
 ## This fighter's session-global entity id, or 0 while the facade is OFFLINE. A veto names it; so does an
 ## observer that follows this fighter.
@@ -168,6 +176,43 @@ func entity_id() -> int:
 ## honest situation rather than a gap: what an entity that stopped updating MEANS is the game's decision.
 func last_known_state() -> int:
 	return -1 if _handle == null else _handle.get_last_known_state()
+
+## The tick of the newest row this peer DECODED for this fighter, or -1 if none ever arrived.
+##
+## THE RECEIPT, AND IT IS A DIFFERENT QUESTION FROM last_known_state(). That one is a FRONTIER -- the newer of
+## "a row arrived" and "this peer authored a tick" -- so on a server, or on a listen-server host, it rises
+## every tick for every body whether or not anything crossed the wire. This one has a single writer on the
+## receive path, so it answers "am I still being sent this entity" on every peer, which is the question a
+## cull, a membership refusal and a per-peer veto all produce the same answer to.
+func last_received_state() -> int:
+	return -1 if _handle == null else _handle.last_received_state()
+
+## Whether THIS peer writes this fighter's rows rather than receiving them. True on every peer that holds state
+## authority, which is the server and a listen-server host; false on a client for every fighter, its own
+## included, because the server owns every body's state.
+##
+## What it is for: [method last_received_state] is -1 forever on such a peer, because it never receives
+## anything, so a staleness rule that did not ask this would fade the whole world on a host.
+func authors_state() -> bool:
+	return _handle != null and _handle.authors_state()
+
+## Whether this peer is still being sent this fighter's rows, within `within_ticks` of the present.
+##
+## THE CALL A GAME MAKES, and it FAILS OPEN where the raw tick does not: it answers true on the authority, true
+## on a backend too old to report a receipt, and true when a row landed recently. Only a measuring, receiving
+## peer with nothing recent answers false. Reading the raw tick and thresholding it yourself inverts that --
+## an older binary reports -1 for every body and the whole world reads as culled.
+func is_receiving(within_ticks: int = InterestMeter.STALE_TICKS) -> bool:
+	return _handle == null or _handle.is_receiving(within_ticks)
+
+## Whether THIS peer simulates this fighter in its rollback loop.
+##
+## The question a client asks about its OWN seat, and the one that is silent when the answer is wrong: a body
+## registered before its owner was known stays exempt from the loop, keeps applying authoritative rows, and
+## therefore keeps moving -- so nothing about the scene says the player's input is a round trip late. See
+## [method set_owner_peer].
+func is_predicted() -> bool:
+	return _handle != null and _handle.is_predicted()
 
 # --- bulk marshalling --------------------------------------------------------------------------------
 ## Marshal a whole lane in ONE script-boundary crossing instead of one per property.
@@ -212,6 +257,13 @@ func set_bulk_marshalling(on: bool) -> void:
 		return
 	_handle.set_bulk_capture(MARSHAL_OUT if on else "")
 	_handle.set_bulk_restore(MARSHAL_IN if on else "")
+	# THE APPLY DIRECTION REUSES THE RESTORE METHOD, AND THAT IS ONLY SAFE HERE BECAUSE THIS BODY DECLARES NO
+	# COSMETICS. An apply hook is handed the CAPTURE slots; a restore hook is handed the restore slots, which
+	# are the capture slots minus the lane's cosmetic entries. This fighter registers five state properties and
+	# no cosmetic sixth, so the two lists coincide entry for entry. Add a cosmetic to STATE_PROPS' registration
+	# and this line must stop sharing a method, or a received row lands its values one slot out with nothing
+	# erroring.
+	_handle.set_bulk_apply(MARSHAL_IN if on else "")
 	_handle.process_settings()
 
 ## Whether each lane is actually marshalling in bulk. Asked of the backend rather than assumed: a name that
@@ -311,7 +363,7 @@ func _apply_pose() -> void:
 
 # --- server-side outcomes ------------------------------------------------------------------------------
 ## Queue damage from `by_seat`. SERVER-SIDE, from the shot resolution, which runs OUTSIDE the tick -- see
-## `_drain_pending()` for why that means queueing rather than writing.
+## `_drain_pending()` for why that means queuing rather than writing.
 func queue_damage(amount: float, by_seat: int) -> void:
 	if not is_alive():
 		return

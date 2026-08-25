@@ -54,7 +54,7 @@ jobs:
       #
       # `cargo` is what the build invokes, and the rustup cargo shim points rustc at the toolchain itself,
       # so cargo resolving is the condition that matters. native/rust-toolchain.toml pins the version;
-      # rustup honours it from inside that directory with no help from CI.
+      # rustup honors it from inside that directory with no help from CI.
       - name: Check the Rust toolchain on this runner
         shell: bash
         run: |

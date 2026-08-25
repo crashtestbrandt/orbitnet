@@ -4,7 +4,7 @@ class_name Formation
 ##
 ## WHY THIS EXISTS AT ALL: without it, an order to 24 units is 24 units ordered to the SAME point, which they
 ## all reach and then fight over, jittering forever because each one's arrival braking is fighting the others'
-## presence. The obvious fix is neighbour separation -- but that is an O(n^2) force loop whose output depends
+## presence. The obvious fix is neighbor separation -- but that is an O(n^2) force loop whose output depends
 ## on iteration order, and it would put a second, subtler source of "why do they look like that?" into a demo
 ## whose job is to make the NETWORK legible. Giving each unit its own destination removes the contention at
 ## the source, costs nothing per tick, and is trivially testable.
@@ -18,16 +18,16 @@ const SLOT_SPACING: float = 2.4
 
 ## The offset from the order's target point for the `index`-th unit of a `count`-unit order.
 ##
-## Lays out a centred grid, rows across X and columns along Z, widest-first: a 24-unit order becomes a 5x5
+## Lays out a centered grid, rows across X and columns along Z, widest-first: a 24-unit order becomes a 5x5
 ## block minus one, which reads as a formation rather than a queue. The grid is axis-aligned rather than
 ## rotated to the approach direction -- rotating it looks better and costs an extra input (which way is the
 ## group is coming from) that the server would have to derive from state the order does not carry.
 ##
 ## WHAT IS GUARANTEED IS THE CENTROID, NOT ANY INDIVIDUAL UNIT. It is tempting to special-case index 0 onto
 ## the click so that something always lands exactly where the player pointed -- and that is wrong twice. It
-## collides with the grid's own centre slot, handing two units the same destination (which is the whole
+## collides with the grid's own center slot, handing two units the same destination (which is the whole
 ## problem this function exists to avoid); and it cannot hold in general anyway, because a block with an even
-## number of columns has no centre slot for anything to land on. The group centres on the click; with an odd
+## number of columns has no center slot for anything to land on. The group centers on the click; with an odd
 ## square, the middle unit happens to sit exactly on it.
 static func slot_offset(index: int, count: int) -> Vector3:
 	# A negative index is nonsense input, not a slot -- degrade to the target rather than to a mirrored
@@ -42,7 +42,7 @@ static func slot_offset(index: int, count: int) -> Vector3:
 	var row: int = index / columns
 	var column: int = index % columns
 	var rows: int = ceili(float(count) / float(columns))
-	# Centre the block on the target: half a slot of offset per row/column either side of the middle.
+	# Center the block on the target: half a slot of offset per row/column either side of the middle.
 	var x: float = (float(column) - (float(columns) - 1.0) * 0.5) * SLOT_SPACING
 	var z: float = (float(row) - (float(rows) - 1.0) * 0.5) * SLOT_SPACING
 	return Vector3(x, 0.0, z)

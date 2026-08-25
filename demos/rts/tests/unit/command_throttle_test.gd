@@ -47,9 +47,9 @@ func test_forget_releases_a_sender() -> void:
 	assert_eq(throttle.tracked(), 1,
 		"a disconnect drops the entry, so a long-lived server does not accumulate one per peer that ever joined")
 
-func test_time_going_backwards_does_not_grant_tokens() -> void:
+func test_time_going_backward_does_not_grant_tokens() -> void:
 	# Clocks are handed in by callers, and a caller can hand in a smaller value than last time (a resync, a
 	# wrapped counter). Negative elapsed time must not be treated as a refill.
 	var throttle: CommandThrottle = CommandThrottle.new(1.0, 1)
 	assert_true(throttle.allow(7, 100.0), "spend the token at t=100")
-	assert_false(throttle.allow(7, 50.0), "and time moving backwards refills nothing")
+	assert_false(throttle.allow(7, 50.0), "and time moving backward refills nothing")

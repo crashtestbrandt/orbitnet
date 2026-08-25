@@ -22,7 +22,7 @@ class_name RtsBenchSubject
 ## commander's "simulation" is a clamp, so it essentially never mispredicts. That column is legitimately flat,
 ## and BenchMetrics reads every field with a 0.0 default precisely so a game can leave one out.
 
-## Metres of cursor travel per second at full stick. Fast enough that the cursor crosses the field in a few
+## Meters of cursor travel per second at full stick. Fast enough that the cursor crosses the field in a few
 ## seconds, so a bot fleet's cursors genuinely spread out and AOI has something to cull.
 const CURSOR_SPEED: float = 30.0
 ## Seconds between orders while the policy holds `fire`. Without a floor, a `fire` that is true for half of

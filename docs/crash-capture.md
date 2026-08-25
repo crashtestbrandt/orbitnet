@@ -20,7 +20,7 @@ frames, written with async-signal-safe calls only. Every handler chains — it r
 disposition and re-raises (POSIX) or returns `EXCEPTION_CONTINUE_SEARCH` (Windows) — so a debugger, a core
 dump and Godot's own debug-build handler all still get their turn. Installing only ever ADDS a record.
 
-Addresses arrive unsymbolized. Keep the shipped cdylib and resolve them afterwards:
+Addresses arrive unsymbolized. Keep the shipped cdylib and resolve them afterward:
 
 ```sh
 addr2line -e liborbitnet.linux.template_release.x86_64.so 0x1a2b3c

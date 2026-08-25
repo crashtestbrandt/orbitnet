@@ -66,7 +66,7 @@ func test_entity_zero_is_refused() -> void:
 	var desk: ObserverDesk = ObserverDesk.new()
 	desk.watch_point(Vector3(5.0, 0.0, 5.0))
 	assert_false(desk.watch_entity(0),
-		"0 is the facade's RETRACTION value, so tracking it would declare a centre and withdraw it forever")
+		"0 is the facade's RETRACTION value, so tracking it would declare a center and withdraw it forever")
 	assert_eq(desk.mode(), ObserverDesk.Mode.FIXED, "and the desk is left as it was")
 	assert_eq(desk.point(), Vector3(5.0, 0.0, 5.0), "including the point it was watching")
 

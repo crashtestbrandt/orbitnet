@@ -162,5 +162,5 @@ func test_clear_forgets_held_seats_too() -> void:
 	roster.assign(10)
 	roster.hold(10, SESSION_A)
 	roster.clear()
-	assert_eq(roster.reserved(), 0, "a teardown leaves no reclaims for the next session to honour")
+	assert_eq(roster.reserved(), 0, "a teardown leaves no reclaims for the next session to honor")
 	assert_eq(roster.assign(11, SESSION_A), 0, "and that identity is simply a newcomer again")

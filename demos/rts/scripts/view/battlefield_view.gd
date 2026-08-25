@@ -38,7 +38,7 @@ func _add_obstacle(box: AABB, index: int) -> void:
 	var instance: MeshInstance3D = MeshInstance3D.new()
 	instance.name = "Obstacle%02d" % index
 	instance.mesh = mesh
-	# An AABB is min-corner + size; a BoxMesh is centred on its origin. Placing it at the centre is the whole
+	# An AABB is min-corner + size; a BoxMesh is centered on its origin. Placing it at the center is the whole
 	# conversion, and getting it wrong puts the visual half a box away from the thing units actually hit.
 	instance.position = box.position + box.size * 0.5
 	add_child(instance)

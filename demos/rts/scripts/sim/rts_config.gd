@@ -12,7 +12,7 @@ class_name RtsConfig
 ##   * Entities are served STALEST-FIRST, so exceeding that does not drop anyone -- it raises everyone's
 ##     staleness. 96 units at 20 Hz means a full refresh every 2 net ticks, i.e. ~100 ms worst-case age.
 ##
-## The header was 12.5 bytes until the entity's 64-bit id came off the wire in favour of a 16-bit session
+## The header was 12.5 bytes until the entity's 64-bit id came off the wire in favor of a 16-bit session
 ## slot: the id was a hash spread across the whole 64-bit range, so its varint cost 9.5 bytes on average.
 ## The figure here read ~26 bytes and ~46 units, which was never the measured header -- the real numbers
 ## before that change were 32.5 bytes and ~37 units.
@@ -41,10 +41,10 @@ const NET_TICK_HZ: int = 20
 const NET_TICK_DT: float = 1.0 / float(NET_TICK_HZ)
 
 # --- battlefield ---------------------------------------------------------------------------------
-## Half-extents of the playable ground plane, metres. Units are clamped inside it.
+## Half-extents of the playable ground plane, meters. Units are clamped inside it.
 const FIELD_HALF_X: float = 60.0
 const FIELD_HALF_Z: float = 40.0
-## Where each seat's units start and respawn, as a fraction of FIELD_HALF_X from the centre.
+## Where each seat's units start and respawn, as a fraction of FIELD_HALF_X from the center.
 const SPAWN_X_FRACTION: float = 0.82
 ## Radius of the spawn blob a seat's units are scattered into.
 const SPAWN_SPREAD: float = 14.0
@@ -147,7 +147,7 @@ static func is_valid_id(id: int) -> bool:
 static func first_id_of_seat(seat: int) -> int:
 	return seat * UNITS_PER_SEAT
 
-## A seat's team colour, for the renderer and the HUD.
+## A seat's team color, for the renderer and the HUD.
 static func seat_color(seat: int) -> Color:
 	if seat == 0:
 		return Color(0.35, 0.62, 1.0)
@@ -155,7 +155,7 @@ static func seat_color(seat: int) -> Color:
 		return Color(1.0, 0.44, 0.33)
 	return Color(0.7, 0.7, 0.7)
 
-## The centre of a seat's spawn area.
+## The center of a seat's spawn area.
 static func spawn_center(seat: int) -> Vector3:
 	var sign_x: float = -1.0 if seat == 0 else 1.0
 	return Vector3(sign_x * FIELD_HALF_X * SPAWN_X_FRACTION, 0.0, 0.0)

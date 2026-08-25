@@ -49,7 +49,7 @@ wire or the interest pass.
 
 That is the arrangement membership exists for, and it is the demo's central fact:
 
-> Two fighters standing on the same spot in different arenas are **zero metres apart**. No radius can separate
+> Two fighters standing on the same spot in different arenas are **zero meters apart**. No radius can separate
 > them. A declared world can, and nothing else in the facade can.
 
 ```gdscript
@@ -107,7 +107,7 @@ datagram's limit, not the policy's.
 ## Split-screen is what a seat is for
 
 `--seats=2` gives one connection two locally-driven, locally-predicted fighters. Each is a **seat** in the
-backend's sense: its own interest anchor, its own centre, its own world, its own hysteresis band. The
+backend's sense: its own interest anchor, its own center, its own world, its own hysteresis band. The
 connection receives the **union** of its seats' sets, with the nearest seat's distance kept per entity.
 
 ```gdscript
@@ -116,7 +116,7 @@ handle.set_seat(index)             # WHICH OF THAT CONNECTION'S BODIES this one 
 ```
 
 Both are needed and they are different axes. Two fighters on one connection that both sat at seat `0` would
-share one interest centre, and the second player's surroundings would be culled around where the first was
+share one interest center, and the second player's surroundings would be culled around where the first was
 standing.
 
 **By default the two seats are in different arenas**, which is the case worth having: a connection with a body
@@ -135,28 +135,28 @@ mistake this shape makes available.
 
 ## An observer declares where it watches from
 
-A peer with no seat has no body to infer an interest centre from, and a peer with no centre is filtered in
+A peer with no seat has no body to infer an interest center from, and a peer with no center is filtered in
 nowhere — the backend falls open and sends it everything. That is why a seatless spectator used to be refused
 at the door.
 
 ```gdscript
 Net.set_peer_anchor(peer, local_point, arena_id)        # a ground point, in that arena
 Net.set_peer_anchor_entity(peer, entity_id, arena_id)   # ...or a fighter, wherever it goes
-Net.clear_peer_anchor(peer)                             # back to inference, one centre per seat
+Net.clear_peer_anchor(peer)                             # back to inference, one center per seat
 ```
 
-**The arena is the half that cannot be inferred.** An observer that declared only a centre would be watching
-one point in all three arenas at once. A declaration replaces inference on the centre *and* the world at once,
+**The arena is the half that cannot be inferred.** An observer that declared only a center would be watching
+one point in all three arenas at once. A declaration replaces inference on the center *and* the world at once,
 which is exactly what a peer with no body needs.
 
 **A peer arriving at a full table is admitted as an observer**, not disconnected. There is now something to do
 with it.
 
 **The declaration is throttled.** An observer pans continuously, and one reliable message per frame restating a
-centre that slid twenty centimetres is how a spectator costs more than a player. `ObserverDesk` decides: a
+center that slid twenty centimeters is how a spectator costs more than a player. `ObserverDesk` decides: a
 distance threshold, an interval so a lost message is still corrected, and an unconditional resend on a change
-of mode or arena — because an observer that moved its centre to the same local point in the next arena moved
-zero metres and changed everything it can see.
+of mode or arena — because an observer that moved its center to the same local point in the next arena moved
+zero meters and changed everything it can see.
 
 ## The rewind is per shooter and per target
 
@@ -212,7 +212,7 @@ fresh tick only. The result is recorded at that tick, and every replay restores 
 | Arena | The values must stay on the **rollback** lane, so the **write** is what moves |
 
 Whether a hit was fatal is therefore not known when the shot resolves. The director reads the answer off the
-fighters afterwards and credits the scorecard — which is on the state lane, so writing it outside the tick is
+fighters afterward and credits the scorecard — which is on the state lane, so writing it outside the tick is
 safe.
 
 ## Entity slots
@@ -225,6 +225,50 @@ with tens of thousands of entities churning steadily spends real reliable bandwi
 not move. Past 65,536 the server refuses to replicate the entity and says so, rather than wrapping an index
 onto a live one.
 
+## Slot-table pressure, and what a delta manifest removes
+
+`just arena-slots 8000` builds 24,027 entities — three arenas of 8,000 props plus the fighters and the
+scorecards — and `--wire-log` prints the server's total egress once a second, reliable control frames included.
+
+One whole manifest is about **530 kB** at that entity count: 24,027 rows of `(slot, id, two schema hashes,
+owner, seat)`, and the id is a full-width hash whose varint averages 9.5 bytes.
+
+| moment | whole table | delta |
+|---|---|---|
+| steady state, 1 peer | ~21 kB/s | ~21 kB/s |
+| first client joins | 547 kB | 532 kB |
+| **second client joins** | **1,074 kB** | **557 kB** |
+
+**A joining peer still costs a whole table** — it holds none to diff against, so there is nothing to send it a
+difference from. What went away is the copy that used to be re-broadcast to the peer already in the session:
+that peer's table did not change, so it now receives a **two-row** delta naming the joiner's two seats. An
+*observer* joining changes no row at all, and costs the existing peer nothing.
+
+It needs two processes to show anything: with no peer, there is nobody to send a manifest to.
+
+## Interest as an event, not only as a threshold
+
+`InterestMeter` polls every body's receipt tick once a frame, which is the right shape for a **fade**: "how
+stale is this" is a continuous quantity and a threshold is how you read one. What a poll cannot give you is the
+**edge** — the tick an entity stopped being sent, and the tick it started again.
+
+The server already knew. Interest runs where state authority is, and the send path computes the per-peer diff
+to clear its own delta bookkeeping; `Net.entity_left_interest` and `Net.entity_entered_interest` publish it,
+and `Net.entities_in_interest()` answers the same question for a handler bound mid-session.
+
+`InterestLog` is this demo's ~90-line adoption: it seeds from the query, counts the transitions, and the HUD's
+`EVENTS` line prints them beside the polled `INTEREST` count so the two readings can be compared live.
+
+**The demo still does not delete anything**, and that is the point of showing both. A culled fighter is drawn
+faded and keeps being drawn, because a shooter that deleted opponents at the edge of the interest radius would
+be a shooter where cover is a render distance. The event is what a game *could* act on once; the policy is
+still the game's.
+
+**The probe listens to the signal, not to the log's set.** `InterestLog.is_in_interest()` fails open — a binary
+that publishes no events must not blank the world — which is exactly wrong for a gate: a backend that says
+nothing would answer "not in interest" for everything through an empty set, and an assertion reading it would
+pass without a single event arriving. Listening directly means silence reads as silence.
+
 ## Bulk marshalling
 
 The fighter is a fat rollback body — five state properties and three input ones — and the rollback loop pays a
@@ -234,9 +278,16 @@ property reads and 96 writes in one frame, for one fighter.
 ```gdscript
 handle.set_bulk_capture("_net_marshal_out")
 handle.set_bulk_restore("_net_marshal_in")
+handle.set_bulk_apply("_net_marshal_in")      # a RECEIVED row, and the quantized write-back
 ```
 
-**F2 takes them away**, live, and `restore_ms` / `record_ms` in the HUD move. Nothing about a hook reaches the
+**The apply direction shares the restore method here, and that is only safe because this body declares no
+cosmetics.** An apply hook is handed the *capture* slots; a restore hook is handed the restore slots, which are
+the capture slots minus the lane's cosmetic entries. The fighter registers five state properties and no
+cosmetic sixth, so the two lists coincide entry for entry — add one and the two must stop sharing a method, or
+a received row lands its values one slot out with nothing erroring.
+
+**F2 takes all three away**, live, and `restore_ms` / `record_ms` in the HUD move. Nothing about a hook reaches the
 wire, so one peer may marshal in bulk while another walks its properties and neither notices.
 
 The HUD reports which lanes are *actually* marshalling in bulk, asked of the backend rather than echoed from
@@ -248,11 +299,12 @@ nothing at the call site.
 | Line | What it says |
 |---|---|
 | `MARSHAL` | which lanes are marshalling in bulk, and the property counts behind the arithmetic |
+| `EVENTS` | interest transitions this peer was told about, and what it currently holds |
 | `WIRE` | bytes and datagrams per second, peers, entities in interest, and the interest pass's own cost |
 | `INTEREST` | what this peer is **being sent**, against what exists. A server says so and reports what it holds |
 | `ARENAS` | fighters received per arena — the membership axis, made visible |
 | `CLOAK` | how many entity-peer pairs are withheld right now |
-| `CENTRE` | whether this peer's interest centre is inferred or declared |
+| `CENTER` | whether this peer's interest center is inferred or declared |
 | `REWIND` | the base window and all three per-band depths, and whether they differ |
 | `INTERP` | each peer's own measured send cadence, and the pooled figure it falls back to |
 
@@ -264,7 +316,7 @@ nothing at the call site.
 | **F2** | bulk marshalling on/off |
 | **F3** | the cloak veto on/off |
 | **F4** | observe / play |
-| **F5** | cycle what an observer watches: each arena's centre, then a fighter in it |
+| **F5** | cycle what an observer watches: each arena's center, then a fighter in it |
 
 F1, F3 and the seating are **server-side**; on a client they change nothing, which is the security property
 rather than a limitation — a peer cannot decide what it is allowed to receive.
@@ -279,25 +331,39 @@ rather than a limitation — a peer cannot decide what it is allowed to receive.
 | **B** | listen server, a two-seat client | the same channel against the other server shape |
 | **C** | dedicated server, a client killed and relaunched | a session identity reclaims its seats under a new peer id |
 
-**The readings are rises, not values.** `NetStateHandle.last_known_state()` fails open — on a backend that
-cannot answer it returns the present tick — so a threshold test would be satisfied by the fallback and prove
-nothing.
+**The readings are rises, not values.** `last_known_state()` fails open — on a backend that cannot answer it
+returns the present tick — so a threshold test would be satisfied by the fallback and prove nothing.
 
-**On the rollback lane it is not a veto signal at all.** A withheld body's reading keeps advancing on the
-client, so the probe prints it and asserts on it nowhere; the veto assertion is the cloak *flag*, which a
-withheld peer demonstrably never learns.
+**The probe reads the receipt, not the frontier.** `last_received_state()` has one writer, on the receive path,
+so it does not move for a body a veto is withholding — which is what makes the veto assertable directly:
+
+| the client asserts | why it is not vacuous |
+|---|---|
+| the watched fighter's receipt **rose** before the cloak | an entity that was never sent also never stops |
+| its receipt is **flat** across the whole cloak | this is the veto, stated as the rows themselves |
+| **its own** body's receipt rose over the same window | the positive control: "nothing arrived at all" cannot pass the line above |
+| it never learned the cloak **flag** | the flag rides in the withheld rows, and it is what the game is about |
+
+**The phases key on the session tick**, not on seconds since each process attached. The shell starts the three
+processes staggered, so an elapsed-time threshold fires at a different moment in each of them — and it did:
+the client's before-the-cloak sample was taken after the server had cloaked, and its after sample after the
+cloak had expired. `Net.current_tick()` is the one clock all three agree on.
+
+**The probe keeps the watched arena quiet.** A shot is resolved on the server against the server's world, so a
+client can kill a fighter it is being withheld — and a dead fighter drops its cloak, which lifts the veto and
+legitimately resumes the rows. Declining to fire into that arena is what keeps the cloak alive across every
+sample; the probe re-forces it each frame for the same reason.
 
 ## Known gaps
 
 Recorded rather than hidden.
 
-- **The retained interest grid is not exercised.** What the interest pass sees is arena-local, so the session's
-  occupancy is about ±20 m however far apart the arenas are drawn — far inside the crossover where the grid
-  overtakes the linear scan. The grid is not what ships either way.
+- **The interest grid never selects here, and that is now a rule rather than a gap.** What the interest pass
+  sees is arena-local, so the session's occupancy is about ±20 m however far apart the arenas are drawn — far
+  inside the band where the linear scan wins. The path is chosen automatically from the occupancy each tick,
+  and a unit test asserts it refuses the grid at this one.
 - **A shot is not validated for plausibility**, only for ownership, liveness and rate. There is no
   plausible-aim test that is not also a test of what the player could see.
-- **No client-side hit feedback beyond the replicated result.** `NetCommand` has no `rejected` signal, so a
-  refused shot is invisible to the client.
 - **An observer is on no team, so every cloak is withheld from it.** That is this demo's rule rather than the
   facade's: a spectator watching cloaked fighters would have better information than either player.
 - **A build/protocol version handshake.** Two incompatible peers connect and misbehave rather than being

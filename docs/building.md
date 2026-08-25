@@ -8,7 +8,7 @@ changing the backend.
 
 ## Toolchain
 
-- **Rust**, pinned exactly in `native/rust-toolchain.toml`. `rustup` honours the pin automatically. The Nix
+- **Rust**, pinned exactly in `native/rust-toolchain.toml`. `rustup` honors the pin automatically. The Nix
   dev shell installs `rustup` rather than nixpkgs' `rustc`/`cargo` deliberately: the nixpkgs version floats
   with the unstable channel and would silently drift off the pin.
 - **A C toolchain.** `rustc` shells out to `cc` to link the cdylib. On a bare container this is the step that

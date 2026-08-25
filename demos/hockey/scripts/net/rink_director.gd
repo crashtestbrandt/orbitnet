@@ -3,7 +3,7 @@ class_name RinkDirector
 ## Builds the rink, owns the mallet pool and the puck, and adjudicates serve requests.
 ##
 ## A STATIC MALLET POOL, NOT SPAWN/DESPAWN. Every peer creates all HockeyConfig.SEATS mallet nodes at world
-## build, with identical names, and the node set NEVER changes afterwards. Seating sets a mallet's owning peer;
+## build, with identical names, and the node set NEVER changes afterward. Seating sets a mallet's owning peer;
 ## leaving clears it. That is a deliberate departure from "the server queue_free()s a mallet when its player
 ## quits", and the reason is entity identity:
 ##
@@ -26,9 +26,6 @@ class_name RinkDirector
 signal world_built()
 ## Emitted on the peer that applied a serve.
 signal serve_applied(seat: int)
-## Emitted on the peer that refused one, with the validator's reason. Rejections are the interesting half: a
-## demo that never shows you a refused request has not shown you the security model.
-signal serve_rejected(seat: int, reason: String)
 ## Emitted on EVERY peer when the replicated goal sequence moves. The state lane carries the event; this turns
 ## it into a signal the view can flash on, exactly once.
 signal goal_scored(team: int, sequence: int)
@@ -92,6 +89,8 @@ func build(seat_roster: TeamRoster, seat_owners: PackedInt32Array) -> void:
 	_serve_channel.register(ServeValidator.VERB_SERVE, _apply_serve)
 
 	world_built.emit()
+	# `world_built` is what a HUD waits on before reaching serve_channel(), so the channel is registered above
+	# it rather than below.
 	print("HOCKEY world built: %d mallets, 1 puck, sig=%d" % [mallets.size(), world_signature()])
 
 ## Register every entity with the facade. A SEPARATE pass from build(), and the split is not cosmetic.
@@ -239,22 +238,34 @@ func submit_serve() -> void:
 	if _serve_channel != null:
 		_serve_channel.request(ServeValidator.VERB_SERVE, {})
 
+## The serve channel, so a HUD can hear its refusals directly.
+##
+## [signal NetCommand.rejected] fires on the peer that REFUSED the command and on the client that ASKED for
+## it, which is why this demo no longer carries a refusal signal of its own: a re-emitted one would only ever
+## have reached the server, and the player who pressed the key is on the other end.
+##
+## Null until [signal world_built].
+func serve_channel() -> NetCommand:
+	return _serve_channel
+
 # The server-side validator+applier. Runs ONLY on the applying peer (server, or the local peer offline).
 # Everything a client sent is suspect until this returns.
 #
 # `payload` is untyped on purpose: it crosses the @rpc boundary, where Godot decodes it as a PLAIN Dictionary,
 # and a Dictionary[String, Variant] annotation would reject the wire-decoded value. This verb carries no
 # fields, so there is nothing to read out of it -- which is itself the reason one channel is enough.
-func _apply_serve(sender_id: int, _payload: Dictionary) -> bool:
+## Returns a [ServeValidator.Code] rather than a bool, which is what makes the refusal reach the client that
+## asked: [NetCommand] replies with an int verdict and announces nothing for a `false`. `OK` is 0, so the
+## acceptance path reads the same as it always did.
+func _apply_serve(sender_id: int, _payload: Dictionary) -> int:
 	if puck == null or roster == null:
-		return false
+		return ServeValidator.Code.NO_SEAT
 	# WHO is asking comes from the sender id, never from the payload.
 	var seat: int = roster.seat_for_sender(sender_id)
 	var result: ServeValidator.Result = ServeValidator.validate(
 		seat, puck.is_at_rest(), puck.faceoff_ticks())
 	if not result.accepted:
-		serve_rejected.emit(seat, result.reason)
-		return false
+		return result.code
 	puck.request_serve()
 	serve_applied.emit(seat)
-	return true
+	return ServeValidator.Code.OK

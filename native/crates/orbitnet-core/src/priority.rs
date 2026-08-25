@@ -138,10 +138,10 @@ impl Band {
 ///
 /// * The cull radius asks *should this entity be sent at all*, so it has to clear the longest range
 ///   at which a player can legitimately engage or observe a body. For a shooter carrying a scoped
-///   rifle that is thousands of metres — cull inside it and the scoped shooter watches a frozen
+///   rifle that is thousands of meters — cull inside it and the scoped shooter watches a frozen
 ///   ghost and cannot hit it.
 /// * `band_scale` asks *how often, relative to everything else*, so it has to resolve the distances
-///   a firefight actually happens over — tens of metres.
+///   a firefight actually happens over — tens of meters.
 ///
 /// Deriving both from one value made each setting break the other. At a 256 m radius the edges land
 /// at 85/171 m and the weighting differentiates properly, but everything past 320 m is culled —
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn an_unanchored_channel_must_not_outweigh_the_row_that_says_where_a_body_is() {
         // THE INVERSION THAT KEPT INTEREST MANAGEMENT OFF. `PeerInterest` stores always-relevant members at
-        // 0.0 (they are pushed at NEG_INFINITY so the nearest-N cap cannot evict them, then normalised), and
+        // 0.0 (they are pushed at NEG_INFINITY so the nearest-N cap cannot evict them, then normalized), and
         // `band_of` reads 0.0 as Near. Only the channels carrying a position declare an anchor, so a body's
         // health, equipment, sensors and lights all took the 4x near weight while the ONE anchored row
         // carrying that body's position took Far's 1x -- four-plus channels per body outbidding the row that
@@ -377,7 +377,7 @@ mod tests {
         );
         assert!(
             position_of_a_distant_body >= its_unanchored_equipment,
-            "a body's position must never be outbid by its own torch or hit points"
+            "a body's position must never be outbid by its own flashlight or hit points"
         );
         // And the thing that made it an INVERSION rather than a tie: scoring an absent distance as Near.
         let if_scored_as_near = weight_for(band_of(0.0, 256.0), 1, false);

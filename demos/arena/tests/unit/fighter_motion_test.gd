@@ -13,7 +13,7 @@ func test_an_oversized_move_intent_is_bounded_to_the_unit_disc() -> void:
 func test_a_small_intent_is_left_alone() -> void:
 	var gentle: Vector3 = Vector3(0.3, 0.0, 0.4)
 	assert_vec_almost_eq(FighterMotion.clamp_intent(gentle), gentle, 0.0001,
-		"inside the disc the clamp is the identity, so analogue input keeps its magnitude")
+		"inside the disc the clamp is the identity, so analog input keeps its magnitude")
 
 func test_vertical_intent_is_discarded() -> void:
 	assert_almost_eq(FighterMotion.clamp_intent(Vector3(0.0, 9.0, 0.0)).length(), 0.0, 0.0001,

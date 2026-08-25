@@ -44,13 +44,13 @@ func test_capsule_normal_on_the_cylinder_wall() -> void:
 	var xf: Transform3D = Transform3D(Basis.IDENTITY, Vector3(10.0, 0.0, 0.0))
 	var hit_pos: Vector3 = Vector3(10.0, 0.0, 0.3)   # the case-1 entry point
 	var n: Vector3 = NetLagComp._capsule_normal(hit_pos, xf, 0.3, 1.0)
-	assert_vec_almost_eq(n, Vector3(0.0, 0.0, 1.0), 1e-4, "radial from the nearest axis point, not from the capsule centre")
+	assert_vec_almost_eq(n, Vector3(0.0, 0.0, 1.0), 1e-4, "radial from the nearest axis point, not from the capsule center")
 
 func test_capsule_normal_on_the_hemisphere_cap() -> void:
 	var xf: Transform3D = Transform3D(Basis.IDENTITY, Vector3.ZERO)
 	var hit_pos: Vector3 = Vector3(0.0, 0.5, 0.0)   # the case-4 apex entry point
 	var n: Vector3 = NetLagComp._capsule_normal(hit_pos, xf, 0.3, 1.0)
-	assert_vec_almost_eq(n, Vector3(0.0, 1.0, 0.0), 1e-4, "from the clamped cap centre, not the capsule centre")
+	assert_vec_almost_eq(n, Vector3(0.0, 1.0, 0.0), 1e-4, "from the clamped cap center, not the capsule center")
 
 # --- tick ring bookkeeping (record/has_tick; pure -- no physics space involved) -------------------------
 func test_ring_records_exactly_the_queried_ticks() -> void:
@@ -170,7 +170,7 @@ func _sample_at(collider: Object, xform: Transform3D, radius: float, height: flo
 	sample.height = height
 	return sample
 
-# A capsule lying ACROSS the ray (axis rotated onto world X) that the ray clips well off its centre. The centre is
+# A capsule lying ACROSS the ray (axis rotated onto world X) that the ray clips well off its center. The center is
 # 0.6 m off the ray line -- twice the capsule's 0.3 radius -- so a cull bounded by the RADIUS rather than the
 # capsule's half-HEIGHT would reject it, and a real torso shot along the body's long axis would stop registering.
 func test_the_cull_keeps_a_capsule_the_ray_reaches_end_on() -> void:
@@ -179,7 +179,7 @@ func test_the_cull_keeps_a_capsule_the_ray_reaches_end_on() -> void:
 	var lc: NetLagComp = _recorded_ring([_sample_at(live, across, 0.3, 2.0)])
 	var hit: NetRay.Hit = lc.resolve_hit(null, Vector3(10.6, 0.0, 5.0), Vector3(0.0, 0.0, -1.0), 20.0, [],
 		0xFFFFFFFF, 10, 13, _HITBOX_LAYER)
-	assert_true(hit.valid, "a capsule struck 0.6 m off its centre, along its own axis, survives the cull")
+	assert_true(hit.valid, "a capsule struck 0.6 m off its center, along its own axis, survives the cull")
 	assert_almost_eq(hit.distance, 4.7, 1e-4, "and resolves at the same entry the narrow phase alone would give")
 	live.free()
 
@@ -472,7 +472,7 @@ func test_a_lan_shooter_is_rewound_less_than_a_ceiling_shooter_in_the_same_sessi
 	assert_eq(lan, 1, "a LAN shooter is rewound one tick -- their view lag IS the interpolation term")
 
 func test_no_estimate_is_not_zero_and_falls_back_to_the_flat_window() -> void:
-	# A peer the server has heard no acknowledgement from is a DIFFERENT state from one on a perfect link.
+	# A peer the server has heard no acknowledgment from is a DIFFERENT state from one on a perfect link.
 	# Treating "we do not know" as 0 would hand a fresh joiner the shallowest window in the session at exactly
 	# the moment their link is least settled, so it falls back to the flat window instead.
 	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(-1.0, 60.0), -1.0, 1e-6,
@@ -560,6 +560,67 @@ func test_no_shooter_can_ask_for_more_history_than_the_ring_retains() -> void:
 		assert_true(deepest < NetLagComp.retain_ticks(hz),
 			"at %d Hz the deepest window (%d ticks) stays inside the ring's residency (%d)" % [
 				hz, deepest, NetLagComp.retain_ticks(hz)])
+
+# --- the two ceilings: what the server BELIEVES, and how deep a shot REWINDS ----------------------------
+# The backend now caps the round trip it reports for a peer (`rtt_believed_max_ms`, 250 ms by default) as well
+# as storing it, so the figure reaching `rewind_ticks_for_shooter` is already bounded. `max_delay_ms` is the
+# OTHER ceiling and bounds the window built from that figure. Both default to 250 ms, which is exactly the
+# arrangement that could quietly halve a window if the two stacked -- so what these pin is that they do not,
+# and that a shooter under both is touched by neither.
+#
+# `NetLagComp` names no session type, so the backend cap is modeled here as `minf(raw, ceiling)` -- which is
+# what the backend's `peer_rtt_ms` now does to the raw estimate before a shot site ever sees it.
+const _BELIEVED_CEILING_MS: float = 250.0   # the backend's rtt_believed_max_ms default
+
+func _believed(raw_ms: float) -> float:
+	return minf(raw_ms, _BELIEVED_CEILING_MS)
+
+func test_the_two_ceilings_do_not_compound() -> void:
+	# A shooter whose RAW estimate is absurd arrives here already believed at 250 ms, and 250 ms of round trip
+	# plus a tick of interpolation is still over `max_delay_ms` -- so the rewind clamp is what answers, exactly
+	# as it did before the backend cap existed. The depth must be the ceiling depth and not a hair less: two
+	# 250 ms bounds applied in series must land on one 250 ms window, never on 250 minus a tick.
+	for hz: float in [30.0, 60.0, 120.0]:
+		var ceiling_ticks: int = NetLagComp.rewind_ticks_for(NetLagComp.max_delay_ms, hz)
+		assert_eq(NetLagComp.rewind_ticks_for_shooter(_believed(10_000.0), hz), ceiling_ticks,
+			"a believed-capped shooter still receives the full ceiling depth at %d Hz" % int(hz))
+		assert_eq(NetLagComp.rewind_ticks_for_shooter(_believed(10_000.0), hz),
+			NetLagComp.rewind_ticks_for_shooter(10_000.0, hz),
+			"...the same depth an uncapped figure earns at %d Hz -- the two caps do not stack" % int(hz))
+	# And the depth the pair produces is still inside what the ring retains, which is the property retain_ticks
+	# is derived from and the one a silently-shallower window would not have broken.
+	for hz: int in [30, 60, 120]:
+		assert_true(NetLagComp.rewind_ticks_for_shooter(_believed(INF), float(hz)) < NetLagComp.retain_ticks(hz),
+			"at %d Hz the believed-capped deepest window still fits the ring's residency" % hz)
+
+func test_no_shooter_under_the_believed_ceiling_changes() -> void:
+	# The cap binds AT the ceiling and nowhere below it, so every honest shooter is rewound exactly as before.
+	#
+	# ASSERTED ON THE BELIEVED FIGURE ITSELF, not on the depth it produces. Comparing
+	# `rewind_ticks_for_shooter(_believed(x))` against `rewind_ticks_for_shooter(x)` for an `x` below the
+	# ceiling is `f(x) == f(x)`, because `_believed` is the identity there -- it would hold whatever
+	# `rewind_ticks_for_shooter` did, including nothing. The statement that carries content is that the cap
+	# does not move the input below itself and does move it above, so both halves are pinned here.
+	for raw_ms: float in [0.0, 1.0, 16.0, 50.0, 100.0, 200.0, 249.0, 250.0]:
+		assert_eq(_believed(raw_ms), raw_ms,
+			"a %.0f ms estimate is under the ceiling and reaches the shot site unchanged" % raw_ms)
+	for raw_ms: float in [251.0, 400.0, 10_000.0]:
+		assert_eq(_believed(raw_ms), _BELIEVED_CEILING_MS,
+			"a %.0f ms estimate is over the ceiling and reaches the shot site as the ceiling" % raw_ms)
+	# And the depth an unchanged figure earns is still the depth it earned, at every rate.
+	for raw_ms: float in [0.0, 1.0, 16.0, 50.0, 100.0, 200.0, 249.0, 250.0]:
+		for hz: float in [30.0, 60.0, 120.0]:
+			assert_eq(NetLagComp.rewind_ticks_for_shooter(_believed(raw_ms), hz),
+				NetLagComp.rewind_ticks_for_shooter(raw_ms, hz),
+				"a %.0f ms shooter is unchanged by the belief ceiling at %d Hz" % [raw_ms, int(hz)])
+	# ...and shooters under it are still told apart from each other, which is what measuring is for.
+	var lan: int = NetLagComp.rewind_ticks_for_shooter(_believed(1.0), 60.0)
+	var mid: int = NetLagComp.rewind_ticks_for_shooter(_believed(100.0), 60.0)
+	var slow: int = NetLagComp.rewind_ticks_for_shooter(_believed(200.0), 60.0)
+	assert_true(lan < mid and mid < slow,
+		"three links under the ceiling are still three depths (%d < %d < %d ticks)" % [lan, mid, slow])
+	assert_true(slow < NetLagComp.rewind_ticks_for_shooter(_believed(10_000.0), 60.0),
+		"and every one of them is shallower than the capped shooter, which is what the ceiling is for")
 
 # --- the per-TARGET rewind depth: one cast, three depths -----------------------------------------------
 # The window is the shooter's view lag of WHAT THEY ARE SHOOTING AT, and the interpolation half of that is how
@@ -754,7 +815,7 @@ func test_the_band_tick_array_is_the_present_tick_less_each_bands_depth() -> voi
 
 # --- the resolve path: each target reconstructed at its OWN band's tick ---------------------------------
 # One shooter at the world origin, three targets laid out so exactly one ray reaches each, and a ring whose
-# recorded poses encode the tick they were recorded at: every body sits one metre further out per tick into the
+# recorded poses encode the tick they were recorded at: every body sits one meter further out per tick into the
 # past, so the resolved entry distance names the slot the resolver read. `space` is null throughout, which
 # NetRay.cast answers with a miss, so the analytic capsule half is what the assertions read.
 #
@@ -802,9 +863,9 @@ func _band_ray(lc: NetLagComp, y: float, band_ticks: PackedInt64Array) -> NetRay
 		_BASE_TICK, _PRESENT_TICK, _HITBOX_LAYER, band_ticks, _SHOOTER)
 
 func test_one_cast_resolves_three_targets_at_three_ticks() -> void:
-	# The headline: a contested body a few metres away and one across the map are not the same age, so they are
+	# The headline: a contested body a few meters away and one across the map are not the same age, so they are
 	# not rewound by the same amount. Near reads tick 19, mid tick 17, far tick 16 -- and the entry distance
-	# names which, because each body sits one metre further out per tick into the past.
+	# names which, because each body sits one meter further out per tick into the past.
 	var was_scale: float = NetLagComp.band_scale_m
 	NetLagComp.band_scale_m = _BAND_SCALE
 	var lc: NetLagComp = _band_ring()
@@ -897,7 +958,7 @@ func test_every_target_is_banded_once_so_none_can_be_dropped() -> void:
 	# The failure the swap-not-a-pass shape exists to prevent. A pass per band reads each band's slot and
 	# rejects the samples that do not belong to it -- so a body straddling a band edge, which reads NEAR in the
 	# slot the near pass walks and MID in the slot the mid pass walks, is rejected by BOTH and silently stops
-	# being hittable. Here the mid target sits one metre inside the near edge at the near tick and one metre
+	# being hittable. Here the mid target sits one meter inside the near edge at the near tick and one meter
 	# outside it at the mid tick; it must still resolve.
 	var was_scale: float = NetLagComp.band_scale_m
 	NetLagComp.band_scale_m = _BAND_SCALE

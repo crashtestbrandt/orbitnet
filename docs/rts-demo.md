@@ -36,7 +36,7 @@ The rollback lane exists for input arriving **every tick** that can be **predict
 has exactly one thing like that — the command cursor — and it is not a unit.
 
 The cursor is also the **AOI anchor**, which is not a nice-to-have: `set_aoi_radius()` finds the rollback
-entity whose *input* authority is that peer and uses its first `Vector3` state property as the centre. A peer
+entity whose *input* authority is that peer and uses its first `Vector3` state property as the center. A peer
 with **no rollback body has no anchor**, so without one, interest management cannot function at all.
 
 It also demonstrates the server-authoritative split on a **non-character** entity — the API shape people most
@@ -91,15 +91,33 @@ the payload is parsed.
 
 This is the single most transferable trick in the demo, and a yaw scalar is wrong **twice over**:
 
-1. **A GDScript `float` is an f64.** `"facing@half"` would silently fall back to lossless and save nothing —
-   `@half` is valid only for `Vector3`/`Vector2`/`f32`, and an invalid pairing degrades quietly rather than
-   erroring.
+1. **A GDScript `float` is an f64.** `"facing@half"` falls back to lossless and saves nothing — `@half`
+   applies to `Vector3` and `Vector2` only. The fallback is reported: it warns, it is an error in a checked
+   build, and `quantizer_fallbacks()` lists it so a boot check can fail on one.
 2. **Interpolating an angle across the ±π wrap sweeps the long way round.** A unit facing roughly south spins
    a full rotation every time it wobbles.
 
 `(sin, cos)` costs 4 bytes as halves, interpolates correctly *because it is a point on a circle*, and rides
 along in a `Vector3` that had a spare component anyway. `hp01` takes that component for the same reason: a
 bare `float` hp cannot be narrowed at all, but as a normalized third component it costs 2 bytes.
+
+### One crossing per row, in both directions
+
+The RTS demo's own reason for a bulk hook is not the rollback loop — its units are on the state lane and there
+is no replay multiplier there. **The multiplier is the entity count**, which is what a state lane is for:
+
+- the **server** captures 96 rows a tick, at one `Object.get` per property;
+- a **client** lands up to 48 rows a tick, at one `Object.set` per property — 144 crossings for three
+  properties, every tick, on the peer with the least to spare.
+
+`UnitBody` declares `set_bulk_capture()` and `set_bulk_apply()`, which makes each of those one call. The
+`RTS-MARSHAL` boot line reports how many channels actually resolved a hook, **asked of the backend rather than
+echoed from the call site** — a hook is resolved by name on the channel's root, and a name that did not resolve
+leaves the channel on the walk with nothing erroring.
+
+`bulk_marshal_test.gd` pins the slot correspondence, including the negative control: a round trip alone passes
+even when both hooks agree on the wrong order, so the three values are made mutually distinguishable and each
+slot is asserted to carry its own.
 
 ### Where 96 comes from
 
@@ -111,7 +129,7 @@ bare `float` hp cannot be narrowed at all, but as a normalized third component i
 - 2 seats × 48 = **96 units**: a full refresh every 2 net ticks, i.e. ~100 ms worst-case age at 20 Hz.
 
 **This page read ≈26 B/unit and ≈46 units, and neither was ever measured.** The header was 12.5 B until the
-entity's 64-bit id came off the wire in favour of a 16-bit session slot — a hash spread across the whole
+entity's 64-bit id came off the wire in favor of a 16-bit session slot — a hash spread across the whole
 64-bit range, so its varint cost 9.5 B on average. The real figures before that change were 32.5 B/unit and
 ≈37 units per peer per tick. See [protocol.md](protocol.md#entity-slots).
 
@@ -121,8 +139,9 @@ linearly. That is the experiment, which is why the number lives in `RtsConfig` w
 
 Measuring that from the outside takes care: "ticks since this unit last changed" counts a **stationary** unit
 as starving, which it is not. The probe records the gap between *consecutive updates* of a unit known to be
-moving, which is the round-robin interval and nothing else. A per-entity staleness counter belongs in the
-library — it is one of the [filed gaps](../README.md#limits).
+moving, which is the round-robin interval and nothing else. The library's own per-entity reading is
+`NetStateHandle.last_received_state()` — the tick of the newest row this peer decoded, with one writer on the
+receive path — and `is_receiving()` is the same reading with the two fail-open short-circuits applied.
 
 ## Determinism is not needed, and that is the point
 
@@ -197,6 +216,24 @@ cases are unit-testable with no session. Four rules:
 
 Plus a per-sender token bucket, checked *first* as the cheapest rejection.
 
+**A refusal reaches the peer that asked**, and there are two halves to why the demo bothers. The validator
+returns an `OrderValidator.Code` rather than `false`, which is what makes `NetCommand` reply at all; and the
+**code** crosses the wire while the **sentence** does not. `Result.reason` names the ids and seats involved,
+which is what a server log wants and what a client must never be handed — it is server-side knowledge about
+units the asker may not own, which is exactly the ownership answer rule 1 refuses to give. `describe(code)`
+is a pure static function the client calls for itself, and a unit case asserts it names no id.
+
+That reply is also what fixed the order-RTT measurement. A refused order changes no sequence number, so the
+measurement had nothing to stop on and gave up after four seconds — blocking the next sample for that whole
+window and folding every refusal into the percentile as a four-second reading. It now cancels on the reply,
+keyed on the tag `request()` returned, so a second order issued before the first resolves cannot be canceled
+by an older refusal.
+
+The rate-limit branch replies too, and the alternative is worth stating: a refusal is one reliable packet per
+request, so answering a throttled client is strictly 1:1 with what it already sent and amplifies nothing.
+Returning `false` there instead makes it silent, which is the right choice for a channel a client can ask on
+far faster than it can be answered.
+
 `ScoutPolicy` is the other pure one — which enemy units a seat can currently see, with the same 1.25× exit
 hysteresis the backend's own interest band uses, reporting only what CHANGED. The session layer turns those
 indices into `Net.set_entity_hidden()` calls; the policy never names `Net` and never touches the tree, which
@@ -257,7 +294,7 @@ every peer. Fog of war is a property of the *pair*: seat 0 can see a unit that s
 instant, at the same distance. `Net.set_entity_hidden(peer, entity, true)` is the only call in the facade that
 can say that.
 
-The behaviour a veto has is exactly the one the genre wants: **the rows stop and the node stays**, frozen at
+The behavior a veto has is exactly the one the genre wants: **the rows stop and the node stays**, frozen at
 the last pose that arrived. That is the last-known-position ghost, and it costs no code.
 
 `ScoutPolicy` decides and reports only what CHANGED. Re-asserting a veto that is already in force clears that
@@ -273,17 +310,17 @@ the server sends itself none.
 
 **F7**, or `--observe` at launch.
 
-A peer with no rollback body has no interest centre, and a peer with no centre is filtered in nowhere — the
+A peer with no rollback body has no interest center, and a peer with no center is filtered in nowhere — the
 backend falls open and sends it everything. That is why this demo puts a cursor on the rollback lane at all,
 and why a seatless peer used to be refused at the door.
 
 `Net.set_peer_anchor()` removes the compulsion. An observer holds no seat, drives no commander, and has its
-centre declared for it; **F8** cycles between its own camera (`set_peer_anchor`) and following a seat's lead
+center declared for it; **F8** cycles between its own camera (`set_peer_anchor`) and following a seat's lead
 unit (`set_peer_anchor_entity`). A peer arriving at a full table is now admitted as an observer instead of
 disconnected.
 
 The declaration is throttled — an observer pans every frame, and one reliable message per frame restating a
-centre that slid twenty centimetres is how a spectator costs more than a player.
+center that slid twenty centimeters is how a spectator costs more than a player.
 
 ## Reconnection: the seat is the player's, not the connection's
 
@@ -336,7 +373,7 @@ later `seat released -- peer N did not return`, and the next joiner takes seat 1
   and the render representation are demonstrably separable. Each unit's barrel exists so replicated *facing*
   is legible — a capsule has no visible orientation, and without it the `(sin, cos)` packing looks like a
   flourish.
-- **Formation slots, not neighbour separation.** Separation is an O(n²) force loop whose output depends on
+- **Formation slots, not neighbor separation.** Separation is an O(n²) force loop whose output depends on
   iteration order; giving each unit its own destination removes the contention at the source.
 - **No win condition.** A respawn drip holds a steady state, so the demo can be left running.
 
@@ -351,9 +388,10 @@ later `seat released -- peer N did not return`, and the next joiner takes seat 1
   lets one connection drive several owned bodies, each with its own interest anchor, which is what local
   split-screen needs. `SeatRoster` refusing a second seat to the same peer is a rule about *this game*;
   [arena-demo.md](arena-demo.md#split-screen-is-what-a-seat-is-for) is where several are shown.
-- **No bulk marshalling.** The commander cursor is one `Vector3` and the units are on the state lane, so there
-  is no replay multiplier to divide — [hockey-demo.md](hockey-demo.md#bulk-marshalling-which-this-demo-is-the-case-for)
-  is the case for it.
+- **No bulk marshalling on the ROLLBACK lane.** The commander cursor is one `Vector3`, so there is no replay
+  multiplier worth dividing — [hockey-demo.md](hockey-demo.md#bulk-marshalling-which-this-demo-is-the-case-for)
+  is the case for that half. The units *do* use the capture and apply hooks, because on a state lane the
+  multiplier is the entity count; see [above](#one-crossing-per-row-in-both-directions).
 - **No lag compensation.** Orders are adjudicated, not traced; there is no hitscan to rewind for.
 
 ## What a 16-bit slot removed from the budget

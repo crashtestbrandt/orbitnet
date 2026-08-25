@@ -68,13 +68,16 @@ signal post_tick()
 ## `resumed_from` NAMES A CONNECTION THAT MAY STILL BE UP, and that matters because acting on it hands the new
 ## claimant that peer's body. It is whichever connection last claimed this identity, whether or not the server
 ## saw it drop: a relaunched client routinely beats its own keepalive timeout, so the connection it replaces is
-## still in the peer list. A forged token looks identical, and the consequence is the same -- the original
-## keeps its socket, gets no error, and stops driving its own entity.
+## still in the peer list. The original keeps its socket, gets no error, and stops driving its own entity.
 ##
-## THE CONSERVATIVE RULE, IF YOU WANT IT: honour `resumed_from` only for a session you already saw
-## [signal peer_dropped] report with `held = true`. That costs a returning player their body until the
-## transport notices the old socket is gone, which can take tens of seconds, which is why it is not the
-## default. See [method session_id] for what the identity is and is not worth.
+## IT IS REPORTED ONLY FOR A CLAIM THE SERVER GRANTED, and a claim is granted only when the joiner quoted the
+## [method resume_token] this server issued for that identity. A peer that merely observed somebody's session
+## id cannot produce one, so it arrives here with `resumed_from` 0 and `session_id` 0 -- it takes nothing.
+##
+## `session_id` IS THE IDENTITY THE CONNECTION WAS SEATED UNDER, not the one it presented. A refused claim on
+## an identity somebody else still holds is seated anonymously as 0, so this is always safe to use as a roster
+## key. [method set_resume_policy] set to ONLY_IF_DROPPED refuses every claim against a still-connected
+## incumbent, which is the conservative rule in one call.
 signal peer_joined(peer: int, session_id: int, resumed_from: int)
 
 ## SERVER-SIDE: a peer's transport connection is gone. `held` is whether its session is being kept open for
@@ -84,16 +87,25 @@ signal peer_joined(peer: int, session_id: int, resumed_from: int)
 ## knowing about -- for a GHOST connection whose identity a returning player already took back. A transport
 ## does not notice a killed client until its keepalive times out, which on ENet's defaults is the better part
 ## of a minute, so a player who relaunches quickly is admitted first and the dead connection's drop arrives
-## afterwards. That drop reports `session_id` 0, and whatever it held has already moved to the new peer id.
+## afterward. That drop reports `session_id` 0, and whatever it held has already moved to the new peer id.
+##
+## A ghost whose claim was REFUSED keeps its identity, so its drop reports that identity with `held = true`
+## and opens the real window the refusal was waiting for. That is what [method set_resume_policy] set to
+## ONLY_IF_DROPPED trades a fast reconnect for.
 signal peer_dropped(peer: int, session_id: int, held: bool)
 
 ## SERVER-SIDE: a held session's grace window closed with nobody claiming it. `peer` is the id it was last
 ## connected under, for logging.
 ##
-## THIS IS THE RELEASE POINT AND THE ADDON DOES NOT ACT ON IT. The entity is still in the scene, still
-## replicating, and still pointed at a peer id that no longer exists. Free the body, or hand its input back to
-## the server with [method NetRollbackHandle.set_input_authority] and open the place to the next joiner -- the
-## same shape of decision as an entity a cull stopped sending.
+## THIS IS THE RELEASE POINT AND BY DEFAULT THE ADDON DOES NOT ACT ON IT. The entity is still in the scene,
+## still replicating, and still pointed at a peer id that no longer exists. Free the body, or hand its input
+## back to the server with [method NetRollbackHandle.set_input_authority] and open the place to the next joiner
+## -- the same shape of decision as an entity a cull stopped sending.
+##
+## YOU CAN NOW SAY OTHERWISE IN ONE CALL. [method set_seat_release_policy] set to RELEASE_ON_EXPIRY hands every
+## body this connection drove back to the server BEFORE this signal fires, so a handler that seats a replacement
+## is not undone a frame later. It closes the seat and nothing more -- the body is still in the scene, and
+## freeing it is still your decision. The default is unchanged.
 signal peer_session_expired(session_id: int, peer: int)
 
 ## A SEAT ARRIVED on a connection. Fires on BOTH SIDES -- the server when it seats the body, every client
@@ -125,11 +137,51 @@ signal seat_opened(peer: int, seat: int)
 ## ([method NetRollbackHandle.release_seat]), re-pointed at another connection, or unregistered. The
 ## connection is unaffected and may still hold other seats.
 ##
-## A DROPPED CONNECTION DOES NOT CLOSE ITS SEATS BY ITSELF. Its bodies keep the authority they were given
-## until the game changes them -- the same rule [signal peer_session_expired] states, for the same reason:
+## BY DEFAULT A DROPPED CONNECTION DOES NOT CLOSE ITS SEATS BY ITSELF. Its bodies keep the authority they were
+## given until the game changes them -- the same rule [signal peer_session_expired] states, for the same reason:
 ## whether to free the body, hand it back, or hold it for a reconnect is your decision. Release the seat and
 ## this fires.
+##
+## YOU CAN NOW SAY OTHERWISE IN ONE CALL. [method set_seat_release_policy] set to RELEASE_ON_DROP or
+## RELEASE_ON_EXPIRY hands the connection's bodies back to the server at the drop or at the end of the grace
+## window, and this fires from the announcement that follows. [method release_peer_seats] does the same for one
+## connection on demand, under every policy. The default is unchanged.
 signal seat_closed(peer: int, seat: int)
+
+## AN ENTITY BECAME RELEVANT to one connection. Fires on BOTH SIDES -- the server from its own interest pass,
+## every client from the trailing section on the snapshot it is already receiving. Inert OFFLINE and against a
+## backend that predates the signal.
+##
+## `peer` is the connection that gained it: a remote connection on a server, this client's own id on a client.
+## `entity_id` is the opaque token `entity_id()` answers on either handle.
+##
+## TELEPORT ON RE-ENTRY. A body that moved while it was away is interpolating from the pose it had when the rows
+## stopped, so it would fly across the world over one tick. [method NetInterpolatorHandle.teleport] is what
+## suppresses that.
+##
+## NOT A PER-HANDLE SIGNAL, and its twin is why: a leave routinely names an entity this client has no node for,
+## which is exactly the case that matters, so there is no handle to hang it on.
+signal entity_entered_interest(peer: int, entity_id: int)
+
+## AN ENTITY STOPPED BEING RELEVANT to one connection: culled by distance, refused by a membership, evicted by
+## [method set_aoi_max_entities], withheld by [method set_entity_hidden], or unregistered outright. Fires on both
+## sides, like [signal entity_entered_interest].
+##
+## ONE SIGNAL COVERS BOTH CAUSES. "The server stopped sending you this" and "this entity unregistered" are the
+## same fact to a game holding a node it can no longer update, so a client emits this from an entity manifest
+## rebuild as well as from a cull. An entity culled and unregistered on the same tick fires it EXACTLY ONCE.
+##
+## THIS IS THE RELEASE POINT AND BY DEFAULT THE ADDON DOES NOT ACT ON IT -- the same contract
+## [signal peer_session_expired] states. The node is still in the scene, still holding the last pose it received,
+## and nothing frees, hides, reparents or teleports it. What to do about that is your decision.
+##
+## HIDE, DO NOT FREE. A cap eviction oscillates at the boundary -- a body at the edge of
+## [method set_aoi_max_entities] leaves and re-enters as the population around it moves -- and freeing on the
+## leave turns that into spawn churn. Hiding costs nothing to undo.
+##
+## [method entities_in_interest] is what a handler bound mid-session, or a node built after the fact, resyncs
+## from: a signal is a transition, and an edge needs a starting point.
+signal entity_left_interest(peer: int, entity_id: int)
 
 func _init() -> void:
 	# _init, not _ready: the unit-test runner (--script SceneTree mode) calls into the facade before the
@@ -172,6 +224,10 @@ func _init() -> void:
 	if _orbit.has_signal(&"seat_opened"):
 		_orbit.connect(&"seat_opened", _on_backend_seat_opened)
 		_orbit.connect(&"seat_closed", _on_backend_seat_closed)
+	# Probed separately again, for the same reason: the relevancy signals are newer than the seat pair.
+	if _orbit.has_signal(&"entity_entered_interest"):
+		_orbit.connect(&"entity_entered_interest", _on_backend_entity_entered_interest)
+		_orbit.connect(&"entity_left_interest", _on_backend_entity_left_interest)
 	# One identity per process, minted before anything can join. A consumer that wants a session to survive a
 	# RESTART overwrites it with a stored value -- see set_session_id().
 	set_session_id(_mint_session_id())
@@ -197,6 +253,12 @@ func _on_backend_seat_opened(peer: int, seat: int) -> void:
 
 func _on_backend_seat_closed(peer: int, seat: int) -> void:
 	seat_closed.emit(peer, seat)
+
+func _on_backend_entity_entered_interest(peer: int, entity_id: int) -> void:
+	entity_entered_interest.emit(peer, entity_id)
+
+func _on_backend_entity_left_interest(peer: int, entity_id: int) -> void:
+	entity_left_interest.emit(peer, entity_id)
 
 ## Install the NATIVE crash handler, appending reports to `<dir>/crash-native.log`. Returns false if it was
 ## already installed (or the path did not fit). `dir` must be an absolute, already-created directory.
@@ -311,7 +373,7 @@ func set_net_tick_decoupled(tick_hz: int) -> void:
 	_orbit.sync_to_physics = false
 	set_tickrate(tick_hz)
 
-## Restore the coupled behaviour (net tick == physics tick). Called on session teardown so offline / a
+## Restore the coupled behavior (net tick == physics tick). Called on session teardown so offline / a
 ## re-hosted coupled session runs physics-synced again.
 func set_net_tick_coupled() -> void:
 	_orbit.sync_to_physics = true
@@ -472,21 +534,25 @@ func set_tickrate(rate: int) -> void:
 ##
 ## The facade mints a random one at boot, so a game that does nothing is already resumable within a process.
 ##
-## IT IS ASSERTED BY THE CLIENT AND VERIFIED BY NOBODY. A peer can send any token it likes, including one it
-## watched somebody else use. It is adequate for the thing it exists for -- a player whose link dropped getting
-## their own entity back -- and inadequate for anything that must not be forged. Account identity, entitlement
-## and ban evasion need an authenticated layer above this, and this call is where its verified id would be
-## written.
+## IT IS ASSERTED BY THE CLIENT AND VERIFIED BY NOBODY. A peer can send any identity it likes, including one it
+## watched somebody else use. What that no longer buys is somebody else's body: a RESUME is granted only when
+## the joiner also quotes the server-minted [method resume_token] issued for that identity, and an observer who
+## copied an identity off a roster, a kill feed, a log line or a screenshot never saw the token. It is still
+## inadequate for anything that must not be forged. Account identity, entitlement and ban evasion need an
+## authenticated layer above this, and this call is where its verified id would be written.
 func session_id() -> int:
 	if not _backend_has(&"session_id"):
 		return 0
 	return _orbit.session_id()
 
 ## Set this peer's session identity. CLIENT-SIDE, and it must be set BEFORE the join handshake goes out; a
-## change afterwards reaches the server on the next join.
+## change afterward reaches the server on the next join.
 ##
 ## Pass a value the game stored to make a session survive a PROCESS RESTART -- a crash, an alt-F4, a
 ## reinstalled route. `0` claims no identity, which is always seated as a newcomer.
+##
+## STORE [method resume_token] BESIDE IT. The identity on its own no longer resumes anything once a server has
+## issued a token for it, so a restored id with no restored token is seated as a newcomer.
 func set_session_id(id: int) -> void:
 	if not _backend_has(&"set_session_id"):
 		return
@@ -505,6 +571,159 @@ func is_session_held(session_id: int) -> bool:
 	if _mode == Mode.OFFLINE or not _backend_has(&"is_session_held"):
 		return false
 	return _orbit.is_session_held(session_id)
+
+## The SERVER-MINTED RESUME TOKEN this peer holds for its session identity, or 0 when it holds none.
+##
+## CLIENT-SIDE. [method session_id] names the player; this is what a claim on that identity has to quote. The
+## server mints one per identity, sends it in the join reply, and will not hand that identity's body to a peer
+## that cannot quote it back.
+##
+## PERSIST IT BESIDE THE STORED SESSION ID. It is the half of the pair a restarted process cannot re-derive,
+## and a saved identity with no saved token is exactly what an observer who copied the identity presents -- so
+## it is seated as a newcomer. Save both or resume nothing.
+##
+## WHAT THE TOKEN CLOSES: a peer that merely OBSERVED another player's session id -- off a roster broadcast, a
+## kill feed, a log line, a screenshot -- can no longer take that player's body.
+##
+## WHAT IT DOES NOT CLOSE: an on-path observer, who reads the join reply and can then quote the token
+## verbatim. That is the same boundary [method session_id]'s own session key already has, and closing it needs
+## a key exchange.
+##
+## ONE TOKEN PER CLIENT, NAMING WHICHEVER SERVER LAST ISSUED ONE. A token is minted per server per identity, so
+## joining a second server under the same identity replaces the stored value and forfeits the resume on the
+## first. Storing one per server would need a server identity the protocol does not carry, and what it would
+## buy is a player alternating between two servers inside one [method reconnect_grace] window.
+##
+## 0 against a backend that predates the call, and 0 until a server has answered a join.
+func resume_token() -> int:
+	if not _backend_has(&"resume_token"):
+		return 0
+	return _orbit.resume_token()
+
+## Restore the resume token a previous run of this process was issued. CLIENT-SIDE, and set it BEFORE the join
+## handshake goes out, beside [method set_session_id]; a change afterward reaches the server on the next join.
+##
+## BOTH HALVES ARE NEEDED TO RESUME. The identity alone reclaims nothing once a server holds a token for it,
+## and a token alone names no player. The two are not checked against each other here -- a mismatched pair is
+## refused by the server and seated as a newcomer -- so they may be restored in either order, and a game that
+## stores them in one blob cannot get the ordering wrong.
+##
+## 0 quotes no token, which is always seated as a newcomer once a server holds a token for that identity.
+func set_resume_token(token: int) -> void:
+	if not _backend_has(&"set_resume_token"):
+		return
+	_orbit.set_resume_token(token)
+
+## The resume token this server issued to `peer`, or 0 for an unknown peer and one holding no identity.
+##
+## SERVER-SIDE, and a DIAGNOSTIC: it is what an admin tool or a log line prints to see why a rejoiner was or
+## was not resumed. Nothing needs it to seat a player. 0 OFFLINE and against a backend that predates the call.
+func peer_resume_token(peer: int) -> int:
+	if _mode == Mode.OFFLINE or not _backend_has(&"peer_resume_token"):
+		return 0
+	return _orbit.peer_resume_token(peer)
+
+# --- the shared session secret -----------------------------------------------------------------------
+## Set the SHARED SESSION SECRET this session's per-datagram keys are derived from. An empty array clears it.
+##
+## BOTH ENDS MUST SET THE SAME ONE, AND SET IT BEFORE [method set_mode]. The client folds it into the key it
+## seals with, the server folds it into the key it opens with, and a session where the two disagree
+## authenticates nothing.
+##
+## SOURCE IT FROM A CHANNEL THE GAME ALREADY AUTHENTICATED -- a lobby's metadata, a matchmaking ticket, a
+## session record fetched over TLS. Any length works: it is folded to 16 bytes internally, so a token, a
+## ticket or a passphrase can be passed as they are.
+##
+## WHAT IT CHANGES. Without a secret the per-datagram key is minted by the client and carried in the join
+## handshake in the clear, so an ON-PATH OBSERVER who reads that handshake can forge anything the client can.
+## With one, the handshake carries only a NONCE, both ends derive the key from `(secret, nonce)`, and that
+## observer learns the nonce and nothing else.
+##
+## WHAT IT DOES NOT CHANGE. The tag is still 64 bits and the key still 128. The derived key is worth exactly
+## the entropy of the secret you supply -- one a lobby prints on screen buys what it looks like it buys. And
+## NONE OF THIS ENCRYPTS ANYTHING: every payload is still on the wire in the clear.
+##
+## A MISCONFIGURATION LOOKS THE SAME TO THE PLAYER EITHER WAY: the two ends derive different keys, nothing
+## either sends opens at the other, and the join never completes while the handshake retries. What differs is
+## whether anything says why.
+##
+## - SERVER WITH A SECRET, CLIENT WITHOUT is refused at the handshake, with one readable rejection in the
+##   server's log naming the secret. That is what the confirm tag on the handshake exists for.
+## - CLIENT WITH A SECRET, SERVER WITHOUT cannot be reported at all. The server's reply is sealed under a key
+##   the client will not derive, so it never reads a byte of it -- a rejection included -- and the server sees
+##   a hello it has no reason to refuse.
+##
+## COMPARE [method has_session_secret] ON BOTH ENDS WHEN A JOIN HANGS. It is the only thing that separates
+## this from a dead link.
+##
+## A no-op against a backend that predates the call, which leaves that session on the cleartext key.
+func set_session_secret(secret: PackedByteArray) -> void:
+	if not _backend_has(&"set_session_secret"):
+		return
+	_orbit.set_session_secret(secret)
+
+## Whether a session secret is set. THERE IS NO GETTER FOR THE BYTES, deliberately -- the only questions a
+## game has are "did my configuration take" and "am I about to join in the clear", and both are this one.
+##
+## false against a backend that predates the call, which is the honest answer: that backend derives nothing.
+func has_session_secret() -> bool:
+	if not _backend_has(&"has_session_secret"):
+		return false
+	return _orbit.has_session_secret()
+
+## Which claims on a session identity this server grants. See [method set_resume_policy]. ALWAYS is the default
+## and stays the default.
+enum ResumePolicy {
+	ALWAYS = 0,
+	ONLY_IF_DROPPED = 1,
+	NEVER = 2,
+}
+
+## The resume policy in force. ALWAYS unless the game chose otherwise, and ALWAYS against a backend that
+## predates the property.
+func resume_policy() -> ResumePolicy:
+	return _resume_policy_of(_backend_int(&"resume_policy", ResumePolicy.ALWAYS))
+
+## Choose which claims on a session identity this server grants. SERVER-SIDE. A value outside the enum clamps
+## to ALWAYS, here and in the backend.
+##
+## [b]ALWAYS[/b] -- a claim quoting the right resume token is granted, including against a connection that is
+## still up. That connection loses the identity and stops driving its bodies; it is reported to the game as
+## `resumed_from` on [signal peer_joined].
+## [b]ONLY_IF_DROPPED[/b] -- the same claim is refused while the incumbent connection is still up. The
+## incumbent KEEPS its identity, so its own later drop still opens a real grace window, and the claimant is
+## seated as an anonymous newcomer with session id 0 and `resumed_from` 0. It has to join again once the drop
+## lands.
+## [b]NEVER[/b] -- no claim is ever granted. A returning player is a new player. An identity that is currently
+## HELD is not seated on anybody either, so pair this with [method set_reconnect_grace] at 0 if you want a
+## returning player to carry its own identity again immediately.
+##
+## THE DEFAULT IS ALWAYS, AND THAT IS A CHOICE RATHER THAN AN OMISSION:
+##
+## - THE TOKEN IS WHAT REMOVED THE REACHABLE ATTACK. A claim is granted only when the quoted
+##   [method resume_token] matches the one the server has on record, so a peer that merely observed somebody's
+##   session id is refused under ALWAYS exactly as it is under NEVER.
+## - WHAT ALWAYS IS STILL OPEN TO IS AN ON-PATH OBSERVER, who reads the join reply and can quote the token
+##   verbatim. ONLY_IF_DROPPED buys nothing against that adversary: it can read the traffic, so it can already
+##   do everything the client can, and it can wait for the drop like anybody else.
+## - WHAT ALWAYS BUYS IS EVERY HONEST FAST RECONNECT. A relaunched client routinely arrives before the
+##   transport reports its old socket gone -- measured at anywhere from 45 s to never on ENet's defaults -- and
+##   under ONLY_IF_DROPPED that player is refused their own body for the whole of that span.
+##
+## ONLY_IF_DROPPED is a supported setting and ONE CALL, for a game that will not accept a live takeover on any
+## terms.
+func set_resume_policy(policy: int) -> void:
+	_orbit.set(&"resume_policy", int(_resume_policy_of(policy)))
+
+## The enum member `policy` names, or ALWAYS for anything else. One definition, so the read-back and the write
+## clamp the same way -- and so a value from a newer backend reads as "refuse nobody" rather than as whichever
+## member happens to sit at that number here. ALWAYS is the safe direction because it is token-gated: falling
+## onto a stricter policy by accident locks honest players out of their own bodies.
+static func _resume_policy_of(policy: int) -> ResumePolicy:
+	match policy:
+		ResumePolicy.ONLY_IF_DROPPED: return ResumePolicy.ONLY_IF_DROPPED
+		ResumePolicy.NEVER: return ResumePolicy.NEVER
+	return ResumePolicy.ALWAYS
 
 ## Seconds a dropped peer's session is held open for it to come back to. 0 disables resume entirely: a peer
 ## that drops is forgotten in the same frame and [signal peer_dropped] reports `held = false`.
@@ -592,7 +811,7 @@ func resim_force() -> int:
 func set_resim_force(ticks: int) -> void:
 	_orbit.resim_force = clampi(ticks, 0, 64)
 
-## Interest-management radius in metres, the 100-player lever: with a radius set, the SERVER sends each peer only
+## Interest-management radius in meters, the 100-player lever: with a radius set, the SERVER sends each peer only
 ## the entities within it of that peer's own body (1.25x exit hysteresis so boundary entities don't flicker).
 ## Server-side only; ignored on clients.
 ##
@@ -609,10 +828,10 @@ func set_resim_force(ticks: int) -> void:
 func aoi_radius() -> float:
 	return _orbit.aoi_radius
 
-func set_aoi_radius(metres: float) -> void:
-	_orbit.aoi_radius = maxf(0.0, metres)
+func set_aoi_radius(meters: float) -> void:
+	_orbit.aoi_radius = maxf(0.0, meters)
 
-## The scale the PRIORITY BANDS are derived from, in metres: edges at `scale/3` and `2*scale/3`.
+## The scale the PRIORITY BANDS are derived from, in meters: edges at `scale/3` and `2*scale/3`.
 ##
 ## A separate number from [method aoi_radius] because they answer different questions and their answers differ by
 ## two orders of magnitude -- one decides whether an entity is sent at all, the other how often relative to
@@ -623,8 +842,8 @@ func set_aoi_radius(metres: float) -> void:
 func aoi_band_radius() -> float:
 	return _backend_float(&"aoi_band_radius", 0.0)
 
-func set_aoi_band_radius(metres: float) -> void:
-	_orbit.set(&"aoi_band_radius", maxf(0.0, metres))
+func set_aoi_band_radius(meters: float) -> void:
+	_orbit.set(&"aoi_band_radius", maxf(0.0, meters))
 
 ## Hard cap on one peer's interest set, 0 = uncapped. The nearest N CULLABLE entities win; a peer's own body and
 ## every always-relevant channel are exempt, so this bounds the scenery, never the gameplay. An entity evicted by
@@ -638,7 +857,7 @@ func set_aoi_max_entities(count: int) -> void:
 ## Declare where one peer OBSERVES from, and which world it observes in. SERVER-SIDE ONLY; no-op OFFLINE or
 ## against a backend that predates the call.
 ##
-## Undeclared, each SEAT on a peer is centred on -- and put in the world of -- the lowest-id rollback body that
+## Undeclared, each SEAT on a peer is centered on -- and put in the world of -- the lowest-id rollback body that
 ## seat drives. That answers what a seat CONTROLS, and interest management asks what it OBSERVES. The two agree
 ## in a game with one world and one avatar per player, and disagree in every other one: a spectator drives
 ## nothing, a commander watches ground its body is not standing on, and a peer with a body in each of two worlds
@@ -654,7 +873,7 @@ func set_aoi_max_entities(count: int) -> void:
 ##
 ## IT ALSO COLLAPSES A SPLIT-SCREEN CONNECTION TO ONE VIEWPOINT. This declares where a CONNECTION observes from,
 ## and a connection with several seats has stated one answer for all of them. That is the same precedence that
-## stops a declared centre from falling back to an avatar's. A game that wants a centre per seat declares
+## stops a declared center from falling back to an avatar's. A game that wants a center per seat declares
 ## nothing here and lets each seat's own body anchor it -- see [method NetRollbackHandle.set_seat].
 func set_peer_anchor(peer: int, position: Vector3, membership: int = 0) -> void:
 	if _mode == Mode.OFFLINE or not _backend_has(&"set_peer_anchor"):
@@ -668,10 +887,10 @@ func set_peer_anchor(peer: int, position: Vector3, membership: int = 0) -> void:
 ## token, routinely negative, only ever passed back unmodified. The entity need NOT be one the peer drives, which
 ## is the point. `0` retracts, exactly as [method clear_peer_anchor] does.
 ##
-## The same statement as [method set_peer_anchor], differing in what it costs the caller: a tracked centre follows
+## The same statement as [method set_peer_anchor], differing in what it costs the caller: a tracked center follows
 ## the entity with no per-tick call. **When the tracked entity despawns the peer keeps the last position it
 ## resolved to, and stays in the world it was declared into** -- a membership is a declaration and did not fail,
-## while a centre is a measurement and did. A declaration made before the entity has any replicated state simply
+## while a center is a measurement and did. A declaration made before the entity has any replicated state simply
 ## starts resolving on the tick it does.
 func set_peer_anchor_entity(peer: int, entity_id: int, membership: int = 0) -> void:
 	if _mode == Mode.OFFLINE or not _backend_has(&"set_peer_anchor_entity"):
@@ -679,7 +898,7 @@ func set_peer_anchor_entity(peer: int, entity_id: int, membership: int = 0) -> v
 	_orbit.set_peer_anchor_entity(peer, entity_id, membership)
 
 ## Retract a peer's anchor declaration AND its world, together. The peer returns to the inferred pair, one per
-## seat: each centred on the lowest-id body that seat drives, in that body's world. Retracting one axis without
+## seat: each centered on the lowest-id body that seat drives, in that body's world. Retracting one axis without
 ## the other would leave a peer declared into a world it has no declared position in, or positioned in a world it
 ## is no longer in.
 func clear_peer_anchor(peer: int) -> void:
@@ -696,6 +915,235 @@ func peer_membership(peer: int) -> int:
 	if _mode == Mode.OFFLINE or not _backend_has(&"peer_membership"):
 		return 0
 	return _orbit.peer_membership(peer)
+
+## Where an anchor the filter is USING came from. The `source` key of [method peer_anchor].
+enum AnchorSource {
+	## No answer: the peer names no connection, or the interest pass has not run for it. `stale` is true.
+	NONE = 0,
+	## Inferred from the bodies the connection drives -- the default, and what a game that declares nothing gets.
+	INFERRED = 1,
+	## A fixed position declared by [method set_peer_anchor].
+	FIXED = 2,
+	## An entity declared by [method set_peer_anchor_entity], tracked wherever it is.
+	ENTITY = 3,
+}
+
+## The interest anchor ACTUALLY IN EFFECT for one connection, as the last interest pass resolved it. SERVER-SIDE
+## diagnostic; every key present and zeroed OFFLINE, on a client, and against a backend that predates the call.
+##
+## NOT [method peer_membership], which reports the DECLARATION and therefore answers 0 for every peer that
+## declared nothing -- indistinguishable from a peer declared into every world. The pair the filter actually ran
+## with is computed inside the send path, and this is the only way to read it.
+##
+## [b]KEYS[/b]
+## [code]source[/code] ([AnchorSource]) -- 0 none, 1 inferred, 2 fixed position, 3 tracked entity.
+## [code]viewpoints[/code] (int) -- how many observers the filter ran. One per resolved seat; 1 for a declared or
+##   failed-open connection; 0 for a connection closed by [method set_unanchored_policy].
+## [code]membership[/code] (int) -- the world IN EFFECT, not the declared one.
+## [code]located[/code] (bool) -- false when the center could not be established, so nothing is culled by distance.
+## [code]center[/code] (Vector3) -- the center, or ZERO when `located` is false.
+## [code]open[/code] (bool) -- this connection culls NOTHING by distance, because one of its viewpoints has no
+##   center. Read beside `viewpoints`: 0 viewpoints with `open` false is the opposite state, receiving nothing.
+## [code]ambiguous[/code] (bool) -- some seat drives several anchored bodies, so its center is one arbitrary
+##   (deterministic) pick among them. Declare the same membership on every body a seat drives, put them on
+##   separate seats, or declare the connection's anchor, if that pick is not the one you want.
+## [code]stale[/code] (bool) -- THE INTEREST PASS HAS NOT RUN. Read nothing else.
+##
+## [b]`stale` IS THE GATE AND IT IS NOT AN EDGE CASE.[/b] The pass is skipped entirely whenever nothing can be
+## culled -- no [method aoi_radius] and no entity declaring a membership, which is a session replicating
+## everything to everybody -- and it never runs on a client. Without `stale` this would answer "centered at the
+## origin, in world 0, located" for every peer in those sessions, describing a filter that is not running.
+##
+## `center`, `located` and `membership` describe the FIRST viewpoint, which is the whole connection whenever
+## `viewpoints` is 1. A split-screen connection has one per seat and they differ; ask [method seat_anchor] there.
+func peer_anchor(peer: int) -> Dictionary[String, Variant]:
+	var out: Dictionary[String, Variant] = {
+		"source": int(AnchorSource.NONE),
+		"viewpoints": 0,
+		"membership": 0,
+		"located": false,
+		"center": Vector3.ZERO,
+		"open": false,
+		"ambiguous": false,
+		"stale": true,
+	}
+	if _mode == Mode.OFFLINE or not _backend_has(&"peer_anchor_info"):
+		return out
+	var info: Dictionary = _orbit.peer_anchor_info(peer)
+	for key: String in out.keys():
+		out[key] = info.get(key, out[key])
+	return out
+
+## The same answer for ONE seat on a connection, for the split-screen case. Keys: `center` (Vector3, ZERO when
+## unlocated), `located` (bool), `membership` (int). Every key present and zeroed OFFLINE, on a client, and
+## against a backend that predates the call.
+##
+## A DECLARED connection answers its one collapsed viewpoint for every seat label, including labels no body
+## currently drives -- [method set_peer_anchor] states where the CONNECTION observes from and is not re-split by
+## seat. An inferred connection answers only for the seats that resolved a center; a seat whose body has not
+## spawned reads zeroed, which is exactly what the filter does with it.
+func seat_anchor(peer: int, seat: int) -> Dictionary[String, Variant]:
+	var out: Dictionary[String, Variant] = {
+		"center": Vector3.ZERO,
+		"located": false,
+		"membership": 0,
+	}
+	if _mode == Mode.OFFLINE or not _backend_has(&"seat_anchor_info"):
+		return out
+	var info: Dictionary = _orbit.seat_anchor_info(peer, seat)
+	for key: String in out.keys():
+		out[key] = info.get(key, out[key])
+	return out
+
+## What a connection that resolved NO interest anchor receives. See [method set_unanchored_policy]. OPEN is the
+## default and stays the default.
+enum UnanchoredPolicy {
+	OPEN = 0,
+	CLOSED = 1,
+}
+
+## Choose what a connection that resolved no interest anchor receives. SERVER-SIDE, session-wide; a value outside
+## the enum clamps to OPEN, here and in the backend. No-op against a backend that predates the call.
+##
+## [b]OPEN[/b] -- today's behavior. Such a connection is treated as unlocatable, which makes every entity
+## uncullable for it, and an uncullable entity is kept regardless of [method aoi_max_entities]. So it receives
+## every non-vetoed entity in EVERY world, with the nearest-N cap not bounding it and the per-datagram send
+## budget as the only remaining brake. That is the right answer for a player whose avatar is still spawning and
+## the wrong one for a connection that will never drive anything.
+## [b]CLOSED[/b] -- such a connection is given no viewpoint, and no viewpoint makes nothing relevant. It
+## receives nothing until it declares an anchor or drives a body.
+##
+## [b]THE CARVE-OUT IS THE WHOLE DESIGN.[/b] CLOSED applies ONLY to a connection that declared nothing AND drives
+## no rollback body at all. A connection whose seats exist but have not RESOLVED a center yet -- a player whose
+## body is still spawning -- keeps the fail-open above, and that is deliberate: closing it would deny a player
+## their own avatar for as many ticks as the body takes to spawn.
+##
+## [b]THE DEFAULT DOES NOT MOVE.[/b] The cdylib is refreshed only at a release tag, so the same project source
+## runs against older and newer binaries; a CLOSED default would mean a game's spectators see the world or do
+## not, depending on which binary is on disk. Choose it in one call, in a session whose spectators are supposed
+## to declare an anchor with [method set_peer_anchor].
+func set_unanchored_policy(policy: int) -> void:
+	if not _backend_has(&"set_unanchored_policy"):
+		return
+	_orbit.set_unanchored_policy(int(_unanchored_of(policy)))
+
+## The session default in force. OPEN unless the game chose otherwise, and OPEN against a backend that predates
+## the call. Per-connection overrides are not folded in -- this is what a connection nobody declared a policy for
+## follows.
+func unanchored_policy() -> UnanchoredPolicy:
+	# A method rather than a backend property, so `_backend_int` (which reads a property) cannot answer it.
+	if not _backend_has(&"unanchored_policy"):
+		return UnanchoredPolicy.OPEN
+	var raw: int = _orbit.unanchored_policy()
+	return _unanchored_of(raw)
+
+## The same policy for ONE connection, overriding the session default outright. SERVER-SIDE; no-op OFFLINE or
+## against a backend that predates the call.
+##
+## For the mixed session the session-wide value cannot express: a game whose spectators declare an anchor and
+## whose late joiners do not can close the first without closing the second. The carve-out on
+## [method set_unanchored_policy] applies here unchanged.
+##
+## IT IS DROPPED WITH THE CONNECTION. A reused peer id follows the session default again rather than inheriting a
+## policy nobody set for it. May be called before the peer finishes its handshake.
+func set_peer_unanchored_policy(peer: int, policy: int) -> void:
+	if _mode == Mode.OFFLINE or not _backend_has(&"set_peer_unanchored_policy"):
+		return
+	_orbit.set_peer_unanchored_policy(peer, int(_unanchored_of(policy)))
+
+## The enum member `policy` names, or OPEN for anything else. One definition, so the read-back and the write
+## clamp the same way -- and so a value from a newer backend reads as "withhold nothing" rather than as whichever
+## member happens to sit at that number here.
+static func _unanchored_of(policy: int) -> UnanchoredPolicy:
+	if policy == UnanchoredPolicy.CLOSED:
+		return UnanchoredPolicy.CLOSED
+	return UnanchoredPolicy.OPEN
+
+## What a session does with a connection's seats once that connection ends. See
+## [method set_seat_release_policy]. HOLD is the default and stays the default.
+enum SeatRelease {
+	HOLD = 0,
+	RELEASE_ON_EXPIRY = 1,
+	RELEASE_ON_DROP = 2,
+}
+
+## The seat-release policy in force. HOLD unless the game chose otherwise, and HOLD against a backend that
+## predates the property.
+func seat_release_policy() -> SeatRelease:
+	return _seat_release_of(_backend_int(&"seat_release_policy", SeatRelease.HOLD))
+
+## Choose what happens to a connection's seats when that connection ends. SERVER-SIDE. A value outside the
+## enum clamps to HOLD, here and in the backend, so a stored number this build does not know releases nothing.
+##
+## [b]HOLD[/b] -- nothing is released. The bodies keep the peer they were given, through the drop and past the
+## expiry, until the game re-points them itself.
+## [b]RELEASE_ON_EXPIRY[/b] -- the seats are released when the grace window closes with nobody having claimed
+## the session back, immediately BEFORE [signal peer_session_expired] fires. A drop on its own changes nothing,
+## so a player who reconnects inside the window finds the body where they left it.
+## [b]RELEASE_ON_DROP[/b] -- the seats are released at the next tick boundary after the transport connection
+## goes away. For a game with no reconnect story: the place opens to the next joiner at once, and a player who
+## comes back is a new player.
+##
+## THE DEFAULT IS HOLD AND IT DOES NOT MOVE. Four reasons, each sufficient on its own:
+##
+## - IT IS WHAT THE INSTALLED BINARY ALREADY DOES. The cdylib is refreshed only at a release tag, so the same
+##   project source runs against older and newer binaries. A releasing default would mean a game despawns
+##   players' viewpoints or does not, depending on which binary happens to be on disk.
+## - IT IS THE DOCUMENTED CONTRACT IN THREE PLACES: [signal peer_session_expired], [signal seat_closed] and the
+##   sizing note on [method set_reconnect_grace] all state that a dropped connection keeps its seats. Moving the
+##   default falsifies all three for every existing consumer, silently.
+## - IT IS WHAT THE RECONNECT GRACE WINDOW EXISTS FOR. A player whose link drops a burst of packets comes back
+##   to the body they left, and that only works because nothing took it away meanwhile. Releasing on every
+##   transient drop despawns players for a hiccup.
+## - THE ADDON DOES NOT KNOW WHAT A RELEASED BODY SHOULD BECOME. Freed, parked as a corpse, handed to a queued
+##   joiner, kept as an idle NPC -- those are game rules, and this facade declines to make that decision. THIS
+##   CALL DOES NOT MAKE IT EITHER: RELEASE_ON_* hands input back to the server and closes the seat, and freeing
+##   the node stays your call, exactly as it is for a body a cull stopped sending.
+##
+## What choosing a RELEASE_ON_* buys is ONE CALL INSTEAD OF A SECOND TABLE. The alternative is a peer-to-bodies
+## map maintained beside the roster the backend already derives from ownership, and two tables answering "which
+## bodies does this connection drive" are two things that can disagree -- while only one of them, ownership, is
+## what the anti-forgery check on received input reads.
+func set_seat_release_policy(policy: int) -> void:
+	_orbit.set(&"seat_release_policy", int(_seat_release_of(policy)))
+
+## The enum member `policy` names, or HOLD for anything else. One definition, so the read-back and the write
+## clamp the same way -- and so a value from a newer backend reads as "release nothing" rather than as whichever
+## member happens to sit at that number here.
+static func _seat_release_of(policy: int) -> SeatRelease:
+	match policy:
+		SeatRelease.RELEASE_ON_EXPIRY: return SeatRelease.RELEASE_ON_EXPIRY
+		SeatRelease.RELEASE_ON_DROP: return SeatRelease.RELEASE_ON_DROP
+	return SeatRelease.HOLD
+
+## Hand every body `peer` drives back to the server, closing its seats. Answers how many entities changed.
+##
+## SERVER-SIDE, and AVAILABLE UNDER EVERY POLICY including the default -- [method set_seat_release_policy] only
+## decides whether the backend makes this call by itself on a drop or an expiry. Use it for the cases no policy
+## covers: a kick, an admin command, a match ending, a player who forfeits.
+##
+## 0 off the authority, 0 for a peer that drives nothing, 0 for peer id 1 (a body handed back to the server is
+## what an unclaimed body already looks like), and 0 against a backend that predates the call.
+##
+## IT RELEASES THE SEAT AND NOTHING ELSE. The body stays registered, stays replicated and stays in the scene;
+## what leaves is the viewpoint. [signal seat_closed] fires from the next announcement, on both sides. Freeing
+## the node is your decision, exactly as it is for a session whose grace window expired.
+func release_peer_seats(peer: int) -> int:
+	if not _backend_has(&"release_peer_seats"):
+		return 0
+	var released: int = _orbit.release_peer_seats(peer)
+	return released
+
+## The same release, narrowed to ONE seat label on that connection. Answers how many entities changed.
+##
+## For a connection holding several seats -- local split-screen -- where only one of them is going away. A
+## `seat` outside the label range answers 0 rather than releasing the whole connection, because the caller
+## asked for a seat that cannot exist. 0 against a backend that predates the call.
+func release_seat(peer: int, seat: int) -> int:
+	if not _backend_has(&"release_seat_of"):
+		return 0
+	var released: int = _orbit.release_seat_of(peer, seat)
+	return released
 
 ## Which SEATS a connection currently holds, ascending. Empty for a connection that drives nothing, empty
 ## OFFLINE, and empty against a backend that predates the call.
@@ -768,6 +1216,36 @@ func is_entity_hidden(peer: int, entity_id: int) -> bool:
 	if _mode == Mode.OFFLINE or not _backend_has(&"is_entity_hidden"):
 		return false
 	return _orbit.is_entity_hidden(peer, entity_id)
+
+## Whether `entity_id` is currently in `peer`'s interest. False OFFLINE and against a backend that predates the
+## call.
+##
+## A SESSION THAT CULLS NOTHING ANSWERS TRUE FOR EVERY REGISTERED ENTITY. With no [member aoi_radius] and no
+## declared membership the interest pass does not run at all, so there is no set to read; "everything is in
+## interest" is the honest answer there, not "nothing is".
+##
+## WORKS ON BOTH SIDES. A server answers from its own interest pass. A client answers from the set the interest
+## sections built and ignores `peer` -- a client holds exactly one interest set, its own -- and answers true for
+## everything it holds until it has received a section, because a server that culls nothing sends none.
+func is_entity_in_interest(peer: int, entity_id: int) -> bool:
+	if _mode == Mode.OFFLINE or not _backend_has(&"is_entity_in_interest"):
+		return false
+	return _orbit.is_entity_in_interest(peer, entity_id)
+
+## Every entity in `peer`'s interest, as opaque entity ids, ascending. Empty OFFLINE and against a backend that
+## predates the call.
+##
+## WHAT GIVES AN EDGE A STARTING POINT. [signal entity_entered_interest] and [signal entity_left_interest] are
+## transitions, so a handler bound mid-session -- or a node built after the fact -- has nothing to resync from
+## and would wait for the next churn. This is the standing answer, and it follows the same "culling off means
+## everything" rule [method is_entity_in_interest] states.
+func entities_in_interest(peer: int) -> PackedInt64Array:
+	if _mode == Mode.OFFLINE or not _backend_has(&"entities_in_interest"):
+		return PackedInt64Array()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant, and the
+	# GDScript rule for a wire-ish value is that the conversion is an assignment, never a cast.
+	var ids: PackedInt64Array = _orbit.entities_in_interest(peer)
+	return ids
 
 ## Rate tiering by distance band: send the MID band every other tick and the FAR band every fourth, phase-offset
 ## by entity id so a band's traffic is level rather than spiking once per interval.
@@ -884,11 +1362,33 @@ func perf_metrics() -> Dictionary[String, float]:
 ##   starve_ticks_max               -- worst age in ticks of an in-interest entity that HAS been sent at least once
 ##   unsent_backlog_max             -- worst count of in-interest entities never yet sent to a peer (the re-entry
 ##                                     storm gauge, which starve_ticks_max cannot see: a never-sent entity has no age)
-##   interest_ms                    -- ms/tick in the interest pass. The number that would justify revisiting the
-##                                     grid-vs-scan decision recorded in orbitnet-core's interest module.
+##   interest_ms                    -- ms/tick in the interest pass. The cost of whichever path ran, and the
+##                                     column to watch when a host overruns its net tick.
+##   interest_grid                  -- fraction of the window's ticks whose interest pass ran through the SPATIAL
+##                                     INDEX rather than the flat scan: 0.0 all-scan, 1.0 all-grid, in between
+##                                     while the session crosses the threshold. THE VERDICT, REPORTED -- there is
+##                                     no setter, and there is deliberately none: the session picks its path from
+##                                     its own occupancy each tick, and a wrong pick costs time and nothing else,
+##                                     because the two paths are proven to compute identical members, identical
+##                                     per-member distances and identical leaves. Read it BESIDE interest_ms and
+##                                     nowhere else -- it can never explain a behavior difference, only which
+##                                     cost interest_ms is the cost of. A whole window at a fraction strictly
+##                                     between 0.0 and 1.0 means the occupancy is hovering in the selector's
+##                                     hysteresis band, which describes the arena rather than a fault. A session
+##                                     with no aoi_radius reads 0.00 always: there is no distance to index.
 ##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded
 ##                                     before rate tiering may be enabled.
 ##   peers / interest_entities      -- peers synced, and the mean size of ONE peer's interest set
+##   rtt_at_ceiling_peers           -- connected peers whose RAW round trip is above
+##                                     [method rtt_believed_max_ms], so peer_rtt_ms reports the ceiling for them
+##                                     rather than what was measured. A GAUGE like starve_ticks_max, not a
+##                                     per-second rate: the standing count as of the publish. A subset of
+##                                     `peers`, so read it against that one -- 3 of 4 says the ceiling is the
+##                                     session's policy for nearly everybody, 3 of 40 says three players are
+##                                     having a bad time. Persistently large is the reading that says the
+##                                     ceiling is set too low for the population actually playing. Non-zero is
+##                                     not an accusation: a peer above the ceiling is either lagging its acks
+##                                     deliberately or genuinely that far away, and nothing can tell those apart.
 ## The POOLED mean ticks between admissions across every band -- the one figure from
 ## [method bandwidth_metrics] that is read EVERY NET TICK on the authority rather than at human rates.
 ##
@@ -1018,10 +1518,11 @@ func bandwidth_metrics() -> Dictionary[String, float]:
 		"want_full_nacks_s": 0.0, "unproven_acks_s": 0.0, "stale_blocks_s": 0.0, "blocks_oversize_s": 0.0,
 		"blocks_full_s": 0.0,
 		"starve_ticks_max": 0.0, "unsent_backlog_max": 0.0,
-		"interest_ms": 0.0,
+		"interest_ms": 0.0, "interest_grid": 0.0,
 		"interarrival_near": 0.0, "interarrival_mid": 0.0, "interarrival_far": 0.0,
 		"interarrival_all": 0.0,
 		"peers": 0.0, "interest_entities": 0.0,
+		"rtt_at_ceiling_peers": 0.0,
 	}
 	if _mode == Mode.OFFLINE or not _backend_has(&"bandwidth_metrics"):
 		return out
@@ -1054,14 +1555,14 @@ func clock_metrics() -> Dictionary[String, float]:
 		"lead_ticks": lead_ticks,
 	}
 
-## What THIS SERVER measured about `peer`'s round trip, in milliseconds, or a NEGATIVE value when there is no
+## What THIS SERVER BELIEVES about `peer`'s round trip, in milliseconds, or a NEGATIVE value when there is no
 ## estimate: an unknown peer, a peer that has not acknowledged a snapshot frame since it joined, a client (which
 ## measures nobody), or offline. The input to the per-shooter lag-compensation rewind ([NetLagComp]).
 ##
 ## NOT the same figure as `clock_metrics()["rtt_ms"]`, which is the LOCAL peer's own ping sampler and reads 0.0 on
 ## a server -- the pong path only ever runs client-side. Ask this one about somebody else, that one about yourself.
 ##
-## The backend derives it from the snapshot acknowledgements it already receives, so nothing was added to the wire.
+## The backend derives it from the snapshot acknowledgments it already receives, so nothing was added to the wire.
 ## A caller must handle the negative: "we do not know yet" is a real answer for the first moments of every join,
 ## and treating it as zero would hand a fresh joiner the shallowest possible rewind at exactly the moment their
 ## link is least settled. It is also what a backend binary older than this script answers -- see the `has_method`
@@ -1071,12 +1572,65 @@ func clock_metrics() -> Dictionary[String, float]:
 ## defensive: the backend's peer table holds REMOTE peers only, so a host's own shots would otherwise fall back to
 ## the flat window and be rewound further than a LAN client's in the same session -- the exact inversion this
 ## exists to remove. The host's round trip to itself is zero by construction; nothing is measured or believed.
+##
+## CAPPED AT [method rtt_believed_max_ms]. The estimate is derived from acknowledgments the client chooses when
+## to send, and the residual the backend's ack rules cannot close is a client that advances its ack at full rate
+## behind a constant lag -- it quotes a real frame token every time and reads as a slow link. This is the figure
+## every rewind input reads, so bounding it here bounds that residual for every consumer at once. Ask
+## [method peer_rtt_raw_ms] for the unclamped number. A backend older than the ceiling answers the raw figure
+## from both, which is the pre-ceiling behavior rather than an error.
 func peer_rtt_ms(peer: int) -> float:
 	if _mode == Mode.OFFLINE or not _backend_has(&"peer_rtt_ms"):
 		return -1.0
 	if is_server() and peer == multiplayer.get_unique_id():
 		return 0.0
 	return _orbit.peer_rtt_ms(peer)
+
+## The same round trip WITHOUT the belief ceiling: what the server actually measured, on the same contract as
+## [method peer_rtt_ms] -- negative for no estimate, 0.0 for a listen host asking about itself, negative OFFLINE.
+##
+## FOR ANYTHING THAT SHOWS A NUMBER TO A HUMAN: a scoreboard ping, a connection-quality readout, an admin tool.
+## Those want to say what the link is doing, and a figure pinned at the ceiling would tell every player on a bad
+## connection the same wrong number. Only the rewind input is bounded, and that is [method peer_rtt_ms].
+##
+## DO NOT FEED THIS TO A REWIND. It is the figure the ceiling exists to bound, so a caller reaching past
+## [method peer_rtt_ms] for it has undone the bound.
+##
+## Falls back to [method peer_rtt_ms] against a backend that predates the split, rather than to -1.0: on such a
+## binary `peer_rtt_ms` IS the raw figure, so the fallback is the right answer rather than a degraded one.
+func peer_rtt_raw_ms(peer: int) -> float:
+	if _mode == Mode.OFFLINE:
+		return -1.0
+	if not _backend_has(&"peer_rtt_raw_ms"):
+		return peer_rtt_ms(peer)
+	if is_server() and peer == multiplayer.get_unique_id():
+		return 0.0
+	return _orbit.peer_rtt_raw_ms(peer)
+
+## The largest round trip this server will BELIEVE about a peer, in milliseconds. Clamped 0..10000 by the backend
+## on set; 250.0 by default, the same figure [member NetLagComp.max_delay_ms] defaults to.
+##
+## THERE ARE TWO CEILINGS AND THEY BOUND DIFFERENT THINGS. This one bounds WHAT THE SERVER BELIEVES ABOUT A LINK,
+## so every consumer of [method peer_rtt_ms] gets a bounded figure -- a rewind, a diagnostic, a game's own
+## matchmaking rule. [member NetLagComp.max_delay_ms] bounds THE REWIND DEPTH, and the ring retention that keys
+## off it. Neither subsumes the other: lowering only the rewind ceiling still leaves a fabricated round trip
+## reaching anything else that asks, and lowering only this one still leaves the rewind free to ask for more
+## history than the ring holds.
+##
+## WHAT IT DOES NOT CLOSE, plainly: a client advancing its ack at full rate behind a constant lag still reads as a
+## slow link, up to this value. No wire field closes that -- the round trip is the only quantity the server can
+## derive, so a deliberate lag and an honest one are the same measurement. Lowering this narrows the residual and
+## narrows the honest slow link by exactly as much.
+##
+## SERVER-SIDE. 0.0 believes nothing about anybody: every connected peer reports a 0 ms round trip, which a
+## per-shooter rewind reads as the shallowest window in the session. Reads 250.0 against a backend that predates
+## the property, which is what that backend's `peer_rtt_ms` is NOT bounded by -- ask
+## [method bandwidth_metrics]'s `rtt_at_ceiling_peers` to see whether a ceiling is binding on anyone.
+func rtt_believed_max_ms() -> float:
+	return _backend_float(&"rtt_believed_max_ms", 250.0)
+
+func set_rtt_believed_max_ms(ms: float) -> void:
+	_orbit.set(&"rtt_believed_max_ms", maxf(0.0, ms))
 
 # --- rollback / state / interpolation handles (created here so the backend is named only here) ----
 ## Create a rollback handle for a predicted body (owner prediction + reconciliation). OFFLINE returns an
@@ -1144,11 +1698,19 @@ func make_interpolator(root: Node) -> NetInterpolatorHandle:
 ## non-owning client (apply state only). Splitting state vs input authority requires input to live on its OWN
 ## node -- hence `input_node`, a child whose authority differs from the body's.
 ##
-## WHAT THE BACKEND DOES NOT CHECK: the VALUES in a received input row. Each datagram is authenticated
-## against the sender's session key and each row is refused unless the sender holds the input node's
-## authority, but a row that decodes at the right stride is stored as-is -- a client can send any value its
-## input schema can express. Clamp axes, bound rates and reject impossible states in `_rollback_tick`, on the
-## server. docs/protocol.md states the full split.
+## WHAT THE BACKEND DOES NOT CHECK: the VALUES in a received input row, apart from finiteness. Each datagram
+## is authenticated against the sender's session key and each row is refused unless the sender holds the input
+## node's authority, but a row that decodes at the right stride is otherwise stored as-is -- a client can send
+## any finite value its input schema can express. Clamp axes, bound rates and reject impossible states in
+## `_rollback_tick`, on the server. docs/protocol.md states the full split.
+##
+## THE ONE EXCEPTION IS A NON-FINITE FLOAT. A NaN or an infinity in any input float lane is refused before the
+## row enters history, always, because it is a poison value that breaks the simulation for every peer rather
+## than only for its sender: an input row is RESTORED before every replayed tick, the non-finite state that
+## results goes back out on the state lane, and a non-finite position has no grid cell, so the body becomes
+## uncullable and replicates to every peer in every world. The row is DROPPED rather than sanitized, so the
+## body coasts on its last received input down the same path a lost datagram takes. Refused rows are counted
+## as `input_nonfinite` under ORBITNET_DEBUG, and the first one from a connection names that peer in a warning.
 ##
 ## There is no "one synchronizer type per body on every peer" constraint: replication routes by an entity id
 ## DERIVED from the root's node path rather than by RPC node paths -- but the

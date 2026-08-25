@@ -67,7 +67,7 @@ func test_a_policy_is_a_pure_function() -> void:
 		"the same (policy, t, seed) yields a BIT-IDENTICAL frame -- no RNG state carried between calls")
 
 func test_seeds_de_correlate_a_fleet() -> void:
-	# Without a per-seed phase offset, N bots are one correlated waveform and the bench measures a synchronised
+	# Without a per-seed phase offset, N bots are one correlated waveform and the bench measures a synchronized
 	# burst rather than N independent clients.
 	var a: Vector3 = BenchSubject.vec3_field(
 		BenchPolicy.frame(BenchPolicy.Policy.STRAFE, 1.0, 1), BenchSubject.KEY_TRANSLATE)
@@ -106,6 +106,6 @@ func test_unknown_policy_names_default_rather_than_failing() -> void:
 	assert_eq(BenchPolicy.policy_from_name("nonsense"), BenchPolicy.Policy.STRAFE,
 		"an unknown name falls back to the workhorse policy")
 	assert_false(BenchPolicy.has_policy("nonsense"), "but has_policy still reports the truth, so a harness can validate first")
-	assert_true(BenchPolicy.has_policy("strafe_fire"), "a real name is recognised")
+	assert_true(BenchPolicy.has_policy("strafe_fire"), "a real name is recognized")
 	assert_eq(BenchPolicy.policy_from_name("  FIRE  "), BenchPolicy.Policy.STRAFE_FIRE,
 		"names are trimmed and case-folded, and 'fire' is an alias")

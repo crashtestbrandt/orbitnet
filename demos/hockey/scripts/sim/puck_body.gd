@@ -13,7 +13,7 @@ class_name PuckBody
 ##
 ## That is what makes a strike feel instant: your mallet is predicted locally, the puck it hits is predicted
 ## locally, and the pair of them answer before any packet leaves. What the server sends back is a correction,
-## and how big that correction is, in millimetres, is the number this demo exists to show you.
+## and how big that correction is, in millimeters, is the number this demo exists to show you.
 ##
 ## WHY THE CLIENT MISPREDICTS AT ALL. It has its own mallet's input and none of anybody else's -- rollback
 ## input goes client -> server and is never rebroadcast -- so an opponent's strike is unpredictable in the
@@ -25,13 +25,13 @@ class_name PuckBody
 ## in a BTreeMap precisely so replay order cannot vary run to run -- and an entity id is FNV-1a of the node
 ## path, so the order is identical on every peer and is already gated by the world signature. The puck
 ## therefore reads each mallet either at the start or the end of the tick depending on that fixed order,
-## consistently everywhere; at 60 Hz the difference is under a centimetre. Mallets never write puck state, so
+## consistently everywhere; at 60 Hz the difference is under a centimeter. Mallets never write puck state, so
 ## there is exactly one direction of cross-entity read and it is this one.
 
 ## STATE, replicated: the puck's pose. Registered first, and a Vector3, so the interest anchor would be a real
 ## world position if this demo ever turned interest management on.
 var net_pos: Vector3 = Vector3.ZERO
-## STATE, replicated: the puck's velocity. NOT an optimisation -- a restore that returned position without
+## STATE, replicated: the puck's velocity. NOT an optimization -- a restore that returned position without
 ## velocity would resume the resim from the wrong basis and diverge on the very next tick.
 var net_vel: Vector3 = Vector3.ZERO
 ## STATE, replicated: liveness, the face-off countdown, the serve sequence and the end being served toward, in
@@ -99,7 +99,7 @@ func _init() -> void:
 func configure(pool: Array[MalletBody], record: Scoreboard) -> void:
 	mallets = pool
 	scoreboard = record
-	net_pos = TableGeometry.centre_spot()
+	net_pos = TableGeometry.center_spot()
 	net_vel = Vector3.ZERO
 	position = net_pos
 	# Dead with a countdown running, so a fresh world serves itself rather than waiting for someone to ask.
@@ -174,6 +174,9 @@ func set_bulk_marshalling(on: bool) -> void:
 		return
 	_handle.set_bulk_capture(HockeyConfig.MARSHAL_OUT if on else "")
 	_handle.set_bulk_restore(HockeyConfig.MARSHAL_IN if on else "")
+	# The apply direction shares the restore method, which is safe only because this body declares no cosmetic
+	# entries -- an apply hook reads the CAPTURE slots, and those are the restore slots plus the cosmetics.
+	_handle.set_bulk_apply(HockeyConfig.MARSHAL_IN if on else "")
 	_handle.process_settings()
 
 ## Whether the state lane is actually marshalling in bulk. Asked rather than assumed: a name that does not
@@ -215,10 +218,10 @@ func advance(delta: float, tick: int, is_fresh: bool) -> void:
 			faceoff = HockeyConfig.FACEOFF_TICKS
 			sequence = (sequence % _SEQ_MASK) + 1
 			to_team = 1 - scorer     # serve toward the team that conceded
-			net_pos = TableGeometry.centre_spot()
+			net_pos = TableGeometry.center_spot()
 			net_vel = Vector3.ZERO
 	else:
-		net_pos = TableGeometry.centre_spot()
+		net_pos = TableGeometry.center_spot()
 		net_vel = Vector3.ZERO
 		_contacts = 0
 		if faceoff > 0:
@@ -278,12 +281,12 @@ func is_at_rest() -> bool:
 # before they were excluded:
 #
 #   THE JOIN SYNC. A client builds its own puck and predicts it forward before any authoritative row has
-#   arrived. The first row rewinds it onto a puck that was somewhere else entirely -- a third of a metre is
+#   arrived. The first row rewinds it onto a puck that was somewhere else entirely -- a third of a meter is
 #   typical, and it is a state TRANSFER rather than a mispredicted simulation. It happens exactly once per
 #   session, but a percentile window holds it for the rest of the run: measured on an otherwise untouched
 #   puck, it was the only sample ever recorded, so p50, p99 and peak all reported that one join.
 #
-#   A FACE-OFF. The puck is teleported to the centre spot, so a peer that placed the goal one tick differently
+#   A FACE-OFF. The puck is teleported to the center spot, so a peer that placed the goal one tick differently
 #   differs by half a table. That is real, and it is a different quantity from drift -- reported through the
 #   score, which is what a player actually reads it from.
 #

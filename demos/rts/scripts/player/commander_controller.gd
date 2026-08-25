@@ -19,6 +19,13 @@ class_name CommanderController
 ## every unit it named, and that number already replicates inside net_meta. So the client records the
 ## sequence it saw at send time and stops the clock when any targeted unit's sequence changes.
 ##
+## A REFUSED ORDER IS CANCELLED, NOT TIMED OUT. A refusal changes no sequence number, so the measurement has
+## nothing to stop on; it used to sit for four seconds and then give up, which blocked the next measurement
+## for that whole window and folded every refusal into the percentile as a four-second sample.
+## [signal NetCommand.rejected] now reaches the peer that asked, carrying the tag [method NetCommand.request]
+## returned, so the pending entry is cleared on the reply and only the request that actually failed is
+## canceled.
+##
 ## Controls (raw keys, no InputMap -- see CameraRig for why):
 ##   LMB drag / click      select (hold Shift to add to the selection)
 ##   Ctrl+A                select every living unit you own
@@ -49,7 +56,14 @@ var _drag_now: Vector2 = Vector2.ZERO
 var _pending_ids: PackedInt32Array = PackedInt32Array()
 var _pending_seq: PackedInt32Array = PackedInt32Array()
 var _pending_sent_us: int = 0
+# The tag NetCommand minted for the pending order, so a refusal can name exactly that request. 0 means none.
+var _pending_tag: int = 0
+# The tag of the most recent refusal. Recorded rather than acted on, because on a HOST the refusal arrives
+# INSIDE `submit_order()` -- before the call has returned the tag this side would have compared it against.
+var _refused_tag: int = 0
 var _rtt_ms: Array[float] = []
+## The most recent refusal, in words, for the HUD. Empty until one arrives.
+var _last_refusal: String = ""
 
 func _ready() -> void:
 	name = "CommanderController"
@@ -60,7 +74,14 @@ func configure(director: WorldDirector, rig: CameraRig, seat_index: int) -> void
 	camera = rig
 	seat = seat_index
 	_selected.clear()
-	_pending_ids = PackedInt32Array()
+	_clear_pending()
+	_last_refusal = ""
+	# Hear this seat's own refusals. The signal fires on the peer that refused the order and on the client that
+	# asked for it, so a client learns the verdict on the reliable reply rather than by watching nothing happen.
+	if world != null:
+		var channel: NetCommand = world.order_channel(seat)
+		if channel != null and not channel.rejected.is_connected(_on_order_rejected):
+			channel.rejected.connect(_on_order_rejected)
 
 func has_seat() -> bool:
 	return seat >= 0 and seat < RtsConfig.SEATS and world != null and camera != null
@@ -85,9 +106,9 @@ func _publish_selection_hint(commander: CommanderAvatar, ground: Vector3) -> voi
 		return
 	var a: Vector3 = camera.ground_at_screen(_drag_start)
 	var b: Vector3 = camera.ground_at_screen(_drag_now)
-	var centre: Vector3 = (a + b) * 0.5
+	var center: Vector3 = (a + b) * 0.5
 	var half: float = maxf(absf(a.x - b.x), absf(a.z - b.z)) * 0.5
-	commander.set_selection_hint(_selected.size(), centre, half)
+	commander.set_selection_hint(_selected.size(), center, half)
 
 # --- input ---------------------------------------------------------------------------------------
 func _unhandled_input(event: InputEvent) -> void:
@@ -194,22 +215,35 @@ func _issue(verb: StringName, point: Vector3) -> void:
 	var ids: PackedInt32Array = selection_ids()
 	if ids.is_empty():
 		return
-	_arm_rtt(ids)
-	world.submit_order(seat, verb, ids, point)
+	_arm_rtt(ids, world.submit_order(seat, verb, ids, point))
 	order_issued.emit(verb, point)
 
 # Record what the targeted units' sequence numbers were BEFORE the order went out. The measurement stops on
 # the first one that changes -- not on a fixed count, because the stalest-first rotation means the units in
 # one order do not all refresh on the same tick, and waiting for the last one would measure the round-robin's
 # worst case rather than the latency a player perceives.
-func _arm_rtt(ids: PackedInt32Array) -> void:
+## Arm the measurement for the order just sent.
+##
+## THE REFUSAL MAY ALREADY HAVE ARRIVED. On a host the validator runs inside `submit_order()`, so
+## [signal NetCommand.rejected] fires before that call returns and before this function has the tag to compare
+## against -- which is why the handler records the refused tag and this checks it, rather than the other way
+## round. On a client the refusal is a reply and always arrives later, where `_on_order_rejected` cancels.
+func _arm_rtt(ids: PackedInt32Array, tag: int) -> void:
+	if tag != 0 and tag == _refused_tag:
+		_clear_pending()
+		return
 	_pending_ids = ids
+	_pending_tag = tag
 	_pending_seq = PackedInt32Array()
 	_pending_seq.resize(ids.size())
 	for index: int in ids.size():
 		var unit: UnitBody = world.units[ids[index]]
 		_pending_seq[index] = unit.order_seq() if unit != null else 0
 	_pending_sent_us = Time.get_ticks_usec()
+
+func _clear_pending() -> void:
+	_pending_ids = PackedInt32Array()
+	_pending_tag = 0
 
 func _poll_pending_order() -> void:
 	if _pending_ids.is_empty():
@@ -223,12 +257,28 @@ func _poll_pending_order() -> void:
 			_rtt_ms.push_back(elapsed_ms)
 			if _rtt_ms.size() > RTT_WINDOW:
 				_rtt_ms.remove_at(0)
-			_pending_ids = PackedInt32Array()
+			_clear_pending()
 			return
-	# A rejected order never changes any sequence, so the pending entry would linger forever and block the
-	# next measurement. Time it out at a generous multiple of any plausible round trip.
+	# The BACKSTOP, and it is no longer the mechanism. A refused order never changes any sequence, and it used
+	# to be canceled by this timeout alone -- four seconds of blocked measurement, and every refusal folded
+	# into the percentile as a four-second sample. `_on_order_rejected` now cancels it on the reply, so what
+	# is left here is the case no reply covers: an order the server accepted whose units all died before any
+	# of their sequence numbers reached this client.
 	if Time.get_ticks_usec() - _pending_sent_us > 4_000_000:
-		_pending_ids = PackedInt32Array()
+		_clear_pending()
+
+# A refusal for THIS seat's channel. Cancelling on the tag rather than on the verb is what keeps the
+# measurement honest when a player issues a second order before the first resolves: the reply names the
+# request that failed, so an older refusal cannot cancel a newer pending order.
+func _on_order_rejected(_verb: StringName, code: int, tag: int) -> void:
+	_last_refusal = OrderValidator.describe(code)
+	_refused_tag = tag
+	if tag != 0 and tag == _pending_tag:
+		_clear_pending()
+
+## The most recent order refusal in words, for the HUD. Empty until one arrives.
+func last_refusal() -> String:
+	return _last_refusal
 
 ## Order round-trip percentile over the recent window, in milliseconds. 0 with no samples yet.
 func order_rtt_percentile(fraction: float) -> float:

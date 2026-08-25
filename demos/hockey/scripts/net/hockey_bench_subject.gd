@@ -15,14 +15,14 @@ class_name HockeyBenchSubject
 ##   fire      -> asks for a serve, which exercises the COMMAND lane (reliable, server-validated) and is
 ##                refused while the puck is live -- so a bot holding `fire` measures the validator too.
 
-## Metres per second the policy's own motion sweeps the requested point at. It is a JITTER on top of the puck
+## Meters per second the policy's own motion sweeps the requested point at. It is a JITTER on top of the puck
 ## tracking below, not the whole of the bot's motion.
 const SWEEP_SPEED: float = 1.1
 ## Fraction of the way to the tracked point the bot moves its request each tick. Below 1.0 so the mallet
 ## approaches rather than teleports, which is what gives it a velocity to strike with.
 const TRACK_GAIN: float = 0.16
 ## How far up its own half a bot will come to meet the puck, as a fraction of the half's length. Short of the
-## centre line, so two bots trade the puck back and forth instead of both camping on it.
+## center line, so two bots trade the puck back and forth instead of both camping on it.
 const COMMIT_FRACTION: float = 0.72
 
 var _net: HockeyNet = null
@@ -107,7 +107,7 @@ func sample(_body: Node) -> Dictionary:
 	var out: Dictionary = {}
 	if _net == null or _net.rink == null or _net.rink.puck == null:
 		return out
-	# In METRES, the game's own units, as the vocabulary asks. The meter reports millimetres because that is
+	# In METRES, the game's own units, as the vocabulary asks. The meter reports millimeters because that is
 	# what a human reads; the CSV keeps the unit the rest of the bench uses.
 	var meter: ReconcileMeter = _net.rink.puck.meter()
 	out[KEY_RECONCILE_ERROR] = meter.percentile_mm(0.5) / 1000.0

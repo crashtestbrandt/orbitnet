@@ -46,3 +46,14 @@ func entity_id() -> int:
 ## The tick of the newest authoritative row this peer holds for this prop. See FighterBody.last_known_state().
 func last_known_state() -> int:
 	return -1 if _handle == null else _handle.last_known_state()
+
+## The tick of the newest row this peer DECODED for this prop, or -1 if none ever arrived.
+##
+## THE RECEIPT, NOT THE FRONTIER, and it is what a "still being sent this" question wants. See
+## FighterBody.last_received_state().
+func last_received_state() -> int:
+	return -1 if _handle == null else _handle.last_received_state()
+
+## Whether this peer is still being sent this prop's rows. Fails open -- see FighterBody.is_receiving().
+func is_receiving(within_ticks: int = InterestMeter.STALE_TICKS) -> bool:
+	return _handle == null or _handle.is_receiving(within_ticks)

@@ -105,7 +105,7 @@ static func evaluate(profile: NetProfile, rtt_ms: Array[float], stretch: Array[f
 	r._record(snap_rate <= 0.25, "reconcile snap rate %.3f (%d over %d ticks) <= 0.25" % [snap_rate, reconcile_snaps, n])
 
 	# 4) Rollback resim depth: REPORTED, not gated. Under real latency/jitter/loss the resim window legitimately
-	# deepens (a late/lost input forces a deep catch-up resim) -- that is the resim COST, expected behaviour,
+	# deepens (a late/lost input forces a deep catch-up resim) -- that is the resim COST, expected behavior,
 	# and it is bounded by history_limit by design, so it can't "run away". If deep resims were
 	# actually breaking prediction, the reconcile snap-rate gate above would catch it. So this is an INFO line (cost
 	# for the artifact / comparing profiles), never a pass/fail. The counters are live in EVERY build -- they

@@ -148,19 +148,33 @@ impl OrbitInterpolator {
     }
 
     /// Resolve the declared properties. Call after configuration changes.
+    ///
+    /// An entry that does not resolve is **reported**, not dropped in silence. This node used to
+    /// allocate the unresolved list and discard it, so a mistyped path here produced a body that
+    /// simply never smoothed — the hardest kind of interpolation bug to attribute, because
+    /// stepping at the tick boundary is also what a correctly-configured interpolator does before
+    /// it is primed.
     #[func]
     fn process_settings(&mut self) {
         let mut schema = SchemaBuilder::new();
-        let mut unresolved = PackedStringArray::new();
+        let mut report = binding::EntryReport::default();
+        let root = self.resolved_root();
+        let label = format!("OrbitInterpolator {}", self.base().get_path());
         self.bindings.clear();
         binding::resolve_entries(
-            self.resolved_root().as_ref(),
+            root.as_ref(),
             &self.properties,
             PropRole::Cosmetic,
             &mut schema,
             &mut self.bindings,
-            &mut unresolved,
+            &mut report,
+            &label,
         );
+        binding::warn_unresolved(&label, &report.unresolved);
+        // `report.fallbacks` is deliberately not published here: this node is purely local, puts
+        // no bytes on a wire, and ignores the quantizer on a binding entirely, so an annotation on
+        // one of its entries buys nothing whether or not it is in force. The diagnostic
+        // `resolve_entries` already raised is the whole of what a reader needs.
         self.from_values = vec![Variant::nil(); self.bindings.len()];
         self.to_values = vec![Variant::nil(); self.bindings.len()];
         self.primed = false;

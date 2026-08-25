@@ -19,6 +19,12 @@
 //! `(slot, id)` pairs, reliably, and a client that has not yet received a slot's binding skips that
 //! block — which is exactly what it already did for an entity whose spawn was still in flight.
 //!
+//! **The manifest states a change rather than the whole table** ([`crate::codec::ManifestDelta`]),
+//! so a receiver applies [`SlotTable::bind`] and [`SlotTable::unbind`] instead of clearing and
+//! rebuilding. A rebuild was self-repairing and a delta is not, which is what the quarantine below
+//! now also has to cover: a receiver that missed a removal keeps a binding the server has retired,
+//! and the window is what stops that binding naming a *different* entity before the repair lands.
+//!
 //! # Reissuing a freed slot
 //!
 //! Ids are reused: a body respawning under its old node name reclaims the same id. Slots are reused
@@ -246,6 +252,33 @@ impl SlotTable {
         self.bind_at(slot, id);
     }
 
+    /// CLIENT: drop `slot`'s binding in both directions, answering the id it named.
+    ///
+    /// **This is not [`SlotTable::release`], and a client must never call that one.** `release` is
+    /// the SERVER's record of a name it may hand out again: it pushes the slot onto the free list
+    /// with the tick it was freed on, and that stamp is what
+    /// [`SLOT_QUARANTINE_TICKS`] is measured from. A client issues no names, so a free list on its
+    /// side would describe a decision it does not make — and a client that pushed onto one would
+    /// start refusing its own [`SlotTable::alloc`] calls with [`SlotError::Quarantined`] if anything
+    /// ever asked it for a slot.
+    ///
+    /// What this is for is the **removal half of an entity-manifest delta**
+    /// ([`crate::codec::ManifestDelta`]). A complete manifest needed nothing like it: the receiver
+    /// cleared its table and rebuilt, so a binding that had gone away simply did not come back. A
+    /// delta names the slot instead, and the receiver has to retire exactly that binding and leave
+    /// every other one alone.
+    ///
+    /// Answers `None` for a slot that named nothing, which is the ordinary case for a duplicate or
+    /// re-ordered record rather than an error.
+    pub fn unbind(&mut self, slot: u16) -> Option<u64> {
+        let id = self.id_of(slot)?;
+        if let Some(entry) = self.ids.get_mut(usize::from(slot)) {
+            *entry = 0;
+        }
+        self.slots.remove(&id);
+        Some(id)
+    }
+
     /// SERVER: make this table name exactly the entities in `registered`, as of `tick`.
     ///
     /// **Releases before it allocates**, so a pass that swaps one entity for another returns the
@@ -433,6 +466,68 @@ mod tests {
         assert_eq!(table.slot_of(600), Some(9));
         assert_eq!(table.id_of(6), None);
         assert_eq!(table.id_of(9), Some(600));
+    }
+
+    /// The removal half of a manifest delta: both directions cleared, and the free list untouched.
+    ///
+    /// A client holds no free list — it issues no names — and pushing onto one would make the
+    /// client's own `alloc` start refusing with `Quarantined` for slots the server owns.
+    #[test]
+    fn unbinding_clears_both_directions_and_never_touches_the_free_list() {
+        let mut table = SlotTable::new();
+        table.bind(3, 300);
+        table.bind(4, 400);
+
+        assert_eq!(table.unbind(3), Some(300), "it answers the id it retired");
+        assert_eq!(table.id_of(3), None);
+        assert_eq!(
+            table.slot_of(300),
+            None,
+            "and the reverse direction with it"
+        );
+        assert_eq!(
+            table.id_of(4),
+            Some(400),
+            "every other binding is left alone"
+        );
+        assert_eq!(table.len(), 1);
+
+        // Unbinding a slot that named nothing is the ordinary duplicate record, not an error.
+        assert_eq!(table.unbind(3), None);
+        assert_eq!(table.unbind(u16::MAX), None);
+        assert_eq!(table.unbind(9), None);
+
+        // THE FREE LIST IS UNTOUCHED. `release` would have pushed slot 3 onto it with a quarantine
+        // stamp; an `alloc` right after this proves nothing was pushed, because a table holding a
+        // freed slot reissues it once the window expires and this one mints instead.
+        assert_eq!(
+            table.alloc(500, SLOT_QUARANTINE_TICKS),
+            Ok(5),
+            "the frontier grew past the bound slots; nothing was reused"
+        );
+        assert_eq!(table.id_of(3), None, "and slot 3 was never handed out");
+    }
+
+    /// The other half of that: `release` IS a free-list push, so the two are not interchangeable.
+    #[test]
+    fn releasing_records_a_reuse_and_unbinding_does_not() {
+        let mut released = SlotTable::new();
+        released.alloc(1, 0).unwrap();
+        released.release(1, 0);
+        assert_eq!(
+            released.alloc(2, SLOT_QUARANTINE_TICKS),
+            Ok(0),
+            "a released slot comes back once its quarantine expires"
+        );
+
+        let mut unbound = SlotTable::new();
+        unbound.alloc(1, 0).unwrap();
+        unbound.unbind(0);
+        assert_eq!(
+            unbound.alloc(2, SLOT_QUARANTINE_TICKS),
+            Ok(1),
+            "an unbound slot is never reissued, because nothing recorded it as free"
+        );
     }
 
     #[test]

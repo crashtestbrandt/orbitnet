@@ -14,7 +14,7 @@ class_name PuckView
 ##   offset    *= decay               # and the offset bleeds away over the next few frames
 ##
 ## That extrapolation is a straight line while the simulation damps and substeps, so every tick disagrees by a
-## fraction of a millimetre whether or not anything was corrected. HockeyConfig.CORRECTION_DEADBAND_M is what
+## fraction of a millimeter whether or not anything was corrected. HockeyConfig.CORRECTION_DEADBAND_M is what
 ## keeps those out of the counters -- without it the blended count climbs once per tick forever, including
 ## offline, where nothing is being corrected at all.
 ##
@@ -22,7 +22,7 @@ class_name PuckView
 ## through a rail and sliding back into it:
 ##
 ##   * a rail or mallet contact -- PuckPhysics reports the count, which is why State carries it;
-##   * a face-off, where the puck is teleported to the centre spot.
+##   * a face-off, where the puck is teleported to the center spot.
 ##
 ## Anything above HockeyConfig.CORRECTION_SNAP_M snaps as well: past that the blend would be a visible slide,
 ## and a slide reads as the puck being somewhere it is not. The smooth and snap counts are what

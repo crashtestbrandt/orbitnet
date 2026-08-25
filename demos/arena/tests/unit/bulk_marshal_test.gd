@@ -27,7 +27,7 @@ func test_the_fighter_is_a_fat_lane() -> void:
 
 func test_the_anchor_is_the_first_state_property() -> void:
 	# A rollback body's interest anchor is its FIRST Vector3 state property, so the registration ORDER is
-	# load-bearing: putting velocity first would centre this peer's interest on a velocity.
+	# load-bearing: putting velocity first would center this peer's interest on a velocity.
 	assert_true(FighterBody.STATE_PROPS[0].begins_with("net_pos"),
 		"net_pos is registered first, because that is what makes it the anchor")
 

@@ -279,6 +279,12 @@ fn write_f32(bytes: &mut [u8], value: f32) {
     bytes.copy_from_slice(&value.to_le_bytes());
 }
 
+fn read_f64(bytes: &[u8]) -> f64 {
+    f64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
+}
+
 /// Encode one property's native bytes to its wire form, appending to `out`.
 fn encode_prop(prop: &PropSchema, native: &[u8], out: &mut Vec<u8>) {
     match (prop.quant, prop.kind) {
@@ -397,6 +403,76 @@ pub fn decode_row(props: &[PropSchema], wire: &[u8], row: &mut [u8]) -> Option<u
         cursor += consumed;
     }
     Some(cursor)
+}
+
+/// Whether every float lane in `row` holds a finite value.
+///
+/// Reads the **native** row layout — each property at `PropSchema::offset` for
+/// `PropKind::stride()` bytes, the in-memory history stride — never the wire layout that
+/// [`wire_stride`] describes. The caller runs it after decoding, on the row [`decode_row`] or
+/// [`apply_masked_wire`] just wrote. A row shorter than some property's native extent answers
+/// `false` instead of panicking or indexing out of bounds.
+///
+/// # Why the receive path needs this
+///
+/// The receive path checks **who** wrote a row, not what is in it. A property with no `@`
+/// quantizer decodes by `copy_from_slice`, so any bit pattern that arrives — a NaN, an infinity —
+/// lands in input history verbatim. One such float does not stay local:
+///
+/// - a `PropRole::Input` property is restored onto the game's input node before every replayed
+///   tick, so each resim step runs through the poison and the result poisons state;
+/// - that state leaves on the state lane to every peer, so one sender poisons the session;
+/// - a non-finite position has no grid cell, so the interest filter classifies the body as
+///   `uncullable` and it then replicates to every peer in every world. One poisoned float is a
+///   wire-cost regression as well as a simulation one.
+///
+/// The check is therefore always on, and finiteness is the only thing it looks at. Range, rate and
+/// plausibility stay the game's job. A non-finite float is a poison value that breaks the
+/// simulation for every peer, which is not something a game gets to opt out of.
+///
+/// # What is already covered
+///
+/// Both quantizers are total over poison, so an `@`-annotated property cannot carry a non-finite
+/// value in at all:
+///
+/// | Decoder | Behaviour on poison |
+/// | --- | --- |
+/// | [`f16_bits_to_f32`] | exponent 31 — every inf/NaN pattern — decodes to `0.0` |
+/// | [`ss3_to_quat`] | the payload clamps, then the quaternion renormalizes to unit or identity |
+///
+/// The exposure is the **unannotated** float property, which is what a plain `float` or `Vector3`
+/// input property gets by default.
+#[must_use]
+pub fn row_is_finite(props: &[PropSchema], row: &[u8]) -> bool {
+    for prop in props {
+        // `checked_add` so a malformed offset answers `false` rather than overflow-panicking under
+        // `[profile.template-debug]`, which is the build every source run loads.
+        let Some(end) = prop.offset.checked_add(prop.kind.stride()) else {
+            return false;
+        };
+        if end > row.len() {
+            return false;
+        }
+        let native = &row[prop.offset..end];
+        let finite = match prop.kind {
+            // Integer and bool lanes cost one match arm and no load. Every bit pattern they can
+            // hold is a legal value, and reading one as a float would refuse legal rows.
+            PropKind::Bool | PropKind::I32 | PropKind::I64 => true,
+            PropKind::F64 => read_f64(native).is_finite(),
+            PropKind::F32
+            | PropKind::Vec2
+            | PropKind::Vec3
+            | PropKind::Quat
+            | PropKind::Basis
+            | PropKind::Transform => native
+                .chunks_exact(4)
+                .all(|lane| read_f32(lane).is_finite()),
+        };
+        if !finite {
+            return false;
+        }
+    }
+    true
 }
 
 /// Total wire bytes the masked properties occupy.
@@ -686,5 +762,165 @@ mod tests {
         wire.truncate(wire.len() - 1);
         let mut decoded = vec![0u8; schema.row_stride()];
         assert_eq!(decode_row(schema.props(), &wire, &mut decoded), None);
+    }
+
+    /// Every float-carrying kind, as (lane width, lane count) in the NATIVE row layout.
+    fn float_lanes(kind: PropKind) -> (usize, usize) {
+        match kind {
+            PropKind::F64 => (8, 1),
+            _ => (4, kind.stride() / 4),
+        }
+    }
+
+    fn write_lane(row: &mut [u8], kind: PropKind, lane: usize, value: f64) {
+        let (width, _) = float_lanes(kind);
+        let at = lane * width;
+        if width == 8 {
+            row[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        } else {
+            // f64 -> f32 preserves NaN and both infinities, which is the point of the case.
+            row[at..at + 4].copy_from_slice(&(value as f32).to_le_bytes());
+        }
+    }
+
+    fn one_prop(kind: PropKind) -> Vec<PropSchema> {
+        vec![PropSchema {
+            name: String::new(),
+            kind,
+            role: PropRole::State,
+            offset: 0,
+            quant: QuantKind::None,
+        }]
+    }
+
+    /// A row of the given kind whose every float lane holds an ordinary finite value.
+    fn ordinary_float_row(kind: PropKind) -> Vec<u8> {
+        let mut row = vec![0u8; kind.stride()];
+        let (_, lanes) = float_lanes(kind);
+        for lane in 0..lanes {
+            write_lane(&mut row, kind, lane, 1.5 + lane as f64);
+        }
+        row
+    }
+
+    #[test]
+    fn row_is_finite_rejects_poison_in_every_float_kind() {
+        for kind in [
+            PropKind::F32,
+            PropKind::F64,
+            PropKind::Vec2,
+            PropKind::Vec3,
+            PropKind::Quat,
+            PropKind::Basis,
+            PropKind::Transform,
+        ] {
+            let props = one_prop(kind);
+            let (_, lanes) = float_lanes(kind);
+            for lane in 0..lanes {
+                for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                    let mut row = ordinary_float_row(kind);
+                    // Control: the same row is accepted before the lane is poisoned, so a check
+                    // that refused everything would not pass this assertion.
+                    assert!(
+                        row_is_finite(&props, &row),
+                        "{kind:?} must be finite before lane {lane} is poisoned"
+                    );
+                    write_lane(&mut row, kind, lane, poison);
+                    assert!(
+                        !row_is_finite(&props, &row),
+                        "{kind:?} lane {lane} holding {poison} must be refused"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_is_finite_passes_integer_rows() {
+        // The negative control that matters: integer and bool lanes are read as integers, so a
+        // legal value whose bytes happen to spell a float NaN must PASS. A check that refused
+        // every poison bit pattern regardless of kind would fail here.
+        let mut schema = SchemaBuilder::new();
+        schema.push("flag", PropKind::Bool, PropRole::State);
+        schema.push("count", PropKind::I32, PropRole::State);
+        schema.push("stamp", PropKind::I64, PropRole::State);
+        let props = schema.props();
+        let mut row = vec![0u8; schema.row_stride()];
+        row[props[0].offset] = 1;
+        // 0x7fc00000 read as f32 is a quiet NaN; read as i32 it is 2143289344, a legal count.
+        let at = props[1].offset;
+        row[at..at + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(
+            i32::from_le_bytes([row[at], row[at + 1], row[at + 2], row[at + 3]]),
+            0x7fc0_0000,
+        );
+        // Same trick one width up: 0x7ff8000000000000 is a legal i64 stamp.
+        let at = props[2].offset;
+        row[at..at + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(
+            row_is_finite(props, &row),
+            "integer lanes spelling float poison are legal values and must pass"
+        );
+    }
+
+    #[test]
+    fn row_is_finite_accepts_an_ordinary_row() {
+        let schema = quantized_schema();
+        let row = canonical_row(&schema);
+        assert!(row_is_finite(schema.props(), &row));
+        // And it still refuses one poisoned lane inside that mixed schema — the unannotated `pos`
+        // Vec3, which is the property with no quantizer standing between the wire and history.
+        let mut poisoned = row.clone();
+        poisoned[8..12].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(!row_is_finite(schema.props(), &poisoned));
+    }
+
+    #[test]
+    fn row_is_finite_refuses_a_short_row() {
+        let schema = quantized_schema();
+        let row = canonical_row(&schema);
+        assert!(row_is_finite(schema.props(), &row));
+        // One byte short of the last property's native extent, and empty: both answer false
+        // rather than panicking or indexing out of bounds.
+        assert!(!row_is_finite(schema.props(), &row[..row.len() - 1]));
+        assert!(!row_is_finite(schema.props(), &[]));
+    }
+
+    #[test]
+    fn row_is_finite_holds_across_a_wire_round_trip() {
+        let schema = quantized_schema();
+        let row = canonical_row(&schema);
+        let mut wire = Vec::new();
+        encode_row(schema.props(), &row, &mut wire);
+        let mut decoded = vec![0u8; schema.row_stride()];
+        assert_eq!(
+            decode_row(schema.props(), &wire, &mut decoded),
+            Some(wire.len())
+        );
+        assert!(
+            row_is_finite(schema.props(), &decoded),
+            "an ordinary row must still be finite after encode/decode"
+        );
+
+        // The exposure the check exists for: poison in the unannotated `pos` survives the wire
+        // verbatim, while the same poison in the `@half` `vel` dies in the quantizer.
+        let mut hostile = row.clone();
+        hostile[0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        hostile[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
+        wire.clear();
+        encode_row(schema.props(), &hostile, &mut wire);
+        assert_eq!(
+            decode_row(schema.props(), &wire, &mut decoded),
+            Some(wire.len())
+        );
+        assert!(
+            !row_is_finite(schema.props(), &decoded),
+            "an unannotated float carries poison through the wire, which is what this check catches"
+        );
+        assert_eq!(
+            read_f32(&decoded[28..32]),
+            0.0,
+            "the @half lane must have sanitized its own poison"
+        );
     }
 }

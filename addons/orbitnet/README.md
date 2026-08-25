@@ -39,6 +39,6 @@ bench/                 netbench — impairment relay, bot fleet, tick-domain gat
   bench_subject.gd       the seam between the bench and YOUR game
 ```
 
-## Licence
+## License
 
 MIT OR Apache-2.0, at your option. See the repository's `LICENSE` and `THIRD_PARTY.md`.

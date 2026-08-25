@@ -127,6 +127,11 @@ func _compose() -> String:
 			controller.order_rtt_percentile(0.50), controller.order_rtt_percentile(0.95),
 			controller.order_rtt_samples(), controller.selection_size()])
 		lines.push_back("           click -> validate -> state broadcast -> observed. Not ping.")
+		# The refusal reaches the peer that ASKED, so this line works on a client. It is also what stops a
+		# refused order sitting in the RTT window for four seconds before the old timeout canceled it.
+		var refusal: String = controller.last_refusal()
+		if refusal != "":
+			lines.push_back("           last order refused: %s" % refusal)
 	lines.push_back("")
 
 	lines.push_back("F1 net tick %d Hz    F2 remote_resim %s    F3 input_delay %d" % [
@@ -147,29 +152,29 @@ func _aoi_line() -> String:
 		return "AOI     off -- every peer receives every entity"
 	var mine: CommanderAvatar = _local_commander()
 	if mine == null:
-		# An observer declares its centre instead of driving one. Reporting a cull it does not compute here
+		# An observer declares its center instead of driving one. Reporting a cull it does not compute here
 		# would be a guess; the declared-anchor line says where it is watching from.
-		return "AOI     %.0f m -- no local cursor; this peer's centre is declared, not driven" % _aoi_radius
-	var centre: Vector3 = mine.cmd_cursor
+		return "AOI     %.0f m -- no local cursor; this peer's center is declared, not driven" % _aoi_radius
+	var center: Vector3 = mine.cmd_cursor
 	var cursors: int = 0
 	var cursors_culled: int = 0
 	for commander: CommanderAvatar in world.commanders:
 		if commander == null or commander == mine:
 			continue
 		cursors += 1
-		if _outside_aoi(centre, commander.cmd_cursor):
+		if _outside_aoi(center, commander.cmd_cursor):
 			cursors_culled += 1
 	var units_culled: int = 0
 	for unit: UnitBody in world.units:
-		if unit != null and _outside_aoi(centre, unit.position):
+		if unit != null and _outside_aoi(center, unit.position):
 			units_culled += 1
 	return "AOI     %.0f m -- rollback %d/%d cursors culled, state %d/%d units culled" % [
 		_aoi_radius, cursors_culled, cursors, units_culled, RtsConfig.UNIT_COUNT]
 
 ## The rule the backend applies: enter at the radius, leave at 1.25x. Computed here only to REPORT it -- the
 ## server is the only peer that actually culls, because it is the only one that knows every entity.
-func _outside_aoi(centre: Vector3, at: Vector3) -> bool:
-	return centre.distance_to(at) > _aoi_radius * 1.25
+func _outside_aoi(center: Vector3, at: Vector3) -> bool:
+	return center.distance_to(at) > _aoi_radius * 1.25
 
 func _alive_count() -> int:
 	if world == null:
@@ -191,7 +196,7 @@ func _local_commander() -> CommanderAvatar:
 ## The wire, per second. Two columns here are facts the demo could not report before.
 ##
 ## `unproven` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret it
-## never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot acknowledge a
+## never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot acknowledge a
 ## frame that never reached it -- and therefore cannot deepen its own rewind by claiming a link it does not
 ## have. A clean session sits at 0. Anything else is a peer whose acks do not match what it was sent.
 ##
@@ -247,17 +252,17 @@ func _fog_line() -> String:
 	return "FOG     on (vision %.0f m, lost past %.0f m)   %s" % [
 		ScoutPolicy.VISION_RADIUS_M, ScoutPolicy.VISION_EXIT_M, "   ".join(parts)]
 
-## Where this peer's interest centre comes from, and how many peers are watching without playing.
+## Where this peer's interest center comes from, and how many peers are watching without playing.
 ##
-## THE TWO SOURCES ARE NOT THE SAME KIND OF FACT. A player's centre is INFERRED -- read off the rollback body
+## THE TWO SOURCES ARE NOT THE SAME KIND OF FACT. A player's center is INFERRED -- read off the rollback body
 ## its input drives, and therefore wherever that body happens to be. An observer's is DECLARED, and a
-## declaration replaces inference on both the centre and the world at once, which is why the line says which
+## declaration replaces inference on both the center and the world at once, which is why the line says which
 ## one is in force rather than just printing a position.
 func _observer_line() -> String:
 	var watching: String = "%d observing" % net.observer_count() if Net.is_server() else ""
 	if not net.is_observing():
-		return "CENTRE  inferred from this peer's own cursor   %s" % watching
-	return "CENTRE  DECLARED %s -- this peer drives nothing   %s" % [net.observer.describe(), watching]
+		return "CENTER  inferred from this peer's own cursor   %s" % watching
+	return "CENTER  DECLARED %s -- this peer drives nothing   %s" % [net.observer.describe(), watching]
 
 ## Cycle what an observer watches: its own camera, then each seat's lead unit, then back.
 ##
@@ -361,12 +366,12 @@ func _draw_drag_box() -> void:
 
 # A polyline in _draw rather than a Line2D node: identical output, and it keeps the whole HUD one Control
 # instead of a CanvasLayer with Node2D children whose coordinates would need keeping in step with it.
-func _draw_spark(history: PackedFloat32Array, rect: Rect2, colour: Color, caption: String) -> void:
+func _draw_spark(history: PackedFloat32Array, rect: Rect2, color: Color, caption: String) -> void:
 	draw_rect(rect, Color(0.0, 0.0, 0.0, 0.35), true)
 	var font: Font = get_theme_default_font()
 	if font != null:
 		draw_string(font, rect.position + Vector2(4.0, -3.0), caption,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, colour)
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, color)
 	if history.size() < 2:
 		return
 	var peak: float = 1.0
@@ -378,7 +383,7 @@ func _draw_spark(history: PackedFloat32Array, rect: Rect2, colour: Color, captio
 		var x: float = rect.position.x + step * float(index)
 		var y: float = rect.position.y + rect.size.y * (1.0 - clampf(history[index] / peak, 0.0, 1.0))
 		points.push_back(Vector2(x, y))
-	draw_polyline(points, colour, 1.5)
+	draw_polyline(points, color, 1.5)
 	if font != null:
 		draw_string(font, rect.position + Vector2(rect.size.x - 62.0, 12.0), "peak %.0f" % peak,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, colour.darkened(0.15))
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, color.darkened(0.15))
