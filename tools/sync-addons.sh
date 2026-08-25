@@ -60,6 +60,21 @@ if [ "$MODE" != "sync" ] && [ "$MODE" != "--check" ] && [ "$MODE" != "--check-tr
 	exit 2
 fi
 
+# Report what a synced copy differs by, dropping the one difference that is not an edit: a `.uid` sidecar
+# Godot generated inside the copy. Prints nothing and succeeds when the copy is clean; prints the differences
+# and fails when it is not.
+drift_report() {
+	local src="$1" dest="$2" out
+	# Drop ONLY "Only in <dest>...: *.uid" lines. The direction matters: a `.uid` present only in the COPY is
+	# a file Godot generated there, and a `.uid` present only in the SOURCE is a synced file that went missing,
+	# which is exactly the drift this gate exists to catch -- every canonical `.gd` in the addon has a tracked
+	# `.gd.uid` beside it, so a filter that dropped both directions would hide 24 missing files per project.
+	out="$(diff -r -q "$src" "$dest" 2>&1 | grep -v -E "^Only in ${dest}(/[^:]*)?: [^:]*\.uid$")"
+	[ -z "$out" ] && return 0
+	printf '%s\n' "$out"
+	return 1
+}
+
 if [ "$MODE" = "--check-tracked" ]; then
 	tracked=""
 	for project in "${PROJECTS[@]}"; do
@@ -111,9 +126,24 @@ for project in "${PROJECTS[@]}"; do
 				printf 'ok: %s -> symlink (ORBITNET_LINK)\n' "$dest"
 				continue
 			fi
-			if ! diff -r -q "$src" "$dest" >/dev/null 2>&1; then
+			# A .uid PRESENT ONLY IN THE COPY IS NOT DRIFT, and refusing to say so is what made this gate
+			# fail on a clean tree. Godot writes a `.uid` sidecar beside every script it loads, so opening
+			# any project generates them inside its synced copy -- files the canonical source never had and
+			# that `cp -R` therefore never put there. They are a generated artifact of a project run, not an
+			# edit somebody made to a copy, which is the only thing this gate exists to catch.
+			#
+			# THE SIDECARS ARE ALSO COMMITTED, which is the other half. Every `.gd` under `addons/orbitnet/`
+			# already carries a tracked `.gd.uid`, and `tools/test-harness/` now does too -- so the payload
+			# arrives complete and Godot has nothing to generate. The filter below is what keeps the gate from
+			# depending on that being true of every script anyone ever adds.
+			#
+			# THE FILTER IS DIRECTIONAL. A .uid that exists in both and DIFFERS is drift; a .uid present only
+			# in the SOURCE is drift, and it is the case that matters most, because every canonical script has
+			# one and a copy missing them is a copy that was not synced. Only "Only in <dest>" lines naming a
+			# `.uid` are dropped.
+			if ! diff_report="$(drift_report "$src" "$dest")"; then
 				printf 'DRIFT: %s differs from the canonical %s --\n' "$dest" "$src"
-				diff -r -q "$src" "$dest" 2>&1 | sed 's/^/       /'
+				printf '%s\n' "$diff_report" | sed 's/^/       /'
 				printf '       run `just sync-addons` (or edit the canonical copy, never the synced one)\n'
 				drift=1
 			fi
