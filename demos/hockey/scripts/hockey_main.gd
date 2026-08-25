@@ -11,6 +11,12 @@ class_name HockeyMain
 ##   --join=ADDR[:PORT]  client
 ##   --dedicated[=PORT]  authoritative server with no local player (headless)
 ##   --session=N         pin this peer's session identity, so a RESTARTED process reclaims its seat
+##   --resume-token=N    the token the SERVER issued this identity on a previous join. An identity alone no
+##                       longer reclaims a seat: the server mints a token per identity and a rejoiner must
+##                       quote it back, which is what stops a peer that merely READ somebody's session id off
+##                       a roster broadcast from taking their body. A real game persists it beside the
+##                       identity; this demo has no store, so the value comes from the command line and the
+##                       process prints its own on `HOCKEY-TOKEN=`
 ##   --bench             attach netbench's harness with this demo's BenchSubject
 ##   --quit-after=SEC    exit after N seconds (smoke runs)
 ##
@@ -24,6 +30,9 @@ var view: TableView = null
 var mallets: MalletRenderer = null
 var puck_view: PuckView = null
 var hud: HockeyHud = null
+
+## Whether the resume token this session issued has been printed. Once per process. See _log_resume_token().
+var _token_logged: bool = false
 
 func _ready() -> void:
 	# One greppable line per boot, in the shape every smoke script keys on. Cheap, and it turns "did it even
@@ -60,6 +69,12 @@ func _start_session() -> void:
 	var session: int = _int_flag("--session=", 0)
 	if session != 0:
 		Net.set_session_id(session)
+	# BEFORE THE HANDSHAKE, like the identity, and for the same reason: the token rides the hello, and the
+	# hello is the first thing a client sends. Without it a pinned identity reclaims nothing, because the
+	# server refuses any claim that does not quote the token it minted for that identity.
+	var token: int = _int_flag("--resume-token=", 0)
+	if token != 0:
+		Net.set_resume_token(token)
 	# A build exported with the dedicated-server preset boots authoritative with NO argument. That is the
 	# property that makes a server image deployable: an operator runs the binary, not a command line.
 	if OS.has_feature("dedicated_server"):
@@ -76,6 +91,24 @@ func _start_session() -> void:
 		net.join(join)
 		return
 	net.start_offline()
+
+## Print the resume token the server issued this process, once, so the next launch can quote it back.
+##
+## POLLED RATHER THAN ANSWERED ON A SIGNAL, and this node has no other per-frame work -- the token arrives in
+## the WELCOME, which lands after the transport is up, so reading it when the session first reports PLAYING
+## returns 0. A real game reads it the same way and writes it beside the identity in its own store.
+##
+## A server mints tokens rather than holding one, and an offline session has no server to mint one, so both
+## return early. So does a peer seated with identity 0 -- a token names an identity, and an anonymous seat has
+## none.
+func _process(_delta: float) -> void:
+	if _token_logged or Net.is_server() or Net.is_offline():
+		return
+	var token: int = Net.resume_token()
+	if token == 0:
+		return
+	_token_logged = true
+	print("HOCKEY-TOKEN=%d session=%d" % [token, Net.session_id()])
 
 func _build_views() -> void:
 	var rink: RinkDirector = net.rink

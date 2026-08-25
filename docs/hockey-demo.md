@@ -300,7 +300,10 @@ names: a player whose old socket the transport has not yet noticed is gone comes
 them the game.
 
 `--session=N` pins the identity so a *restarted binary* can reclaim its seat; `Net` mints a random one per
-process, which already covers a player who returns through the same process.
+process, which already covers a player who returns through the same process. The identity is not sufficient
+on its own: the server mints a resume token per identity and a rejoiner has to quote it back with
+`--resume-token=N`. The client prints the token it was issued on `HOCKEY-TOKEN=`, and a real game persists it
+beside the identity rather than reading it off a log line.
 
 ## No token bucket on the command channel
 

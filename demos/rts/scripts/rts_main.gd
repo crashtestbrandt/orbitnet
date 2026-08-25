@@ -11,6 +11,12 @@ class_name RtsMain
 ##   --join=ADDR[:PORT]  client
 ##   --dedicated[=PORT]  authoritative server with no local player (headless)
 ##   --session=N         pin this peer's session identity, so a RESTARTED process reclaims its seat
+##   --resume-token=N    the token the SERVER issued this identity on a previous join. An identity alone no
+##                       longer reclaims a seat: the server mints a token per identity and a rejoiner must
+##                       quote it back, which is what stops a peer that merely READ somebody's session id off
+##                       a roster broadcast from taking their body. A real game persists it beside the
+##                       identity; this demo has no store, so the value comes from the command line and the
+##                       process prints its own on `RTS-TOKEN=`
 ##   --observe           watch without playing: no seat, no commander, an interest center DECLARED by the
 ##                       server and driven by this peer's camera
 ##   --rts-probe         attach the automated gate (tools/instr/rts_probe.gd)
@@ -28,6 +34,9 @@ var hud: RtsHud = null
 var renderer: UnitRenderer = null
 var markers: OrderMarkers = null
 var battlefield: BattlefieldView = null
+
+## Whether the resume token this session issued has been printed. Once per process. See _log_resume_token().
+var _token_logged: bool = false
 
 func _ready() -> void:
 	# One greppable line per boot, in the shape every probe and smoke script keys on. Cheap, and it turns
@@ -69,6 +78,12 @@ func _start_session() -> void:
 	var session: int = _int_flag("--session=", 0)
 	if session != 0:
 		Net.set_session_id(session)
+	# BEFORE THE HANDSHAKE, like the identity, and for the same reason: the token rides the hello, and the
+	# hello is the first thing a client sends. Without it a pinned identity reclaims nothing, because the
+	# server refuses any claim that does not quote the token it minted for that identity.
+	var token: int = _int_flag("--resume-token=", 0)
+	if token != 0:
+		Net.set_resume_token(token)
 	# A build exported with the dedicated-server preset boots authoritative with NO argument. That is the
 	# property that makes the server image deployable: an operator runs the binary, not a command line.
 	if OS.has_feature("dedicated_server"):
@@ -130,12 +145,31 @@ func _on_session_state(state: RtsNet.State) -> void:
 ## frame is correct and cheap: ObserverDesk decides which offers are worth a message, and the throttle is
 ## the reason this can be wired to _process at all.
 func _process(_delta: float) -> void:
+	_log_resume_token()
 	if net == null or camera == null or not net.is_observing():
 		return
 	if net.observer.mode() == ObserverDesk.Mode.TRACKED:
 		net.observe_entity(net.observer.tracked_entity())
 		return
 	net.observe_from(camera.position)
+
+## Print the resume token the server issued this process, once, so the next launch can quote it back.
+##
+## POLLED RATHER THAN ANSWERED ON A SIGNAL. The token arrives in the WELCOME, which lands after the transport
+## is up: reading it when the session first reports PLAYING returns 0. A real game reads it the same way and
+## writes it beside the identity in its own store.
+##
+## A server mints tokens rather than holding one, and an offline session has no server to mint one, so both
+## return early. So does a peer seated with identity 0 -- a token names an identity, and an anonymous seat has
+## none.
+func _log_resume_token() -> void:
+	if _token_logged or Net.is_server() or Net.is_offline():
+		return
+	var token: int = Net.resume_token()
+	if token == 0:
+		return
+	_token_logged = true
+	print("RTS-TOKEN=%d session=%d" % [token, Net.session_id()])
 
 func _on_local_seat(seat: int) -> void:
 	print("RTS-SEAT %d" % seat)

@@ -168,7 +168,7 @@ func join(address: String) -> bool:
 	# RULE 1, first half. Seats are owned by nobody until the roster lands; see the header.
 	_build_world()
 
-	var peer: MultiplayerPeer = NetTransport.create_client(address)
+	var peer: MultiplayerPeer = NetTransport.create_client(target_address(address), target_port(address))
 	if peer == null:
 		_fail("could not create a client peer for '%s'" % address)
 		return false
@@ -177,7 +177,8 @@ func join(address: String) -> bool:
 	Net.set_mode(Net.Mode.CLIENT)
 	world.bind_net_all()                                 # RULE 1, second half
 	_set_state(State.CONNECTING)
-	print("RTS: joining %s (%s)" % [address, NetTransport.preferred_kind_name()])
+	print("RTS: joining %s:%d (%s)" % [
+		target_address(address), target_port(address), NetTransport.preferred_kind_name()])
 	return true
 
 ## Tear the session down and return the process to a clean OFFLINE state.
@@ -200,6 +201,38 @@ func leave() -> void:
 	_local_seat = -1
 	_teardown_world()
 	_set_state(State.OFFLINE)
+
+# --- join targets ----------------------------------------------------------------------------------
+# `ADDR` or `ADDR:PORT`, split here rather than by the caller.
+#
+# The host recipe takes a port, so without this a session hosted on anything but the default was unreachable:
+# `NetTransport.create_client` takes the port as its own argument and would have handed ENet the whole
+# "1.2.3.4:47900" string as a hostname to resolve. The flag's own documentation promised the suffix worked.
+#
+# A Steam target is a 64-bit Steam ID and carries no colon, so it falls through unchanged -- the demo still
+# never learns which transport it is talking to.
+
+## The address half of a join target.
+static func target_address(target: String) -> String:
+	var separator: int = _port_separator(target)
+	return target if separator < 0 else target.substr(0, separator)
+
+## The port half of a join target, or the transport's default when it carries none.
+static func target_port(target: String) -> int:
+	var separator: int = _port_separator(target)
+	if separator < 0:
+		return NetTransport.DEFAULT_PORT
+	return clampi(target.substr(separator + 1).to_int(), 1, 65535)
+
+# The index of the ':' that introduces a port, or -1. ONE rule, so the two accessors above can never disagree
+# about where the split is and hand ENet an address and a port that came from different readings of the string.
+static func _port_separator(target: String) -> int:
+	var separator: int = target.rfind(":")
+	if separator <= 0 or separator >= target.length() - 1:
+		return -1
+	if not target.substr(separator + 1).is_valid_int():
+		return -1
+	return separator
 
 # --- the authoritative step ------------------------------------------------------------------------
 func _on_pre_tick(_tick: int) -> void:
