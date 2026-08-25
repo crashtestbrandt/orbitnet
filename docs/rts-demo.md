@@ -345,12 +345,19 @@ process, so a client that rejoins from the same process resumes for free; a clie
 relaunched has a new identity and is seated as a newcomer. The demo's `--session=N` flag pins one so the
 restart case can be watched at all — a real game persists the value instead.
 
+**An identity alone reclaims nothing.** The server mints a resume token per identity and a rejoiner has to
+quote it back, so reading somebody's session id off a roster broadcast is not enough to take their seat. The
+client prints the token it was issued on `RTS-TOKEN=`; `--resume-token=N` hands it to the next launch. A real
+game persists it beside the identity.
+
 ```sh
-just rts-host                                                  # the host takes seat 0
-godot --path demos/rts -- --join=127.0.0.1 --session=424242    # seat 1; kill it, then run the line again
+just rts-host                                                # the host takes seat 0
+godot --path demos/rts -- --join=127.0.0.1 --session=424242  # seat 1; note RTS-TOKEN=, then kill it
+godot --path demos/rts -- --join=127.0.0.1 --session=424242 --resume-token=<the token it printed>
 ```
 
-Relaunch **at once** and the host prints `peer N resumed seat 1 (was peer M)`. There is no `holding` line
+Relaunch **at once** and the host prints `peer N resumed seat 1 (was peer M)`. Omit `--resume-token=` and it
+prints `admitted as an observer` instead, which is the token doing its job. There is no `holding` line
 first, and that is the interesting part: ENet does not declare a killed client dead until its keepalive
 times out, so the returning player's handshake arrives while the server still believes the old connection is
 up. The handshake takes the identity back from it and names it as `resumed_from`; the ghost's own drop lands
