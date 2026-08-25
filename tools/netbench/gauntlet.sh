@@ -15,7 +15,9 @@
 # Required env: SERVER_HOST, CLIENT_HOSTS (space-separated ssh targets -- Tailscale MagicDNS names or IPs).
 # Optional env: REMOTE_ROOT (default = local repo path; must be an identical checkout -- SYNC=1 rsyncs it),
 #   GODOT_REMOTE (default godot on PATH), PROFILE (congested_wifi), MEASURE_S (25), SEED (1), POLICY (strafe),
-#   CLIENTS_PER_HOST (1), SERVER_PORT (47800), RELAY_PORT (47810), RELAY (0), SYNC (1), GAUNTLET_DRYRUN (0).
+#   CLIENTS_PER_HOST (1), SERVER_PORT (47800), RELAY_PORT (47810), RELAY (0), SYNC (1), GAUNTLET_DRYRUN (0),
+#   DEMO (arena) -- which demo project every host runs. The repository root is not a Godot project, so every
+#   launch names `demos/$DEMO`; all hosts must run the same one or they will not agree on a world.
 #
 # NOTE: this orchestrator needs real reachable hosts with passwordless SSH + Godot 4.7; it CANNOT be exercised in
 # a single-box CI sandbox (that is what tools/netbench/bench.sh is for). Run GAUNTLET_DRYRUN=1 to print the exact
@@ -37,6 +39,7 @@ CLIENTS_PER_HOST="${CLIENTS_PER_HOST:-1}"
 SERVER_PORT="${SERVER_PORT:-47800}"
 RELAY_PORT="${RELAY_PORT:-47810}"
 RELAY="${RELAY:-0}"
+DEMO="${DEMO:-arena}"
 SYNC="${SYNC:-1}"
 DRY="${GAUNTLET_DRYRUN:-0}"
 RELAY_SCRIPT="res://addons/orbitnet/bench/relay_main.gd"
@@ -56,9 +59,11 @@ run() { local host="$1"; shift; if [ "$DRY" = "1" ]; then echo "  [ssh $host] $*
 # must NOT add another (bash applies redirects left-to-right, last-wins -- an extra '>>launch.log' would clobber
 # CMD's redirect and leave the per-role log empty, breaking readiness/verdict). Only stdin is detached here.
 launch() { local host="$1"; shift; run "$host" "cd '$REMOTE_ROOT' && mkdir -p '$REMOTE_ART' && setsid nohup $* </dev/null & echo launched"; }
-sweep_host() { run "$1" "pkill -9 -f -- '--headless --path $REMOTE_ROOT' 2>/dev/null || true"; }
+sweep_host() { run "$1" "pkill -9 -f -- '--headless --path demos/$DEMO' 2>/dev/null || true"; }
 collect() { local host="$1"; if [ "$DRY" = "1" ]; then echo "  scp -r $host:$REMOTE_ART/ $OUT/$host/"; else mkdir -p "$OUT/$host"; scp -q -o BatchMode=yes -r "$host:$REMOTE_ART/" "$OUT/$host/" 2>/dev/null || true; fi; }
-grep_remote() { run "$1" "grep -aq '$2' '$3' 2>/dev/null"; }
+# `--` before the pattern on the REMOTE grep: the server readiness marker starts with a hyphen, which grep
+# would otherwise read as an option.
+grep_remote() { run "$1" "grep -aq -- '$2' '$3' 2>/dev/null"; }
 
 banner() { echo "=== netbench GAUNTLET: server=$SERVER_HOST clients=[$CLIENT_HOSTS] x$CLIENTS_PER_HOST profile=$PROFILE relay=$RELAY ${MEASURE_S}s ==="; }
 
@@ -85,15 +90,16 @@ fi
 # 1) Dedicated server (+ relay if RELAY=1) on the server host.
 echo "-- launch server on $SERVER_HOST --"
 run "$SERVER_HOST" "rm -rf '$REMOTE_ART'; mkdir -p '$REMOTE_ART'"
-launch "$SERVER_HOST" "$GODOT_REMOTE --headless --path . -- --dedicated --no-combat-spawn --port=$SERVER_PORT >'$REMOTE_ART/server.log' 2>&1"
+launch "$SERVER_HOST" "$GODOT_REMOTE --headless --path demos/$DEMO -- --dedicated=$SERVER_PORT >'$REMOTE_ART/server.log' 2>&1"
 if [ "$DRY" != "1" ]; then
 	i=0; ok=0
-	while [ "$i" -lt 40 ]; do grep_remote "$SERVER_HOST" "SMOKE net=server" "$REMOTE_ART/server.log" && { ok=1; break; }; sleep 1; i=$((i+1)); done
+	# Every demo prints `<DEMO>-STATE PLAYING` once its session is up. That is the one marker all three share.
+	while [ "$i" -lt 40 ]; do grep_remote "$SERVER_HOST" "-STATE PLAYING" "$REMOTE_ART/server.log" && { ok=1; break; }; sleep 1; i=$((i+1)); done
 	[ "$ok" = "1" ] || { echo "server never bound on $SERVER_HOST"; run "$SERVER_HOST" "tail -12 '$REMOTE_ART/server.log'"; exit 1; }
 fi
 if [ "$RELAY" = "1" ]; then
 	echo "-- launch relay on $SERVER_HOST ($PROFILE) --"
-	launch "$SERVER_HOST" "$GODOT_REMOTE --headless --path . -s $RELAY_SCRIPT -- --relay-listen=$RELAY_PORT --relay-target=127.0.0.1:$SERVER_PORT --relay-profile=$PROFILE --relay-seed=$SEED --relay-duration=$((MEASURE_S + 120)) >'$REMOTE_ART/relay.log' 2>&1"
+	launch "$SERVER_HOST" "$GODOT_REMOTE --headless --path demos/$DEMO -s $RELAY_SCRIPT -- --relay-listen=$RELAY_PORT --relay-target=127.0.0.1:$SERVER_PORT --relay-profile=$PROFILE --relay-seed=$SEED --relay-duration=$((MEASURE_S + 120)) >'$REMOTE_ART/relay.log' 2>&1"
 	if [ "$DRY" != "1" ]; then
 		i=0; while [ "$i" -lt 25 ]; do grep_remote "$SERVER_HOST" "RELAY: bound" "$REMOTE_ART/relay.log" && break; sleep 1; i=$((i+1)); done
 	fi
@@ -107,7 +113,7 @@ for h in $CLIENT_HOSTS; do
 	run "$h" "rm -rf '$REMOTE_ART'; mkdir -p '$REMOTE_ART'"
 	for c in $(seq 1 "$CLIENTS_PER_HOST"); do
 		peer=$((peer + 1))
-		launch "$h" "$GODOT_REMOTE --headless --path . -- --join=$SERVER_HOST:$JOIN_PORT --bench --bench-bot=$POLICY --bench-seed=$((SEED + peer)) --bench-metrics='$REMOTE_ART/client${c}.csv' --bench-profile=$PROFILE --bench-duration=$MEASURE_S >'$REMOTE_ART/client${c}.log' 2>&1"
+		launch "$h" "$GODOT_REMOTE --headless --path demos/$DEMO -- --join=$SERVER_HOST:$JOIN_PORT --bench --bench-bot=$POLICY --bench-seed=$((SEED + peer)) --bench-metrics='$REMOTE_ART/client${c}.csv' --bench-profile=$PROFILE --bench-duration=$MEASURE_S >'$REMOTE_ART/client${c}.log' 2>&1"
 	done
 done
 

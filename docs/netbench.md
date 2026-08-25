@@ -12,6 +12,18 @@ A run launches a dedicated server, a UDP impairment relay, and N headless bot cl
 the relay. Each bot drives the real input path, streams per-tick metrics to a CSV, and self-evaluates a gate.
 Exit code is the verdict.
 
+**It drives a demo project.** The repository root is not a Godot project — OrbitNet is configured through an
+`[orbitnet]` block in `project.godot` and the demos disagree about those values on purpose — so every launch
+names `demos/<DEMO>`. The default is `arena`: decoupled at 30 Hz with a 128-tick ring, which is the
+configuration closest to a shooter, and the only one that fills the hit-registration columns.
+
+```sh
+just netbench 4 congested_wifi 20 1 strafe rts      # CLIENTS PROFILE SECONDS SEED POLICY DEMO
+```
+
+**Seat count bounds the fleet.** A client past the demo's seats is admitted as an observer, drives no body and
+fails its own gate for having no samples. `arena` seats 24, `hockey` 32, `rts` 2.
+
 ## The one rule that shapes the design
 
 **Impair the link BELOW the reliability layer.** ENet ships no conditioner, and wrapping the peer would sit
@@ -62,6 +74,36 @@ recorded tapes. An **empty** frame means "release": stop overriding and hand the
 
 `demos/rts/` implements this in ~90 lines, mapping `translate` onto a command cursor and `fire` onto issuing
 orders — so the same policies drive an RTS and a shooter unchanged.
+
+## Comparing two runs
+
+The impairment scheduler is **seeded and deterministic**, so the same seed replays the same link exactly. Two
+runs of the same command therefore differ only by what changed in the netcode, and `compare.py` turns that into
+a table rather than an opinion:
+
+```sh
+NETBENCH_OUT=/tmp/nb-before just netbench 4 congested_wifi 25 1 strafe_fire
+# ...make the change, then rebuild: just native-install
+NETBENCH_OUT=/tmp/nb-after  just netbench 4 congested_wifi 25 1 strafe_fire
+tools/netbench/compare.py /tmp/nb-before /tmp/nb-after
+```
+
+`NETBENCH_OUT` names a stable artifact directory instead of a temp one. `compare.py` pools every row, reports
+p50 and p95 per column, and prints `REGRESSED` / `improved` / `same` against a tolerance (5% by default) for
+the columns whose direction is known. It drops the first three seconds of each client's series — the
+handshake, the first full-state burst and the clock's initial convergence — and it exits non-zero on a
+regression.
+
+**Two tables, and the second one is the point for a send-path change.** Every column describing the SEND path
+reads zero in a client CSV, because a client is not the authority and runs none of it. The server is therefore
+run under `ORBITNET_DEBUG=1` and its per-second wire line is folded into `server.csv`:
+
+| `server.csv` column | |
+|---|---|
+| `tx_bytes_s` | snapshot payload bytes per second, across every peer — **server egress** |
+| `blocks_s` | entity blocks admitted per second. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
+| `rx_applied_s` / `rx_rejected_s` / `rx_skipped_s` | inbound rows applied, refused, and unplaceable |
+| `peers` / `ents_rollback` / `ents_state` | what the session held that second |
 
 ## What a run asserts
 
@@ -132,6 +174,9 @@ All after `--`:
 | `--bench-record=<path>` / `--bench-replay=<path>` | tape capture / playback (replay wins over a bot) |
 | `--bench-duration=<s>` | finish, print the verdict, quit. Measured from the **first spawn**, so a slow connect does not starve the sample count. |
 | `--bench-profile=<name>` | the profile this client runs under, for the RTT gate |
+
+Environment: `NETBENCH_OUT=<dir>` writes the artifacts somewhere stable (see *Comparing two runs*), and
+`SERVER_PORT` / `RELAY_PORT` move the two UDP ports.
 
 ## Multi-machine
 

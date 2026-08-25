@@ -265,11 +265,21 @@ arena-lint: (lint-project "demos/arena")
 # on the machine. See docs/netbench.md.
 # =====================================================================================================
 
-netbench CLIENTS="4" PROFILE="congested_wifi" SECONDS="20" SEED="1" POLICY="strafe":
-    tools/netbench/bench.sh {{CLIENTS}} {{PROFILE}} {{SECONDS}} {{SEED}} {{POLICY}}
+# IT DRIVES A DEMO PROJECT. The repository root is not a Godot project, so every launch names demos/<DEMO>.
+# The default is `arena` -- decoupled at 30 Hz with a 128-tick ring, the configuration closest to a shooter,
+# and the only one that fills BenchSubject's hit-registration columns.
+#
+# SEAT COUNT BOUNDS THE FLEET. A client past the demo's seats is admitted as an OBSERVER, drives no body, and
+# fails its own gate for having no samples. arena seats 24, hockey 32, rts 2.
+#
+# NETBENCH_OUT=<dir> writes the artifacts somewhere stable instead of a temp directory, which is what makes a
+# before/after comparison possible: the same seed replays the same link, so two runs differ only by the change.
+netbench CLIENTS="4" PROFILE="congested_wifi" SECONDS="20" SEED="1" POLICY="strafe" DEMO="arena":
+    tools/netbench/bench.sh {{CLIENTS}} {{PROFILE}} {{SECONDS}} {{SEED}} {{POLICY}} {{DEMO}}
 
 # Multi-machine bench: one SSH controller drives a server host plus bot-client hosts. Needs real reachable
-# hosts, passwordless SSH and Godot on each. GAUNTLET_DRYRUN=1 prints the plan without running it.
+# hosts, passwordless SSH and Godot on each. GAUNTLET_DRYRUN=1 prints the plan without running it. DEMO=<name>
+# picks the demo project every host runs, and every host must run the same one.
 netbench-gauntlet:
     tools/netbench/gauntlet.sh
 
