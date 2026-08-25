@@ -12,10 +12,16 @@ Little-endian.
 ```
 frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | 32-bit ack token | input-arrival margin byte
            | header flags byte | entity count (varint)
+CLIENT TO SERVER ONLY, before the blocks: the interest generation this client holds (varint)
 then per entity:  { slot (u16) | frame-tick delta | body length | flags | changed-property bitmask | packed payload }
-then, if the header's flags say so: the interest-delta section
+then, SERVER TO CLIENT, if the header's flags say so: the interest-delta section
 then the trailer: { sequence (u32) | MAC tag (u64) }
 ```
+
+**The client's interest generation rides BEFORE the blocks**, because the server's block loop stops early
+when its receive budget refuses one — so anything after them is not reliably reached. It is what lets the
+server decline to build an interest-delta section at all until the two ends agree on the baseline; see
+[the whole interest set](#the-whole-interest-set).
 
 No property names, no type tags — the schema is positional and agreed in advance. Client input carries the
 last N ticks for redundancy, so a single lost packet costs nothing.
@@ -84,7 +90,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 5 | Blocks name entities by a **16-bit session slot**; the entity manifest distributes the slot table for both lanes. |
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 | 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
-| 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. The leading generation shifts the offsets of the section's own counts, which is what makes this a major rather than a trailing addition. |
+| 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. A client input frame also carries, before its blocks, the interest generation that client holds, so the server builds a section only for a peer that provably holds the baseline it is diffed against. The leading generation shifts the offsets of the section's own counts and the echo shifts every block's, which is what makes this a major rather than a trailing addition. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -321,6 +327,11 @@ Three things owe a connection one, and the server knows two of them without bein
 | a prefix was given up on unacknowledged | the server, retiring it |
 | a section named an `entered` slot the peer could not resolve | the client, via `WANT_INTEREST` |
 
+- **A section is only built for a peer that holds its baseline.** The client echoes the generation it holds
+  on the input frame it is already sending, and the server declines to build a section until the two agree.
+  That is what stops a section overtaking the whole set it was computed after: there is nothing to overtake,
+  because none is sent. The pending halves hold meanwhile and ride the first frame after the client catches
+  up.
 - **The generation places a section, and the match is exact.** A section states a change against one
   baseline, and a receiver holding any other is not holding the set it was diffed from. The table is reliable
   and a section is not, so a section built either side of a table can arrive on the wrong side of it; a
