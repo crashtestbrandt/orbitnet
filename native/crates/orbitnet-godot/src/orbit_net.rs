@@ -5595,7 +5595,7 @@ impl OrbitNet {
             // Its bytes come off the budget the loop is about to spend, because a section appended
             // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. The
             // ack that retires it is the ordinary one every frame already carries and proves.
-            let (carries_delta, interest_generation) = {
+            let (carries_delta, interest_generation, gate_shut) = {
                 let Some(peer) = self.peers.get_mut(&peer_id) else {
                     continue;
                 };
@@ -5603,6 +5603,7 @@ impl OrbitNet {
                 // in this same flush would bump it, and the section would then claim a generation it
                 // was not built against.
                 let generation = peer.interest_generation;
+                let shut = peer.interest_generation_acked != peer.interest_generation;
                 (
                     build_interest_section(
                         &self.slots,
@@ -5613,6 +5614,7 @@ impl OrbitNet {
                         &mut delta_entered,
                     ),
                     generation,
+                    shut,
                 )
             };
             let admit_budget = budget.saturating_sub(interest_delta_reserve(
@@ -5776,7 +5778,16 @@ impl OrbitNet {
             // relevancy event is something: skipping the frame because no entity block was admitted
             // is exactly the tick on which a peer needs to be told that an entity stopped being sent
             // to it.
-            if sent.is_empty() && !carries_delta {
+            //
+            // AND A TICK WITH A SHUT INTEREST GATE STILL SENDS, carrying nothing but its header. The
+            // client's generation echo rides an input frame, a connection driving no body sends one
+            // only when a snapshot has arrived, and the echo is discharged when the frame is handed
+            // to an UNRELIABLE transport — so a single lost datagram leaves the client believing it
+            // has told the server something the server never heard. The client cannot detect that;
+            // nothing tells it whether its echo landed. The server can, because it holds both
+            // generations, so the server is what breaks the silence. One header per tick, only while
+            // a gate is shut, which is about a round trip.
+            if sent.is_empty() && !carries_delta && !gate_shut {
                 continue;
             }
             let header = FrameHeader {
@@ -10242,6 +10253,47 @@ mod tests {
         let (carries, left, _) = section_for(&slots, &mut peer, 103);
         assert!(carries, "the two agree now");
         assert_eq!(left, vec![0u16], "and what waited is what rides");
+    }
+
+    /// **THE GATE CANNOT HOLD ITSELF SHUT, AND ONE LOST ECHO CANNOT SHUT IT FOR EVER.**
+    ///
+    /// The two ends close a loop: the server builds no section until the client's echo catches up, the
+    /// echo rides a client input frame, and a connection driving no body sends one only when a
+    /// snapshot arrives. If the server also declined to send a snapshot while the gate was shut, or if
+    /// the client only ever echoed once per generation, the loop would have no way to open.
+    ///
+    /// This drives the decision the send path makes for the state that broke: an empty interest set,
+    /// no blocks, no section, and a gate the client has not yet acknowledged.
+    #[test]
+    fn a_shut_gate_still_sends_the_frame_that_opens_it() {
+        // The send path's own condition, as the rule it applies.
+        let skips = |has_blocks: bool, carries_delta: bool, gate_shut: bool| {
+            !has_blocks && !carries_delta && !gate_shut
+        };
+
+        assert!(
+            skips(false, false, false),
+            "nothing to carry and nothing owed: an ordinary quiet tick sends nothing"
+        );
+        assert!(
+            !skips(true, false, false),
+            "blocks are the ordinary reason to send"
+        );
+        assert!(
+            !skips(false, true, false),
+            "and a leave-only tick still sends, which is what the section is for"
+        );
+        assert!(
+            !skips(false, false, true),
+            "a shut gate sends a header and nothing else: it is the frame that prompts the echo, and \
+             without it a lost echo shuts the interest lane for the rest of the session"
+        );
+
+        // And the client answers such a frame: an arriving snapshot is one of its reasons to send.
+        assert!(
+            input_frame_is_owed(false, true, false, false, false, false),
+            "the empty frame lands, the client owes an ack, and the echo rides that frame"
+        );
     }
 
     /// **CAUSE 1: THE PENDING HALF OVERFLOWED.** The cap was written as a backstop for a peer that
