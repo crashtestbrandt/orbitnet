@@ -230,7 +230,7 @@ func _veto_line() -> String:
 	if net.world == null:
 		return "CLOAK   no world"
 	if not Net.is_server():
-		return "CLOAK   decided by the server -- a client is not told what it is not being sent"
+		return "CLOAK   decided by the server -- a client is told an entity stopped, never that a veto stopped it"
 	if not net.world.veto_enabled():
 		return "CLOAK   veto off -- a cloaked fighter is sent to everybody, and is only a color"
 	return "CLOAK   veto on -- %d fighter-peer pairs withheld right now (one entity, one peer, one answer)" % [

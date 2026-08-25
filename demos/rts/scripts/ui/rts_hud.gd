@@ -243,7 +243,7 @@ func _interp_line() -> String:
 ## kept from it, which is the honest thing for a client to say about fog anyway.
 func _fog_line() -> String:
 	if not Net.is_server():
-		return "FOG     decided by the server -- a client is not told what it is not being sent"
+		return "FOG     decided by the server -- a client is told a unit stopped being sent, never that fog is why"
 	if not world.fog_enabled():
 		return "FOG     off -- every seated peer receives every unit its radius admits"
 	var parts: PackedStringArray = PackedStringArray()

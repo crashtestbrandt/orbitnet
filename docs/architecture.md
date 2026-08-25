@@ -183,8 +183,8 @@ nothing resolved sees everything.
 seat table beside ownership — a second source of truth about who drives a body is one that can disagree with the
 anti-forgery check on received input. The server rescans its registry once per frame, diffs the deduplicated
 pairs against what it last announced, and emits `Net.seat_opened` / `Net.seat_closed`; the entity manifest
-carries the same two columns per entity, so a client rebuilds the roster from a complete table and emits the same
-two events one manifest later.
+carries the same two columns per entity, so a client projects the roster from the manifest rows it holds — a
+delta patches that table rather than replacing it — and emits the same two events one manifest later.
 
 **That inference is a fallback, and `Net.set_peer_anchor()` replaces it.** What a peer observes is a different
 question from what its input drives — a spectator drives nothing, and a peer with a body in each of two worlds

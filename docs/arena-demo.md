@@ -220,10 +220,11 @@ safe.
 A block names its entity by a **16-bit session slot** rather than a 64-bit id. A three-arena session with the
 default prop count names 315 entities; `just arena-slots 8000` seeds enough to put real pressure on the table.
 
-The slot table is distributed by the entity manifest as a **whole table each time it changes**, so a session
-with tens of thousands of entities churning steadily spends real reliable bandwidth restating bindings that did
-not move. Past 65,536 the server refuses to replicate the entity and says so, rather than wrapping an index
-onto a live one.
+The slot table is distributed by the entity manifest as a **delta against the generation the receiver holds**,
+so a session with tens of thousands of entities churning steadily no longer spends reliable bandwidth restating
+bindings that did not move. A whole table goes only to a peer that holds none, or to one that could not apply a
+delta and asked for the table back with `FLAG_WANT_MANIFEST`. Past 65,536 the server refuses to replicate the
+entity and says so, rather than wrapping an index onto a live one.
 
 ## Slot-table pressure, and what a delta manifest removes
 

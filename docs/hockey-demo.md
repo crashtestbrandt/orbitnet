@@ -291,13 +291,17 @@ signal fires when the socket comes up, which is before the OrbitNet handshake �
 and identity is the only thing that can tell a returning player from a newcomer. On this table, seating on the
 transport signal is what makes a rejoiner come back onto the other team.
 
-**This demo takes the conservative rule, where the RTS demo takes the permissive one.** A session identity is
-client-asserted and unauthenticated, so a peer presenting an identity it watched someone else use takes that
-player's seat while the original keeps its connection with no error. So a reclaim is honored only for an
-identity this layer already saw `Net.peer_dropped` report with `held = true`. The price is the one the facade
-names: a player whose old socket the transport has not yet noticed is gone comes back as a newcomer. On a
-32-seat table that costs them their end of the rink, which is cheap; on the RTS's two-seat table it would cost
-them the game.
+**This demo takes the conservative rule, where the RTS demo takes the backend's default.** A claim on a session
+identity has to quote the **resume token** the server minted for it, so an identity read off a roster broadcast
+or a log line no longer buys that player's seat; an on-path observer, who reads the welcome the token traveled
+in, can still quote it. The token does not settle the **incumbent**. Under the default policy a valid claim is
+granted against a connection that is still up, which is what makes a relaunched client's reconnect immediate
+rather than waiting out a keepalive. This demo will not accept a live takeover on any terms, so a reclaim is
+honored only for an identity this layer already saw `Net.peer_dropped` report with `held = true`.
+`Net.set_resume_policy(Net.ResumePolicy.ONLY_IF_DROPPED)` is the backend's version of the same refusal, in one call. The price is
+the one the facade names: a player whose old socket the transport has not yet noticed is gone comes back as a
+newcomer. On a 32-seat table that costs them their end of the rink, which is cheap; on the RTS's two-seat table
+it would cost them the game.
 
 `--session=N` pins the identity so a *restarted binary* can reclaim its seat; `Net` mints a random one per
 process, which already covers a player who returns through the same process. The identity is not sufficient
@@ -350,5 +354,6 @@ looks exactly like a netcode bug. `puck_physics_test.gd` asserts the derivation 
 A block names its entity by a **16-bit session slot** rather than the 64-bit id, which is where about a third
 of a small block used to go. On a 34-entity rink that is invisible in the totals and it is still the reason
 the puck's row is as small as it is; [protocol.md](protocol.md#entity-slots) has the format. The cost it moves
-rather than removes — the manifest restating the whole slot table each time it changes — needs thousands of
-entities to matter, which is [arena-demo.md](arena-demo.md#entity-slots).
+rather than removes — the manifest that binds every slot, sent whole to a peer holding no table and as a delta
+against the generation a receiver holds thereafter — needs thousands of entities to matter, which is
+[arena-demo.md](arena-demo.md#entity-slots).

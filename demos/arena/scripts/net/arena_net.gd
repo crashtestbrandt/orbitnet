@@ -33,12 +33,20 @@ class_name ArenaNet
 ## seatless peer here is given a center and a world with `Net.set_peer_anchor()`, which also fixes WHICH ARENA
 ## it is watching: an observer without one would be in every arena at once.
 ##
-## THE CONSERVATIVE RESUME RULE. `resumed_from` names a connection that may still be up, and a session
-## identity is client-asserted and unauthenticated -- so a peer presenting an identity it watched someone else
-## use takes that player's seats, and the original keeps its connection with no error. This demo honors a
-## reclaim only for an identity it already saw `Net.peer_dropped` report with `held = true`. The price is the
-## one the facade names: a player whose old socket the transport has not yet noticed is gone comes back as a
-## newcomer.
+## THE CONSERVATIVE RESUME RULE, HAND-ROLLED HERE ON PURPOSE. `resumed_from` names a connection that may still
+## be up: under the default resume policy a claim is granted against a live connection, and the original keeps
+## its socket with no error while its fighters stop answering it. What a claim has to present is an IDENTITY
+## PLUS THE SERVER-MINTED RESUME TOKEN for that identity, so a peer that merely watched somebody's session id
+## go past on a roster broadcast or a log line is refused and seated as an anonymous newcomer with session id
+## 0. The adversary that remains is an ON-PATH OBSERVER, who reads the join reply the token arrives in and
+## quotes it back verbatim.
+##
+## This layer hands seats back only for an identity it saw `Net.peer_dropped` report with `held = true`.
+## `Net.set_resume_policy(Net.ResumePolicy.ONLY_IF_DROPPED)` is the same rule in one call and this demo does
+## NOT set it. The gate here is a ROSTER decision about which seats an arrival gets back, kept in game code
+## where a game would make it. Neither version buys anything against the on-path observer -- the facade's
+## `set_resume_policy` docs say so -- and both charge the same price. A player whose old socket the transport
+## has not yet noticed is gone comes back as a newcomer, to fresh seats or, at a full arena, to none.
 
 signal session_state_changed(state: State)
 signal local_seats_changed(seats: PackedInt32Array)
@@ -262,8 +270,10 @@ func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 		print("ARENA: peer %d resumed seats %s (was peer %d)" % [peer, seats, resumed_from])
 	else:
 		if resumed_from > 0:
-			# Worth saying out loud rather than seating them quietly: this is the conservative rule costing a
-			# returning player their seats, and it looks identical to a forgery being refused.
+			# Worth saying out loud rather than seating them quietly. `resumed_from` is nonzero only for a
+			# claim the BACKEND granted, which means the token was quoted correctly -- so this line is
+			# always this layer overriding a good claim, never a forgery being caught. A forgery arrives
+			# with session id 0 and never reaches here.
 			print("ARENA: peer %d claimed session %d, never seen to drop -- seating as new" % [
 				peer, session_id])
 		print("ARENA: peer %d seated at %s (arena %d)" % [

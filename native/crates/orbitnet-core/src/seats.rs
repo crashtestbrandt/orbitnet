@@ -67,9 +67,12 @@ impl SeatId {
 /// merge walk of two ordered slices rather than a set difference over a hash map.
 ///
 /// **Both sides hold one and they hold it for different reasons.** The server derives its roster
-/// from the bodies it owns the state of; a client rebuilds its from each entity manifest, which is a
-/// complete table and therefore self-repairing. The diff below is the same code for both, so a seat
-/// event means the same thing on either end of the link.
+/// from the bodies it owns the state of; a client projects its from the entity-manifest rows it
+/// holds, which a delta patches rather than replaces. Rebuilding from a complete table was
+/// self-repairing, and [`crate::codec::ManifestDelta`] states what stands in for that — a reliable
+/// and ordered channel, the base generation a delta names, and a full table on every path that can
+/// desynchronize a receiver. The diff below is the same code for both, so a seat event means the
+/// same thing on either end of the link.
 #[derive(Clone, Debug, Default)]
 pub struct SeatRoster {
     /// Sorted ascending, no duplicates.

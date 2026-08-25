@@ -282,8 +282,9 @@ func test_each_sender_is_checked_against_its_own_row() -> void:
 # truthiness, because a non-zero int is truthy and means the opposite of `true` here.
 
 func test_a_bool_false_refuses_silently_and_reports_no_code() -> void:
-	# TODAY'S BEHAVIOR, PINNED. Every validator in this repository and in a consuming game is declared
-	# `-> bool`, so this is the row that must not move.
+	# TODAY'S BEHAVIOR, PINNED. `bool` was the only verdict type before this version, so a consumer's
+	# existing `-> bool` validator must keep working byte for byte -- silent refusal, no code, nothing
+	# announced. That is the row that must not move.
 	var lane: NetCommand = _fresh()
 	lane.register(VERB_MOVE, _refuse)
 	var code: int = lane._apply(5, VERB_MOVE, {}, 42)

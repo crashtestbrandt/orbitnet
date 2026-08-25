@@ -274,13 +274,19 @@ func _connect_peer_signals() -> void:
 ## The seat assignment, on the OrbitNet handshake rather than the transport connect -- see RULE 4. `resumed_from`
 ## is the peer id this player held before it dropped, or 0 for a newcomer.
 ##
-## THIS DEMO TAKES THE PERMISSIVE RULE, DELIBERATELY. A session reclaims its seat on presentation of the
-## identity alone, which is what makes a fast reconnect work at all -- the transport can take tens of seconds
-## to report the old socket as gone, and until it does, a returning player would otherwise be refused as
-## "every seat is taken". The price is that a forged identity takes a live player's seat rather than merely
-## losing a future resume: the original keeps its connection and its commander simply stops answering it. That
-## is stated as a limit in `README.md`. A game that wants the conservative rule honors `resumed_from` only for
-## a session it already saw `Net.peer_dropped` report with `held = true`.
+## THIS DEMO TAKES THE PERMISSIVE RULE, DELIBERATELY. A session reclaims its seat on presentation of its
+## IDENTITY PLUS THE SERVER-MINTED RESUME TOKEN, and the default policy grants that claim even against a
+## connection that is still up -- which is what makes a fast reconnect work at all, because the transport can
+## take tens of seconds to report the old socket as gone and until it does a returning player would be refused
+## as "every seat is taken". A peer that merely watched somebody's session id go past cannot produce the token
+## and is seated as an anonymous newcomer. The price is a live takeover by whoever holds the token. The
+## adversary that remains is an ON-PATH OBSERVER, who reads the join reply the token arrives in and can take
+## the seat while the original keeps its connection and its commander stops answering it. The Security bullet
+## on session identity under `README.md`'s Limits records that boundary.
+##
+## `Net.set_resume_policy(Net.ResumePolicy.ONLY_IF_DROPPED)` is the conservative rule in one call and this
+## demo does not set it: on a two-seat table refusing a fast reconnect costs the returning player the game,
+## and it buys nothing against the on-path observer that remains.
 func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	if not Net.is_server():
 		return

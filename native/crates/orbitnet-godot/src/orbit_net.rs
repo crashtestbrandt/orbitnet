@@ -1934,9 +1934,11 @@ pub struct OrbitNet {
     ///
     /// **The server derives it and a client is told it.** On a server it is rebuilt from the
     /// registry once per frame and compared against itself to decide whether the manifest owes a
-    /// republish; on a client it is rebuilt from each received manifest, which is a complete table.
-    /// Both then project the same roster out of it, so a seat event means the same thing on either
-    /// end of the link.
+    /// republish; on a client it is rebuilt from the manifest rows this peer holds
+    /// ([`Self::manifest_published`]), which a delta patches rather than replaces. A roster built
+    /// from a delta's own rows would drop every seat that delta was silent about, so the client arm
+    /// runs off the held table — see [`Self::rebuild_seats_from_manifest`]. Both then project the
+    /// same roster out of it, so a seat event means the same thing on either end of the link.
     entity_seats: Vec<(u64, i32, SeatIndex)>,
     /// Announcement scratch, pooled so a steady session allocates nothing: the server's per-frame
     /// rescan, the projected seat set, and the two transition lists [`SeatRoster::replace_into`] fills.
