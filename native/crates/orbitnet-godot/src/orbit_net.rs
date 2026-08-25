@@ -1992,6 +1992,15 @@ pub struct OrbitNet {
     /// Set by a whole [`FrameKind::InterestTable`] and compared against every delta section, so a
     /// section built before the table cannot undo it. See [`InterestDeltaSection::generation`].
     interest_mirror_generation: u64,
+    /// CLIENT: the interest generation this peer has actually told the server about.
+    ///
+    /// **THE ECHO HAS TO BE OWED BY ITS OWN STALENESS, NOT BY A SNAPSHOT ARRIVING.** It rides a client
+    /// input frame; a connection that drives no body sends one only when a snapshot has arrived; and
+    /// the server skips a snapshot entirely when it has no block to send and the section is
+    /// suppressed — which is what the gate does while it waits for this very echo. An observer whose
+    /// interest emptied inside that window would therefore never be sent a frame, never send one,
+    /// never echo, and the gate would hold itself shut for the rest of the session.
+    interest_generation_echoed: u64,
     /// CLIENT: whether this peer owes the server a [`FrameHeader::FLAG_WANT_INTEREST`].
     ///
     /// Raised four ways, and cleared only by being ANSWERED — by a whole set that this peer could
@@ -2215,6 +2224,7 @@ impl INode for OrbitNet {
             interest_mirror: std::collections::HashSet::new(),
             interest_mirror_seeded: false,
             interest_mirror_generation: 0,
+            interest_generation_echoed: 0,
             want_interest: false,
             // OPEN. Today's behavior, and the only default that cannot take a world away from a
             // consumer whose binary is refreshed without their source changing.
@@ -2554,6 +2564,7 @@ impl OrbitNet {
         self.interest_mirror.clear();
         self.interest_mirror_seeded = false;
         self.interest_mirror_generation = 0;
+        self.interest_generation_echoed = 0;
         self.want_interest = false;
         self.interest_events.clear();
         // The path verdict describes THIS session's occupancy, and the next session's arena is not
@@ -5090,6 +5101,7 @@ impl OrbitNet {
         if !input_frame_is_owed(
             !blocks.is_empty(),
             self.snapshot_unacked,
+            self.interest_mirror_generation != self.interest_generation_echoed,
             self.want_full,
             self.want_manifest,
             self.want_interest,
@@ -5097,6 +5109,7 @@ impl OrbitNet {
             return;
         }
         self.snapshot_unacked = false;
+        self.interest_generation_echoed = self.interest_mirror_generation;
 
         let mut carried: Vec<usize> = Vec::with_capacity(blocks.len());
         let lengths: Vec<usize> = blocks.iter().map(Vec::len).collect();
@@ -7048,7 +7061,10 @@ impl OrbitNet {
                             self.planner.mark(entity, tick);
                         }
                         Ok(outcome) => self.note_integration(outcome, meta.full),
-                        Err(_) => return,
+                        Err(_) => {
+                            self.note_snapshot_break(header.flags);
+                            return;
+                        }
                     }
                     continue;
                 }
@@ -7061,7 +7077,10 @@ impl OrbitNet {
                     };
                     match result {
                         Ok(outcome) => self.note_integration(outcome, meta.full),
-                        Err(_) => return,
+                        Err(_) => {
+                            self.note_snapshot_break(header.flags);
+                            return;
+                        }
                     }
                     continue;
                 }
@@ -7828,15 +7847,21 @@ fn session_is_filtering(culling: bool, vetoing: bool, ran: bool, any_membership:
 /// every interest prefix was given up on unacknowledged, which now owes it a whole set every
 /// [`INTEREST_DELTA_RETRY_TICKS`] for the rest of the session. Interest filtering is what an observer
 /// is for, and it was the one connection that could never confirm any of it.
+///
+/// **AND WHEN ITS ECHO IS STALE**, which is what stops the interest gate holding itself shut. The
+/// server builds no section until the client's echoed generation catches up, and it sends no snapshot
+/// at all when it has no block to send and no section to carry — so on a connection driving no body,
+/// waiting for a snapshot before echoing is waiting for a frame the gate is suppressing.
 #[must_use]
 fn input_frame_is_owed(
     has_blocks: bool,
     owes_ack: bool,
+    owes_echo: bool,
     want_full: bool,
     want_manifest: bool,
     want_interest: bool,
 ) -> bool {
-    has_blocks || owes_ack || want_full || want_manifest || want_interest
+    has_blocks || owes_ack || owes_echo || want_full || want_manifest || want_interest
 }
 
 /// The tick a block's oldest newly-landed input row starts a resim from, or `None` for no resim.
@@ -9959,34 +9984,39 @@ mod tests {
     /// **A CLIENT THAT DRIVES NOTHING STILL HAS TO SEND.** The gate suppresses a frame carrying no
     /// blocks, and an observer drives no body, so every frame it sends carries none.
     ///
-    /// Two things it must not suppress. A NACK that cannot leave is a session that never repairs.
-    /// And the input frame is the only frame that carries this peer's ack — without it an observer
-    /// never acked at all, so every interest prefix was given up on unacknowledged, which owes it a
-    /// whole set every retry window for the rest of the session.
+    /// Three things it must not suppress. A NACK that cannot leave is a session that never repairs.
+    /// The input frame is the only frame carrying this peer's ack, so without it an observer never
+    /// acked at all. And a stale generation echo must own its own reason to send: the server builds no
+    /// section until the echo catches up and sends no snapshot at all when it has nothing else to
+    /// carry, so waiting for a snapshot before echoing is waiting for a frame the gate is suppressing.
     #[test]
-    fn an_ack_or_any_nack_keeps_an_empty_frame_alive() {
+    fn an_ack_an_echo_or_any_nack_keeps_an_empty_frame_alive() {
         assert!(
-            !input_frame_is_owed(false, false, false, false, false),
+            !input_frame_is_owed(false, false, false, false, false, false),
             "nothing to say, nothing to send"
         );
         assert!(
-            input_frame_is_owed(true, false, false, false, false),
+            input_frame_is_owed(true, false, false, false, false, false),
             "blocks are the ordinary reason"
         );
         assert!(
-            input_frame_is_owed(false, true, false, false, false),
+            input_frame_is_owed(false, true, false, false, false, false),
             "an unacked snapshot is the observer's reason, and it has no other"
         );
         assert!(
-            input_frame_is_owed(false, false, true, false, false),
+            input_frame_is_owed(false, false, true, false, false, false),
+            "a stale echo is what stops the interest gate holding itself shut"
+        );
+        assert!(
+            input_frame_is_owed(false, false, false, true, false, false),
             "a broken delta base must reach the server"
         );
         assert!(
-            input_frame_is_owed(false, false, false, true, false),
+            input_frame_is_owed(false, false, false, false, true, false),
             "so must a broken manifest"
         );
         assert!(
-            input_frame_is_owed(false, false, false, false, true),
+            input_frame_is_owed(false, false, false, false, false, true),
             "and so must a broken interest set"
         );
     }
