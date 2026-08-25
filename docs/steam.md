@@ -66,6 +66,31 @@ definitive negative verdict.
 The gate is deliberately **fail-open on an indeterminate result** — a validation timeout or an unreachable
 Steam backend must not lock every player out of your server. It bites only on a definitive rejection.
 
+## Where a session secret comes from
+
+`Net.set_session_secret()` derives every datagram key of a session from bytes both ends already hold, so the
+join handshake carries a nonce instead of the key and an on-path observer can no longer forge. It needs a
+secret the game distributed on a channel it **already authenticated**, and the two seams above are exactly
+that channel.
+
+| Source | Who sets what | What it is worth |
+|---|---|---|
+| **Lobby metadata** | the host writes a per-lobby value beside the player cap and the game tag; every joiner reads it off the same row it read the headcount from | Valve delivers it only to members of that lobby, so it is as private as lobby membership. A public lobby anyone may join hands it to anyone who joins. |
+| **Auth tickets** | a dedicated server already validates each client's ticket with Valve; the value it derives per session goes to that client over the same validated exchange | tied to an account Valve confirmed, which is the strongest of the two |
+
+Two rules, both about where the value is **not** allowed to come from:
+
+- **Never a build-time constant.** One secret compiled into every copy of the game is public the moment one
+  copy ships, and it degrades every session to the cleartext-key regime while looking like it did not.
+- **Never a value a player can read and retype.** A lobby code shown on screen derives a key worth exactly
+  that code's entropy. `Net.set_session_secret()` accepts any length and folds it, and the fold cannot add
+  entropy that was not supplied.
+
+On ENet there is no equivalent seam and the game supplies its own — a value from whatever account service it
+already runs. A session that sets none stays on the cleartext key, which is what every session did before.
+See [protocol.md](protocol.md#datagram-authentication) for the two regimes and for what a misconfiguration
+looks like from each side.
+
 ## Testing without Steam
 
 Everything above is inert on an ENet build, so the whole netcode surface — including `just netbench` and the

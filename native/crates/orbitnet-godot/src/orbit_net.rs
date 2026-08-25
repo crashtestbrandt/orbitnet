@@ -30,18 +30,25 @@ use godot::classes::{
 };
 use godot::prelude::*;
 
-use orbitnet_core::auth::{siphash24, TRAILER_LEN};
+use orbitnet_core::auth::{
+    compress_secret, confirm_tag, derive_session_key, siphash24, TRAILER_LEN,
+};
 use orbitnet_core::codec::{
-    decode_input_block_meta, decode_manifest, decode_state_block_meta, encode_manifest,
-    input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
-    Handshake, ManifestEntry, Ping, Pong, Reader, Welcome, Writer, MAGIC, MAX_FRAME_PAYLOAD,
+    apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_manifest_delta,
+    decode_manifest_full, decode_state_block_meta, diff_manifest, encode_interest_delta,
+    encode_manifest_delta, encode_manifest_full, input_block_row, skip_input_block_body,
+    skip_state_block_body, FrameHeader, FrameKind, Handshake, InterestDeltaSection, ManifestDelta,
+    ManifestEntry, Ping, Pong, Reader, Welcome, Writer, MAGIC, MAX_FRAME_PAYLOAD,
 };
 use orbitnet_core::interest::{
-    ConnectionInterest, InterestCandidate, MembershipId, SeatObserver, SeatScratch,
+    ConnectionInterest, InterestCandidate, InterestDelta, InterestGrid, InterestOccupancy,
+    InterestPath, MembershipId, OccupancyScratch, PathSelector, SeatObserver, SeatScratch,
     MEMBERSHIP_GLOBAL,
 };
 use orbitnet_core::priority::{self, Band};
-use orbitnet_core::seats::{SeatId, SeatIndex, SeatRoster};
+use orbitnet_core::seats::{
+    releases_seats, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SeatRoster,
+};
 use orbitnet_core::slots::SlotTable;
 use orbitnet_core::{
     AoiConfig, AuthError, ClockEstimator, CoupledSlew, Direction, LeadTracker, ReceiveBudget,
@@ -50,7 +57,8 @@ use orbitnet_core::{
 
 use crate::binding;
 use crate::sync::{
-    self, OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration, STATE_HISTORY_DEPTH,
+    self, InputIntegration, OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration,
+    STATE_HISTORY_DEPTH,
 };
 
 /// Network role, mirroring the facade's `Net.Mode`.
@@ -60,6 +68,56 @@ const MODE_SERVER: i64 = 2;
 const MODE_HOST: i64 = 3;
 
 pub(crate) const SERVER_PEER: i32 = 1;
+
+/// `seat_release_policy` values, mirroring the facade's `Net.SeatRelease` and
+/// `orbitnet_core::seats::SeatReleasePolicy`. The property is an `i64` because that is what an
+/// exported enum crosses the script boundary as; [`seat_release_policy_of`] is the only place the
+/// number becomes the core enum, and [`clamp_seat_release_policy`] is the only place an unknown one
+/// is decided.
+const SEAT_RELEASE_HOLD: i64 = 0;
+const SEAT_RELEASE_ON_EXPIRY: i64 = 1;
+const SEAT_RELEASE_ON_DROP: i64 = 2;
+
+/// `resume_policy` values, mirroring the facade's `Net.ResumePolicy`. Which claims on a held or
+/// still-connected identity this server will grant. [`resume_grant`] is the whole rule.
+const RESUME_ALWAYS: i64 = 0;
+const RESUME_ONLY_IF_DROPPED: i64 = 1;
+const RESUME_NEVER: i64 = 2;
+
+/// What a connection that resolved **no** interest anchor receives, mirroring the facade's
+/// `Net.UnanchoredPolicy`. See [`OrbitNet::set_unanchored_policy`] for the carve-out that decides
+/// which connections the CLOSED value can reach at all.
+const UNANCHORED_OPEN: i64 = 0;
+const UNANCHORED_CLOSED: i64 = 1;
+
+/// The known `unanchored_policy` values, and OPEN for anything else.
+///
+/// Clamped on set rather than on read, for the reason [`clamp_seat_release_policy`] is: the getter
+/// then reports the policy **in force**, and a caller that writes a number this build does not know
+/// learns it by reading back. OPEN is the direction that is safe to be wrong in — it is today's
+/// behaviour and it withholds nothing from anybody.
+#[must_use]
+fn clamp_unanchored_policy(policy: i64) -> i64 {
+    if policy == UNANCHORED_CLOSED {
+        UNANCHORED_CLOSED
+    } else {
+        UNANCHORED_OPEN
+    }
+}
+
+/// Where the anchor `peer_anchor_info` reports came from, mirroring the facade's `Net.AnchorSource`.
+///
+/// | Value | Meaning |
+/// | --- | --- |
+/// | `0` | no answer — the peer names no connection, or the interest pass has not run for it |
+/// | `1` | inferred from the bodies the connection drives |
+/// | `2` | a declared fixed position ([`OrbitNet::set_peer_anchor`]) |
+/// | `3` | a declared tracked entity ([`OrbitNet::set_peer_anchor_entity`]) |
+const ANCHOR_SOURCE_NONE: i64 = 0;
+const ANCHOR_SOURCE_INFERRED: i64 = 1;
+const ANCHOR_SOURCE_FIXED: i64 = 2;
+const ANCHOR_SOURCE_ENTITY: i64 = 3;
+
 /// Seconds between clock probes.
 const PING_INTERVAL: f64 = 0.25;
 /// Ticks between forced full-state blocks per entity (phase-offset by entity id).
@@ -169,6 +227,22 @@ struct PeerObserver {
     center: [f32; 3],
     /// The world this seat is in.
     membership: MembershipId,
+    /// **The seat drove more than one anchored body**, so the two facts above came from an
+    /// arbitrary — deterministic, but arbitrary — one of them. See [`OrbitNet::collect_observers`]
+    /// for why the pick is not moving.
+    ///
+    /// Reported as `ambiguous` by [`OrbitNet::peer_anchor_info`] and **not warned about**. A game
+    /// that swaps one body for another on a seat holds two of them for the frame the swap takes,
+    /// and a warning there fires on every swap for a configuration that is correct.
+    ambiguous: bool,
+    /// The dropped rows disagreed about the **world**, which is the misconfiguration worth a log
+    /// line. `ambiguous` is always true beside it.
+    ///
+    /// The cost is a whole-world swap for the seat on any tick the pick changes: everything only
+    /// that seat held leaves the connection's interest at once, and [`OrbitNet::update_interest`]
+    /// clears `last_sent`, `last_full` and `acked_base` for each — a full-state burst rather than
+    /// the per-entity repair clearing exists to buy. See [`OrbitNet::warn_anchor_conflicts`].
+    membership_conflict: bool,
 }
 
 /// One connection's anchor declaration as the interest pass reads it for a tick.
@@ -187,6 +261,88 @@ struct PeerDeclaration {
     /// Where it last resolved to, so its despawn leaves the peer there rather than opening its
     /// radius to the whole world.
     last: Option<[f32; 3]>,
+    /// This connection's effective `unanchored_policy`: `true` for CLOSED.
+    ///
+    /// Rides the declaration because it is only ever read **against** one — it decides what happens
+    /// to a connection that declared nothing and drives nothing, and nothing else.
+    /// [`seat_observers_into`] states the whole carve-out.
+    closed_when_unanchored: bool,
+}
+
+/// The viewpoints one connection's filter runs this tick, and what resolving them revealed.
+///
+/// **The observers are the answer that is IN EFFECT**, which no other read-back on this node
+/// reports. [`OrbitNet::peer_membership`] answers the DECLARATION and therefore `0` for every
+/// inferred peer, and `NetRollbackHandle.membership()` answers one body rather than the pick made
+/// among a seat's several. Everything a game would have to reconstruct from those two — which of
+/// several bodies anchored a seat, whether the connection is culling anything at all, whether the
+/// pass ran — is here because it is a fact of the pass rather than a fact of the scene.
+///
+/// Filled by [`seat_observers_into`] once per connection per tick, then copied onto that
+/// connection's [`AnchorReport`] so a getter can read it between ticks.
+#[derive(Default)]
+struct ResolvedSeats {
+    /// The observers handed to the filter, in the order it runs them.
+    observers: Vec<SeatObserver>,
+    /// Positionally, which seat label each observer belongs to.
+    ///
+    /// `None` marks the single collapsed viewpoint a declaration — or the connection-wide fail-open
+    /// — produces, which belongs to **every** seat on the connection rather than to one of them.
+    /// That is what lets [`OrbitNet::seat_anchor_info`] answer for a seat label the inferred path
+    /// never enumerated.
+    labels: Vec<Option<SeatIndex>>,
+    /// One of the `ANCHOR_SOURCE_*` values: what produced the observers above.
+    source: i64,
+    /// At least one seat drove several anchored bodies, so its centre is one arbitrary pick among
+    /// them. See [`PeerObserver::ambiguous`].
+    ambiguous: bool,
+}
+
+/// One connection's [`ResolvedSeats`], kept between ticks so [`OrbitNet::peer_anchor_info`] can
+/// report the anchor that is in effect rather than the one that was declared.
+///
+/// Held on [`PeerState`] rather than in a table of its own, so it is **dropped with the rest of the
+/// connection** when the peer disconnects. A report that outlived its socket would be answered for
+/// whoever the transport hands that peer id to next.
+///
+/// Copied into rather than reassigned ([`Self::adopt`]), so a steady session allocates nothing here:
+/// this sits inside the per-peer loop of the interest pass, which the send path exists to keep cheap.
+#[derive(Default)]
+struct AnchorReport {
+    /// Whether [`OrbitNet::update_interest`] has ever written this report for this connection.
+    ///
+    /// `false` is one half of `stale`; the other half is the pass not having run **this** tick, which
+    /// is [`OrbitNet::interest_ran`]. A default [`PeerState`] starts here, so a reused peer id reports
+    /// stale until its first pass rather than inheriting the last connection's viewpoints.
+    resolved: bool,
+    /// One of the `ANCHOR_SOURCE_*` values.
+    source: i64,
+    ambiguous: bool,
+    observers: Vec<SeatObserver>,
+    labels: Vec<Option<SeatIndex>>,
+}
+
+impl AnchorReport {
+    /// Take a copy of this tick's resolution, reusing the vectors already allocated.
+    fn adopt(&mut self, seats: &ResolvedSeats) {
+        self.resolved = true;
+        self.source = seats.source;
+        self.ambiguous = seats.ambiguous;
+        self.observers.clear();
+        self.observers.extend_from_slice(&seats.observers);
+        self.labels.clear();
+        self.labels.extend_from_slice(&seats.labels);
+    }
+}
+
+/// Whether a centre is a measurement rather than [`UNLOCATABLE_CENTRE`].
+///
+/// The same three-component finite test [`orbitnet_core::interest::PeerInterest`] runs, stated here
+/// so the diagnostic reports the sentinel by the rule the filter reads it by rather than by
+/// comparing against a NaN — which is never equal to itself.
+#[must_use]
+fn is_located(center: [f32; 3]) -> bool {
+    center[0].is_finite() && center[1].is_finite() && center[2].is_finite()
 }
 
 /// What one peer's filter actually runs against this tick: where it observes from, and its world.
@@ -298,6 +454,17 @@ struct BandwidthMetrics {
     /// Milliseconds per tick spent in the interest pass. The number that would justify revisiting
     /// the grid-versus-scan decision recorded in `orbitnet_core::interest`.
     interest_ms: f64,
+    /// Fraction of the window's ticks whose interest pass ran through the spatial index rather than
+    /// the flat scan: `0.0` all-scan, `1.0` all-grid, in between while the session crosses the
+    /// threshold. **The verdict, reported — there is no setting behind it.**
+    ///
+    /// Read it beside `interest_ms` and nowhere else. The two paths compute identical members,
+    /// distances and leaves, so this column can never explain a behaviour difference; the only
+    /// question it answers is which cost `interest_ms` is the cost of. A session that sits at a
+    /// fraction strictly between `0.0` and `1.0` for a whole window is one whose occupancy is
+    /// hovering in the selector's hysteresis band, which is a description of the arena rather than
+    /// a fault.
+    interest_grid: f64,
     /// Mean ticks between admissions, per distance band. The evidence to demand before rate
     /// tiering may be turned on: it says whether the far band is genuinely far.
     interarrival_near: f64,
@@ -310,6 +477,19 @@ struct BandwidthMetrics {
     /// Peers synced, and the mean size of one peer's interest set.
     peers: f64,
     interest_entities: f64,
+    /// Connected peers whose RAW round-trip estimate is above [`OrbitNet::rtt_believed_max_ms`], so
+    /// the figure `peer_rtt_ms` reports for them is the ceiling rather than what was measured.
+    ///
+    /// **A gauge like `starve_ticks_max`, not a per-second rate**: the standing count as of the
+    /// publish. A subset of `peers`, so read it against that one — `3` out of `4` says the ceiling is
+    /// the session's policy for nearly everybody, and `3` out of `40` says three players are having a
+    /// bad time. Persistent and large is the reading that says the ceiling is set too low for the
+    /// population actually playing.
+    ///
+    /// Non-zero is not an accusation. A peer above the ceiling is either lagging its acks
+    /// deliberately or genuinely that far away, and nothing here can tell those apart — see
+    /// [`PeerState::note_ack`].
+    rtt_at_ceiling_peers: f64,
 }
 
 enum PendingOp {
@@ -414,6 +594,27 @@ struct PeerState {
     /// Per CONNECTION, not per seat: a session identity says which player is on the far end of one socket,
     /// and every seat behind that socket belongs to the same player.
     session_id: u64,
+    /// The **server-minted resume token** issued for [`Self::session_id`], or `0` for a connection holding
+    /// no identity.
+    ///
+    /// The identity names the player; this is what a claim on that identity has to quote. A rejoiner sends it
+    /// back in its handshake, and [`resume_grant`] refuses a claim that does not match the token on record.
+    ///
+    /// **Minted once per identity, at the first hello that seats one**, and carried forward verbatim onto
+    /// the connection a granted resume seats. Two reasons, and the first alone would be enough:
+    ///
+    /// - **A hello is retried until the welcome lands.** Re-minting on the retry would strand the token the
+    ///   client stored from the welcome that did arrive, and the peer would be refused its own identity.
+    /// - **The client persists it beside the session id.** A token that changed on every connection would
+    ///   have to be re-persisted on every connection, and a process killed between the two would lose it.
+    ///
+    /// **This is NOT [`Self::token_salt`].** That value is deliberately never transmitted, and transmitting
+    /// it would let a client mint the ack token for frames it never received — which is the exact claim
+    /// `unproven_acks_s` counts. The two are separate draws from the same generator and never alias.
+    ///
+    /// It rides the connection so `self.peers.remove()` takes it away on a drop; what survives the drop is
+    /// the copy on [`HeldSession::token`].
+    resume_token: u64,
     /// Where this peer observes from, declared by the game. See [`PeerAnchor`].
     anchor: PeerAnchor,
     /// The last position [`PeerAnchor::Entity`] resolved to, and the answer once it no longer can.
@@ -433,6 +634,16 @@ struct PeerState {
     /// — "this peer is at this point, in this world" — and a centre without the world it is measured
     /// in is precisely the pairing the inferred path takes from one row to keep consistent.
     anchor_membership: MembershipId,
+    /// What THIS connection receives when it resolves no anchor, or `None` to follow the session
+    /// default ([`OrbitNet::set_unanchored_policy`]). `Some(true)` is CLOSED.
+    ///
+    /// **Per connection and dropped with the connection.** It lives here rather than in a table
+    /// keyed by peer id precisely so `_on_peer_disconnected`'s `self.peers.remove()` takes it away:
+    /// a policy that outlived its socket would be applied to whoever the transport hands that id to
+    /// next, and "receive nothing" is not a state to inherit from a stranger.
+    unanchored_closed: Option<bool>,
+    /// What the interest pass last resolved this connection's viewpoints to. See [`AnchorReport`].
+    anchor_report: AnchorReport,
     /// The key and replay window for this connection's datagrams, seated by its handshake.
     ///
     /// `None` until the handshake lands, and that is the gate: [`OrbitNet::open_datagram`] drops
@@ -440,6 +651,32 @@ struct PeerState {
     auth: Option<SessionAuth>,
     /// What this peer has spent of the server's receive path in the current tick.
     budget: ReceiveBudget,
+    /// SERVER: the entity-manifest generation this connection is believed to hold.
+    ///
+    /// **`0` means "has never been sent a table", and it is the same statement as "holds the empty
+    /// table"** — a receiver's manifest starts empty and only becomes non-empty by applying a frame
+    /// that also moves this off `0`. So a fresh connection needs no special case: it is simply
+    /// behind, and [`manifest_owed`] answers it with a full table unless the session has published
+    /// nothing at all.
+    ///
+    /// **Every path that can desynchronize this peer zeroes it**, which is the whole of what stands
+    /// in for the complete table's self-repair:
+    ///
+    /// | Path | Where |
+    /// | --- | --- |
+    /// | a reconnect | a dropped peer is removed from `peers`, so the rejoiner starts at a `PeerState::default` |
+    /// | a rekey on a live connection | [`OrbitNet::handle_hello`], in the block that replaces [`Self::auth`] |
+    /// | the peer could not apply a delta | [`FrameHeader::FLAG_WANT_MANIFEST`] on its next input frame |
+    ///
+    /// It rides the connection, so `self.peers.remove()` takes it away on a drop.
+    manifest_generation: u64,
+    /// Whether this connection has already been named in a non-finite-input warning.
+    ///
+    /// **One warning per peer per session**, for the reason [`OrbitNet::note_unauthenticated`]
+    /// latches its own: under an actual flood the log is the second thing to fall over. It lives on
+    /// the connection, so `self.peers.remove()` on a disconnect takes it away — a reconnecting
+    /// player is warned about again, and a peer id handed to somebody else starts clean.
+    nonfinite_warned: bool,
     /// Per-entity newest tick sent — drives send priority.
     last_sent: HashMap<u64, u64>,
     /// Per-entity newest tick sent as a full block. Drives the keyframe interval.
@@ -464,6 +701,52 @@ struct PeerState {
     /// member is the nearest seat's, and a leave is a leave from the union. See
     /// [`ConnectionInterest`].
     interest: ConnectionInterest,
+    /// The relevancy events this connection is owed but has not provably received: what left its
+    /// interest and what entered it since the last section it acknowledged.
+    ///
+    /// **It is a net difference, not a log.** [`PeerState::note_interest_leave`] and
+    /// [`PeerState::note_interest_enter`] each drop any pending entry for the same entity in the
+    /// other half before appending, so an id is named in at most one of the two lists and the list
+    /// says where that entity stands NOW. Applying it to the receiver's mirrored set therefore
+    /// converges whether or not the intermediate frames landed — an entity that left and re-entered
+    /// while a frame was in flight is announced once, as an enter.
+    ///
+    /// Three sources fill it, and only the first is a `leaves` list anything else could read:
+    ///
+    /// | Source | What it pushes |
+    /// | --- | --- |
+    /// | [`OrbitNet::update_interest`] | both halves of the union diff |
+    /// | [`PeerState::set_entity_hidden`] | a leave, when a veto starts |
+    /// | the despawn sweep in `drain_pending` | a leave, on every peer that held the entity |
+    ///
+    /// **A retraction pushes nothing.** The entity re-enters through the enter radius on the next
+    /// update, and that update reports it.
+    interest_pending: InterestDelta,
+    /// The tick of the frame that FIRST carried the prefix currently in flight, or `None` when
+    /// nothing is in flight.
+    ///
+    /// The section rides an unreliable datagram, so it is re-sent every tick until `newest_ack`
+    /// reaches this — the ack window and the frame token are already verified per frame, so a
+    /// relevancy event needs no reliable channel of its own, only a tick stamp. It does NOT move on
+    /// a re-send: what an ack has to reach is the first frame that carried the prefix, because that
+    /// is the frame whose arrival proves the client applied it.
+    interest_delta_tick: Option<u64>,
+    /// How many entries from the FRONT of each half of [`Self::interest_pending`] rode the frame
+    /// stamped above.
+    ///
+    /// One frame carries at most [`INTEREST_DELTA_PER_FRAME`] of each half, so a burst — a joining
+    /// peer, whose first update enters everything it can see — is spread over several frames instead
+    /// of eating the send budget in one. Both halves are pushed at the back and retired from the
+    /// front, so the prefix is stable across re-sends.
+    interest_delta_left_sent: usize,
+    interest_delta_entered_sent: usize,
+    /// Whether this connection has ever been told that the session is filtering at all.
+    ///
+    /// A client that has received no section cannot tell "the server culls nothing" from "the server
+    /// culls and I am owed a section", and the two want opposite answers out of
+    /// [`OrbitNet::entities_in_interest`]. So a filtering server sends the section once even when it
+    /// is empty — two bytes, once per connection — and the flag retires with the first ack of it.
+    interest_seeded: bool,
     /// Recent snapshot sends awaiting acknowledgement: (frame tick, entity ticks it carried).
     sent_log: std::collections::VecDeque<(u64, Vec<(u64, u64)>)>,
     /// Per-entity newest tick this peer CONFIRMED receiving (via ack_tick/ack_bits) — the only
@@ -504,11 +787,19 @@ struct HeldSession {
     peer: i32,
     /// Wall-clock millisecond stamp past which the session is forgotten.
     expires_at_ms: u64,
+    /// The **resume token** the departed connection held for this identity, or `0` if it held none.
+    ///
+    /// A rejoiner has to quote this to claim the session. It is copied off [`PeerState::resume_token`] at
+    /// the drop rather than re-minted here, because the value the client is holding was issued at its first
+    /// hello and a new one would reach nobody — the connection that would have carried it in a welcome is
+    /// already gone.
+    token: u64,
 }
 
 /// The dropped sessions a server is holding, keyed by the identity their handshake carried.
 ///
-/// **What is held is the identity and nothing else.** None of the departed peer's send bookkeeping is
+/// **What is held is the identity, the token that proves a claim on it, and nothing else.** None of the
+/// departed peer's send bookkeeping is
 /// retained — `last_sent`, `acked_base`, the sent log — and retaining it would be wrong: a rejoiner is a new
 /// transport connection whose client-side delta bases are gone, so it is handshaked as a newcomer and asks
 /// for full blocks. The one thing that cannot be rebuilt from the connection is who the player was, and that
@@ -521,12 +812,13 @@ struct ResumeTable {
 }
 
 impl ResumeTable {
-    /// Hold `session_id` open until `expires_at_ms`. Identity `0` is refused — that is what a peer claiming
-    /// no identity sends, and holding one slot for "everybody anonymous" would hand the next anonymous
-    /// joiner the last one's seat.
+    /// Hold `session_id` open until `expires_at_ms`, recording the resume `token` a claimant must quote.
+    ///
+    /// Identity `0` is refused — that is what a peer claiming no identity sends, and holding one slot for
+    /// "everybody anonymous" would hand the next anonymous joiner the last one's seat.
     ///
     /// Re-holding an id already present overwrites it: the newer drop is the one whose window should run.
-    fn hold(&mut self, session_id: u64, peer: i32, expires_at_ms: u64) -> bool {
+    fn hold(&mut self, session_id: u64, peer: i32, expires_at_ms: u64, token: u64) -> bool {
         if session_id == 0 {
             return false;
         }
@@ -535,6 +827,7 @@ impl ResumeTable {
             HeldSession {
                 peer,
                 expires_at_ms,
+                token,
             },
         );
         true
@@ -545,11 +838,33 @@ impl ResumeTable {
     /// `None` for an unheld id, which is every first-time joiner and every peer that claimed no identity.
     /// Claiming REMOVES: a session is resumed once, by the connection that arrived first, and a second
     /// claimant with the same token is a newcomer rather than a second resume of one player's place.
-    fn claim(&mut self, session_id: u64) -> Option<i32> {
+    ///
+    /// **`presented_token` must match the token on record, and a mismatch LEAVES THE HELD SESSION IN
+    /// PLACE.** Spending somebody else's window on a wrong quote would turn one forged hello into a denial
+    /// of service — the real player comes back inside the grace window and finds nothing held — which is a
+    /// worse outcome than the takeover the token exists to refuse. A record whose token is `0` accepts any
+    /// quote: that is a session held for a connection this server minted no token for, and refusing it
+    /// would refuse a resume nobody can ever satisfy.
+    fn claim(&mut self, session_id: u64, presented_token: u64) -> Option<i32> {
         if session_id == 0 {
             return None;
         }
+        let held = self.held.get(&session_id)?;
+        if held.token != 0 && held.token != presented_token {
+            return None;
+        }
         self.held.remove(&session_id).map(|held| held.peer)
+    }
+
+    /// The resume token recorded for `session_id`, or `0` when no session is held under it.
+    ///
+    /// Read by `handle_hello` to answer [`resume_grant`]'s `token_on_record`, so the decision and the claim
+    /// are made against the same value.
+    fn token_of(&self, session_id: u64) -> u64 {
+        if session_id == 0 {
+            return 0;
+        }
+        self.held.get(&session_id).map_or(0, |held| held.token)
     }
 
     /// Remove and return every session whose window closed at or before `now_ms`, as `(session, peer)`.
@@ -587,17 +902,56 @@ impl ResumeTable {
 /// How many unacked snapshot frames a peer's sent log retains before the oldest expire.
 const SENT_LOG_DEPTH: usize = 64;
 
+/// How many entries of each half of a peer's pending interest delta ride one frame.
+///
+/// **This is what bounds the reserve the send path takes off the byte budget.** The section costs
+/// [`interest_delta_reserve`] bytes, so 32 of each half is `3 + 2 × 64` = 131 B — about 11% of the
+/// default 1200 B budget, and only on a tick that has relevancy news. A joining peer, whose first
+/// update enters everything it can see, spreads that burst over consecutive frames rather than
+/// paying for it in one: nothing is dropped, it arrives a round trip later.
+const INTEREST_DELTA_PER_FRAME: usize = 32;
+
+/// How many entries each half of a peer's pending interest delta holds before the OLDEST is dropped.
+///
+/// The backstop for a session churning relevancy faster than the acknowledged prefix drains — a peer
+/// on a link that is up enough to be sent to and down enough never to ack. What is dropped is the
+/// oldest event, never the newest: the recent transitions are the ones a game is about to act on,
+/// and the stale set is repaired by [`OrbitNet::entities_in_interest`] rather than by a replay.
+const INTEREST_DELTA_PENDING_MAX: usize = 256;
+
+/// How many ticks a prefix rides unacknowledged before it is given up on.
+///
+/// **The same depth as [`SENT_LOG_DEPTH`]**, and for the same reason: past 64 frames an ack can no
+/// longer confirm the frame anyway, so holding the prefix past that reserves budget on every tick
+/// for a section nothing will ever retire. What is dropped is the prefix — those events are never
+/// announced to that peer, and its mirrored set stays wrong for those entities until one of them
+/// transitions again or the game resyncs from [`OrbitNet::entities_in_interest`]. The rest of the
+/// pending delta is unaffected and takes the next frame.
+const INTEREST_DELTA_RETRY_TICKS: u64 = SENT_LOG_DEPTH as u64;
+
 /// How many round-trip samples the per-peer rewind estimate keeps — about a second of
 /// them at every rate the loop runs at, which is short enough to follow a real route change and
 /// long enough that the minimum below is drawn from a healthy population.
 const RTT_WINDOW: usize = 64;
 
-/// The largest single round-trip sample worth storing, in milliseconds. Ten seconds is far past
-/// any link a shooter is compensated on — the 250 ms ceiling in `NetLagComp` is what actually
-/// bounds the rewind — and the cap only keeps one stalled peer from parking an absurd value in the
-/// window. Same shape as the `history_limit` bound on accepted input ticks below: the wire says
-/// what it says, and the server decides what it is willing to believe.
+/// The largest single round-trip sample worth STORING, in milliseconds. It only keeps one stalled
+/// peer from parking an absurd value in the window; at ten seconds it is 40x the rewind policy and
+/// therefore never binds on anything a shooter is compensated on.
+///
+/// It is also the outer bound on [`OrbitNet::rtt_believed_max_ms`], which is the cap that does bind.
+/// Same shape as the `history_limit` bound on accepted input ticks below: the wire says what it
+/// says, and the server decides what it is willing to believe.
 const RTT_SAMPLE_MAX_MS: f32 = 10_000.0;
+
+/// What [`OrbitNet::rtt_believed_max_ms`] starts at, in milliseconds.
+///
+/// **The same figure `NetLagComp.max_delay_ms` defaults to, deliberately.** The two bound different
+/// quantities — this one what the server BELIEVES about a link, that one how deep a shot REWINDS —
+/// so they are not redundant, and see [`PeerState::rtt_believed_ms`] for why both exist. Starting
+/// them at one number means a game that lowers its rewind ceiling and forgets this one is still
+/// bounded at the depth it asked for, rather than believing 10 s about a peer it only ever rewinds
+/// 250 ms for.
+const RTT_BELIEVED_MAX_MS_DEFAULT: f64 = 250.0;
 
 /// What an arriving acknowledgement bought its sender. See [`PeerState::consume_ack`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -664,12 +1018,134 @@ impl PeerState {
     /// Retracting clears nothing, because nothing was sent while the veto was in force: the entries
     /// cleared at the start are still empty, which is what makes the re-admission a full block.
     fn set_entity_hidden(&mut self, id: u64, hidden: bool) {
+        let held = self.interest.contains(id);
         self.interest.set_hidden(id, hidden);
         if hidden {
             self.last_sent.remove(&id);
             self.last_full.remove(&id);
             self.acked_base.remove(&id);
+            // A veto is a leave, and it is one of the two that happen BETWEEN updates — no `leaves`
+            // list will ever name it. Queued only when the entity was actually in the set: vetoing
+            // something this connection never held announces a departure that never happened, and a
+            // presentation layer that hides a node on it hides one it never showed.
+            if held {
+                self.note_interest_leave(id);
+            }
         }
+        // RETRACTING QUEUES NOTHING. The entity re-enters through the enter radius on the next
+        // update, and that update reports it — announcing it here would name a body the filter may
+        // still refuse.
+    }
+
+    /// Queue "this entity left your interest" for this connection.
+    ///
+    /// Any pending enter for the same id is dropped first, so the two halves never both name it and
+    /// the receiver's idempotent apply cannot land them in the wrong order. See
+    /// [`Self::interest_pending`].
+    fn note_interest_leave(&mut self, id: u64) {
+        Self::drop_pending(
+            &mut self.interest_pending.enters,
+            &mut self.interest_delta_entered_sent,
+            id,
+        );
+        Self::push_pending(
+            &mut self.interest_pending.leaves,
+            &mut self.interest_delta_left_sent,
+            id,
+        );
+    }
+
+    /// Queue "this entity entered your interest" for this connection. The mirror of
+    /// [`Self::note_interest_leave`].
+    fn note_interest_enter(&mut self, id: u64) {
+        Self::drop_pending(
+            &mut self.interest_pending.leaves,
+            &mut self.interest_delta_left_sent,
+            id,
+        );
+        Self::push_pending(
+            &mut self.interest_pending.enters,
+            &mut self.interest_delta_entered_sent,
+            id,
+        );
+    }
+
+    /// Remove `id` from one half, keeping `sent` pointing at the same entries it did.
+    ///
+    /// `sent` counts entries from the FRONT, so removing one inside that range has to shrink it —
+    /// otherwise the ack that retires the prefix would drain an entry that never rode.
+    fn drop_pending(list: &mut Vec<u64>, sent: &mut usize, id: u64) {
+        let Some(index) = list.iter().position(|&held| held == id) else {
+            return;
+        };
+        list.remove(index);
+        if index < *sent {
+            *sent -= 1;
+        }
+    }
+
+    /// Append `id` to one half, dropping the oldest entry when the half is full.
+    fn push_pending(list: &mut Vec<u64>, sent: &mut usize, id: u64) {
+        if list.len() >= INTEREST_DELTA_PENDING_MAX {
+            list.remove(0);
+            *sent = sent.saturating_sub(1);
+        }
+        list.push(id);
+    }
+
+    /// Drop everything this connection holds about one entity that has left the registry, answering
+    /// whether it was in this connection's interest.
+    ///
+    /// The whole of what the despawn sweep does per peer, as a method a test can call without a
+    /// `SceneTree`. The three per-entity entries go either way — they describe the DEPARTED body's
+    /// history, and a replacement inheriting the id must not be delta-encoded against it — and the
+    /// leave is queued only when the set actually held the entity, so a peer that was never sent it
+    /// is told nothing.
+    fn forget_entity(&mut self, id: u64) -> bool {
+        self.last_sent.remove(&id);
+        self.last_full.remove(&id);
+        self.acked_base.remove(&id);
+        let held = self.interest.contains(id);
+        if held {
+            self.note_interest_leave(id);
+        }
+        self.interest.remove(id);
+        held
+    }
+
+    /// Retire the prefix that rode the stamped frame, or give up on it.
+    ///
+    /// Called once per peer per snapshot tick, BEFORE the section for this tick is built. Three
+    /// outcomes, and the middle one is the whole of the reliability model:
+    ///
+    /// | State | What happens |
+    /// | --- | --- |
+    /// | nothing in flight | nothing |
+    /// | `newest_ack` reached the stamp | the prefix is dropped, and the connection counts as seeded |
+    /// | the stamp is [`INTEREST_DELTA_RETRY_TICKS`] old | the prefix is dropped unconfirmed, and so is the seed |
+    ///
+    /// The two drops are the same operation, which is deliberate: an unconfirmed prefix is not
+    /// re-queued, because re-queuing it would make one unreachable peer accumulate for ever.
+    fn retire_interest_delta(&mut self, current: u64) {
+        let Some(stamp) = self.interest_delta_tick else {
+            return;
+        };
+        let acked = self.newest_ack >= stamp;
+        if !acked && current < stamp.saturating_add(INTEREST_DELTA_RETRY_TICKS) {
+            return;
+        }
+        let left = self
+            .interest_delta_left_sent
+            .min(self.interest_pending.leaves.len());
+        self.interest_pending.leaves.drain(..left);
+        let entered = self
+            .interest_delta_entered_sent
+            .min(self.interest_pending.enters.len());
+        self.interest_pending.enters.drain(..entered);
+        self.interest_delta_tick = None;
+        self.interest_delta_left_sent = 0;
+        self.interest_delta_entered_sent = 0;
+        self.interest_seeded = true;
     }
 
     /// The token the snapshot frame at `tick` is minted with, or `None` for a peer with no salt yet.
@@ -703,6 +1179,21 @@ impl PeerState {
     /// [`note_ack`]: PeerState::note_ack
     fn ack_is_proven(&self, ack: u64, token: u32) -> bool {
         self.frame_token(ack) == Some(token)
+    }
+
+    /// Stop believing this peer holds any entity-manifest table.
+    ///
+    /// **The one repair for every way the manifest stream can break**, as a method a test can call
+    /// without a `SceneTree`. Two callers, and they are the two breaks a live connection can suffer:
+    /// a hello that rekeys it (the client restarted its session and its table went with it), and a
+    /// [`FrameHeader::FLAG_WANT_MANIFEST`] NACK (the client could not apply a delta). The third
+    /// break — a reconnect — needs no call, because the rejoiner arrives on a fresh `PeerState`.
+    ///
+    /// Generation `0` is not a sentinel that needs handling downstream: it is the generation of the
+    /// empty table, so [`manifest_owed`] answers this peer with the whole table on the next publish
+    /// and with nothing at all in a session that has published nothing.
+    fn forget_manifest(&mut self) {
+        self.manifest_generation = 0;
     }
 
     /// Take a NACK from this peer: ask for full rows, and stop trusting every delta base held for it.
@@ -805,7 +1296,13 @@ impl PeerState {
     /// closes that one: `current - ack` is the whole round trip whatever lead the client runs at, so there
     /// is no second quantity for the server to derive an independent figure from, and a client that
     /// under-reports gains nothing a client routing through a traffic shaper does not already gain
-    /// honestly. The containment for the remainder is the millisecond ceiling in `NetLagComp`.
+    /// honestly.
+    ///
+    /// **The containment for the remainder is two ceilings, and they bound different things.**
+    /// [`OrbitNet::rtt_believed_max_ms`] bounds what the server believes about the link, so every
+    /// consumer of [`OrbitNet::peer_rtt_ms`] gets a bounded figure; `NetLagComp.max_delay_ms` bounds
+    /// how deep a shot rewinds. Neither is applied here — the sample is stored as measured, and
+    /// [`PeerState::rtt_believed_ms`] says why.
     fn note_ack(&mut self, ack: u64, current: u64, tick_ms: f64) -> bool {
         if ack <= self.newest_ack {
             return false;
@@ -837,6 +1334,56 @@ impl PeerState {
                 Some(acc.map_or(ms, |best| best.min(ms)))
             })
     }
+
+    /// The same estimate, bounded by what this server is willing to BELIEVE about one link:
+    /// [`PeerState::rtt_ms`] capped at `ceiling_ms`. `None` for a peer with no sample, exactly as
+    /// the raw estimate answers.
+    ///
+    /// **It bounds the BELIEF, not the acknowledgement.** Every ack that proves its frame token is
+    /// still consumed whole — `newest_ack` still rises, `acked_base` is still promoted, the sample
+    /// still enters the window. Only the figure handed to a consumer is capped. Refusing the ack
+    /// instead would break the peer's own delta chain over a measurement policy, which is a
+    /// bandwidth failure imposed on a peer that may simply be far away.
+    ///
+    /// **Clamped at the READ rather than inside [`PeerState::note_ack`]**, and that is a deliberate
+    /// choice rather than the obvious one:
+    ///
+    /// - Clamping the stored sample would re-tune five existing `#[test]` cases that assert exact
+    ///   millisecond figures over gaps above this ceiling. Re-tuning five assertions is where one of
+    ///   them quietly stops asserting anything.
+    /// - The window keeps its honest contents, so the minimum filter still sees the real
+    ///   distribution and [`OrbitNet::peer_rtt_raw_ms`] can report it. A clamped store would make
+    ///   every peer above the ceiling indistinguishable from every other one, and the ceiling gauge
+    ///   in the bandwidth metrics could not be computed at all.
+    ///
+    /// **What this does NOT close.** A client that advances its ack at full rate while holding a
+    /// constant lag still reads as a slow link, up to `ceiling_ms`. No wire field closes that — see
+    /// [`PeerState::note_ack`] for why there is no second quantity to derive an independent figure
+    /// from. What changes is that the residual is now bounded by a number the server owns, instead
+    /// of by [`RTT_SAMPLE_MAX_MS`], which is 40x any rewind policy and never binds.
+    fn rtt_believed_ms(&self, ceiling_ms: f32) -> Option<f32> {
+        self.rtt_ms().map(|ms| ms.min(ceiling_ms))
+    }
+}
+
+/// How many of `peers` are connected AND have a raw round-trip estimate above `ceiling_ms` — the
+/// `rtt_at_ceiling_peers` gauge in [`OrbitNet::bandwidth_metrics`].
+///
+/// **A gauge, not a rate**, like `starve_ticks_max` beside it: it is the count as of the publish, not
+/// a per-second figure, so a window in which nothing changed still reports the standing count.
+///
+/// **Counted at the once-per-second publish, never in the per-tick read path.** It is a scan of every
+/// connected peer's sample window, which is the shape of work the send path must not do per tick, and
+/// nothing acts on it — it is a diagnostic that says how much of the session the belief ceiling is
+/// currently binding on.
+///
+/// `synced` peers only, so the count is a subset of the `peers` figure published beside it. Strictly
+/// above the ceiling: a peer measured at exactly the ceiling is believed in full and is not being
+/// bound by it.
+fn rtt_at_ceiling_peers<'a>(peers: impl Iterator<Item = &'a PeerState>, ceiling_ms: f32) -> u64 {
+    peers
+        .filter(|p| p.synced && p.rtt_ms().is_some_and(|ms| ms > ceiling_ms))
+        .count() as u64
 }
 
 /// The OrbitNet session node. Owned and driven by the `Net` facade autoload.
@@ -894,6 +1441,10 @@ pub struct OrbitNet {
     /// refuses the worlds a peer is not in, and is billed as `interest_ms` like any other tick. A
     /// game that declares no memberships does get the whole pass skipped at `0`, which is what this
     /// used to say unconditionally.
+    ///
+    /// **At `0` the pass never takes the spatial index**, whatever the occupancy: there is no
+    /// distance to index, so a rebuild would cost a tick and refuse nothing. `bandwidth_metrics()`'s
+    /// `interest_grid` reads `0.00` for the whole session.
     #[export]
     aoi_radius: f64,
 
@@ -946,6 +1497,94 @@ pub struct OrbitNet {
     #[export]
     reconnect_grace: f64,
 
+    /// Which claims on an identity this server grants: `0` always, `1` only if the incumbent has dropped,
+    /// `2` never. Clamped to a known value on set; anything else reads back as `0`.
+    ///
+    /// SERVER-SIDE. It is one of the two inputs to [`resume_grant`], and that function is the whole rule.
+    ///
+    /// **THE DEFAULT IS `0` (ALWAYS), AND THAT IS A DELIBERATE CHOICE RATHER THAN AN OMISSION.**
+    ///
+    /// - **The token is what removed the reachable attack, not the policy.** A claim is granted only when
+    ///   the presented [`Handshake::resume_token`] matches the one on record, so a peer that merely
+    ///   observed another's session id — off a roster broadcast, a kill feed, a log line, a screenshot —
+    ///   is refused under ALWAYS exactly as it is under NEVER.
+    /// - **What ALWAYS is still open to is an on-path observer**, who reads the welcome and can quote the
+    ///   token verbatim. ONLY_IF_DROPPED buys nothing against that adversary: it can read the traffic, so
+    ///   it can already do everything the client can, and it can wait for the drop like anybody else.
+    /// - **What ALWAYS buys is every honest fast reconnect.** A relaunched client routinely arrives before
+    ///   the transport reports its old socket gone — measured here at anywhere from 45 s to never on ENet's
+    ///   defaults — and under ONLY_IF_DROPPED that player is refused their own body for the whole of that
+    ///   span.
+    ///
+    /// ONLY_IF_DROPPED is a supported setting and one call, for a game that will not accept a live takeover
+    /// on any terms. NEVER is for a game with no reconnect story at all.
+    #[export]
+    #[var(set = set_resume_policy)]
+    resume_policy: i64,
+
+    /// What this session does with a connection's seats once that connection ends: `0` hold, `1`
+    /// release when the grace window closes, `2` release the moment the transport drops. Clamped to
+    /// a known value on set; anything else reads back as `0`.
+    ///
+    /// SERVER-SIDE. It selects [`SeatReleasePolicy`] and nothing else: [`releases_seats`] is the whole
+    /// rule, this node acts on its answer, and a release means the bodies that connection drove have
+    /// their input handed back to the server (`OrbitRollbackSynchronizer::release_seat`) so their
+    /// seats close.
+    ///
+    /// **THE DEFAULT IS `0` (HOLD), AND IT STAYS THERE.** Four reasons, and each of them on its own
+    /// would be enough:
+    ///
+    /// - **It is what the pinned released binary already does.** The cdylib a project has on disk is
+    ///   refreshed only at a release tag, so new GDScript routinely runs against an older one. A
+    ///   default that released seats would mean the same project despawns players' viewpoints or does
+    ///   not, depending on which binary happened to be installed — a behaviour difference no source
+    ///   change explains.
+    /// - **It is the documented contract in three places**: [`Self::peer_session_expired`],
+    ///   [`Self::seat_closed`], and the sizing note on [`Self::reconnect_grace`] all state that a
+    ///   dropped connection keeps its seats until the game says otherwise. Changing the default
+    ///   silently falsifies all three for every existing consumer.
+    /// - **It is what the reconnect grace window is for.** A player whose wifi drops a burst of
+    ///   packets comes back to the body they left, and that only works because nothing took it away
+    ///   in the meantime. A session that released on every transient drop would despawn players for a
+    ///   hiccup, which is the failure [`Self::reconnect_grace`] exists to prevent.
+    /// - **The addon does not know what a released body should become.** Freed, parked as a corpse,
+    ///   handed to a queued joiner, kept as an idle NPC — those are game rules, and the facade
+    ///   declines to make that decision. THIS DOES NOT MAKE IT EITHER: `1` and `2` hand input back to
+    ///   the server and close the seat, and freeing the node stays the game's call, exactly as it is
+    ///   for a body a cull stopped sending.
+    ///
+    /// What choosing `1` or `2` buys is **one call instead of a second table**. The alternative every
+    /// game hand-rolls is a peer-to-bodies map maintained beside the roster this node already derives
+    /// from ownership, and two tables answering "which bodies does this connection drive" are two
+    /// things that can disagree — while only one of them, ownership, is what the anti-forgery check
+    /// on a received input block reads.
+    #[export]
+    #[var(set = set_seat_release_policy)]
+    seat_release_policy: i64,
+
+    /// The largest round trip this server will BELIEVE about a peer, in milliseconds. Clamped into
+    /// `0.0..=RTT_SAMPLE_MAX_MS` on set; defaults to [`RTT_BELIEVED_MAX_MS_DEFAULT`].
+    ///
+    /// SERVER-SIDE. It caps [`Self::peer_rtt_ms`] and nothing else: no acknowledgement is refused, no
+    /// stored sample is altered, and [`Self::peer_rtt_raw_ms`] still reports the unclamped window
+    /// minimum for a scoreboard ping or an admin tool. See [`PeerState::rtt_believed_ms`].
+    ///
+    /// **What it is for.** A round-trip estimate is derived from acknowledgements the client chooses
+    /// when to send, and the one thing the three ack rules do not close is a client that advances at
+    /// full rate behind a constant lag: it quotes a real frame token every time and is believed at
+    /// that lag. Without this the only bound on that figure was [`RTT_SAMPLE_MAX_MS`] at ten seconds,
+    /// which is 40x any rewind policy and never binds — so a deeper rewind was there for the asking.
+    ///
+    /// **It does not close the residual, it bounds it.** A client behind a constant lag still reads as
+    /// a slow link, up to this value. Lowering it is the only lever that narrows that, and it narrows
+    /// the honest slow link by exactly as much: the two are indistinguishable by construction.
+    ///
+    /// `0.0` believes nothing about anybody — every connected peer reports a 0 ms round trip, which a
+    /// per-shooter rewind reads as the shallowest window there is.
+    #[export]
+    #[var(set = set_rtt_believed_max_ms)]
+    rtt_believed_max_ms: f64,
+
     mode: i64,
     running: bool,
     synced: bool,
@@ -982,14 +1621,75 @@ pub struct OrbitNet {
     peers: HashMap<i32, PeerState>,
     /// This peer's own session identity, sent in its handshake. `0` claims none.
     session_id: u64,
-    /// Client: the key this session's datagrams are authenticated with, and the window that refuses a
-    /// replayed one from the server. Minted fresh in [`OrbitNet::start`] and carried in the handshake.
+    /// Client: the **resume token** a server issued for [`Self::session_id`], quoted back in every later
+    /// handshake. `0` holds none.
     ///
-    /// The server holds no session key of its own — a session's key is the client's, and the server
-    /// keeps one [`SessionAuth`] per connected peer on [`PeerState`].
+    /// Server-minted and client-stored: it arrives in [`Welcome::resume_token`] and goes out in
+    /// [`Handshake::resume_token`]. It survives [`Self::stop`], because it describes an identity rather
+    /// than a session — but it does NOT survive the process, so a game that wants a restarted client to
+    /// resume has to persist it beside the session id and write it back through
+    /// [`Self::set_resume_token`].
+    ///
+    /// A welcome carrying `0` does not clear it. That answer means "this connection holds no identity of
+    /// ours" — an anonymous seat, or a refused resume — and forgetting a live token on the strength of it
+    /// would cost the peer its next honest reconnect.
+    ///
+    /// **ONE TOKEN PER CLIENT, naming whichever server last issued one.** A token is minted per server per
+    /// identity, and joining a second server under the same identity replaces the stored value — so the
+    /// resume on the first server is forfeited. Storing one per server would need a server identity the
+    /// protocol does not carry, and the case it would buy is a player alternating between two servers inside
+    /// one grace window, which is 30 s by default.
+    resume_token: u64,
+    /// Client: the key this session's datagrams are authenticated with, and the window that refuses a
+    /// replayed one from the server. Seated in [`OrbitNet::start`] from [`Self::session_nonce`].
+    ///
+    /// The server holds no session key of its own — a session's key is derived from what the client
+    /// minted, and the server keeps one [`SessionAuth`] per connected peer on [`PeerState`].
     session_auth: Option<SessionAuth>,
+    /// Client: the 16 bytes drawn fresh for this session and carried in the handshake.
+    ///
+    /// **It is the key itself when no [`Self::session_secret`] is set, and only a nonce when one is.**
+    /// The draw is the same either way; what changes is whether [`Self::session_auth`] is seated with
+    /// these bytes or with what they and the secret derive. Held separately from the key because under a
+    /// secret the two differ and the handshake carries this one.
+    session_nonce: Option<[u8; KEY_LEN]>,
+    /// The **shared session secret**, already folded to [`KEY_LEN`] bytes, or `None` for a session that
+    /// configured none.
+    ///
+    /// The game distributes it out of band on a channel it has already authenticated — a lobby's
+    /// metadata, a matchmaker's ticket, anything the player did not type into a public field — and hands
+    /// it to both ends before either starts. It changes who can forge a datagram in this session:
+    ///
+    /// | | No secret | A secret |
+    /// | --- | --- | --- |
+    /// | What the handshake carries | the session key, in the clear | a nonce, in the clear |
+    /// | What an on-path observer can do | everything the client can | read the traffic, forge nothing |
+    ///
+    /// **THE SECRET IS A DERIVATION INPUT AND IS NEVER SEATED AS THE SESSION KEY**, however much shorter
+    /// that implementation looks. Sequence numbers restart at 1 on every join and the replay window only
+    /// ever knows the session in front of it, so a key that did not change between joins would make every
+    /// datagram captured in one session a valid, unreplayed datagram in the next. The per-join nonce is
+    /// what keeps the key per-join. See [`session_key_from`].
+    ///
+    /// It is never read back out: there is [`OrbitNet::has_session_secret`] and no getter for the bytes.
+    session_secret: Option<[u8; KEY_LEN]>,
     /// Server: the sessions of dropped peers, held open until their grace window closes.
     resume: ResumeTable,
+    /// Server: peer ids whose seats a `RELEASE_ON_DROP` policy owes a release, queued by
+    /// [`OrbitNet::_on_peer_disconnected`] and drained by [`OrbitNet::drain_seat_releases`].
+    ///
+    /// **THE RELEASE IS QUEUED RATHER THAN IMMEDIATE, AND THAT IS NOT A LATENCY CHOICE.**
+    /// `_on_peer_disconnected` is a transport callback, and `SceneMultiplayer` delivers it from
+    /// inside `poll()` — which this node calls from the tick loop, with a `bind` held on the
+    /// synchronizer it is part-way through stepping. A release walks the registry and needs
+    /// `bind_mut()` on every entity it touches, and godot-rust answers that with a **borrow panic**,
+    /// not a wrong value: the frame goes down rather than doing something slightly wrong.
+    ///
+    /// Draining at the frame boundary also puts the release on **the tick boundary every other seat
+    /// write already lands on**, so a game sees one announcement per frame whatever caused it.
+    ///
+    /// Nothing is queued under the default policy, so a session that sets none never allocates here.
+    pending_seat_releases: Vec<i32>,
     /// Server: the transport peer ids connected as of this frame, plus our own.
     ///
     /// Refreshed once per frame and read once per rollback entity per tick to decide which entities have
@@ -1011,7 +1711,37 @@ pub struct OrbitNet {
     /// Server: the slot table has been reported exhausted once already. The condition persists for
     /// as long as the session stays at the cap, and a per-tick per-entity error would bury the log.
     slots_exhausted_warned: bool,
+    /// Something may be owed on the entity-manifest channel: the table changed, a peer joined, or a
+    /// peer asked for the whole table again.
+    ///
+    /// **It no longer means "the table changed".** A flush diffs the rebuilt table against
+    /// [`Self::manifest_published`] and publishes nothing when the two agree, so raising this
+    /// costs a rebuild and a diff rather than a broadcast.
     manifest_dirty: bool,
+    /// The generation of the entity-manifest table the far end holds.
+    ///
+    /// **One field, two roles, the way [`Self::slots`] is one table for two roles.** On a SERVER it
+    /// is the generation of [`Self::manifest_published`], and a delta names it as its base. On a
+    /// CLIENT it is the generation of the table this peer holds, and a delta naming any other base
+    /// is refused. The send path runs only on a server and the receive arm only on a client, so the
+    /// two never overlap.
+    ///
+    /// `0` is "nothing has been published" on a server and "no table has been applied" on a client,
+    /// and both describe the empty table.
+    manifest_generation: u64,
+    /// The entity-manifest rows the far end holds, ascending by slot.
+    ///
+    /// SERVER: what every peer at [`Self::manifest_generation`] holds, and the table the next diff
+    /// is taken against. CLIENT: the rows this peer holds, which is what a delta is applied to and
+    /// what the seat roster is projected from — a delta carries only the change, so the client has
+    /// to keep the whole table to project anything derived from it.
+    manifest_published: Vec<ManifestEntry>,
+    /// Client: this peer has already been warned once that its manifest stream broke.
+    ///
+    /// Latched for the reason [`OrbitNet::note_unauthenticated`] latches its own: a server that
+    /// sends undecodable frames sends them every tick, and under a flood the log is the second thing
+    /// to fall over.
+    manifest_break_warned: bool,
     /// Client: schema fingerprints announced by the server, checked as entities register.
     expected_schemas: HashMap<u64, (u32, u32)>,
     /// Client: newest snapshot frame tick received (our ack).
@@ -1026,6 +1756,13 @@ pub struct OrbitNet {
     snapshot_ack_token: u32,
     /// Client: raise WANT_FULL on the next input frame.
     want_full: bool,
+    /// Client: raise WANT_MANIFEST on the next input frame — this peer could not apply a manifest
+    /// delta and needs the whole table.
+    ///
+    /// **Losing the frame that carries it costs one tick.** The refusal zeroed
+    /// [`Self::manifest_generation`] at the same moment, so the next delta fails its base check as
+    /// well and raises this again.
+    want_manifest: bool,
     /// Client: which owned body the next input frame's admission walk starts at.
     ///
     /// Only ever off zero when the frame is full, which takes several seats on one connection. See
@@ -1066,6 +1803,12 @@ pub struct OrbitNet {
     acc_stale_blocks: u64,
     acc_interest_us: u64,
     acc_interest_ticks: u64,
+    /// Ticks of the window whose interest pass ran through the grid rather than the flat scan.
+    ///
+    /// Divided by `acc_interest_ticks` — every tick of the send loop, including the ones that
+    /// skipped the pass entirely — so the published `interest_grid` is a fraction of the window and
+    /// reads `0.0` in a session that never selects the grid.
+    acc_interest_grid_ticks: u64,
     acc_interest_peer_ticks: u64,
     acc_interest_members: u64,
     acc_band_sends: [u64; 3],
@@ -1105,15 +1848,83 @@ pub struct OrbitNet {
     /// **which seats that connection has at all**, including one whose body has no anchor yet and so
     /// appears in no observer.
     aoi_owned_rows: Vec<(SeatId, u32)>,
-    /// The observer slice handed to [`ConnectionInterest::update_linear_into`], rebuilt per peer.
-    aoi_seats: Vec<SeatObserver>,
+    /// The observers handed to whichever update path the tick selected, rebuilt per peer, plus
+    /// what resolving them revealed. See [`ResolvedSeats`].
+    aoi_seats: ResolvedSeats,
     aoi_seat_scratch: SeatScratch,
+    /// The tick's spatial index, rebuilt **once per tick** and only on [`InterestPath::Grid`]. Its
+    /// bucket `Vec`s are pooled inside it, so a warm grid tick allocates nothing; a session that
+    /// never leaves [`InterestPath::Linear`] never fills it and pays for an empty `HashMap`.
+    aoi_grid: InterestGrid,
+    /// Which path the interest pass runs, held across ticks so the verdict has hysteresis.
+    ///
+    /// **The session decides and the game declares nothing** — there is no setter, because a wrong
+    /// verdict costs time and nothing else: both paths compute the same members, the same distances
+    /// and the same leaves, which is what licenses an automatic rule in place of a knob. See
+    /// `orbitnet_core::interest`'s `PathSelector` for the measurements the rule reproduces.
+    aoi_path: PathSelector,
+    /// The per-world bounds accumulator [`InterestOccupancy::measure`] reuses, so measuring the
+    /// candidate list costs no allocation after the first tick.
+    aoi_occupancy: OccupancyScratch,
+    /// One connection's own rows, handed to [`ConnectionInterest::update_grid_into`] as `also`.
+    ///
+    /// **The grid cannot hold a per-connection fact.** It is rebuilt once for every peer in the
+    /// session, and a body the connection drives is always-relevant to that connection and to no
+    /// other, so the override list carries exactly the rows the linear path patches into the shared
+    /// candidate vector. Pooled and refilled per connection.
+    aoi_overrides: Vec<InterestCandidate>,
     /// This peer's candidate set for the order build: `(id, distance²)`. Filled from the peer's
     /// interest when culling is on and from every row when it is off, so the order loop has one
     /// shape either way. Pooled, so a warm frame allocates nothing.
     aoi_members: Vec<(u64, f32)>,
-    aoi_leaves: Vec<u64>,
+    /// The union diff one connection's update reports, pooled across peers and ticks. Both halves
+    /// are consumed in the same loop that produced them; see [`OrbitNet::update_interest`].
+    aoi_delta: InterestDelta,
     order_scratch: Vec<(priority::Candidate, Band)>,
+    /// Relevancy transitions awaiting their signal, as `(peer, entity id, entered)`.
+    ///
+    /// **Queued rather than emitted where they are found, and drained on a tick boundary** — the
+    /// same rule `announce_seats` follows. A server finds them inside the send path and a client
+    /// inside a packet handler, and emitting from either would run game code with a bind held on a
+    /// synchronizer. See [`OrbitNet::announce_interest`].
+    interest_events: Vec<(i32, u64, bool)>,
+    /// The wire slots one connection's section carries, pooled so a warm tick allocates nothing.
+    delta_left_scratch: Vec<u16>,
+    delta_entered_scratch: Vec<u16>,
+    /// CLIENT: the entities this peer has been told are in its interest.
+    ///
+    /// **A mirror of the server's set, not a derivation.** A client cannot compute its own interest
+    /// — it has no candidate list, no radius and no anchor for anybody — so this is exactly what the
+    /// sections it has received say, applied idempotently: a repeat of a section it already applied
+    /// changes nothing and announces nothing, which is what makes re-sending one free.
+    interest_mirror: std::collections::HashSet<u64>,
+    /// CLIENT: whether any interest-delta section has ever been applied this session.
+    ///
+    /// Until one has, a client answers [`OrbitNet::entities_in_interest`] with everything it holds,
+    /// because a server that culls nothing sends no section at all and "no section" must not read as
+    /// "nothing is relevant to you".
+    interest_mirror_seeded: bool,
+
+    /// The session default for a connection that resolves no anchor: `UNANCHORED_OPEN` or
+    /// `UNANCHORED_CLOSED`, always one of the two because [`clamp_unanchored_policy`] runs on set.
+    /// See [`Self::set_unanchored_policy`].
+    unanchored_policy: i64,
+    /// Whether [`Self::update_interest`] ran on the last frame that built snapshots.
+    ///
+    /// **The other half of `stale`**, and the half a per-peer flag cannot carry: the pass is skipped
+    /// wholesale when nothing can be culled (no radius, no declared membership), and every
+    /// connection's cached [`AnchorReport`] then describes a tick the session has moved on from.
+    /// Without this a getter would answer "centred at the origin in world 0" for every peer in a
+    /// session that is replicating everything to everybody.
+    interest_ran: bool,
+    /// Seats already warned about by [`Self::warn_anchor_conflicts`], so one misconfiguration is one
+    /// log line rather than one per tick.
+    ///
+    /// **Entries are REMOVED when the seat stops colliding**, which is what makes this once per seat
+    /// per EPISODE rather than once per process. A game that fixes the configuration, changes map,
+    /// and reintroduces the same mistake is told about it again — a set that only ever grew would
+    /// report the second occurrence to nobody.
+    anchor_conflicts: std::collections::HashSet<SeatId>,
 
     // --- the seat roster, and the announcement it feeds ---
     /// The seats this session has already announced. See [`Self::announce_seats`].
@@ -1157,6 +1968,10 @@ pub struct OrbitNet {
     /// session: under an actual flood the log is the second thing to fall over.
     auth_warned: bool,
     dbg_input_novel: u64,
+    /// Input rows refused for carrying a non-finite float, counted per row rather than per block —
+    /// a redundancy window re-sends the same poisoned tick, and the row count is what says how much
+    /// of the receive path it is costing. Counted always; printed under `ORBITNET_DEBUG`.
+    dbg_input_nonfinite: u64,
     dbg_resim_spans: u64,
     dbg_resim_ticks_total: u64,
     dbg_fresh: u64,
@@ -1184,6 +1999,12 @@ impl INode for OrbitNet {
             aoi_max_entities: 0,
             rate_tiering: false,
             reconnect_grace: 30.0,
+            // ALWAYS. Token-gated, so it refuses the peer that merely observed an identity; see the
+            // property's own comment for why the policy stays permissive on top of that.
+            resume_policy: RESUME_ALWAYS,
+            // HOLD. See the property's own comment for why this one does not move.
+            seat_release_policy: SEAT_RELEASE_HOLD,
+            rtt_believed_max_ms: RTT_BELIEVED_MAX_MS_DEFAULT,
             mode: MODE_OFFLINE,
             running: false,
             synced: false,
@@ -1205,18 +2026,26 @@ impl INode for OrbitNet {
             state_entities: BTreeMap::new(),
             peers: HashMap::new(),
             session_id: 0,
+            resume_token: 0,
             session_auth: None,
+            session_nonce: None,
+            session_secret: None,
             resume: ResumeTable::default(),
+            pending_seat_releases: Vec::new(),
             live_peers: std::collections::HashSet::new(),
             slots: SlotTable::new(),
             slots_dirty: false,
             slots_exhausted_warned: false,
             manifest_dirty: false,
+            manifest_generation: 0,
+            manifest_published: Vec::new(),
+            manifest_break_warned: false,
             expected_schemas: HashMap::new(),
             newest_snapshot_tick: 0,
             snapshot_ack_bits: 0,
             snapshot_ack_token: 0,
             want_full: false,
+            want_manifest: false,
             input_rotor: 0,
             m_resim_ticks: 0.0,
             m_rollback_ms: 0.0,
@@ -1242,6 +2071,7 @@ impl INode for OrbitNet {
             acc_stale_blocks: 0,
             acc_interest_us: 0,
             acc_interest_ticks: 0,
+            acc_interest_grid_ticks: 0,
             acc_interest_peer_ticks: 0,
             acc_interest_members: 0,
             acc_band_sends: [0; 3],
@@ -1254,10 +2084,24 @@ impl INode for OrbitNet {
             aoi_observers: Vec::new(),
             aoi_candidates: Vec::new(),
             aoi_owned_rows: Vec::new(),
-            aoi_seats: Vec::new(),
+            aoi_seats: ResolvedSeats::default(),
             aoi_seat_scratch: SeatScratch::default(),
+            aoi_grid: InterestGrid::new(),
+            aoi_path: PathSelector::new(),
+            aoi_occupancy: OccupancyScratch::default(),
+            aoi_overrides: Vec::new(),
             aoi_members: Vec::new(),
-            aoi_leaves: Vec::new(),
+            aoi_delta: InterestDelta::default(),
+            interest_events: Vec::new(),
+            delta_left_scratch: Vec::new(),
+            delta_entered_scratch: Vec::new(),
+            interest_mirror: std::collections::HashSet::new(),
+            interest_mirror_seeded: false,
+            // OPEN. Today's behaviour, and the only default that cannot take a world away from a
+            // consumer whose binary is refreshed without their source changing.
+            unanchored_policy: UNANCHORED_OPEN,
+            interest_ran: false,
+            anchor_conflicts: std::collections::HashSet::new(),
             seat_roster: SeatRoster::new(),
             entity_seats: Vec::new(),
             seat_scan: Vec::new(),
@@ -1279,6 +2123,7 @@ impl INode for OrbitNet {
             dbg_rx_unauth: 0,
             auth_warned: false,
             dbg_input_novel: 0,
+            dbg_input_nonfinite: 0,
             dbg_resim_spans: 0,
             dbg_resim_ticks_total: 0,
             dbg_fresh: 0,
@@ -1352,9 +2197,17 @@ impl OrbitNet {
     ///
     /// **`resumed_from` NAMES A CONNECTION THAT MAY STILL BE UP.** It is whichever connection last claimed
     /// this identity, whether the server saw it drop or not — the second case is a relaunched client that
-    /// beat its own keepalive timeout, and it is also what a forged token looks like. Honouring it hands the
-    /// new claimant that peer's body, so a game that wants the conservative rule honours it only for a
-    /// session it already saw [`Self::peer_dropped`] report as `held`. See `handle_hello`.
+    /// beat its own keepalive timeout. Honouring it hands the new claimant that peer's body.
+    ///
+    /// **It is reported only for a claim the server GRANTED**, and a claim is granted only when the joiner
+    /// quoted the [`Handshake::resume_token`] this server issued for that identity — see [`resume_grant`].
+    /// A peer that merely observed somebody's session id cannot produce one, so it arrives here with
+    /// `resumed_from` `0`. [`Self::resume_policy`] set to `ONLY_IF_DROPPED` additionally refuses every claim
+    /// against a connection that is still up, which is the conservative rule as one setting.
+    ///
+    /// **`session_id` is the identity the connection was SEATED under, not the one it presented.** A refused
+    /// claim on an identity somebody else still holds is seated anonymously as `0`, so this is always safe
+    /// as a roster key.
     #[signal]
     fn peer_joined(peer: i64, session_id: i64, resumed_from: i64);
 
@@ -1371,10 +2224,16 @@ impl OrbitNet {
     /// Server: a held session's grace window closed with nobody claiming it. `peer` is the transport id it
     /// was last connected under, for logging.
     ///
-    /// **This is the release point, and the addon does not act on it.** The entity is still there, still
-    /// replicating, still owned by a peer id that no longer exists. What to do about that — free the body,
-    /// hand its input back to the server with `set_input_authority(1)`, open the seat to the next joiner —
-    /// is the game's decision, exactly as it is for an entity a cull stopped sending.
+    /// **This is the release point, and BY DEFAULT the addon does not act on it.** The entity is still
+    /// there, still replicating, still owned by a peer id that no longer exists. What to do about that —
+    /// free the body, hand its input back to the server with `set_input_authority(1)`, open the seat to the
+    /// next joiner — is the game's decision, exactly as it is for an entity a cull stopped sending.
+    ///
+    /// **A consumer can now say otherwise in one call.** [`Self::seat_release_policy`] set to
+    /// `RELEASE_ON_EXPIRY` hands every body this connection drove back to the server before this signal
+    /// fires, so a handler that seats a replacement is not undone a frame later. It closes the seat and
+    /// nothing more: the body is still in the scene, and freeing it is still the game's decision. The
+    /// default is unchanged.
     #[signal]
     fn peer_session_expired(session_id: i64, peer: i64);
 
@@ -1398,13 +2257,58 @@ impl OrbitNet {
     /// (`OrbitRollbackSynchronizer::release_seat`), re-pointed at another connection, or
     /// unregistered. The connection itself is unaffected and may still hold other seats.
     ///
-    /// **A dropped connection does NOT close its seats by itself.** Its bodies keep the authority
-    /// they were given until the game changes them, which is deliberate and is the same rule
-    /// [`Self::peer_session_expired`] states: what to do with a body whose player is gone — free it,
-    /// hand it back, hold it for a reconnect — is the game's decision. Release the seat and this
+    /// **BY DEFAULT a dropped connection does not close its seats by itself.** Its bodies keep the
+    /// authority they were given until the game changes them, which is deliberate and is the same
+    /// rule [`Self::peer_session_expired`] states: what to do with a body whose player is gone — free
+    /// it, hand it back, hold it for a reconnect — is the game's decision. Release the seat and this
     /// fires.
+    ///
+    /// **A consumer can now say otherwise in one call.** [`Self::seat_release_policy`] set to
+    /// `RELEASE_ON_DROP` or `RELEASE_ON_EXPIRY` hands the connection's bodies back to the server at
+    /// the drop or at the end of the grace window, and this fires from the announcement that follows.
+    /// [`Self::release_peer_seats`] does the same for one connection on demand, under every policy.
+    /// The default is unchanged.
     #[signal]
     fn seat_closed(peer: i64, seat: i64);
+
+    /// An entity became relevant to one connection. Emitted on **both sides**, on a tick boundary.
+    ///
+    /// `peer` is the connection that gained it — a remote connection on a server, this peer's own id
+    /// on a client — and `entity_id` is the opaque token `get_entity_id()` answers.
+    ///
+    /// **A server announces from its own interest pass; a client announces from the trailing
+    /// interest-delta section on the snapshot it is already receiving.** The two therefore mean the
+    /// same thing one round trip apart, exactly as [`Self::seat_opened`] does.
+    ///
+    /// **This is not a per-handle signal, and it cannot be one.** Its twin routinely names an entity
+    /// this client has no node for — that is the case that matters — so there is no handle to hang it
+    /// on. See [`Self::entity_left_interest`].
+    #[signal]
+    fn entity_entered_interest(peer: i64, entity_id: i64);
+
+    /// An entity stopped being relevant to one connection: culled by distance, refused by a
+    /// membership, evicted by the nearest-N cap, withheld by [`Self::set_entity_hidden`], or
+    /// unregistered outright. Emitted on **both sides**, on a tick boundary.
+    ///
+    /// **ONE SIGNAL COVERS BOTH CAUSES.** "The server stopped sending you this" and "this entity
+    /// unregistered" are the same fact to a game holding a node it can no longer update, and a client
+    /// emits this from an unregister as well as from a cull. An entity culled and unregistered on the
+    /// same tick fires it exactly once.
+    ///
+    /// **THIS IS THE RELEASE POINT AND THE ADDON DOES NOT ACT ON IT** — the same contract
+    /// [`Self::peer_session_expired`] states. The node is still in the scene, still holding the last
+    /// pose it received, and nothing frees, hides, reparents or teleports it. What to do about that
+    /// is the game's decision.
+    ///
+    /// **Hide, do not free.** A cap eviction oscillates at the boundary — a body at the edge of
+    /// `aoi_max_entities` leaves and re-enters as the population around it moves — and freeing on the
+    /// leave turns that into spawn churn. Hiding costs nothing to undo.
+    ///
+    /// **Teleport on re-entry.** A body that moved while it was away is interpolating from the pose
+    /// it had when the rows stopped, so it would fly across the world over one tick.
+    /// `NetInterpolatorHandle.teleport()` is what suppresses that.
+    #[signal]
+    fn entity_left_interest(peer: i64, entity_id: i64);
 
     // ------------------------------------------------------------------
     // Session control (facade API)
@@ -1445,16 +2349,26 @@ impl OrbitNet {
         self.lead.clear();
         self.lead_bias_ticks = 0.0;
         self.want_full = false;
+        // Both client NACK flags describe the session that just ended. A manifest NACK carried into
+        // the next one would ask a server that has published nothing for a table it does not have.
+        self.want_manifest = false;
+        self.manifest_break_warned = false;
         self.ping_timer = 0.0;
 
         self.auth_warned = false;
         if self.mode == MODE_CLIENT {
             self.synced = false;
             self.running = false;
-            // A FRESH key per session, never the previous one. Restarting the sequence numbers under
+            // A FRESH DRAW per session, never the previous one. Restarting the sequence numbers under
             // a key an observer already saw would make every datagram captured from the last session
-            // replayable into this one.
-            self.session_auth = Some(SessionAuth::new(Self::mint_session_key()));
+            // replayable into this one — equally true of the key these 16 bytes ARE with no secret set
+            // and of the key they DERIVE with one.
+            let nonce = Self::mint_session_key();
+            self.session_nonce = Some(nonce);
+            self.session_auth = Some(SessionAuth::new(session_key_from(
+                self.session_secret.as_ref(),
+                nonce,
+            )));
             self.send_hello();
         } else {
             // Server, host, and the sessionless smoke path are their own ground truth.
@@ -1472,18 +2386,33 @@ impl OrbitNet {
         self.hello_pending = false;
         self.peers.clear();
         // The key describes a session that has ended, and its sequence numbers are spent. The next
-        // session mints its own.
+        // session draws its own 16 bytes. The SECRET is not cleared here: it describes an agreement
+        // between the game and its peer, not a session, and a game that set it once expects the next
+        // join to use it.
         self.session_auth = None;
+        self.session_nonce = None;
         self.auth_warned = false;
         // A held session describes a player who can come back to THIS session. There is no session to come
         // back to now, and carrying the table into the next one would resume a stranger.
         self.resume.clear();
+        // A queued release names a peer id from THIS session, and the next session hands the same ids
+        // to different people. The `peer_is_live` guard would refuse it anyway, so this is hygiene
+        // rather than a fix — but a queue that survives its session is a queue that has to be reasoned
+        // about, and there is nothing left to release.
+        self.pending_seat_releases.clear();
         self.live_peers.clear();
         self.planner.clear();
         self.clock.clear();
         self.lead.clear();
         self.lead_bias_ticks = 0.0;
         self.expected_schemas.clear();
+        // A manifest table and its generation describe ONE session. Carried into the next one, a
+        // server would diff against rows nobody holds and a client would refuse the first delta of
+        // a session it has every reason to accept.
+        self.manifest_generation = 0;
+        self.manifest_published.clear();
+        self.manifest_break_warned = false;
+        self.want_manifest = false;
         // Slots name entities within ONE session. Carrying the table into the next one would let a
         // stale slot resolve to a stranger, and a server would hand out indices it no longer owns.
         self.slots.clear();
@@ -1495,6 +2424,26 @@ impl OrbitNet {
         self.seat_roster.clear();
         self.entity_seats.clear();
         self.seats_dirty = false;
+        // No interest pass has run in the session that starts next, so every anchor read-back says
+        // so. Carrying the flag would let a getter report the last session's viewpoints as current.
+        self.interest_ran = false;
+        // Relevancy is per session too. The mirrored set names entities of THIS session, and the
+        // queued events name peer ids the next session hands to different people. Dropped rather
+        // than announced away, for the reason the seat roster is: a game that tore the session down
+        // is not hiding nodes in response to it.
+        self.interest_mirror.clear();
+        self.interest_mirror_seeded = false;
+        self.interest_events.clear();
+        // The path verdict describes THIS session's occupancy, and the next session's arena is not
+        // this one's. It has hysteresis, so a held verdict would survive into a world it was never
+        // measured on — for as many ticks as that world sat inside the selector's band. It costs
+        // time and nothing else either way, and starting from the flat pass is the answer for every
+        // arena that never earns the index.
+        self.aoi_path = PathSelector::new();
+        // A warned seat names a connection from THIS session. The next session hands the same peer
+        // ids to different people, and a misconfiguration that survives the teardown is one the next
+        // session is entitled to be told about.
+        self.anchor_conflicts.clear();
         self.stretch_now = 1.0;
         // The window describes a session that has ended; carrying its rates into the next one would make the
         // first second of every session read as the last second of the previous.
@@ -1593,18 +2542,62 @@ impl OrbitNet {
         i64::from(self.effective_rate().hz())
     }
 
-    /// One peer's round trip to this server in MILLISECONDS, or `-1.0` when there is no estimate
-    /// yet (an unknown peer, or one that has not acknowledged a snapshot frame since it joined).
+    /// The believed ceiling, clamped into `0.0..=RTT_SAMPLE_MAX_MS`. See
+    /// [`Self::rtt_believed_max_ms`] for what it bounds.
+    ///
+    /// Clamped on set rather than on read so the property reads back the value that is in force, and
+    /// so a caller that writes an absurd figure learns it by reading the property rather than by
+    /// wondering why the rewind never got deeper. A NaN is refused outright and leaves the ceiling
+    /// where it was: `f64::clamp` returns NaN for a NaN input, and a NaN ceiling makes every
+    /// `min` against it answer the raw figure, which is the ceiling switched off by accident.
+    #[func]
+    fn set_rtt_believed_max_ms(&mut self, ms: f64) {
+        if ms.is_nan() {
+            return;
+        }
+        self.rtt_believed_max_ms = ms.clamp(0.0, f64::from(RTT_SAMPLE_MAX_MS));
+    }
+
+    /// One peer's round trip to this server in MILLISECONDS as this server is willing to BELIEVE it,
+    /// or `-1.0` when there is no estimate yet (an unknown peer, or one that has not acknowledged a
+    /// snapshot frame since it joined).
     ///
     /// SERVER-SIDE ONLY, and a different quantity from the `rtt_ms` in [`Self::metrics`]: that one
     /// is this peer's own ping sampler and reads zero on a server, because `integrate_pong` only
     /// ever runs on a client. This is what the server measured about somebody else, and it is the
     /// input to the per-shooter lag-compensation rewind — `NetLagComp` owns the policy that
-    /// turns it into a rewind depth, and the millisecond ceiling that bounds it.
+    /// turns it into a rewind depth, and the millisecond ceiling that bounds THAT.
+    ///
+    /// **Capped at [`Self::rtt_believed_max_ms`].** The estimate is derived from acknowledgements the
+    /// client chooses when to send, and the residual the ack rules cannot close is a client advancing
+    /// at full rate behind a constant lag. This is the figure every rewind input reads, so bounding it
+    /// here bounds that residual for every consumer at once. [`Self::peer_rtt_raw_ms`] is the
+    /// unclamped figure for anything that wants the honest number instead.
     ///
     /// Derived from state the server already holds; nothing was added to the wire for it.
     #[func]
     fn peer_rtt_ms(&self, peer: i32) -> f64 {
+        let Some(state) = self.peers.get(&peer) else {
+            return -1.0;
+        };
+        match state.rtt_believed_ms(self.rtt_believed_max_ms as f32) {
+            Some(ms) => f64::from(ms),
+            None => -1.0,
+        }
+    }
+
+    /// The same peer's round trip WITHOUT the belief ceiling: the raw minimum of the sample window,
+    /// on the same `-1.0` contract as [`Self::peer_rtt_ms`].
+    ///
+    /// **For anything that reports a number to a human** — a scoreboard ping, an admin tool, a
+    /// connection-quality readout. Those want to say what the link is doing, and a figure pinned at
+    /// the ceiling would tell every player on a bad connection the same lie. Only the rewind input is
+    /// bounded, and that is what [`Self::peer_rtt_ms`] is.
+    ///
+    /// **Do not feed this to a rewind.** It is the figure the belief ceiling exists to bound, so a
+    /// consumer that reaches past `peer_rtt_ms` for it has undone the bound.
+    #[func]
+    fn peer_rtt_raw_ms(&self, peer: i32) -> f64 {
         let Some(state) = self.peers.get(&peer) else {
             return -1.0;
         };
@@ -1623,6 +2616,10 @@ impl OrbitNet {
     /// The token is opaque and it is never interpreted here: the server compares it for equality against the
     /// sessions it is holding and does nothing else with it. `0` claims no identity, and a peer claiming
     /// none is always seated as a newcomer.
+    ///
+    /// **Set [`Self::set_resume_token`] beside it.** The identity on its own no longer resumes anything once
+    /// a server has issued a token for it, so a restored identity with no restored token is seated as a
+    /// newcomer — which is exactly what a peer that copied the identity off a roster presents.
     #[func]
     fn set_session_id(&mut self, id: i64) {
         self.session_id = id as u64;
@@ -1652,6 +2649,105 @@ impl OrbitNet {
     #[func]
     fn is_session_held(&self, session_id: i64) -> bool {
         self.resume.holds(session_id as u64)
+    }
+
+    /// The resume token this peer holds for its session identity. `0` when it holds none.
+    ///
+    /// CLIENT-SIDE. The server mints it, sends it in the welcome, and requires it back before it will hand
+    /// this identity's body to anybody. **Persist it beside the session id**: a process that stored one and
+    /// not the other cannot resume, because a stored identity with no token is exactly what an observer who
+    /// copied the identity presents.
+    #[func]
+    fn resume_token(&self) -> i64 {
+        self.resume_token as i64
+    }
+
+    /// Restore the resume token a previous run of this process was issued.
+    ///
+    /// CLIENT-SIDE, and set it before the join handshake goes out, beside [`Self::set_session_id`]. `0`
+    /// quotes none, which is always seated as a newcomer once the server holds a token for that identity.
+    ///
+    /// **The pair is what resumes, not either half.** The token is not checked against the identity here —
+    /// a mismatched pair is simply refused by the server and seated as a newcomer — so the two may be
+    /// restored in either order.
+    #[func]
+    fn set_resume_token(&mut self, token: i64) {
+        self.resume_token = token as u64;
+    }
+
+    /// Set the **shared session secret** every datagram key of this session is derived from. An empty
+    /// array clears it.
+    ///
+    /// **Both ends must set the same one, and set it BEFORE [`Self::start`].** The client folds it into
+    /// the key it seals with, the server folds it into the key it opens with, and a session where the two
+    /// disagree authenticates nothing.
+    ///
+    /// **Source it from a channel the game already authenticated** — a lobby's metadata, a matchmaker's
+    /// ticket, a session record fetched over TLS. Any length is accepted and folded to [`KEY_LEN`] bytes
+    /// by [`compress_secret`], so a token, a ticket or a passphrase all work as they are.
+    ///
+    /// What it changes:
+    ///
+    /// | | No secret | A secret |
+    /// | --- | --- | --- |
+    /// | The handshake's 16 bytes | the session key, in the clear | a nonce, in the clear |
+    /// | An on-path observer | can do everything the client can | can read the traffic and forge nothing |
+    ///
+    /// **THE SECRET IS A DERIVATION INPUT AND IS NEVER THE SESSION KEY.** See [`session_key_from`] for why
+    /// seating it is the obvious wrong implementation and what it re-opens.
+    ///
+    /// Three ceilings, all unchanged by this: the tag is still 64 bits, the key still 128, and the derived
+    /// key is worth exactly the entropy of the secret. **None of it encrypts anything** — every payload is
+    /// still on the wire in the clear.
+    ///
+    /// **A misconfiguration looks the same to the player either way** — the two ends derive different keys,
+    /// nothing either sends opens at the other, and the join never completes while the handshake retries.
+    /// What differs is whether anything says why:
+    ///
+    /// - **Server with a secret, client without** is refused at the handshake, with one readable rejection
+    ///   in the server's log. That is what [`Handshake::confirm`] exists for.
+    /// - **Client with a secret, server without** cannot be reported at all. The server's reply is sealed
+    ///   under a key the client will not derive, so the client never reads a byte of it — a rejection
+    ///   included — and the server sees a hello it has no reason to refuse.
+    ///
+    /// [`Self::has_session_secret`] on both ends is the only thing that separates that from a dead link.
+    #[func]
+    fn set_session_secret(&mut self, secret: PackedByteArray) {
+        let bytes = secret.as_slice();
+        self.session_secret = if bytes.is_empty() {
+            None
+        } else {
+            Some(compress_secret(bytes))
+        };
+    }
+
+    /// Whether a session secret is set.
+    ///
+    /// **There is no getter for the bytes, deliberately.** The only questions a game has are "did my
+    /// configuration take" and "am I about to join in the clear", and both are this one. Handing the
+    /// material back out would put it in every debug print and crash report that walks the node.
+    #[func]
+    fn has_session_secret(&self) -> bool {
+        self.session_secret.is_some()
+    }
+
+    /// The resume token this server issued to `peer`, or `0` for an unknown peer and one holding no
+    /// identity.
+    ///
+    /// SERVER-SIDE, and a DIAGNOSTIC: it is the value a game prints when it wants to see why a rejoiner was
+    /// or was not resumed. Nothing needs it to seat a player.
+    #[func]
+    fn peer_resume_token(&self, peer: i32) -> i64 {
+        self.peers
+            .get(&peer)
+            .map_or(0, |state| state.resume_token as i64)
+    }
+
+    /// Which claims on an identity this server grants. Clamped to a known value; see
+    /// [`Self::resume_policy`] for why the default stays ALWAYS.
+    #[func]
+    fn set_resume_policy(&mut self, policy: i64) {
+        self.resume_policy = clamp_resume_policy(policy);
     }
 
     /// Declare where one peer observes from, and which world it observes in.
@@ -1740,6 +2836,193 @@ impl OrbitNet {
             }) as i64
     }
 
+    /// The interest anchor ACTUALLY IN EFFECT for one connection, as the last interest pass resolved
+    /// it.
+    ///
+    /// **The read-back [`Self::peer_membership`] is not.** That one reports the DECLARATION, so it
+    /// answers `0` for every peer that declared nothing — which is most of them, and which is
+    /// indistinguishable from a peer declared into every world. What the filter actually ran is
+    /// computed inside [`Self::update_interest`] and was, until this call existed, thrown away with
+    /// the scratch vector it was built in.
+    ///
+    /// Keys:
+    ///
+    /// | Key | Type | Meaning |
+    /// | --- | --- | --- |
+    /// | `source` | `int` | one of the `ANCHOR_SOURCE_*` values: 0 none, 1 inferred, 2 fixed position, 3 tracked entity |
+    /// | `viewpoints` | `int` | how many observers the filter ran — one per resolved seat, `1` for a declared or failed-open connection, `0` for a CLOSED one |
+    /// | `membership` | `int` | the world in effect, NOT the declared one |
+    /// | `located` | `bool` | false when the centre is [`UNLOCATABLE_CENTRE`], so nothing is culled by distance |
+    /// | `centre` | `Vector3` | the centre, or `ZERO` when `located` is false |
+    /// | `open` | `bool` | this connection culls nothing by distance — some viewpoint of it is unlocatable |
+    /// | `ambiguous` | `bool` | some seat drove several anchored bodies, so its centre is one arbitrary pick among them |
+    /// | `stale` | `bool` | **the interest pass has not run**; read nothing else |
+    ///
+    /// **`stale` IS THE GATE AND IT IS NOT AN EDGE CASE.** The pass is skipped entirely whenever
+    /// nothing can be culled — no `aoi_radius` and no entity declaring a membership, which is a
+    /// session replicating everything to everybody — and it never runs on a client at all. Without
+    /// `stale` this call would answer "centred at the origin, in world 0, located" for every peer in
+    /// those sessions, which is a description of a filter that is not running.
+    ///
+    /// **`centre`, `located` and `membership` describe the FIRST viewpoint**, which is the whole
+    /// connection whenever `viewpoints` is 1. A split-screen connection has one per seat and they
+    /// differ; ask [`Self::seat_anchor_info`] per seat there. `open` and `ambiguous` are already
+    /// facts about the whole connection.
+    #[func]
+    fn peer_anchor_info(&self, peer: i32) -> VarDictionary {
+        let Some(report) = self
+            .peers
+            .get(&peer)
+            .map(|state| &state.anchor_report)
+            .filter(|report| report.resolved && self.interest_ran)
+        else {
+            return Self::no_anchor_info();
+        };
+        let first = report.observers.first();
+        let located = first.is_some_and(|o| is_located(o.center));
+        let centre = match first {
+            Some(o) if located => Vector3::new(o.center[0], o.center[1], o.center[2]),
+            _ => Vector3::ZERO,
+        };
+        vdict! {
+            "source" => report.source,
+            "viewpoints" => report.observers.len() as i64,
+            "membership" => first.map_or(0i64, |o| o.membership as i64),
+            "located" => located,
+            "centre" => centre,
+            // A connection culls nothing by distance as soon as ANY of its viewpoints is
+            // unlocatable: its interest is the union of its seats', and an unlocatable seat admits
+            // everything its world allows. A connection with no viewpoint at all is the opposite
+            // claim and reads `false` here.
+            "open" => report.observers.iter().any(|o| !is_located(o.center)),
+            "ambiguous" => report.ambiguous,
+            "stale" => false,
+        }
+    }
+
+    /// The same answer for ONE seat on a connection, for the split-screen case.
+    ///
+    /// Keys: `centre` (`Vector3`, `ZERO` when unlocated), `located` (`bool`), `membership` (`int`).
+    ///
+    /// A **declared** connection answers its one collapsed viewpoint for every seat label, including
+    /// labels no body currently declares — a declaration states where the CONNECTION observes from,
+    /// and the backend does not re-split it. An inferred connection answers only for the seats that
+    /// resolved a centre; a seat whose body has not spawned has no viewpoint of its own and reads
+    /// zeroed, which is exactly what the filter does with it.
+    #[func]
+    fn seat_anchor_info(&self, peer: i32, seat: i32) -> VarDictionary {
+        let found = SeatIndex::try_from(seat).ok().and_then(|label| {
+            let report = self
+                .peers
+                .get(&peer)
+                .map(|state| &state.anchor_report)
+                .filter(|report| report.resolved && self.interest_ran)?;
+            let index = report
+                .labels
+                .iter()
+                .position(|held| held.is_none() || *held == Some(label))?;
+            report.observers.get(index)
+        });
+        let Some(observer) = found else {
+            return Self::no_seat_anchor_info();
+        };
+        let located = is_located(observer.center);
+        let centre = if located {
+            Vector3::new(observer.center[0], observer.center[1], observer.center[2])
+        } else {
+            Vector3::ZERO
+        };
+        vdict! {
+            "centre" => centre,
+            "located" => located,
+            "membership" => observer.membership as i64,
+        }
+    }
+
+    /// The fully keyed "no answer" dictionary [`Self::peer_anchor_info`] returns for a peer that
+    /// names no connection, and for a session whose interest pass has not run.
+    ///
+    /// One definition, because every key must be present on every path: a caller that indexes the
+    /// dictionary directly gets a value rather than a `nil` it then has to type-check, and the
+    /// facade mirrors this exact shape for its OFFLINE answer.
+    #[must_use]
+    fn no_anchor_info() -> VarDictionary {
+        vdict! {
+            "source" => ANCHOR_SOURCE_NONE,
+            "viewpoints" => 0i64,
+            "membership" => 0i64,
+            "located" => false,
+            "centre" => Vector3::ZERO,
+            "open" => false,
+            "ambiguous" => false,
+            "stale" => true,
+        }
+    }
+
+    /// [`Self::no_anchor_info`] for [`Self::seat_anchor_info`]'s three keys.
+    #[must_use]
+    fn no_seat_anchor_info() -> VarDictionary {
+        vdict! {
+            "centre" => Vector3::ZERO,
+            "located" => false,
+            "membership" => 0i64,
+        }
+    }
+
+    /// What a connection that resolved NO interest anchor receives. Session-wide default; `0` is
+    /// OPEN and stays the default.
+    ///
+    /// **OPEN (0)** — today's behaviour. Such a connection is handed [`UNLOCATABLE_CENTRE`] and one
+    /// observer in [`MEMBERSHIP_GLOBAL`], which makes every candidate uncullable, and an uncullable
+    /// candidate is kept by `apply_cap` regardless of `aoi_max_entities`. So the connection receives
+    /// every non-vetoed entity in every world, with the nearest-N cap not bounding it and the
+    /// per-datagram send budget as the only remaining brake.
+    ///
+    /// **CLOSED (1)** — such a connection is given no viewpoint at all, and an empty viewpoint set
+    /// makes nothing relevant. It receives nothing.
+    ///
+    /// **THE CARVE-OUT IS THE WHOLE DESIGN.** CLOSED applies ONLY to a connection that declared
+    /// nothing AND drives no rollback row at all. A connection whose seats exist but have not
+    /// RESOLVED a centre yet — a player whose avatar is still spawning — keeps the connection-wide
+    /// fail-open, and that is deliberate: closing it would deny a player its own avatar for as many
+    /// ticks as the body takes to spawn, which is the failure fail-open exists to prevent.
+    /// [`seat_observers_into`] states the conjunction as a table.
+    ///
+    /// **The default does not move.** The cdylib is refreshed only at a release tag, so the same
+    /// project source runs against older and newer binaries; a CLOSED default would mean a game's
+    /// spectators see the world or do not, depending on which binary is on disk. Choose it in one
+    /// call, in a session whose spectators are supposed to declare an anchor.
+    ///
+    /// An unknown value clamps to OPEN. See [`clamp_unanchored_policy`].
+    #[func]
+    fn set_unanchored_policy(&mut self, policy: i64) {
+        self.unanchored_policy = clamp_unanchored_policy(policy);
+    }
+
+    /// The session default in force, always `0` or `1`. Per-connection overrides are not folded in
+    /// here — this is the value a connection nobody declared a policy for follows.
+    #[func]
+    fn unanchored_policy(&self) -> i64 {
+        self.unanchored_policy
+    }
+
+    /// The same policy for ONE connection, overriding the session default outright.
+    ///
+    /// For the mixed session the session-wide value cannot express: a game whose spectators declare
+    /// an anchor and whose late joiners do not can close the first without closing the second. The
+    /// carve-out on [`Self::set_unanchored_policy`] applies here unchanged — a connection with an
+    /// unresolved seat still fails open whatever this says.
+    ///
+    /// **Dropped with the connection.** It is held on [`PeerState`], which `_on_peer_disconnected`
+    /// removes, so a reused peer id follows the session default again rather than inheriting a policy
+    /// nobody set for it. May be called before the peer completes its handshake, exactly as
+    /// [`Self::set_peer_anchor`] may.
+    #[func]
+    fn set_peer_unanchored_policy(&mut self, peer: i32, policy: i64) {
+        let state = self.peers.entry(peer).or_default();
+        state.unanchored_closed = Some(clamp_unanchored_policy(policy) == UNANCHORED_CLOSED);
+    }
+
     /// Which seats one connection currently holds, ascending by label. Empty for a connection that
     /// drives nothing.
     ///
@@ -1775,6 +3058,51 @@ impl OrbitNet {
             .collect()
     }
 
+    /// Choose the seat-release policy, clamped to a known value. See [`Self::seat_release_policy`]
+    /// for what each one does and for why the default is `0`.
+    ///
+    /// Clamped on set rather than on read so the property reads back the policy that is **in force**,
+    /// and so a caller that writes a number this build does not know learns it by reading the
+    /// property back rather than by wondering why nothing was ever released. An unknown value falls
+    /// onto `HOLD`, which is the direction that is safe to be wrong in: it takes nobody's body away.
+    #[func]
+    fn set_seat_release_policy(&mut self, policy: i64) {
+        self.seat_release_policy = clamp_seat_release_policy(policy);
+    }
+
+    /// Hand every body `peer` drives back to the server, closing its seats. Answers how many entities
+    /// changed.
+    ///
+    /// **Available under every policy, including the default.** The policy decides whether this node
+    /// calls it *by itself* on a drop or an expiry; this is the same work as one call, for a game that
+    /// wants to decide case by case — a kick, an admin command, a match ending, a player who forfeits.
+    ///
+    /// SERVER-SIDE: `0` off the authority, and `0` for peer ids that name no connection (`0`, negative,
+    /// and [`SERVER_PEER`] itself — handing the server's own bodies back to the server is what an
+    /// unclaimed body already looks like).
+    ///
+    /// **It releases the seat and nothing else.** The body stays registered, stays replicated and stays
+    /// in the scene; what leaves is the viewpoint. Freeing the node is the game's decision, exactly as
+    /// it is for a session whose grace window expired.
+    #[func]
+    fn release_peer_seats(&mut self, peer: i32) -> i64 {
+        self.release_owned_bodies(peer, None)
+    }
+
+    /// The same release, narrowed to one seat label on that connection. Answers how many entities
+    /// changed.
+    ///
+    /// For a connection holding several seats — local split-screen — where only one of them is going
+    /// away. A `seat` outside the label range answers `0` rather than releasing everything, because the
+    /// caller asked for a seat that cannot exist.
+    #[func]
+    fn release_seat_of(&mut self, peer: i32, seat: i64) -> i64 {
+        let Ok(label) = SeatIndex::try_from(seat) else {
+            return 0;
+        };
+        self.release_owned_bodies(peer, Some(label))
+    }
+
     /// Withhold one entity from one peer, or stop withholding it.
     ///
     /// SERVER-SIDE ONLY, and the third interest axis. Distance and membership are both properties of
@@ -1807,6 +3135,80 @@ impl OrbitNet {
             .entry(peer)
             .or_default()
             .set_entity_hidden(entity_id as u64, hidden);
+    }
+
+    /// Whether `entity_id` is currently in `peer`'s interest.
+    ///
+    /// **A session that culls nothing answers `true` for every registered entity.** The interest pass
+    /// does not run at all when there is no radius and no declared membership, so `peer.interest` is
+    /// an empty structure describing a tick that never happened — reading it there would answer
+    /// `false` for a session replicating everything to everybody. [`Self::interest_ran`] is what
+    /// separates the two, and it is the same flag the anchor read-backs are gated on.
+    ///
+    /// A CLIENT answers from the mirrored set the interest-delta sections built, and ignores `peer`:
+    /// a client holds exactly one interest set, its own. Until it has received a section it answers
+    /// `true` for everything it holds, because a server that culls nothing sends none.
+    #[func]
+    fn is_entity_in_interest(&self, peer: i32, entity_id: i64) -> bool {
+        let id = entity_id as u64;
+        if self.mode == MODE_CLIENT {
+            return if self.interest_mirror_seeded {
+                self.interest_mirror.contains(&id)
+            } else {
+                self.is_registered(id)
+            };
+        }
+        if !self.interest_ran {
+            return self.is_registered(id);
+        }
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| state.interest.contains(id))
+    }
+
+    /// Every entity in `peer`'s interest, ascending by id. Empty for a connection that holds none.
+    ///
+    /// **What gives an edge a starting point.** A relevancy signal is a transition, so a handler
+    /// bound mid-session, or a node spawned after the fact, has nothing to resync from and would wait
+    /// for the next churn. This is the standing answer, and it follows the same "culling off means
+    /// everything" rule [`Self::is_entity_in_interest`] states.
+    #[func]
+    fn entities_in_interest(&self, peer: i32) -> PackedInt64Array {
+        if self.mode == MODE_CLIENT {
+            if !self.interest_mirror_seeded {
+                return self.registered_ids();
+            }
+            let mut ids: Vec<u64> = self.interest_mirror.iter().copied().collect();
+            // A `HashSet` walk is not an order, and the server answers in ascending id order.
+            ids.sort_unstable();
+            return ids.iter().map(|&id| id as i64).collect();
+        }
+        if !self.interest_ran {
+            return self.registered_ids();
+        }
+        self.peers
+            .get(&peer)
+            .map(|state| state.interest.iter().map(|id| id as i64).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether either registry names `id` — the "everything is in interest" answer's one check, so a
+    /// token that names nothing still reads as `false`.
+    fn is_registered(&self, id: u64) -> bool {
+        self.rollback_entities.contains_key(&id) || self.state_entities.contains_key(&id)
+    }
+
+    /// Every registered entity id, ascending. What "everything is in interest" resolves to.
+    fn registered_ids(&self) -> PackedInt64Array {
+        let mut ids: Vec<u64> = self
+            .rollback_entities
+            .keys()
+            .chain(self.state_entities.keys())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.iter().map(|&id| id as i64).collect()
     }
 
     /// Whether `entity_id` is currently withheld from `peer`. `false` for an unknown peer, and for
@@ -1942,12 +3344,14 @@ impl OrbitNet {
             "starve_ticks_max" => bw.starve_ticks_max,
             "unsent_backlog_max" => bw.unsent_backlog_max,
             "interest_ms" => bw.interest_ms,
+            "interest_grid" => bw.interest_grid,
             "interarrival_near" => bw.interarrival_near,
             "interarrival_mid" => bw.interarrival_mid,
             "interarrival_far" => bw.interarrival_far,
             "interarrival_all" => bw.interarrival_all,
             "peers" => bw.peers,
             "interest_entities" => bw.interest_entities,
+            "rtt_at_ceiling_peers" => bw.rtt_at_ceiling_peers,
         }
     }
 
@@ -2037,17 +3441,40 @@ impl OrbitNet {
     /// The peer entry itself is never retained. Everything on it describes a CONNECTION — what that socket
     /// was last sent, which rows it acked, how long its round trip was — and none of it is true of the new
     /// socket a rejoiner arrives on. What survives is the identity, in [`Self::resume`].
+    ///
+    /// **Under `RELEASE_ON_DROP` this QUEUES the seat release rather than performing it.** This callback is
+    /// delivered by the transport, and `SceneMultiplayer` delivers it from inside `poll()` — which the tick
+    /// loop calls with a `bind` held on the synchronizer it is stepping. A release needs `bind_mut()` on
+    /// every entity it touches, and that is a borrow panic, not a wrong answer. See
+    /// [`Self::pending_seat_releases`].
     #[func]
     fn _on_peer_disconnected(&mut self, id: i64) {
         let peer = id as i32;
-        let session_id = self.peers.remove(&peer).map_or(0, |state| state.session_id);
+        // The token goes into the held record with the identity. It is what the departed client is already
+        // holding, so re-minting one here would reach nobody — the connection that would have carried a new
+        // one in a welcome is exactly the connection that just went away.
+        let (session_id, resume_token) = self
+            .peers
+            .remove(&peer)
+            .map_or((0, 0), |state| (state.session_id, state.resume_token));
         let server = self.mode == MODE_SERVER || self.mode == MODE_HOST;
         let grace_ms = (self.reconnect_grace.max(0.0) * 1000.0) as u64;
         let held = hold_on_drop(session_id, grace_ms, server)
-            && self
-                .resume
-                .hold(session_id, peer, Self::now_ms().saturating_add(grace_ms));
+            && self.resume.hold(
+                session_id,
+                peer,
+                Self::now_ms().saturating_add(grace_ms),
+                resume_token,
+            );
         if server {
+            // Queued only under a policy that acts on drops at all, so the default allocates nothing and
+            // a session whose loop is not running cannot grow a queue nobody drains. `false` for
+            // liveness here asks "does this policy release on a drop"; the real liveness question is
+            // re-asked at the drain, because the id may name a different connection by then.
+            let policy = seat_release_policy_of(self.seat_release_policy);
+            if releases_seats(policy, SeatReleaseEvent::Dropped, false) {
+                queue_seat_release(&mut self.pending_seat_releases, peer);
+            }
             self.signals()
                 .peer_dropped()
                 .emit(id, session_id as i64, held);
@@ -2180,24 +3607,42 @@ impl OrbitNet {
         if peer.get_connection_status() != ConnectionStatus::CONNECTED {
             return;
         }
-        // The one datagram sent unauthenticated, because it is what carries the key everything else
-        // is authenticated with. `start()` mints it; this covers the transport connecting first.
-        let key = self
-            .session_auth
-            .get_or_insert_with(|| SessionAuth::new(Self::mint_session_key()))
-            .key();
+        // The one datagram sent unauthenticated, because it is what carries the bytes everything else
+        // is authenticated with. `start()` draws them; this covers the transport connecting first.
+        let secret = self.session_secret;
+        let nonce = *self
+            .session_nonce
+            .get_or_insert_with(Self::mint_session_key);
+        self.session_auth
+            .get_or_insert_with(|| SessionAuth::new(session_key_from(secret.as_ref(), nonce)));
         let hello = Handshake::local(self.tickrate.clamp(1, 240) as u16)
             .with_session(self.session_id)
-            .with_key(key);
+            .with_nonce(nonce)
+            .with_resume_token(self.resume_token);
+        // The CONFIRMATION, and only when a secret is set. It is tagged over the version this frame
+        // actually carries, because the accepting side recomputes it against the version it reads —
+        // major must match but minor and patch may legitimately differ.
+        let hello = match secret {
+            Some(secret) => {
+                let key = derive_session_key(&secret, &nonce);
+                hello.with_confirm(confirm_tag(&key, &nonce, hello.protocol_version))
+            }
+            None => hello,
+        };
         self.send_raw(SERVER_PEER, &hello.encode(), TransferMode::RELIABLE);
     }
 
-    /// 16 random bytes for this session's key.
+    /// 16 unpredictable bytes, drawn fresh.
+    ///
+    /// **Three unrelated values come from here and each one is its own draw**: the client's session
+    /// nonce, a connection's ack-token salt, and the high bits of a resume token. Sharing the draw
+    /// would let a peer that learns one compute another, and the nonce is the one that is transmitted.
     ///
     /// `Crypto` is Godot's platform CSPRNG. `RandomNumberGenerator` is the fallback for a build
     /// without the mbedtls module, and it is **not** cryptographic: an attacker who can predict its
-    /// stream can forge this session's datagrams. It is stated here rather than substituted silently,
-    /// and the shipped export templates all carry `Crypto`.
+    /// stream can forge this session's datagrams — including under a session secret, because a
+    /// predictable nonce is a predictable derived key. It is stated here rather than substituted
+    /// silently, and the shipped export templates all carry `Crypto`.
     fn mint_session_key() -> [u8; KEY_LEN] {
         let mut key = [0u8; KEY_LEN];
         let random = Crypto::new_gd().generate_random_bytes(KEY_LEN as i32);
@@ -2212,6 +3657,28 @@ impl OrbitNet {
             chunk.copy_from_slice(&rng.randi().to_le_bytes());
         }
         key
+    }
+
+    /// 63 random bits for one identity's resume token.
+    ///
+    /// **A FRESH DRAW**, never a slice of a value the session already uses. In particular it is not
+    /// [`PeerState::token_salt`]: that value is never transmitted, and this one is transmitted by
+    /// definition, so deriving one from the other would hand every client the material to mint the ack
+    /// token for frames it never received.
+    ///
+    /// **63 bits.** The value crosses the script boundary as a GDScript `int`, which is an `i64`,
+    /// and games persist it beside the session id in whatever a save file or a config store holds. A
+    /// negative id is a papercut in every one of those, so the sign bit is cleared for the same reason the
+    /// facade's session id is minted positive. What is left is 9.2e18 values against an attacker who has to
+    /// guess online, one handshake at a time.
+    ///
+    /// **Never `0`**, because `0` is the wire's absent value: a token that happened to draw zero would read
+    /// as "this peer quotes no token" and refuse its own owner.
+    fn mint_resume_token() -> u64 {
+        let bytes = Self::mint_session_key();
+        let mut half = [0u8; 8];
+        half.copy_from_slice(&bytes[..8]);
+        (u64::from_le_bytes(half) & 0x7fff_ffff_ffff_ffff).max(1)
     }
 
     /// Retry the handshake until the welcome lands. Reliable transport should make the first
@@ -2294,11 +3761,23 @@ impl OrbitNet {
                     // so a replacement inheriting the id must not be delta-encoded against it. Cleared, the
                     // next send degrades to a full state block, which is exactly right for a fresh body.
                     self.planner.remove(id);
-                    for peer in self.peers.values_mut() {
-                        peer.last_sent.remove(&id);
-                        peer.last_full.remove(&id);
-                        peer.acked_base.remove(&id);
-                        peer.interest.remove(id);
+                    // THE SECOND LEAVE THAT HAPPENS BETWEEN UPDATES, and the one no `leaves` list
+                    // can ever name: the entity is gone from the candidate list, so the next update
+                    // diffs a union it has already been taken out of and reports nothing.
+                    //
+                    // **Announced to exactly the peers that held it**, and announced whenever the
+                    // removal below actually changes that peer's set — including the respawn case,
+                    // where the id survives in the registry but its interest entry does not. The
+                    // replacement body re-enters through the filter on the next update and that
+                    // update reports the enter, so the pair stays symmetric.
+                    let mut lost: Vec<i32> = Vec::new();
+                    for (&peer_id, peer) in self.peers.iter_mut() {
+                        if peer.forget_entity(id) {
+                            lost.push(peer_id);
+                        }
+                    }
+                    for peer_id in lost {
+                        self.interest_events.push((peer_id, id, false));
                     }
                     // The wire slot goes the same way, and for the same reason — but it is released
                     // by `reconcile_slots` rather than here, because "is this id still registered"
@@ -2555,6 +4034,11 @@ impl OrbitNet {
         // Batch boundary: land buffered authoritative rows before anything reads state.
         self.apply_pending_rows();
 
+        // Immediately before the announcement, so one frame carries both a queued release and the
+        // `seat_closed` it causes. The transport callback that queued it could not do the work
+        // itself: it is delivered from inside `poll()`, with a bind held on a synchronizer.
+        self.drain_seat_releases();
+
         // Before the first tick of the batch, so a seat a handler opens in response is driving a
         // viewpoint from the next frame rather than from part-way through this one — the same
         // tick-boundary rule `drain_pending` gives a registration.
@@ -2580,6 +4064,11 @@ impl OrbitNet {
         self.capture_state_lane(current);
         self.run_net_upkeep(dt * f64::from(ticks));
         self.flush_network(current);
+
+        // AFTER the send, so a server announces the same tick's interest pass rather than the
+        // previous one's, and on a tick boundary, so a client announces what its packet handlers
+        // queued while `poll()` ran. Both ends therefore emit where `announce_seats` does.
+        self.announce_interest();
 
         self.signals().after_rollback_loop().emit();
     }
@@ -2690,6 +4179,145 @@ impl OrbitNet {
         self.seat_closed = closed;
     }
 
+    /// Emit the relevancy transitions queued this frame. Once per frame that runs a tick.
+    ///
+    /// **Queued at the source and emitted here, for the reason `announce_seats` is a separate pass.**
+    /// A server finds a transition inside the send path, with a bind held on a synchronizer; a client
+    /// finds one inside a packet handler, called from `poll()`. Emitting from either would run game
+    /// code there, and a handler is entitled to call back into this node.
+    ///
+    /// **`peer` names the connection the entity left or entered** — a remote connection on a server,
+    /// this peer itself on a client. That is the `seat_opened` / `seat_closed` convention, and it is
+    /// what lets one handler serve both ends.
+    fn announce_interest(&mut self) {
+        if self.interest_events.is_empty() {
+            return;
+        }
+        let mut events = std::mem::take(&mut self.interest_events);
+        for &(peer, id, entered) in &events {
+            if entered {
+                self.signals()
+                    .entity_entered_interest()
+                    .emit(i64::from(peer), id as i64);
+            } else {
+                self.signals()
+                    .entity_left_interest()
+                    .emit(i64::from(peer), id as i64);
+            }
+        }
+        events.clear();
+        // Re-pool the emptied buffer, unless a handler queued into the fresh one while the loop ran.
+        if self.interest_events.is_empty() {
+            self.interest_events = events;
+        }
+    }
+
+    /// Release the seats queued by [`Self::_on_peer_disconnected`]. Once per frame that runs a tick,
+    /// immediately before [`Self::announce_seats`].
+    ///
+    /// **Why the ordering is that and not something else.** The release changes what the rescan in
+    /// `announce_seats` sees, so draining first means one frame carries both the release and the
+    /// `seat_closed` it caused. Draining after would announce the old roster, then the new one a frame
+    /// later — two announcements for one event, with a frame in between where the seat is closed on
+    /// the server and open in every handler.
+    ///
+    /// **The liveness guard is re-asked here, not at the drop.** Transport peer ids are reused, and
+    /// the whole point of `peer_is_live` is that an id naming a dead connection at one moment may name
+    /// a live one at the next. See `orbitnet_core::seats::releases_seats`.
+    fn drain_seat_releases(&mut self) {
+        if self.pending_seat_releases.is_empty() {
+            return;
+        }
+        let policy = seat_release_policy_of(self.seat_release_policy);
+        let mut pending = std::mem::take(&mut self.pending_seat_releases);
+        for &peer in &pending {
+            if releases_seats(policy, SeatReleaseEvent::Dropped, self.peer_is_live(peer)) {
+                self.release_owned_bodies(peer, None);
+            }
+        }
+        pending.clear();
+        // Re-pool the emptied buffer, unless a callback queued into the fresh one while the loop ran
+        // — which is the re-entrancy this queue exists for, so it is handled rather than assumed away.
+        if self.pending_seat_releases.is_empty() {
+            self.pending_seat_releases = pending;
+        }
+    }
+
+    /// Whether `peer` currently names a connected transport peer (or this peer itself).
+    ///
+    /// **Asked live rather than read from [`Self::live_peers`]**, because that set is refreshed once
+    /// per frame that runs a tick and both release paths can run on a frame that ran none. This is one
+    /// engine call on a path that fires at most once per drop and once per expiry, against a cached
+    /// set whose staleness would be wrong in the one direction that costs a live player their body.
+    fn peer_is_live(&self, peer: i32) -> bool {
+        let Some(api) = self.base().get_multiplayer() else {
+            return false;
+        };
+        if !api.has_multiplayer_peer() {
+            return false;
+        }
+        if api.clone().get_unique_id() == peer {
+            return true;
+        }
+        api.get_peers().as_slice().contains(&peer)
+    }
+
+    /// Hand every rollback body `peer` drives (optionally only those on seat `label`) back to the
+    /// server. Answers how many entities changed.
+    ///
+    /// **A SERVER-SIDE-ONLY RELEASE IS SUFFICIENT, and the reason is worth stating** because the rest
+    /// of the authority rules say a write like this must happen on every peer:
+    ///
+    /// - **Nobody on a client believed they owned the body.** The connection that did is gone, and no
+    ///   other peer ever had `input_local` set for it, so no client stops predicting something it was
+    ///   predicting and no client starts.
+    /// - **Clients learn the seat closed from the ENTITY MANIFEST**, which this release dirties: the
+    ///   manifest carries `(entity, owner, seat)`, the rescan in [`Self::announce_seats`] sees the
+    ///   changed owner, and every client projects the new roster and emits `seat_closed` from it.
+    /// - **The residue is inert.** A client's own copy of the node keeps a local multiplayer authority
+    ///   naming the dead peer until the game's roster message re-points it. Nothing reads that: the
+    ///   anti-forgery check on received input runs on the server, prediction is off for a body this
+    ///   peer does not own, and the send path anchors interest from the server's own view. It is a
+    ///   stale number, not a stale decision.
+    ///
+    /// The release itself is `OrbitRollbackSynchronizer::release_seat` — input back to the server, label
+    /// back to `0`, in one call so the body is never briefly `(server, old label)`. It is reached
+    /// through a dynamic call because the registry walk holds no bind at that point and must not: the
+    /// verb re-resolves authority, which reaches back out into the scene.
+    fn release_owned_bodies(&mut self, peer: i32, label: Option<SeatIndex>) -> i64 {
+        if self.mode != MODE_SERVER && self.mode != MODE_HOST {
+            return 0;
+        }
+        // `0` is an unresolved input root and `SERVER_PEER` is what an unclaimed body already reads
+        // as, so neither names a connection whose seats there is anything to release.
+        if peer <= 0 || peer == SERVER_PEER {
+            return 0;
+        }
+        let mut targets: Vec<Gd<OrbitRollbackSynchronizer>> = Vec::new();
+        for sync in self.rollback_entities.values() {
+            let Some(sync) = live_handle(sync) else {
+                continue;
+            };
+            let matches = {
+                let bound = sync.bind();
+                bound.input_owner_hint() == peer
+                    && label.is_none_or(|wanted| bound.seat_hint() == wanted)
+            };
+            if matches {
+                targets.push(sync);
+            }
+        }
+        let released = targets.len() as i64;
+        if released > 0 {
+            let verb = StringName::from("release_seat");
+            let _guard = self.base_mut();
+            for mut sync in targets {
+                sync.call(&verb, &[]);
+            }
+        }
+        released
+    }
+
     /// Capture every locally-authored input row for `tick`.
     ///
     /// Two passes rather than one, because a bulk input hook is game code and has to run with the
@@ -2752,19 +4380,34 @@ impl OrbitNet {
         }
     }
 
+    /// Land every buffered authoritative row, on both lanes, at the frame's tick boundary.
+    ///
+    /// **The receive apply, and the only property walk a peer that simulates nothing runs.** Such a
+    /// peer plans no entities, so `run_rollback` returns on an empty plan and neither the capture
+    /// nor the restore hook is reached. A lane that declares a `bulk_apply_method` decodes its row
+    /// into the hook's array bound, here, and the call runs below with every `bind` dropped.
+    ///
+    /// **Staging changes the interleaving.** One entity's apply used to complete before the next
+    /// one's began; now every row decodes and then every game call runs. Nothing may notice: a hook
+    /// is a marshalling method, the "do not call the facade from a hook" rule already forbids the
+    /// code that could, and the capture direction accepted the same hazard when it was staged. What
+    /// changed is that an apply hook reading ANOTHER entity's properties now reads them before that
+    /// entity's own row has landed.
     fn apply_pending_rows(&mut self) {
+        let mut hook_batch: Vec<binding::HookCall> = Vec::new();
         for sync in self.rollback_entities.values() {
             let Some(mut sync) = live_handle(sync) else {
                 continue;
             };
-            sync.bind_mut().apply_pending_display();
+            sync.bind_mut().apply_pending_display(&mut hook_batch);
         }
         for sync in self.state_entities.values() {
             let Some(mut sync) = live_handle(sync) else {
                 continue;
             };
-            sync.bind_mut().apply_pending();
+            sync.bind_mut().apply_pending(&mut hook_batch);
         }
+        self.run_hooks(&mut hook_batch);
     }
 
     /// Run a batch of staged bulk marshalling hooks with every `bind` on this node surrendered.
@@ -2931,6 +4574,11 @@ impl OrbitNet {
             // Phase 3 — record the resulting state as tick + 1. Entities with a bulk capture hook
             // run it first, binds dropped, filling their preallocated arrays; the encode into the
             // row then happens bound, in record_tick, whichever way the values arrived.
+            //
+            // The quantized write-back closes the phase, and an entity gated onto its apply hook
+            // stages that call rather than making it: like the capture hook it is game code, so it
+            // runs with the binds dropped. That defers it past the other entities' record_tick, the
+            // same interleaving change staging makes everywhere else in this loop.
             let phase_started = Instant::now();
             if any_capture_hook {
                 for (_, range_from, range_to, sync) in &ranges {
@@ -2952,8 +4600,9 @@ impl OrbitNet {
                 let Some(mut sync) = live_handle(sync) else {
                     continue;
                 };
-                sync.bind_mut().record_tick(tick);
+                sync.bind_mut().record_tick(tick, &mut hook_batch);
             }
+            self.run_hooks(&mut hook_batch);
             record_ns += phase_started.elapsed().as_nanos();
         }
         self.rollback_tick_now = None;
@@ -3039,12 +4688,30 @@ impl OrbitNet {
     }
 
     /// Release every held session whose window closed, telling the game about each.
+    ///
+    /// **Under `RELEASE_ON_EXPIRY` the seats are released BEFORE the signal that motivated it.** A game
+    /// that seats a replacement player from its `peer_session_expired` handler is doing the right thing
+    /// with the event, and releasing afterwards would undo that work — the walk would find bodies the
+    /// handler had just re-pointed and hand them straight back to the server. Releasing first means the
+    /// handler runs against a roster the release has already finished with.
+    ///
+    /// **Immediate here, unlike the drop path.** This runs from the frame's own upkeep with no bind
+    /// held, which is what makes `bind_mut()` on the registry safe; `_on_peer_disconnected` is a
+    /// transport callback and is not.
+    ///
+    /// The liveness guard is what keeps this from taking a live player's body: an expiry names the id a
+    /// session was last connected under, and that connection ended up to a whole grace window ago — long
+    /// enough for the transport to have handed the id to somebody else.
     fn expire_held_sessions(&mut self) {
         if self.mode != MODE_SERVER && self.mode != MODE_HOST {
             return;
         }
         let due = self.resume.expire(Self::now_ms());
+        let policy = seat_release_policy_of(self.seat_release_policy);
         for (session_id, peer) in due {
+            if releases_seats(policy, SeatReleaseEvent::Expired, self.peer_is_live(peer)) {
+                self.release_owned_bodies(peer, None);
+            }
             self.signals()
                 .peer_session_expired()
                 .emit(session_id as i64, i64::from(peer));
@@ -3090,13 +4757,15 @@ impl OrbitNet {
                     godot_print!("[orbitnet]   rx_unauthenticated={}", self.dbg_rx_unauth);
                 }
                 godot_print!(
-                    "[orbitnet]   input_novel={} resim_spans={} resim_ticks={} fresh={}",
+                    "[orbitnet]   input_novel={} input_nonfinite={} resim_spans={} resim_ticks={} fresh={}",
                     self.dbg_input_novel,
+                    self.dbg_input_nonfinite,
                     self.dbg_resim_spans,
                     self.dbg_resim_ticks_total,
                     self.dbg_fresh
                 );
                 self.dbg_input_novel = 0;
+                self.dbg_input_nonfinite = 0;
                 self.dbg_resim_spans = 0;
                 self.dbg_resim_ticks_total = 0;
                 self.dbg_fresh = 0;
@@ -3147,6 +4816,7 @@ impl OrbitNet {
             starve_ticks_max: self.win_starve_ticks_max as f64,
             unsent_backlog_max: self.win_unsent_backlog_max as f64,
             interest_ms: self.acc_interest_us as f64 / ticks / 1000.0,
+            interest_grid: self.acc_interest_grid_ticks as f64 / ticks,
             interarrival_near: band(self.acc_band_sends[0], self.acc_band_members[0]),
             interarrival_mid: band(self.acc_band_sends[1], self.acc_band_members[1]),
             interarrival_far: band(self.acc_band_sends[2], self.acc_band_members[2]),
@@ -3157,6 +4827,12 @@ impl OrbitNet {
             peers: self.peers.values().filter(|p| p.synced).count() as f64,
             interest_entities: self.acc_interest_members as f64
                 / self.acc_interest_peer_ticks.max(1) as f64,
+            // Once a second, here, rather than in `peer_rtt_ms`: it walks every connected peer's
+            // sample window, and nothing acts on the answer. See `rtt_at_ceiling_peers`.
+            rtt_at_ceiling_peers: rtt_at_ceiling_peers(
+                self.peers.values(),
+                self.rtt_believed_max_ms as f32,
+            ) as f64,
         };
         // Cleared and refilled rather than updated in place: a peer that disconnected during the
         // window has no entry in the accumulator, and must not keep answering with the figure it
@@ -3185,6 +4861,7 @@ impl OrbitNet {
         self.acc_stale_blocks = 0;
         self.acc_interest_us = 0;
         self.acc_interest_ticks = 0;
+        self.acc_interest_grid_ticks = 0;
         self.acc_interest_peer_ticks = 0;
         self.acc_interest_members = 0;
         self.acc_band_sends = [0; 3];
@@ -3272,7 +4949,10 @@ impl OrbitNet {
                 blocks.push(bytes);
             }
         }
-        if blocks.is_empty() && !self.want_full {
+        // A frame with no blocks still rides when either NACK is up: a client whose owned bodies
+        // have not been named yet is exactly the client whose manifest may have broken, and a NACK
+        // it cannot send is a session that never repairs.
+        if blocks.is_empty() && !self.want_full && !self.want_manifest {
             return;
         }
 
@@ -3290,11 +4970,12 @@ impl OrbitNet {
             ack_bits: self.snapshot_ack_bits,
             ack_token: self.snapshot_ack_token,
             margin_ticks: 0,
-            flags: if self.want_full {
-                FrameHeader::FLAG_WANT_FULL
-            } else {
-                0
-            },
+            // Both client-to-server NACKs ride the same byte, on a frame this peer is sending
+            // anyway, so neither costs a frame kind or a byte of its own. They are independent: a
+            // broken delta base and a broken manifest have nothing to do with each other and a
+            // client can be owed both on one tick.
+            flags: (u8::from(self.want_full) * FrameHeader::FLAG_WANT_FULL)
+                | (u8::from(self.want_manifest) * FrameHeader::FLAG_WANT_MANIFEST),
             entity_count: carried.len() as u32,
         };
         header.encode(&mut writer);
@@ -3302,22 +4983,39 @@ impl OrbitNet {
             writer.bytes(&blocks[index]);
         }
         self.want_full = false;
+        self.want_manifest = false;
         self.send_to(SERVER_PEER, writer.as_slice(), TransferMode::UNRELIABLE);
     }
 
-    /// SERVER: publish the whole slot table, with each entity's schema fingerprints, to every
-    /// synced peer.
+    /// SERVER: publish what has CHANGED in the slot table, with each entity's schema fingerprints,
+    /// to every synced peer.
     ///
-    /// **Both lanes, and a complete snapshot every time.** It carried rollback entities only while
-    /// it was purely a schema check — a state-lane entity has no input schema to disagree about —
-    /// but it is now also the only channel that says what a wire slot names, and state-lane blocks
-    /// carry slots too. Sending the whole table rather than a diff is what makes a receiver's copy
-    /// self-repairing: rebuilding from each frame drops every binding that has gone away, with no
-    /// removal record to lose.
+    /// **Both lanes.** It carried rollback entities only while it was purely a schema check — a
+    /// state-lane entity has no input schema to disagree about — but it is now also the only channel
+    /// that says what a wire slot names, and state-lane blocks carry slots too.
     ///
-    /// **An empty table is sent, not skipped.** A session whose last entity unregistered has to
-    /// tell its peers so; returning early there left every client holding bindings for entities
-    /// that no longer exist.
+    /// **The table is rebuilt in full and then DIFFED, rather than sent in full.** The rebuild is
+    /// unchanged and still runs on every dirty flush; what changed is what goes on the wire. A row
+    /// costs ~22.5 bytes ([`ManifestEntry`]) and this frame is dirtied by a registration, an
+    /// unregistration, a slot reconcile, a seat or authority write and every hello — so the old
+    /// ceiling was one whole-table broadcast per net tick per peer, which at 8,000 named entities is
+    /// ~180 kB per peer per republish against an unreliable hot lane of ~36 kB/s.
+    ///
+    /// **A rebuild that reproduces the published table publishes NOTHING.** That alone deletes the
+    /// whole-table broadcast a single join used to cost every peer already in the session.
+    ///
+    /// **What a delta gives up, and what replaces it.** A complete table was self-repairing: a
+    /// receiver rebuilt from it and thereby dropped every binding that had gone away, with no
+    /// removal record to lose. A delta reintroduces that record, and a receiver that misses one
+    /// keeps a slot bound past its unregister — past the reuse quarantine that slot names a
+    /// different entity and the stale receiver applies the new entity's rows to the old one,
+    /// silently. Three things stand in for the rebuild, and all three are needed:
+    ///
+    /// | Guarantee | What it covers |
+    /// | --- | --- |
+    /// | the channel is **reliable and ordered** ([`TransferMode::RELIABLE`] on one channel) | a removal cannot be dropped or reordered while the connection lives |
+    /// | a delta names the **base generation** it was computed against | a peer holding any other table is sent the whole table instead |
+    /// | every path that can desynchronize a peer **zeroes its generation** | see [`PeerState::manifest_generation`] |
     ///
     /// **The seat columns come from the ANNOUNCED table, not from a live read.** `entity_seats` is
     /// what [`Self::announce_seats`] emitted from at the top of this frame, and a handler it woke may
@@ -3371,15 +5069,68 @@ impl OrbitNet {
                 });
             }
         }
-        let bytes = encode_manifest(&entries);
-        let peers: Vec<i32> = self
+        // ASCENDING BY SLOT, which is what the rebuild loop above does not give: it walks
+        // `bindings()`, and that is ascending by id. The slot is the key of the whole table — a
+        // removal names one and nothing else — so both the diff and the receiver's copy are held in
+        // that order.
+        entries.sort_unstable_by_key(|entry| entry.slot);
+
+        let base_generation = self.manifest_generation;
+        let (removed, added) = diff_manifest(&self.manifest_published, &entries);
+        if !removed.is_empty() || !added.is_empty() {
+            // Saturating rather than wrapping, and it is unreachable either way: one bump per net
+            // tick reaches `u64::MAX` in longer than the universe has run. A wrap would land the
+            // table on a generation some peer already believes it holds, which is the one outcome
+            // that misapplies silently; a saturation degrades every peer to full tables instead.
+            self.manifest_generation = base_generation.saturating_add(1);
+            self.manifest_published = entries;
+        }
+        let generation = self.manifest_generation;
+
+        // What each peer is owed, decided before a byte is encoded: a session where nothing changed
+        // and every peer is current encodes nothing at all.
+        let held: Vec<(i32, u64)> = self
             .peers
             .iter()
             .filter(|(_, p)| p.synced)
-            .map(|(&id, _)| id)
+            .map(|(&id, p)| (id, p.manifest_generation))
             .collect();
-        for peer in peers {
-            self.send_to(peer, &bytes, TransferMode::RELIABLE);
+        let owed =
+            |peer_generation: u64| manifest_owed(peer_generation, base_generation, generation);
+        let delta_bytes = held
+            .iter()
+            .any(|&(_, at)| owed(at) == ManifestOwed::Delta)
+            .then(|| {
+                encode_manifest_delta(&ManifestDelta {
+                    base_generation,
+                    generation,
+                    removed,
+                    added,
+                })
+            });
+        let full_bytes = held
+            .iter()
+            .any(|&(_, at)| owed(at) == ManifestOwed::Full)
+            .then(|| encode_manifest_full(generation, &self.manifest_published));
+
+        for (peer, at) in held {
+            // ONE delta, encoded once and sent to every peer that can apply it; the full table is
+            // addressed to the peers that cannot, which is a joiner and a peer that asked.
+            let bytes = match owed(at) {
+                ManifestOwed::Nothing => continue,
+                ManifestOwed::Delta => delta_bytes.as_ref(),
+                ManifestOwed::Full => full_bytes.as_ref(),
+            };
+            // Unreachable — `owed` answering `Delta` is what caused the delta to be encoded, and the
+            // same for `Full` — and it advances no generation if it ever is. What this peer is
+            // believed to hold may only move on a frame that was actually written for it.
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            self.send_to(peer, bytes, TransferMode::RELIABLE);
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.manifest_generation = generation;
+            }
         }
     }
 
@@ -3422,7 +5173,7 @@ impl OrbitNet {
         // With a long cull radius this is TRUE in a shipped session — the price is real and is
         // reported as `interest_ms`. What it buys is the band split the priority scorer needs, even
         // on a map where nothing is actually culled (`blocks_culled_s` measures 0.00).
-        // `update_linear_into` clears and refills a `BTreeMap` per peer per tick, and a host that
+        // Either path clears and refills a `BTreeMap` per peer per tick, and a host that
         // overruns its net tick is how "rubber banding, sticky input, hits stop landing" arrives all
         // at once, so watch that column.
         let culling = self.aoi_radius > 0.0;
@@ -3453,8 +5204,13 @@ impl OrbitNet {
         let filtering = culling || rows.iter().any(|row| row.membership != MEMBERSHIP_GLOBAL);
         if filtering {
             Self::collect_observers(&rows, &mut observers);
+            self.warn_anchor_conflicts(&observers);
             self.update_interest(&peer_ids, &rows, &observers);
         }
+        // What every anchor read-back is gated on. A pass that did not run left each connection's
+        // `AnchorReport` describing an earlier tick, and reporting that as current would state a
+        // centre and a world for a session that is culling nothing and filtering nobody.
+        self.interest_ran = filtering;
         self.acc_interest_us += interest_started.elapsed().as_micros() as u64;
         self.acc_interest_ticks += 1;
 
@@ -3466,6 +5222,9 @@ impl OrbitNet {
         let tiering = self.rate_tiering;
         let mut order = std::mem::take(&mut self.order_scratch);
         let mut members = std::mem::take(&mut self.aoi_members);
+        // The section's wire slots, pooled: one connection's worth at a time, refilled per peer.
+        let mut delta_left = std::mem::take(&mut self.delta_left_scratch);
+        let mut delta_entered = std::mem::take(&mut self.delta_entered_scratch);
         // The receiver's own retention, in ticks, and THE SHORTER OF THE TWO LANES holds for both.
         // A rollback receiver keeps its bases in `auth_rows`, sized from the same `history_limit`
         // both ends read out of the `[orbitnet]` block. A state receiver keeps them in `history`,
@@ -3584,6 +5343,28 @@ impl OrbitNet {
             // tests could only ever reach the other one.
             order.sort_unstable_by(|a, b| priority::cmp(&a.0, &b.0));
 
+            // --- the trailing interest-delta section, decided BEFORE the admit loop ---
+            //
+            // Its bytes come off the budget the loop is about to spend, because a section appended
+            // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. The
+            // ack that retires it is the ordinary one every frame already carries and proves.
+            let carries_delta = {
+                let Some(peer) = self.peers.get_mut(&peer_id) else {
+                    continue;
+                };
+                build_interest_section(
+                    &self.slots,
+                    peer,
+                    filtering,
+                    current,
+                    &mut delta_left,
+                    &mut delta_entered,
+                )
+            };
+            let admit_budget = budget.saturating_sub(interest_delta_reserve(
+                delta_left.len() + delta_entered.len(),
+            ));
+
             // --- admit ---
             //
             // THE BUDGET BOUNDS THE BODY, AND THE DATAGRAM IS THE BODY PLUS THE FRAME HEADER. `send_budget`
@@ -3592,7 +5373,7 @@ impl OrbitNet {
             // than an oversight, but it is not what the constant's name says: the real wire figure is header +
             // body + 12 (ENet) + 28 (IPv4/UDP), which stays comfortably inside a 1500 B path MTU. Do not read
             // `MAX_FRAME_PAYLOAD` as "the datagram size"; read it as "the entity payload one frame may carry".
-            let mut writer = Writer::with_capacity(budget + 128);
+            let mut writer = Writer::with_capacity(budget + 256);
             let mut body = Writer::with_capacity(budget);
             let mut sent: Vec<(u64, u64)> = Vec::new();
             // The subset of `sent` that went out full, so the keyframe clock is measured against
@@ -3602,7 +5383,7 @@ impl OrbitNet {
 
             for index in 0..order.len() {
                 let (candidate, band) = order[index];
-                if body.len() >= budget {
+                if body.len() >= admit_budget {
                     // Everything left wanted to go out and did not fit: budget pressure, which is
                     // a different fact from a cull and is counted as one.
                     self.acc_blocks_deferred += (order.len() - index) as u64;
@@ -3684,7 +5465,7 @@ impl OrbitNet {
                 } else {
                     None
                 };
-                if body.len() > budget {
+                if body.len() > admit_budget {
                     // IT DID NOT FIT. Deferring is right whenever the frame already carries something --
                     // but if it carries NOTHING, deferring this block sends no frame at all, and that is
                     // not a delay, it is the end of the stream. An entity that has never been sent scores
@@ -3737,7 +5518,11 @@ impl OrbitNet {
             acc.0 += peer_sends;
             acc.1 += peer_members;
 
-            if sent.is_empty() {
+            // A LEAVE-ONLY TICK STILL SENDS. The gate is "did this frame carry anything", and a
+            // relevancy event is something: skipping the frame because no entity block was admitted
+            // is exactly the tick on which a peer needs to be told that an entity stopped being sent
+            // to it.
+            if sent.is_empty() && !carries_delta {
                 continue;
             }
             let header = FrameHeader {
@@ -3747,11 +5532,20 @@ impl OrbitNet {
                 ack_bits: 0,
                 ack_token,
                 margin_ticks: margin,
-                flags: 0,
+                flags: if carries_delta {
+                    FrameHeader::FLAG_INTEREST_DELTA
+                } else {
+                    0
+                },
                 entity_count: sent.len() as u32,
             };
             header.encode(&mut writer);
             writer.bytes(body.as_slice());
+            // AFTER the blocks, which is what makes it invisible to a peer that does not know about
+            // it: a receiver reads exactly `entity_count` blocks and stops.
+            if carries_delta {
+                encode_interest_delta(&delta_left, &delta_entered, &mut writer);
+            }
             self.acc_blocks_admitted += sent.len() as u64;
             self.acc_blocks_full += sent_full.len() as u64;
             self.dbg_sent += sent.len() as u64;
@@ -3760,6 +5554,12 @@ impl OrbitNet {
 
             if let Some(peer) = self.peers.get_mut(&peer_id) {
                 peer.want_full = false;
+                // The stamp is set by the FIRST frame to carry this prefix and does not move on a
+                // re-send: what an ack has to reach is the frame whose arrival proves the client
+                // applied these entries.
+                if carries_delta && peer.interest_delta_tick.is_none() {
+                    peer.interest_delta_tick = Some(current);
+                }
                 for &(id, tick) in &sent {
                     peer.last_sent.insert(id, tick);
                 }
@@ -3777,6 +5577,8 @@ impl OrbitNet {
         self.aoi_observers = observers;
         self.order_scratch = order;
         self.aoi_members = members;
+        self.delta_left_scratch = delta_left;
+        self.delta_entered_scratch = delta_entered;
     }
 
     /// The snapshot byte budget actually used, clamped to what the codec can carry.
@@ -3795,9 +5597,11 @@ impl OrbitNet {
             0.0
         };
         AoiConfig {
-            // Inert on the shipped path — the linear filter has no cells — but derived rather than
-            // left at the 32 m default so a direct core call, or a future grid adoption, starts
-            // from a size proportional to the radius it is querying.
+            // **A quarter of the radius**, which is the size both tables in
+            // `orbitnet_core::interest`'s header were measured at and the size its thresholds are
+            // worked at: a query rectangle is then 11 cells a side whatever the radius. Read by the
+            // flat path only through `select_interest_path` — the filter itself has no cells — and
+            // by every rebuild and every query on the grid path.
             cell_size: (radius / 4.0).max(1.0),
             enter_radius: radius,
             exit_factor: AOI_EXIT_FACTOR,
@@ -3902,6 +5706,19 @@ impl OrbitNet {
     /// drives, put the bodies on separate seats, or declare the connection's world directly with
     /// `OrbitNet::set_peer_anchor`. `NetRollbackHandle.membership()` reports what the filter reads
     /// for an undeclared peer, which is where the mistake shows.
+    ///
+    /// **THE PICK IS NOT SILENT ANY MORE, AND IT STILL DOES NOT MOVE.** Moving it would relocate
+    /// every existing consumer's interest sets on the tick their binary was refreshed, so the
+    /// dropped rows are REPORTED instead, on the row that survived them:
+    ///
+    /// | Dropped rows | [`PeerObserver::ambiguous`] | [`PeerObserver::membership_conflict`] |
+    /// | --- | --- | --- |
+    /// | none — one anchored body on the seat | `false` | `false` |
+    /// | several, all in the row's own world | `true` | `false` |
+    /// | several, disagreeing about the world | `true` | `true` |
+    ///
+    /// A row with no resolved anchor is still skipped before any of this, so a seat whose second
+    /// body has not spawned is not ambiguous — nothing was dropped, because nothing was eligible.
     fn collect_observers(rows: &[EntityRow], observers: &mut Vec<(SeatId, PeerObserver)>) {
         observers.clear();
         for row in rows {
@@ -3914,12 +5731,72 @@ impl OrbitNet {
                     PeerObserver {
                         center,
                         membership: row.membership,
+                        ambiguous: false,
+                        membership_conflict: false,
                     },
                 ));
             }
         }
         observers.sort_by_key(|&(seat, _)| seat);
-        observers.dedup_by_key(|&mut (seat, _)| seat);
+        // `dedup_by` keeps the FIRST of each run — the lowest-id anchored row, since the scan
+        // collected in ascending id order and the sort above is stable — and hands every dropped row
+        // to the closure beside the one that survived. Folding the two flags in there is what makes
+        // the pick reportable at no extra pass: the run is already being walked.
+        observers.dedup_by(|dropped, kept| {
+            if dropped.0 != kept.0 {
+                return false;
+            }
+            kept.1.ambiguous = true;
+            kept.1.membership_conflict |= dropped.1.membership != kept.1.membership;
+            true
+        });
+    }
+
+    /// Log the seats whose several anchored bodies disagree about the **world**, once per seat per
+    /// episode.
+    ///
+    /// **TWO TIERS, BECAUSE ONE OF THE TWO AMBIGUITIES IS A SHAPE GAMES LEGITIMATELY HAVE.**
+    ///
+    /// | Seat drives | Reported as | Logged |
+    /// | --- | --- | --- |
+    /// | several anchored bodies in the SAME world | `ambiguous` on [`Self::peer_anchor_info`] | no |
+    /// | several anchored bodies in DIFFERENT worlds | `ambiguous`, and this warning | once per episode |
+    ///
+    /// The quiet tier is quiet because a game that swaps one body for another on a seat holds both
+    /// for the frame the swap takes. Warning there fires on every swap, for a configuration that is
+    /// correct — and a warning a game learns to ignore reports nothing. Inside one world the pick
+    /// costs a radius that is centred on one of two bodies the same seat drives, which is a
+    /// difference of metres; across worlds it costs the seat's whole membership.
+    ///
+    /// **Once per seat per EPISODE, not per process.** The set is inserted into on the warning and
+    /// pruned of every seat that is no longer colliding, so the same mistake reintroduced after a map
+    /// change is reported again. The alternative — a set that only grows — tells the second
+    /// occurrence to nobody, and the second occurrence is the one somebody is debugging.
+    ///
+    /// The rule is [`anchor_conflicts_owed`]; this is that plus the log line, because `godot_warn!`
+    /// needs the Godot runtime and no unit test has one.
+    fn warn_anchor_conflicts(&mut self, observers: &[(SeatId, PeerObserver)]) {
+        // Empty on every tick of a correctly configured session, and an empty `Vec` allocates
+        // nothing — so the common path here is one `is_empty` and one scan of an already-hot slice.
+        let mut owed: Vec<SeatId> = Vec::new();
+        anchor_conflicts_owed(&mut self.anchor_conflicts, observers, &mut owed);
+        for seat in owed {
+            let membership = observers
+                .binary_search_by_key(&seat, |&(id, _)| id)
+                .map_or(MEMBERSHIP_GLOBAL, |index| observers[index].1.membership);
+            godot_warn!(
+                "OrbitNet: seat {}/{} drives several anchored bodies that declare DIFFERENT \
+                 worlds. Its world is taken from the lowest-id one of them ({}), and that pick is \
+                 arbitrary — every entity only this seat held leaves the connection's interest on \
+                 any tick the pick changes, which costs that connection a full-state burst rather \
+                 than a per-entity repair. Fix it by declaring the same membership on every body \
+                 the seat drives, by putting them on separate seats, or by declaring the \
+                 connection's world with set_peer_anchor().",
+                seat.peer,
+                seat.seat,
+                membership
+            );
+        }
     }
 
     /// The slice of [`Self::collect_observers`]'s output that belongs to one connection, ascending
@@ -3938,7 +5815,8 @@ impl OrbitNet {
     ///
     /// Each peer is centred and placed in a world by [`resolve_observer`] — its own declaration when
     /// it made one, the body it drives when it did not — and then filtered on membership first and
-    /// distance second, which is [`candidate_for_row`] plus `update_linear_into`.
+    /// distance second, which is [`candidate_for_row`] plus whichever update path
+    /// [`select_interest_path`] answered for the tick.
     ///
     /// **The shared candidate list carries no per-peer facts and does not have to.** A visibility
     /// veto ([`OrbitNet::set_entity_hidden`]) is held on the connection's own `ConnectionInterest`,
@@ -3954,6 +5832,14 @@ impl OrbitNet {
     /// Clearing `last_sent` and `acked_base` at the leave instead (the same pair the unregister path
     /// clears, for the same reason) forces a full block for that entity alone, and sorts it to the
     /// front of the rota while it is at it.
+    ///
+    /// **THE DIFF IS SYMMETRIC, AND THE ENTER HALF IS PUBLISHED RATHER THAN CONSUMED.** The leave
+    /// half clears bookkeeping; the enter half clears nothing — an entity that was never sent to
+    /// this peer has none to invalidate. Both halves are queued onto the connection's pending
+    /// [`InterestDelta`], which rides the snapshot that peer is already receiving, and onto
+    /// [`Self::interest_events`] for the signal. Two more leaves happen BETWEEN updates and no
+    /// `leaves` list can ever name them — [`PeerState::set_entity_hidden`] and the despawn sweep in
+    /// `drain_pending` — so each queues its own.
     ///
     /// **ONE CANDIDATE LIST PER TICK, NOT ONE PER PEER.** This loop used to rebuild the whole list
     /// inside itself, which is O(peers · entities) *before* the filter it feeds even runs — measured
@@ -3992,6 +5878,25 @@ impl OrbitNet {
     ///
     /// All three are [`seat_observers_into`], which states the whole rule — including what happens
     /// when the connection's set of seats CHANGES — as one table.
+    ///
+    /// **THE SESSION PICKS ITS OWN PATH, ONCE PER TICK.** [`select_interest_path`] measures the
+    /// candidate list this pass already built and answers [`InterestPath::Grid`] or
+    /// [`InterestPath::Linear`]; on `Grid` one [`InterestGrid::rebuild`] runs here, before the
+    /// per-connection loop, and every connection queries that one index. Three facts about the
+    /// switch, each of them load-bearing:
+    ///
+    /// * **A mid-session switch emits no leaves.** The enter radius is a live setting a game may
+    ///   change at runtime, and changing it moves the cell size and therefore the verdict. Both
+    ///   paths compute the same members from the same state, so the diff against the same set
+    ///   reports nothing — and a spurious leave here would clear `last_sent` for every entity on
+    ///   that peer, which is the full-state burst the leave list exists to prevent.
+    /// * **The grid's iteration is a `HashMap` walk**, and nothing downstream sees it. Every set
+    ///   lands in a `BTreeMap` through `commit`'s id sort, the cap breaks distance ties by
+    ///   ascending id, and the send rota's own sort ties by ascending id — so the wire order is
+    ///   fixed by three separate normalisations and cannot vary run to run with the path.
+    /// * **The verdict is published, never declared.** `bandwidth_metrics()`'s `interest_grid`
+    ///   reports the fraction of the window's ticks that took the index. There is no setter,
+    ///   because a wrong verdict costs time and nothing else.
     fn update_interest(
         &mut self,
         peer_ids: &[i32],
@@ -3999,16 +5904,41 @@ impl OrbitNet {
         observers: &[(SeatId, PeerObserver)],
     ) {
         let cfg = self.aoi_config();
+        let session_closed = self.unanchored_policy == UNANCHORED_CLOSED;
         let mut candidates = std::mem::take(&mut self.aoi_candidates);
         let mut owned = std::mem::take(&mut self.aoi_owned_rows);
         let mut seats = std::mem::take(&mut self.aoi_seats);
         let mut scratch = std::mem::take(&mut self.aoi_seat_scratch);
-        let mut leaves = std::mem::take(&mut self.aoi_leaves);
+        let mut delta = std::mem::take(&mut self.aoi_delta);
+        let mut overrides = std::mem::take(&mut self.aoi_overrides);
+        let mut grid = std::mem::take(&mut self.aoi_grid);
+        let mut occupancy = std::mem::take(&mut self.aoi_occupancy);
         let mut culled = 0u64;
 
         candidates.clear();
         candidates.extend(rows.iter().map(candidate_for_row));
         owned_rows_into(rows, &mut owned);
+
+        // The tick's verdict, taken from the list the loop below is about to filter with — one
+        // measurement and one rebuild for the whole session, not one per connection.
+        let path = select_interest_path(
+            &mut self.aoi_path,
+            &cfg,
+            &candidates,
+            &owned,
+            peer_ids,
+            &mut occupancy,
+        );
+        if path == InterestPath::Grid {
+            grid.rebuild(&cfg, &candidates);
+        }
+        self.acc_interest_grid_ticks += u64::from(path == InterestPath::Grid);
+        let pass = InterestPass {
+            path,
+            grid: &grid,
+            cfg: &cfg,
+            rows,
+        };
 
         for &peer_id in peer_ids {
             let Some(state) = self.peers.get(&peer_id) else {
@@ -4016,6 +5946,9 @@ impl OrbitNet {
             };
             let (anchor, last, declared) =
                 (state.anchor, state.anchor_last, state.anchor_membership);
+            // A per-connection policy overrides the session default outright. `None` is "nobody said
+            // anything about this connection", which is not the same statement as OPEN.
+            let closed_when_unanchored = state.unanchored_closed.unwrap_or(session_closed);
             // Where a tracked entity is THIS tick, if it is still here and still has a position.
             // `rows` is sorted by id, which is what makes this a binary search rather than the
             // per-tick map that sort exists to avoid.
@@ -4027,14 +5960,11 @@ impl OrbitNet {
                 _ => None,
             };
 
-            // This peer's own rows, in and out around the call. Restored unconditionally below, so
-            // no path out of this body can leave the shared list describing the wrong peer. Every
-            // seat on the connection gets every one of them as `always`: the datagram is shared, so
-            // a body one seat drives rides on it whatever the others can see.
+            // This peer's own rows. Every seat on the connection gets every one of them as
+            // `always`: the datagram is shared, so a body one seat drives rides on it whatever the
+            // others can see. Where they are handed to the filter is what the path decides, and
+            // [`filter_connection`] owns both halves of that — including restoring the shared list.
             let mine = owned_rows_of(&owned, peer_id);
-            for &(_, index) in mine {
-                candidates[index as usize] = candidate_for_own_row(&rows[index as usize]);
-            }
 
             seat_observers_into(
                 &cfg,
@@ -4045,6 +5975,7 @@ impl OrbitNet {
                     membership: declared,
                     tracked,
                     last,
+                    closed_when_unanchored,
                 },
                 &mut seats,
             );
@@ -4055,22 +5986,43 @@ impl OrbitNet {
                 if let Some(pos) = tracked {
                     peer.anchor_last = Some(pos);
                 }
-                peer.interest.update_linear_into(
-                    &cfg,
-                    &seats,
-                    &candidates,
+                // THE ANSWER THAT IS IN EFFECT, KEPT. Taken here, beside the call that consumes it,
+                // so the two cannot describe different ticks — and copied into the connection's own
+                // vectors rather than reassigning them, so a steady session allocates nothing on the
+                // path the send loop exists to keep cheap.
+                peer.anchor_report.adopt(&seats);
+                filter_connection(
+                    &pass,
+                    mine,
+                    &seats.observers,
+                    &mut candidates,
+                    &mut overrides,
+                    &mut peer.interest,
                     &mut scratch,
-                    &mut leaves,
+                    &mut delta,
                 );
-                for &id in &leaves {
+                for &id in &delta.leaves {
                     peer.last_sent.remove(&id);
                     peer.last_full.remove(&id);
                     peer.acked_base.remove(&id);
+                    peer.note_interest_leave(id);
+                }
+                // The enter half clears nothing: an entity that was never sent to this peer has no
+                // per-entity bookkeeping to invalidate, and one that left and came back had its
+                // three entries cleared by the leave.
+                for &id in &delta.enters {
+                    peer.note_interest_enter(id);
                 }
                 culled += (rows.len() as u64).saturating_sub(peer.interest.len() as u64);
             }
-            for &(_, index) in mine {
-                candidates[index as usize] = candidate_for_row(&rows[index as usize]);
+            // Queued outside the borrow above, and closed before opened for the reason
+            // `announce_seats` orders its own pair that way: an entity that moved between two
+            // states in one tick reads as the old one ending and the new one beginning.
+            for &id in &delta.leaves {
+                self.interest_events.push((peer_id, id, false));
+            }
+            for &id in &delta.enters {
+                self.interest_events.push((peer_id, id, true));
             }
         }
         self.acc_blocks_culled += culled;
@@ -4079,7 +6031,10 @@ impl OrbitNet {
         self.aoi_candidates = candidates;
         self.aoi_seats = seats;
         self.aoi_seat_scratch = scratch;
-        self.aoi_leaves = leaves;
+        self.aoi_delta = delta;
+        self.aoi_overrides = overrides;
+        self.aoi_grid = grid;
+        self.aoi_occupancy = occupancy;
     }
 
     // ------------------------------------------------------------------
@@ -4151,41 +6106,164 @@ impl OrbitNet {
             FrameKind::EntityManifest => {
                 if self.mode == MODE_CLIENT && sender == SERVER_PEER {
                     let _ = reader.u8();
-                    if let Ok(entries) = decode_manifest(&mut reader) {
-                        // The manifest is a COMPLETE table, so the local copy is rebuilt rather
-                        // than merged. That is what retires the binding of an entity the server has
-                        // unregistered: a merge would keep naming it, and a slot reissued to a
-                        // different entity would then be resolved to the wrong one.
-                        //
-                        // The seat table is rebuilt the same way and for the same reason: a seat
-                        // that went away leaves no removal record, it is simply absent from the next
-                        // table. The roster is projected from it on the next tick boundary rather
-                        // than here, so a client emits its seat events where a server emits its own
-                        // — see `announce_seats`.
-                        self.slots.clear();
-                        self.entity_seats.clear();
-                        self.seats_dirty = true;
-                        for entry in entries {
-                            self.slots.bind(entry.slot, entry.id);
-                            self.expected_schemas
-                                .insert(entry.id, (entry.state_hash, entry.input_hash));
-                            if entry.owner > 0 {
-                                self.entity_seats.push((entry.id, entry.owner, entry.seat));
-                            }
-                            if let Some(sync) = self.rollback_entities.get(&entry.id) {
-                                if sync.is_instance_valid() {
-                                    self.check_expected_schema(entry.id, sync);
-                                }
-                            }
+                    match decode_manifest_full(&mut reader) {
+                        // A FULL TABLE OLDER THAN THE ONE HELD IS IGNORED. The channel is reliable
+                        // and ordered, so this should be unreachable; it is checked because the
+                        // alternative is a client that quietly adopts a table the server has already
+                        // moved past and then refuses every delta built on the newer one.
+                        Ok((generation, entries)) if generation >= self.manifest_generation => {
+                            self.adopt_manifest_full(generation, entries);
                         }
-                        // Ascending by id, the order the server's own table is held in. The frame
-                        // arrives in SLOT order, so this is a sort rather than an assumption, and
-                        // it is what makes the two sides' tables comparable row for row.
-                        self.entity_seats.sort_unstable();
+                        Ok(_) => {}
+                        // **A DECODE ERROR IS REPORTED HERE, NOT SWALLOWED.** Dropping it was
+                        // safe only while the next frame carried the whole table and repaired
+                        // whatever it left behind. There is no next whole table unless this asks
+                        // for one, so a swallowed error is permanent corruption.
+                        Err(err) => {
+                            let why = err.to_string();
+                            self.refuse_manifest(&why);
+                        }
+                    }
+                }
+            }
+            FrameKind::EntityManifestDelta => {
+                if self.mode == MODE_CLIENT && sender == SERVER_PEER {
+                    let _ = reader.u8();
+                    match decode_manifest_delta(&mut reader) {
+                        Ok(delta) if delta.applies_to(self.manifest_generation) => {
+                            self.adopt_manifest_delta(&delta);
+                        }
+                        // A delta against a table this peer is not holding. Refused whole rather
+                        // than applied in part: the records that would land are the ones for slots
+                        // this peer happens to agree about, and the ones that would not are exactly
+                        // the ones that disagree.
+                        Ok(delta) => {
+                            let why = format!(
+                                "it states a change to generation {}, and this peer holds {}",
+                                delta.base_generation, self.manifest_generation
+                            );
+                            self.refuse_manifest(&why);
+                        }
+                        Err(err) => {
+                            let why = err.to_string();
+                            self.refuse_manifest(&why);
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// CLIENT: adopt a whole entity-manifest table, replacing everything derived from the last one.
+    ///
+    /// The table arrives complete, so the slot table is **cleared and rebuilt** rather than merged:
+    /// a merge would keep naming an entity the server has unregistered, and a slot reissued to a
+    /// different entity would then resolve to the wrong one.
+    ///
+    /// The seat table is rebuilt the same way. The roster is projected from it on the next tick
+    /// boundary rather than here, so a client emits its seat events where a server emits its own —
+    /// see [`Self::announce_seats`].
+    fn adopt_manifest_full(&mut self, generation: u64, entries: Vec<ManifestEntry>) {
+        self.slots.clear();
+        for entry in &entries {
+            self.slots.bind(entry.slot, entry.id);
+            self.note_manifest_row(entry);
+        }
+        self.manifest_published = entries;
+        self.manifest_generation = generation;
+        self.rebuild_seats_from_manifest();
+        // An entity that has left the table has left this peer's interest, whatever the last
+        // section said. Run against the REBUILT table, so what it reads is the set of ids the
+        // server still names.
+        self.apply_manifest_interest();
+    }
+
+    /// CLIENT: apply one entity-manifest delta this peer's generation says it can apply.
+    ///
+    /// **THE FRAME IS DECODED WHOLE BEFORE A BYTE OF IT IS APPLIED, and the rows are built into a
+    /// SCRATCH table that is swapped in only once every record has landed.** A complete table could
+    /// be abandoned half-decoded and repaired by the next one; a delta cannot, so the swap point is
+    /// the decode. `decode_manifest_delta` answers a whole [`ManifestDelta`] or an error and touches
+    /// nothing on the way, [`apply_manifest_delta`] builds the new rows beside the held ones, and
+    /// only then is anything the client reads back allowed to move.
+    ///
+    /// The slot table is patched rather than rebuilt — [`SlotTable::unbind`] for each retired slot,
+    /// [`SlotTable::bind`] for each stated row — which is the point of a delta. `bind` replaces both
+    /// directions, so one `added` record covers a new binding, a reissued slot and a changed row
+    /// alike, and applying one twice lands in the same place.
+    fn adopt_manifest_delta(&mut self, delta: &ManifestDelta) {
+        let rows = apply_manifest_delta(&self.manifest_published, delta);
+        self.manifest_published = rows;
+        self.manifest_generation = delta.generation;
+        for &slot in &delta.removed {
+            self.slots.unbind(slot);
+        }
+        for entry in &delta.added {
+            self.slots.bind(entry.slot, entry.id);
+            self.note_manifest_row(entry);
+        }
+        self.rebuild_seats_from_manifest();
+        self.apply_manifest_interest();
+    }
+
+    /// CLIENT: record one row's schema fingerprints, and report a disagreement by name.
+    ///
+    /// Run per row that ARRIVED rather than per row held: a delta states only what changed, and
+    /// re-binding every entity in the table on every delta is the per-entity cost a delta exists to
+    /// avoid.
+    fn note_manifest_row(&mut self, entry: &ManifestEntry) {
+        self.expected_schemas
+            .insert(entry.id, (entry.state_hash, entry.input_hash));
+        if let Some(sync) = self.rollback_entities.get(&entry.id) {
+            if sync.is_instance_valid() {
+                self.check_expected_schema(entry.id, sync);
+            }
+        }
+    }
+
+    /// CLIENT: project the seat table out of the manifest rows this peer holds.
+    ///
+    /// **From the held table, not from the frame that just arrived.** A seat is a projection of the
+    /// whole manifest — a delta that states nothing about an entity says that entity's seat has not
+    /// changed — so a roster built from a delta's rows alone would drop every seat the delta was
+    /// silent about.
+    fn rebuild_seats_from_manifest(&mut self) {
+        self.entity_seats.clear();
+        for entry in &self.manifest_published {
+            if entry.owner > 0 {
+                self.entity_seats.push((entry.id, entry.owner, entry.seat));
+            }
+        }
+        // Ascending by id, the order the server's own table is held in. The rows arrive in SLOT
+        // order, so this is a sort rather than an assumption, and it is what makes the two sides'
+        // tables comparable row for row.
+        self.entity_seats.sort_unstable();
+        self.seats_dirty = true;
+    }
+
+    /// CLIENT: the entity-manifest stream broke — ask for the whole table and stop claiming to hold
+    /// one.
+    ///
+    /// **Both halves are needed.** Zeroing the generation is what makes every later delta fail its
+    /// base check, so a lost NACK costs one tick rather than the session; the flag is what tells the
+    /// server to answer with the whole table rather than another delta.
+    ///
+    /// **The stale table is KEPT until the replacement lands.** Clearing it would stop every block
+    /// resolving for a round trip, which is a worse outage than the one this repairs, and the reuse
+    /// quarantine already covers a binding that is wrong rather than merely old.
+    fn refuse_manifest(&mut self, why: &str) {
+        self.manifest_generation = 0;
+        self.want_manifest = true;
+        if self.manifest_break_warned {
+            return;
+        }
+        self.manifest_break_warned = true;
+        godot_warn!(
+            "OrbitNet: could not apply an entity manifest from the server ({why}) — asking for the \
+             whole table. Slot bindings, schema checks and the seat roster all ride that frame, so \
+             until it arrives this peer is holding the table it had. Further breaks this session \
+             are silent."
+        );
     }
 
     /// Verify a datagram against its session's key and replay window, answering the payload.
@@ -4227,7 +6305,37 @@ impl OrbitNet {
         self.auth_warned = true;
         godot_warn!(
             "OrbitNet: refusing an unauthenticated datagram from peer {sender} — forged, replayed, \
-             or sent before the handshake. Further refusals this session are silent; run with \
+             sent before the handshake, or sealed under a key derived from a different session \
+             secret. Compare has_session_secret() on both ends if a join never completes. Further \
+             refusals this session are silent; run with ORBITNET_DEBUG to count them."
+        );
+    }
+
+    /// Count input rows refused for carrying a non-finite float, and name the sender once.
+    ///
+    /// **Visibility is part of the refusal.** A dropped row is indistinguishable from packet loss
+    /// from the outside — the body coasts on its last received input either way — so an operator
+    /// watching a body behave oddly would have nothing to look at. The count is what a
+    /// `ORBITNET_DEBUG` run prints every second beside `input_novel`, and it is the number that says
+    /// whether one client is misbehaving or one property is simply going non-finite in the game.
+    ///
+    /// **One warning per peer per session**, latched on [`PeerState::nonfinite_warned`] the way
+    /// [`Self::note_unauthenticated`] latches its own: under an actual flood the log is the second
+    /// thing to fall over.
+    fn note_nonfinite_input(&mut self, sender: i32, rows: u32) {
+        self.dbg_input_nonfinite += u64::from(rows);
+        let Some(peer) = self.peers.get_mut(&sender) else {
+            return;
+        };
+        if peer.nonfinite_warned {
+            return;
+        }
+        peer.nonfinite_warned = true;
+        godot_warn!(
+            "OrbitNet: refusing an input row from peer {sender} — a float property arrived \
+             non-finite (NaN or infinity), which would poison this body's simulation on every peer \
+             and make it uncullable. The row is dropped rather than sanitized, so the body coasts \
+             on its last received input. Further refusals from this peer are silent; run with \
              ORBITNET_DEBUG to count them."
         );
     }
@@ -4240,44 +6348,28 @@ impl OrbitNet {
             return;
         };
         let ours = Handshake::local(self.effective_rate().hz() as u16);
-        if let Err(err) = ours.check_compatibility(&hello) {
+        if let Err(err) = ours.check_compatibility(&hello, self.session_secret.as_ref()) {
             godot_error!("OrbitNet: rejecting peer {sender}: {err}");
             return;
         }
-        // **Take the identity off any peer that still claims it.** One player cannot be connected twice
-        // under one identity, so an entry that still claims it is a GHOST — a connection the transport has
-        // not declared dead yet, which on ENet's defaults takes the better part of a minute. Without this
-        // the ghost's disconnect arrives last and holds an identity the returning player is already using,
-        // and closing that window releases the seat of somebody who is playing.
-        //
-        // **NOTHING HERE CHECKS THAT THE SUPERSEDED PEER IS DEAD, AND THE CONSEQUENCE IS A LIVE TAKEOVER,
-        // NOT A FORFEITED FUTURE RESUME.** The match is on the token alone. A peer presenting a token that a
-        // CONNECTED, PLAYING peer holds is reported through `peer_joined` as an ordinary resume of that
-        // peer, and a roster that honours `resumed_from` — including the reference one in the RTS demo —
-        // hands the returning claimant that player's body on the spot: the original keeps its connection,
-        // receives no error, and simply stops driving its own entity. The superseded connection is not
-        // closed; only its claim to the identity is taken.
-        //
-        // That is accepted rather than overlooked, because the alternative costs the case this exists for.
-        // Sourcing a resume only from `ResumeTable::claim` — a drop the server actually observed — refuses
-        // a genuinely returning player for as long as the transport takes to notice the old socket is gone,
-        // which was measured here at anywhere from 45 s to never. Refusing every real fast reconnect to
-        // close a hole that needs 63 guessed bits is the wrong trade. It is a hole, it is stated as one in
-        // `README.md`, and a game that wants the conservative rule can have it without a backend change:
-        // honour `resumed_from` only for a session it already saw `peer_dropped` report as `held`.
-        let mut superseded = 0;
-        if hello.session_id != 0 {
-            for (&id, state) in self.peers.iter_mut() {
-                if id != sender && state.session_id == hello.session_id {
-                    state.session_id = 0;
-                    superseded = id;
-                }
-            }
-        }
-        // Claimed BEFORE the peer entry is touched, and claiming REMOVES: the identity is spent here, so a
-        // later connection carrying the same token resumes nothing. A held session wins over a superseded
-        // ghost when somehow both exist — the held one is the drop the server actually saw.
-        let resumed_from = self.resume.claim(hello.session_id).unwrap_or(superseded);
+        // THE SESSION KEY, DERIVED BEFORE THE REKEY COMPARISON BELOW so that the comparison is
+        // derived-key against derived-key. Comparing the wire nonce instead and re-deriving on every
+        // hello would reset the replay window on each RETRY of one join, which is exactly the property
+        // that comparison exists to preserve.
+        let session_key = session_key_from(self.session_secret.as_ref(), hello.session_nonce);
+        // The whole resume decision, and the two mutations it implies — stripping a superseded incumbent's
+        // identity, and spending the held window. It is a free function over the two plain tables so the
+        // rule this defect lived in is one thing a test can call with no `SceneTree`; see [`seat_hello`].
+        let seat = seat_hello(
+            &mut self.peers,
+            &mut self.resume,
+            self.resume_policy,
+            sender,
+            hello.session_id,
+            hello.resume_token,
+        );
+        let resumed_from = seat.resumed_from;
+        let seated_session_id = seat.session_id;
         let peer = self.peers.entry(sender).or_default();
         // A hello is RETRIED until the welcome lands, so this runs again for a peer already synced. The
         // welcome has to go out again — that is what the retry is for — but the game must hear about the join
@@ -4291,9 +6383,21 @@ impl OrbitNet {
         // and it gets a fresh window and a fresh budget. That a hello can rekey a connection at all is
         // the same trust the transport's sender id already carries: nothing but the connection says
         // who sent it.
-        if peer.auth.is_none_or(|auth| auth.key() != hello.session_key) {
-            peer.auth = Some(SessionAuth::new(hello.session_key));
+        //
+        // Under a session secret the key is derived rather than read off the wire, and the comparison
+        // is unchanged because it was already derived above: a retried hello repeats its nonce, derives
+        // the same key, and keeps its window.
+        if peer.auth.is_none_or(|auth| auth.key() != session_key) {
+            peer.auth = Some(SessionAuth::new(session_key));
             peer.budget = ReceiveBudget::new();
+            // A REKEY IS A CLIENT THAT RESTARTED ITS SESSION ON A LIVE CONNECTION, so its entity
+            // manifest went with it. Zeroed in the same block that replaces the auth, because these
+            // are one fact: everything this connection held is gone. A delta sent against the
+            // generation it held before would apply cleanly to a table it no longer has, and the
+            // rebind of a reissued slot is the record it would then be missing. A RETRIED hello
+            // repeats its nonce, derives the same key and does not enter here, so it keeps the
+            // table it is still holding.
+            peer.forget_manifest();
         }
         // The secret this connection's frame tokens are minted from. `get_or_insert_with`, not an
         // assignment: a hello is retried, and re-minting would strand every token the client already
@@ -4304,21 +6408,44 @@ impl OrbitNet {
         peer.synced = true;
         peer.want_full = true;
         peer.newest_input_tick = -1;
-        peer.session_id = hello.session_id;
+        peer.session_id = seated_session_id;
+        // **The resume token is minted ONCE PER IDENTITY, and only for a connection that holds one.**
+        //
+        // - A granted resume carries the token on record forward verbatim. The client is holding that value
+        //   and quoted it to get here; issuing a fresh one would make every stored copy stale.
+        // - A retried hello re-enters this function for a peer that is already synced, so the mint is
+        //   guarded on the connection already having none. Re-minting there would strand the token the
+        //   client took from the welcome that did arrive.
+        // - A connection seated with identity `0` gets NO token, and its welcome carries `0`. A token names
+        //   an identity, an anonymous seat has none, and a fresh token in that welcome would overwrite the
+        //   one the client is storing for the identity it is still waiting to reclaim.
+        if peer.session_id != 0 && peer.resume_token == 0 {
+            peer.resume_token = if seat.grant == ResumeGrant::Resume && seat.token_on_record != 0 {
+                seat.token_on_record
+            } else {
+                Self::mint_resume_token()
+            };
+        }
+        let resume_token = peer.resume_token;
 
         let welcome = Welcome {
             protocol_version: orbitnet_core::PROTOCOL_VERSION,
             server_tick: self.accumulator.tick(),
             tickrate: self.effective_rate().hz() as u16,
+            resume_token,
         };
         self.send_to(sender, &welcome.encode(), TransferMode::RELIABLE);
         self.manifest_dirty = true;
         // Last, and after every field this call sets: the game answers this signal by seating the player,
         // which re-enters this node through the facade.
+        //
+        // **It reports the identity the connection was SEATED under, not the one it presented.** A refused
+        // claim on an identity somebody else holds is seated anonymously, and announcing the presented
+        // value would hand a game the roster key of the player whose claim was just refused.
         if first_hello {
             self.signals().peer_joined().emit(
                 i64::from(sender),
-                hello.session_id as i64,
+                seated_session_id as i64,
                 i64::from(resumed_from),
             );
         }
@@ -4339,6 +6466,13 @@ impl OrbitNet {
                 self.tickrate = advertised.hz() as i32;
                 self.accumulator.set_rate(advertised);
             }
+        }
+        // The resume token this server issued for our identity. **A `0` does not clear the stored one**:
+        // that answer means the server seated this connection with no identity of its own — an anonymous
+        // peer, or a claim it refused — and forgetting a live token on the strength of it would cost this
+        // peer the honest reconnect the token exists to grant.
+        if welcome.resume_token != 0 {
+            self.resume_token = welcome.resume_token;
         }
         self.accumulator
             .seek(welcome.server_tick.saturating_add(INITIAL_LEAD_TICKS));
@@ -4376,6 +6510,7 @@ impl OrbitNet {
         // round-trip sample in milliseconds while it is still true.
         let tick_ms = self.effective_rate().dt() * 1000.0;
         let mut nacked = false;
+        let mut manifest_nacked = false;
         let unproven_ack;
         {
             let Some(peer) = self.peers.get_mut(&sender) else {
@@ -4410,6 +6545,18 @@ impl OrbitNet {
                 peer.note_nack();
                 nacked = true;
             }
+            // THE MANIFEST NACK: this peer could not apply a delta, so stop believing it holds any
+            // table at all. Zeroing here is the whole answer — the next publish finds it behind and
+            // addresses it the whole table. See `PeerState::manifest_generation`.
+            if header.flags & FrameHeader::FLAG_WANT_MANIFEST != 0 {
+                peer.forget_manifest();
+                manifest_nacked = true;
+            }
+        }
+        // The publish loop runs only on a dirty flush, and a peer asking for the table it should
+        // already be holding is not a change to the table. Raise it so the flush runs at all.
+        if manifest_nacked {
+            self.manifest_dirty = true;
         }
         // The acceptance bar for turning AOI on: a re-entering entity must get its full block
         // WITHOUT a want_full storm, and this is the number that says whether it did.
@@ -4475,6 +6622,7 @@ impl OrbitNet {
             }
             let wire_stride = bound.input_wire_stride();
             let mut earliest_novel: Option<u64> = None;
+            let mut refused_nonfinite: u32 = 0;
             for index in 0..meta.count {
                 let Some(row) = input_block_row(reader, &meta, wire_stride, index) else {
                     break;
@@ -4482,26 +6630,32 @@ impl OrbitNet {
                 let Some(tick) = meta.newest_tick.checked_sub(u64::from(index)) else {
                     break;
                 };
-                if let Some(novel_tick) = bound.integrate_remote_wire_row(tick, row) {
-                    earliest_novel = Some(match earliest_novel {
-                        Some(existing) => existing.min(novel_tick),
-                        None => novel_tick,
-                    });
+                match bound.integrate_remote_wire_row(tick, row) {
+                    InputIntegration::Landed(novel_tick) => {
+                        earliest_novel = Some(match earliest_novel {
+                            Some(existing) => existing.min(novel_tick),
+                            None => novel_tick,
+                        });
+                    }
+                    // Refused for a non-finite float, and NOT folded into the arm below: a dropped
+                    // row is otherwise indistinguishable from packet loss. `saturating_add` because
+                    // `meta.count` is a wire field and `[profile.template-debug]` sets
+                    // `overflow-checks = true`.
+                    InputIntegration::NonFinite => {
+                        refused_nonfinite = refused_nonfinite.saturating_add(1);
+                    }
+                    InputIntegration::Ignored => {}
                 }
             }
             let id = bound.entity_id();
             drop(bound);
             let _ = skip_input_block_body(reader, &meta);
+            if refused_nonfinite > 0 {
+                self.note_nonfinite_input(sender, refused_nonfinite);
+            }
             if let Some(tick) = earliest_novel {
                 self.dbg_input_novel += 1;
-                // Resim from the oldest novel row INSIDE the horizon. Rows older than that are
-                // already integrated — history is truthful and any later resim replays through
-                // them — but they may not start a replay themselves: a joiner's seconds-stale
-                // stamps otherwise had the server resimulating its body across whole seconds,
-                // and every peer watched the frontier pose flail while it settled.
-                let floor = current.saturating_sub(RESIM_INPUT_HORIZON_TICKS);
-                let from = tick.max(floor);
-                if from < current {
+                if let Some(from) = resim_input_from(tick, current) {
                     self.planner.mark(id, from);
                 }
             }
@@ -4613,6 +6767,78 @@ impl OrbitNet {
                 return;
             }
         }
+
+        // THE TRAILING SECTION, AFTER THE BLOCKS AND BEHIND ITS FLAG. Everything above reads exactly
+        // `entity_count` blocks and stops, which is what lets these bytes exist at all: a build that
+        // predates the flag never looks at them.
+        if header.flags & FrameHeader::FLAG_INTEREST_DELTA != 0 {
+            if let Ok(section) = decode_interest_delta(reader) {
+                self.apply_interest_delta(&section);
+            }
+        }
+    }
+
+    /// CLIENT: fold one interest-delta section into the mirrored set, queueing what changed.
+    ///
+    /// **Idempotent, which is what makes a re-send free.** The section rides an unreliable datagram
+    /// and is re-sent until this peer acks the frame it first rode on, so the same content arrives
+    /// several times on a lossy link. Each slot is applied as a set operation and only a set that
+    /// actually changed queues an event, so every copy after the first announces nothing.
+    ///
+    /// **An unbound slot is dropped in silence**, exactly as a block naming one is. That case is
+    /// ordinary rather than hostile: a leave whose cause is an unregister names a slot the manifest
+    /// that follows releases, and the reliable manifest can arrive before the unreliable snapshot
+    /// that names it. The leave is not lost — [`Self::apply_manifest_interest`] emits it from the
+    /// rebuild — and the mirrored set is what makes the two produce exactly one event between them.
+    fn apply_interest_delta(&mut self, section: &InterestDeltaSection) {
+        let peer = self.local_peer_id();
+        self.interest_mirror_seeded = true;
+        apply_interest_section(
+            &self.slots,
+            &mut self.interest_mirror,
+            &mut self.interest_events,
+            peer,
+            section,
+        );
+    }
+
+    /// CLIENT: emit a leave for every mirrored entity the new manifest no longer names.
+    ///
+    /// **ONE SIGNAL COVERS BOTH CAUSES.** "The server stopped sending you this" and "this entity
+    /// unregistered" are the same fact to a game holding a node it can no longer update, and making
+    /// it subscribe to two mechanisms to learn one thing is what this closes.
+    ///
+    /// **It runs after the manifest has been APPLIED, full or delta, against the slot table that
+    /// results.** A complete table made the absence self-evident: an id the frame did not name had
+    /// gone, with no removal record to lose. A delta names the retirement instead
+    /// ([`ManifestDelta::removed`]), so what this reads is the table after those removals landed —
+    /// and the leave is emitted only because the removal was applied, which is why every path that
+    /// can lose one resolves to a full table.
+    ///
+    /// **Culled and unregistered on the same tick fires EXACTLY ONCE.** Both paths gate on
+    /// `interest_mirror.remove()`, which answers whether the set actually held the id, so whichever
+    /// arrives second finds nothing to remove and announces nothing.
+    fn apply_manifest_interest(&mut self) {
+        if self.interest_mirror.is_empty() {
+            return;
+        }
+        let peer = self.local_peer_id();
+        retire_unnamed_interest(
+            &self.slots,
+            &mut self.interest_mirror,
+            &mut self.interest_events,
+            peer,
+        );
+    }
+
+    /// This peer's own transport id, or `0` before the transport has assigned one.
+    ///
+    /// What a client stamps on its own relevancy events: the signal's `peer` names the connection
+    /// that lost or gained the entity, which on a client is always itself.
+    fn local_peer_id(&self) -> i32 {
+        self.base()
+            .get_multiplayer()
+            .map_or(0, |api| api.get_unique_id())
     }
 }
 
@@ -4695,11 +6921,336 @@ fn candidate_for_row(row: &EntityRow) -> InterestCandidate {
 /// read off this very row, so the test could only restate a tautology, or, for a peer that drives
 /// bodies in two worlds, cull that peer's own avatar out of its own view.
 ///
-/// This is the only row of the tick that differs between peers, and swapping it in and out around
-/// each call is what a shared candidate list costs.
+/// This is the only row of the tick that differs between peers. On the flat path it is swapped into
+/// the shared candidate list and back out around each call, which is what sharing that list costs;
+/// on the grid path it is the whole of the connection's override list, because a grid rebuilt once
+/// for every peer cannot hold it. See [`filter_connection`].
 #[must_use]
 fn candidate_for_own_row(row: &EntityRow) -> InterestCandidate {
     InterestCandidate::always(row.id)
+}
+
+/// The tick-wide facts one connection's interest update reads: the path the session picked, the
+/// index that path rebuilt, the config both were derived from, and the rows the shared candidate
+/// list describes.
+///
+/// A bundle rather than four more parameters on [`filter_connection`], and it is also what a test
+/// pins: the same call filters a connection on either path, so "the two paths agree" is a statement
+/// about the send loop and not only about the core.
+struct InterestPass<'a> {
+    /// The verdict [`select_interest_path`] answered for this tick.
+    path: InterestPath,
+    /// Rebuilt once for the tick, and read only on [`InterestPath::Grid`]. On the flat path it holds
+    /// whatever the last grid tick left in it and nothing queries it, so a session that flips back
+    /// onto the index pays one rebuild and no allocation.
+    grid: &'a InterestGrid,
+    /// The config the grid was binned under. A query derives its cell scan from the size the
+    /// entities were binned at, so the rebuild and every query must be handed the same one.
+    cfg: &'a AoiConfig,
+    /// This tick's gathered rows, ascending by id — what the shared candidate list was built from,
+    /// and what a connection's overrides are rebuilt from.
+    rows: &'a [EntityRow],
+}
+
+/// Which path this tick's interest pass runs, measured from the list it is about to filter with.
+///
+/// A free function so the rule the send loop runs is the rule a test can call. Three inputs, and
+/// `PathSelector` is the rule that combines them:
+///
+/// * **The occupancy of the widest world**, from [`InterestOccupancy::measure`] over the shared
+///   candidate list. Per world rather than per session, because the grid bins each world separately
+///   and a query is measured against one world's cells.
+/// * **The config**, which fixes how many cells one query rectangle covers.
+/// * **The widest connection's override count.** The override list is scanned once per grid hit, so
+///   a connection driving many bodies is the case the index cannot pay for. One rebuild serves the
+///   whole tick, so the count taken is the largest any connection in `peer_ids` will hand it: a
+///   single connection over `GRID_MAX_OVERRIDES` keeps the whole tick on the flat pass, which is
+///   the conservative direction — the flat pass folds those same rows in for free.
+///
+/// **A session with no enter radius never selects the grid**, and it is refused twice over. The
+/// caller runs the pass at all only when there is a radius or a declared membership, and
+/// `PathSelector::select` refuses an enter radius of `0` (or `NaN`) before it looks at the
+/// occupancy. A membership-only session has no distance to index and a rebuild would buy it
+/// nothing.
+fn select_interest_path(
+    selector: &mut PathSelector,
+    cfg: &AoiConfig,
+    candidates: &[InterestCandidate],
+    owned: &[(SeatId, u32)],
+    peer_ids: &[i32],
+    scratch: &mut OccupancyScratch,
+) -> InterestPath {
+    let overrides = peer_ids
+        .iter()
+        .map(|&peer_id| owned_rows_of(owned, peer_id).len())
+        .max()
+        .unwrap_or(0);
+    let occupancy = InterestOccupancy::measure(candidates, scratch);
+    selector.select(cfg, occupancy, overrides)
+}
+
+/// One connection's interest update, on whichever path the tick picked, with the setup and the
+/// restore that path needs.
+///
+/// A free function so the rule the send loop runs is the rule a test can call, and so both paths'
+/// bookkeeping sits in one place instead of in two arms of a loop.
+///
+/// **The two paths differ only in where this connection's own rows go**, because those rows are the
+/// one per-connection fact in the tick:
+///
+/// | path | this connection's rows | what the filter reads |
+/// | --- | --- | --- |
+/// | `Linear` | patched into the shared candidate list, restored on the way out | the whole shared list |
+/// | `Grid` | copied into `overrides` | the tick's index, plus `overrides` as `also` |
+///
+/// **The grid cannot hold a per-connection fact.** It is rebuilt once for every peer in the
+/// session, so patching it the way the shared list is patched would state one connection's view of
+/// a body to every other connection. The override list carries it instead: an id named there is
+/// answered by it alone and its binned entry is ignored, so the two can never both admit it.
+///
+/// **The shared list is restored before this returns**, which is what stops the next connection
+/// being filtered against this one's view of the tick. On the grid path the restore is free,
+/// because nothing patched the list.
+#[allow(clippy::too_many_arguments)]
+fn filter_connection(
+    pass: &InterestPass<'_>,
+    mine: &[(SeatId, u32)],
+    seats: &[SeatObserver],
+    candidates: &mut [InterestCandidate],
+    overrides: &mut Vec<InterestCandidate>,
+    interest: &mut ConnectionInterest,
+    scratch: &mut SeatScratch,
+    delta: &mut InterestDelta,
+) {
+    match pass.path {
+        InterestPath::Linear => {
+            for &(_, index) in mine {
+                candidates[index as usize] = candidate_for_own_row(&pass.rows[index as usize]);
+            }
+            interest.update_linear_into(pass.cfg, seats, candidates, scratch, delta);
+            for &(_, index) in mine {
+                candidates[index as usize] = candidate_for_row(&pass.rows[index as usize]);
+            }
+        }
+        InterestPath::Grid => {
+            overrides.clear();
+            overrides.extend(
+                mine.iter()
+                    .map(|&(_, index)| candidate_for_own_row(&pass.rows[index as usize])),
+            );
+            interest.update_grid_into(pass.grid, pass.cfg, seats, overrides, scratch, delta);
+        }
+    }
+}
+
+/// What the trailing interest-delta section costs, and therefore what the admit loop must leave
+/// unspent.
+///
+/// **The reserve is taken BEFORE the admit loop runs, not after it.** The loop admits entity blocks
+/// until the body reaches the budget, so a section appended afterwards would push the datagram past
+/// [`MAX_FRAME_PAYLOAD`] — an unreliable datagram past the path MTU fragments, and a lost fragment
+/// costs the whole frame.
+///
+/// `3 + 2 × count`: two count varints, one byte each at any count one frame can carry, plus a byte
+/// of slack, and a flat 2 bytes per slot. Zero for an empty section, because no flag is raised and
+/// no bytes are written.
+///
+/// **It can leave less than one block's worth of budget**, at the 256 B floor
+/// [`OrbitNet::effective_send_budget`] clamps to: a maximal section there leaves 125 B. That does not
+/// wedge the peer — the admit loop sends an oversized first block anyway rather than end the stream —
+/// and the maximum is only reached on a tick with relevancy news to carry.
+#[must_use]
+fn interest_delta_reserve(count: usize) -> usize {
+    if count == 0 {
+        0
+    } else {
+        3 + 2 * count
+    }
+}
+
+/// What one synced peer is owed by an entity-manifest publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestOwed {
+    /// It already holds the table the server published. **The ordinary answer**, and the one that
+    /// deletes the broadcast: a rebuild that reproduced the published table owes every current peer
+    /// nothing, and a join owes every peer but the joiner nothing.
+    Nothing,
+    /// It holds exactly the table this delta was diffed against, so the delta applies.
+    Delta,
+    /// It holds some other table — it has just joined, it asked for one with
+    /// [`FrameHeader::FLAG_WANT_MANIFEST`], or it rekeyed a live connection — so it is sent the
+    /// whole table, addressed to it alone.
+    Full,
+}
+
+/// Decide what a peer at `peer_generation` is owed when the published table moves from
+/// `base_generation` to `current_generation`.
+///
+/// A free function so the rule the send path runs is the rule a test can call. `base` and `current`
+/// are equal exactly when the rebuild changed nothing, and then no delta exists to send — every peer
+/// that is behind gets the whole table, which is how a joiner is served on a tick where nothing else
+/// happened.
+fn manifest_owed(
+    peer_generation: u64,
+    base_generation: u64,
+    current_generation: u64,
+) -> ManifestOwed {
+    if peer_generation == current_generation {
+        ManifestOwed::Nothing
+    } else if current_generation != base_generation && peer_generation == base_generation {
+        ManifestOwed::Delta
+    } else {
+        ManifestOwed::Full
+    }
+}
+
+/// Fill `left` and `entered` with the wire slots this peer's next snapshot frame should carry, and
+/// answer whether the frame should raise [`FrameHeader::FLAG_INTEREST_DELTA`] at all.
+///
+/// **CULLING OFF SENDS NOTHING, and that is the first thing this decides.** With no radius and no
+/// declared membership the interest pass does not run at all, so `peer.interest` is a set describing
+/// a tick the session has moved on from. A naive gate would diff against it and announce a leave for
+/// every entity in a session that is replicating all of them to everybody. `filtering` is the same
+/// flag [`OrbitNet::interest_ran`] publishes, so the send path and the read-backs cannot disagree.
+///
+/// **A prefix already in flight is re-sent verbatim and nothing is mutated.** That is what lets one
+/// tick stamp retire it: the ack has to reach the frame that first carried *these* entries, so the
+/// entries may not move underneath it.
+///
+/// **A fresh prefix resolves ids to slots, and the two halves fail differently.**
+///
+/// | Half | An id the slot table cannot name |
+/// | --- | --- |
+/// | leaves | retired here — the id has unregistered, and the client's own manifest rebuild emits that leave |
+/// | enters | held, and the walk stops there — its slot is inside another entity's reuse quarantine and arrives shortly |
+///
+/// Stopping rather than skipping is what keeps the prefix contiguous from the front, which is what
+/// makes retiring it a `drain(..n)`. A held enter cannot block for ever: the entity either takes a
+/// slot, or leaves interest and the leave drops the pending enter.
+fn build_interest_section(
+    slots: &SlotTable,
+    peer: &mut PeerState,
+    filtering: bool,
+    current: u64,
+    left: &mut Vec<u16>,
+    entered: &mut Vec<u16>,
+) -> bool {
+    left.clear();
+    entered.clear();
+    if !filtering {
+        return false;
+    }
+    peer.retire_interest_delta(current);
+    if peer.interest_delta_tick.is_some() {
+        // A re-send. An entry whose slot has gone since is simply absent from this copy; the counts
+        // stay put so the ack retires the same range.
+        left.extend(
+            peer.interest_pending.leaves[..peer.interest_delta_left_sent]
+                .iter()
+                .filter_map(|&id| slots.slot_of(id)),
+        );
+        entered.extend(
+            peer.interest_pending.enters[..peer.interest_delta_entered_sent]
+                .iter()
+                .filter_map(|&id| slots.slot_of(id)),
+        );
+        return true;
+    }
+
+    peer.interest_pending
+        .leaves
+        .retain(|&id| slots.slot_of(id).is_some());
+    left.extend(
+        peer.interest_pending
+            .leaves
+            .iter()
+            .take(INTEREST_DELTA_PER_FRAME)
+            .filter_map(|&id| slots.slot_of(id)),
+    );
+    for &id in peer
+        .interest_pending
+        .enters
+        .iter()
+        .take(INTEREST_DELTA_PER_FRAME)
+    {
+        let Some(slot) = slots.slot_of(id) else {
+            break;
+        };
+        entered.push(slot);
+    }
+    peer.interest_delta_left_sent = left.len();
+    peer.interest_delta_entered_sent = entered.len();
+    // An empty section still rides once per connection, to say that the session is filtering at all.
+    !left.is_empty() || !entered.is_empty() || !peer.interest_seeded
+}
+
+/// Fold one interest-delta section into a client's mirrored set, queueing what changed.
+///
+/// A free function so the rule the receive path runs is the rule a test can call. Two properties,
+/// and both are what let an unreliable datagram carry an event at all:
+///
+/// * **Idempotent.** Each slot is a set operation and only a set that actually changed queues an
+///   event, so the second and third copies of a re-sent section announce nothing.
+/// * **An unbound slot is dropped in silence**, exactly as a block naming one is. That is the
+///   ordinary case rather than a hostile one: a leave whose cause is an unregister names a slot the
+///   very next manifest releases, and the reliable manifest can arrive first.
+fn apply_interest_section(
+    slots: &SlotTable,
+    mirror: &mut std::collections::HashSet<u64>,
+    events: &mut Vec<(i32, u64, bool)>,
+    peer: i32,
+    section: &InterestDeltaSection,
+) {
+    for &slot in &section.left {
+        let Some(id) = slots.id_of(slot) else {
+            continue;
+        };
+        if mirror.remove(&id) {
+            events.push((peer, id, false));
+        }
+    }
+    for &slot in &section.entered {
+        let Some(id) = slots.id_of(slot) else {
+            continue;
+        };
+        if mirror.insert(id) {
+            events.push((peer, id, true));
+        }
+    }
+}
+
+/// Drop every mirrored entity the slot table no longer names, queueing a leave for each.
+///
+/// Run against the slot table an entity manifest has just been applied to, and an id it no longer
+/// names has unregistered. That is what makes one signal cover both "you stopped being sent it" and
+/// "it unregistered".
+///
+/// **The manifest used to be a complete table and is now a delta**, so what retires an id here is
+/// the removal record the frame carried rather than the id's absence from a rebuild. The guarantee
+/// moved with it: the channel is reliable and ordered, a delta refuses to apply to any table but the
+/// one it was diffed against, and every path that breaks the stream is answered with a full table.
+/// See [`OrbitNet::send_manifest_if_dirty`].
+///
+/// **Culled and unregistered on the same tick fires EXACTLY ONCE**, because this and
+/// [`apply_interest_section`] both gate on the set actually holding the id.
+fn retire_unnamed_interest(
+    slots: &SlotTable,
+    mirror: &mut std::collections::HashSet<u64>,
+    events: &mut Vec<(i32, u64, bool)>,
+    peer: i32,
+) {
+    let mut gone: Vec<u64> = mirror
+        .iter()
+        .copied()
+        .filter(|&id| slots.slot_of(id).is_none())
+        .collect();
+    // A `HashSet` walk is not an order. Sorted so a game that logs the events reads the same
+    // sequence on every run — the rule `ResumeTable::expire` follows, for the same reason.
+    gone.sort_unstable();
+    for id in gone {
+        mirror.remove(&id);
+        events.push((peer, id, false));
+    }
 }
 
 /// Which of a client input frame's blocks ride this tick, and where the next walk starts.
@@ -4743,6 +7294,29 @@ fn admit_input_blocks(
     refused.unwrap_or(start)
 }
 
+/// The tick a block's oldest newly-landed input row starts a resim from, or `None` for no resim.
+///
+/// A free function so the rule the receive loop runs is the rule a test can call — the same shape
+/// as [`admit_input_blocks`] above.
+///
+/// * **Clamped to the horizon.** Rows older than `current - RESIM_INPUT_HORIZON_TICKS` are already
+///   integrated — history is truthful and any later resim replays through them — but they may not
+///   start a replay themselves: a joiner's seconds-stale stamps otherwise had the server
+///   resimulating its body across whole seconds, and every peer watched the frontier pose flail
+///   while it settled.
+/// * **Nothing at or ahead of `current`.** The forward simulation has not reached that tick yet, so
+///   it will read the row when it gets there.
+///
+/// A row the receive path refused never reaches here: it produces no
+/// [`InputIntegration::Landed`], so the caller's `earliest_novel` stays `None` and the planner is
+/// not marked. That is what keeps a resim from starting at a poisoned tick.
+#[must_use]
+fn resim_input_from(novel_tick: u64, current: u64) -> Option<u64> {
+    let floor = current.saturating_sub(RESIM_INPUT_HORIZON_TICKS);
+    let from = novel_tick.max(floor);
+    (from < current).then_some(from)
+}
+
 /// One seat's observer as the filter takes it: the resolved centre, or [`UNLOCATABLE_CENTRE`] when
 /// there is none to measure from.
 ///
@@ -4778,7 +7352,9 @@ fn seat_observer(
 /// | --- | --- |
 /// | The connection declared an anchor ([`PeerAnchor::Fixed`] / [`PeerAnchor::Entity`]) | exactly one, the declared pair — a declaration collapses a connection to one viewpoint |
 /// | Undeclared, some seats resolved a centre | one per RESOLVED seat; unresolved seats contribute nothing |
-/// | Undeclared, no seat resolved a centre (or it drives nothing) | exactly one, unlocatable — the connection fails open |
+/// | Undeclared, no seat resolved a centre, but the connection DRIVES something | exactly one, unlocatable — the connection fails open |
+/// | Undeclared, drives nothing, policy OPEN (the default) | exactly one, unlocatable — the connection fails open |
+/// | Undeclared, drives nothing, policy CLOSED | **none** — the connection has no viewpoint, so nothing is relevant to it |
 ///
 /// **An unresolved seat is skipped, not passed through unlocatable.** That is the row that matters for
 /// a seat arriving. The connection's interest is the UNION of its seats', and an unlocatable centre
@@ -4787,24 +7363,42 @@ fn seat_observer(
 /// down one datagram, caused by a body that is not in the world yet. It costs the arriving seat
 /// nothing: every body the connection drives is `always` to it whatever any seat can see.
 ///
-/// **Fail-open is kept, at CONNECTION granularity.** The last row above is what protects a peer whose
-/// only avatar has not spawned, and it is the direction every other unresolved axis takes. An EMPTY
-/// output is the different claim that there is no viewpoint at all, which the filter reads as an empty
-/// set, so no case may leave it empty.
+/// **Fail-open is kept at CONNECTION granularity, and CLOSED is the ONE carve-out from it.** An empty
+/// output is the claim that there is no viewpoint at all, which the filter reads as an empty set and
+/// which therefore withholds every entity. Exactly one case may make that claim, and it is stated as
+/// a conjunction because each half is load-bearing:
+///
+/// * **The connection declared nothing** — a declaration is an answer, and a declared anchor that has
+///   not resolved a centre is a measurement that failed, not an absent viewpoint.
+/// * **AND it drives no rollback row at all** — `mine` is empty. A connection whose seats exist but
+///   have not RESOLVED a centre yet keeps the fail-open above. That is **the joining-player
+///   protection**: a player's body takes ticks to spawn, and closing that window would deny the
+///   player their own avatar for every one of them, which is the failure fail-open exists to prevent.
+///
+/// CLOSED is therefore reachable only by a connection nothing in the session has anything to say
+/// about: no declaration, no body, no seat. `set_unanchored_policy` states what that is for.
 fn seat_observers_into(
     cfg: &AoiConfig,
     mine: &[(SeatId, u32)],
     seen: &[(SeatId, PeerObserver)],
     declaration: PeerDeclaration,
-    seats: &mut Vec<SeatObserver>,
+    out: &mut ResolvedSeats,
 ) {
     let PeerDeclaration {
         anchor,
         membership: declared,
         tracked,
         last,
+        closed_when_unanchored,
     } = declaration;
-    seats.clear();
+    out.observers.clear();
+    out.labels.clear();
+    out.ambiguous = false;
+    out.source = match anchor {
+        PeerAnchor::Inferred => ANCHOR_SOURCE_INFERRED,
+        PeerAnchor::Fixed(_) => ANCHOR_SOURCE_FIXED,
+        PeerAnchor::Entity(_) => ANCHOR_SOURCE_ENTITY,
+    };
     if matches!(anchor, PeerAnchor::Inferred) {
         // One seat per distinct label the connection's own rows declare. `mine` is sorted by seat,
         // so the run check is what deduplicates it — several bodies on one seat are one viewpoint,
@@ -4818,14 +7412,23 @@ fn seat_observers_into(
             let Ok(index) = seen.binary_search_by_key(&seat_id, |&(seat, _)| seat) else {
                 continue;
             };
+            let observed = seen[index].1;
+            out.ambiguous |= observed.ambiguous;
             let (resolved, membership) =
-                resolve_observer(anchor, declared, tracked, last, Some(seen[index].1));
-            seats.push(seat_observer(cfg, resolved, membership));
+                resolve_observer(anchor, declared, tracked, last, Some(observed));
+            out.observers.push(seat_observer(cfg, resolved, membership));
+            out.labels.push(Some(seat_id.seat));
         }
     }
-    if seats.is_empty() {
+    if out.observers.is_empty() {
+        if closed_when_unanchored && matches!(anchor, PeerAnchor::Inferred) && mine.is_empty() {
+            return;
+        }
         let (resolved, membership) = resolve_observer(anchor, declared, tracked, last, None);
-        seats.push(seat_observer(cfg, resolved, membership));
+        out.observers.push(seat_observer(cfg, resolved, membership));
+        // `None`, not seat 0: this one viewpoint answers for every seat on the connection, including
+        // labels the inferred path above never enumerated.
+        out.labels.push(None);
     }
 }
 
@@ -4860,6 +7463,44 @@ fn owned_rows_of(owned: &[(SeatId, u32)], peer_id: i32) -> &[(SeatId, u32)] {
     &owned[start..end]
 }
 
+/// Which seats owe an anchor-conflict warning this tick, and the bookkeeping that makes it **once
+/// per seat per episode**.
+///
+/// A free function so the rule the send loop runs is the rule a test can call:
+/// [`OrbitNet::warn_anchor_conflicts`] is this plus `godot_warn!`, and the warning itself needs the
+/// Godot runtime while the rule needs nothing.
+///
+/// Two steps, and the order matters:
+///
+/// 1. **Prune.** Every seat in `warned` that is no longer reporting a conflict is dropped — it fixed
+///    its configuration, or its bodies left, or the connection did. That is what makes a mistake
+///    reintroduced after a map change reportable a second time.
+/// 2. **Insert.** Every seat conflicting now that was not already in `warned` is added and named in
+///    `owed`. A seat conflicting on consecutive ticks is owed nothing after the first.
+///
+/// `observers` is ascending by seat, which is what makes the prune a binary search rather than a
+/// second set. `owed` is cleared on entry.
+fn anchor_conflicts_owed(
+    warned: &mut std::collections::HashSet<SeatId>,
+    observers: &[(SeatId, PeerObserver)],
+    owed: &mut Vec<SeatId>,
+) {
+    owed.clear();
+    if warned.is_empty() && !observers.iter().any(|(_, o)| o.membership_conflict) {
+        return; // the shape of every correctly configured session, on every tick
+    }
+    warned.retain(|seat| {
+        observers
+            .binary_search_by_key(seat, |&(id, _)| id)
+            .is_ok_and(|index| observers[index].1.membership_conflict)
+    });
+    for &(seat, observer) in observers {
+        if observer.membership_conflict && warned.insert(seat) {
+            owed.push(seat);
+        }
+    }
+}
+
 /// The direction this role SENDS in, and the direction it EXPECTS TO RECEIVE.
 ///
 /// A free function so the one rule that must not be inverted is the rule a test can call. Getting it
@@ -4877,16 +7518,220 @@ fn session_directions(mode: i64) -> Option<(Direction, Direction)> {
     }
 }
 
+/// The key one session's datagrams are authenticated with, from the shared secret and the 16 bytes the
+/// handshake carries.
+///
+/// A free function so that both ends run the same line: the client seats it in [`OrbitNet::start`], the
+/// server in `handle_hello`, and a peer that derived differently from the other refuses every datagram
+/// the other sends. It touches no Godot type, so a test calls it directly.
+///
+/// | `secret` | The key | What the handshake's 16 bytes are |
+/// | --- | --- | --- |
+/// | `None` | those 16 bytes, verbatim | the key |
+/// | `Some` | [`derive_session_key`] of the two | a nonce |
+///
+/// **THE SECRET IS AN INPUT AND IS NEVER SEATED AS THE KEY.** Returning `*secret` here is one character
+/// shorter and re-opens cross-session replay: [`SessionAuth`] starts every session's sequence counter at
+/// 1 and the replay window only ever knows the session in front of it, so under a key that did not change
+/// between joins every datagram captured in one session is a valid, unreplayed datagram in the next. The
+/// per-join nonce is the only thing keeping the key per-join, which is why an all-zero nonce is refused
+/// at the handshake as well.
+///
+/// **It changes who can forge, not how hard forging is.** The tag is still 64 bits and the key still 128,
+/// and a derived key is worth exactly the entropy of the secret it came from. Nothing here encrypts
+/// anything.
+#[must_use]
+fn session_key_from(secret: Option<&[u8; KEY_LEN]>, nonce: [u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    match secret {
+        Some(secret) => derive_session_key(secret, &nonce),
+        None => nonce,
+    }
+}
+
 /// Whether a dropped peer's session should be held open for it to come back to.
 ///
 /// - Not a server: only the authority holds sessions.
 /// - No grace window configured: resume is switched off.
 /// - **No identity**, which covers two different peers. One never sent a token. The other is a GHOST whose
-///   token was taken from it by the returning player's handshake — see `handle_hello` — and its late
-///   disconnect must not re-open a window on an identity somebody is currently playing under.
+///   identity was taken from it by a GRANTED resume — see `handle_hello` — and its late disconnect must not
+///   re-open a window on an identity somebody is currently playing under. A ghost whose resume was REFUSED
+///   keeps its identity, so this answers `true` for it and its own drop opens the real window the refusing
+///   policy was waiting for.
 #[must_use]
 fn hold_on_drop(session_id: u64, grace_ms: u64, server: bool) -> bool {
     server && grace_ms > 0 && session_id != 0
+}
+
+/// The stored `resume_policy`, reduced to a value this build knows.
+///
+/// Total by construction, and an unknown number falls onto `ALWAYS`. That is the opposite direction from
+/// [`clamp_seat_release_policy`], deliberately: there the safe answer is the one that takes nothing away,
+/// here the safe answer is the one that refuses nobody. A stricter policy selected by accident locks honest
+/// players out of their own bodies, and `ALWAYS` is token-gated, so falling onto it forfeits nothing the
+/// token was closing.
+#[must_use]
+fn clamp_resume_policy(policy: i64) -> i64 {
+    match policy {
+        RESUME_ONLY_IF_DROPPED => RESUME_ONLY_IF_DROPPED,
+        RESUME_NEVER => RESUME_NEVER,
+        _ => RESUME_ALWAYS,
+    }
+}
+
+/// What a hello presenting a session identity is seated as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeGrant {
+    /// The claim is granted: take the identity, and report whichever connection held it as `resumed_from`.
+    Resume,
+    /// The claim is refused. The presenter is seated as an ordinary joiner and nothing is taken from
+    /// anybody — no identity is stripped, no held window is spent.
+    Newcomer,
+}
+
+/// Whether a hello quoting `presented_token` may resume the identity it named. A free function so the whole
+/// rule is one thing a test can call with no `SceneTree`.
+///
+/// The order is the rule, and each step is a refusal the next one cannot undo:
+///
+/// | Step | Answer |
+/// | --- | --- |
+/// | `policy` is `NEVER` | `Newcomer` |
+/// | a non-zero `token_on_record` the presented token does not match | `Newcomer` |
+/// | `incumbent_is_live` under any policy but `ALWAYS` | `Newcomer` |
+/// | otherwise | `Resume` |
+///
+/// **THE TOKEN IS THE STEP THAT CLOSES THE REACHABLE HOLE.** Matching on the identity alone let a peer that
+/// merely OBSERVED another's session id — off a roster broadcast, a kill feed, a log line, a screenshot —
+/// take that player's body: the incumbent kept its connection, received no error, and simply stopped
+/// driving its entity. A claim now has to quote a value the server minted and sent only to the client that
+/// owned the identity.
+///
+/// **What it does not close is an on-path observer**, who reads the welcome and can quote the token
+/// verbatim. That is the same boundary the session key already has, and closing it needs a key exchange.
+///
+/// **`token_on_record` of `0` grants on the identity alone**, which is what a server that has minted no
+/// token for that identity yet has. That is a first-time join, and refusing it would refuse everybody.
+///
+/// A policy this build does not know reads as `ALWAYS`; see [`clamp_resume_policy`].
+#[must_use]
+fn resume_grant(
+    policy: i64,
+    presented_token: u64,
+    token_on_record: u64,
+    incumbent_is_live: bool,
+) -> ResumeGrant {
+    let policy = clamp_resume_policy(policy);
+    if policy == RESUME_NEVER {
+        return ResumeGrant::Newcomer;
+    }
+    if token_on_record != 0 && presented_token != token_on_record {
+        return ResumeGrant::Newcomer;
+    }
+    if incumbent_is_live && policy != RESUME_ALWAYS {
+        return ResumeGrant::Newcomer;
+    }
+    ResumeGrant::Resume
+}
+
+/// How one hello is seated: the identity the connection gets, what it resumed, and the two values the
+/// caller needs to issue its resume token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelloSeat {
+    /// The identity to seat this connection under. `hello.session_id` on a granted resume, and `0` when a
+    /// refused claim named an identity somebody else still holds.
+    session_id: u64,
+    /// The transport peer id this connection took over from, or `0`. Reported to the game as `resumed_from`.
+    resumed_from: i32,
+    /// Whether the claim was granted. Decided by [`resume_grant`].
+    grant: ResumeGrant,
+    /// The token the server had on record for the presented identity before this hello, or `0`.
+    token_on_record: u64,
+}
+
+/// Seat one hello: decide the resume, take the identity off a superseded incumbent, and spend the held
+/// window.
+///
+/// **A free function over the two plain tables, and every rule this defect lived in is inside it.** It
+/// touches no Godot type, so a test constructs a `HashMap<i32, PeerState>` and a [`ResumeTable`] and calls
+/// the same code the receive path runs.
+///
+/// The order is load-bearing:
+///
+/// 1. **Find the incumbent and the token on record BEFORE anything mutates.** An `incumbent` is a CONNECTED
+///    peer still claiming the presented identity — usually a GHOST, a connection the transport has not
+///    declared dead yet, which on ENet's defaults takes the better part of a minute. Both the grant and the
+///    claim are made against these two values, and re-deriving either from a table the other has already
+///    changed would answer a different question.
+/// 2. **The held record wins as the source of the token.** It is the drop the server actually saw, and its
+///    copy was taken off the connection that departed. An incumbent's own token answers when nothing is
+///    held, which is the fast-reconnect case.
+/// 3. **The supersede step runs ONLY on a granted resume.** It takes the identity off the incumbent, so
+///    running it under a refusal would leave that incumbent unable to hold its own window when its
+///    disconnect finally lands — [`hold_on_drop`] refuses identity `0` — and the player who was actually
+///    playing would lose the seat to the peer that was just told it could not have it.
+/// 4. **Claiming REMOVES**, so the identity is spent here and a later connection quoting the same token
+///    resumes nothing. A held session wins over a superseded ghost when both somehow exist.
+/// 5. **A refused claim is seated ANONYMOUSLY whenever anything else still holds the identity**, live or
+///    merely held. Two live peers under one identity is the state that makes `peer_session_id` and
+///    `is_session_held` lie, and seating a refused claimant under a HELD identity is worse still: its own
+///    later drop would overwrite the held record, token and all, and take the identity from the player it
+///    belongs to permanently. A refusal with nothing on record keeps the identity — that is a first-time
+///    joiner under `NEVER`, and taking its identity away protects nobody while leaving a game under that
+///    policy with no roster key at all.
+fn seat_hello(
+    peers: &mut HashMap<i32, PeerState>,
+    resume: &mut ResumeTable,
+    policy: i64,
+    sender: i32,
+    session_id: u64,
+    presented_token: u64,
+) -> HelloSeat {
+    let mut incumbent: Option<i32> = None;
+    if session_id != 0 {
+        for (&id, state) in peers.iter() {
+            if id != sender && state.session_id == session_id {
+                incumbent = Some(id);
+            }
+        }
+    }
+    let token_on_record = match resume.token_of(session_id) {
+        0 => incumbent
+            .and_then(|id| peers.get(&id))
+            .map_or(0, |state| state.resume_token),
+        held => held,
+    };
+    let grant = resume_grant(
+        policy,
+        presented_token,
+        token_on_record,
+        incumbent.is_some(),
+    );
+    let identity_is_taken = incumbent.is_some() || resume.holds(session_id);
+    if grant == ResumeGrant::Newcomer {
+        return HelloSeat {
+            session_id: if identity_is_taken { 0 } else { session_id },
+            resumed_from: 0,
+            grant,
+            token_on_record,
+        };
+    }
+    let mut superseded = 0;
+    if session_id != 0 {
+        for (&id, state) in peers.iter_mut() {
+            if id != sender && state.session_id == session_id {
+                state.session_id = 0;
+                superseded = id;
+            }
+        }
+    }
+    HelloSeat {
+        session_id,
+        resumed_from: resume
+            .claim(session_id, presented_token)
+            .unwrap_or(superseded),
+        grant,
+        token_on_record,
+    }
 }
 
 /// The tick a masked delta may reference, or `None` when the sender must send a full row instead.
@@ -4944,22 +7789,216 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
             && current.saturating_sub(last_full) >= interval)
 }
 
+/// The stored `seat_release_policy`, reduced to a value this build knows.
+///
+/// Total by construction: an unknown number is `HOLD`, which is the policy that releases nothing.
+/// A build that gains a fourth policy therefore reads an older project's stored value correctly, and
+/// an older build reads a newer project's as "do nothing" rather than as whichever policy happens to
+/// sit at that number.
+#[must_use]
+fn clamp_seat_release_policy(policy: i64) -> i64 {
+    match policy {
+        SEAT_RELEASE_ON_EXPIRY => SEAT_RELEASE_ON_EXPIRY,
+        SEAT_RELEASE_ON_DROP => SEAT_RELEASE_ON_DROP,
+        _ => SEAT_RELEASE_HOLD,
+    }
+}
+
+/// The core policy the stored `seat_release_policy` selects. Unknown values select `Hold`, the same
+/// way [`clamp_seat_release_policy`] does, so the property and the behaviour cannot disagree.
+#[must_use]
+fn seat_release_policy_of(policy: i64) -> SeatReleasePolicy {
+    match policy {
+        SEAT_RELEASE_ON_EXPIRY => SeatReleasePolicy::OnExpiry,
+        SEAT_RELEASE_ON_DROP => SeatReleasePolicy::OnDrop,
+        _ => SeatReleasePolicy::Hold,
+    }
+}
+
+/// Queue `peer` for a seat release at the next frame boundary, at most once.
+///
+/// **Deduplicated**, because a peer id that drops, is reused by a joiner and drops again inside one
+/// frame would otherwise be walked twice for the same answer. A linear scan is the right shape: the
+/// vector holds the connections that dropped since the last frame, which is empty on almost every
+/// frame and single-digit on the worst one.
+fn queue_seat_release(pending: &mut Vec<i32>, peer: i32) {
+    if !pending.contains(&peer) {
+        pending.push(peer);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_input_blocks, band_for_row, candidate_for_own_row, candidate_for_row, classify_rx,
-        delta_reference, full_block_due, hold_on_drop, owned_rows_into, owned_rows_of,
-        resolve_observer, seat_observer, seat_observers_into, session_directions, AckOutcome,
-        EntityRow, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResumeTable,
-        RxOutcome, SeatId, SeatIndex, StateIntegration, FULL_STATE_INTERVAL, MODE_CLIENT,
-        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RTT_SAMPLE_MAX_MS, RTT_WINDOW, UNLOCATABLE_CENTRE,
+        admit_input_blocks, anchor_conflicts_owed, apply_interest_section, band_for_row,
+        build_interest_section, candidate_for_own_row, candidate_for_row, clamp_resume_policy,
+        clamp_seat_release_policy, clamp_unanchored_policy, classify_rx, delta_reference,
+        encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
+        interest_delta_reserve, is_located, manifest_owed, owned_rows_into, owned_rows_of,
+        queue_seat_release, resim_input_from, resolve_observer, resume_grant,
+        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
+        session_key_from, AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed, OrbitNet,
+        PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
+        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
+        FULL_STATE_INTERVAL, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
+        MAX_FRAME_PAYLOAD, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS,
+        RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS,
+        RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY,
+        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTRE,
     };
+    use orbitnet_core::codec::InterestDeltaSection;
+    use std::collections::HashMap;
+
     use orbitnet_core::interest::{
-        AoiConfig, ConnectionInterest, InterestCandidate, MembershipId, PeerInterest, SeatObserver,
-        SeatScratch, MEMBERSHIP_GLOBAL,
+        AoiConfig, ConnectionInterest, InterestCandidate, InterestDelta, InterestGrid,
+        InterestPath, MembershipId, OccupancyScratch, PathSelector, PeerInterest, SeatObserver,
+        SeatScratch, GRID_MAX_OVERRIDES, MEMBERSHIP_GLOBAL,
     };
     use orbitnet_core::priority::Band;
-    use orbitnet_core::KEY_LEN;
+    use orbitnet_core::seats::releases_seats;
+    use orbitnet_core::{
+        compress_secret, AuthError, ColumnarHistory, Confidence, Direction, FreshnessLedger,
+        PropKind, PropRole, ResimPlanner, ResimRange, SchemaBuilder, SessionAuth, KEY_LEN,
+    };
+
+    use crate::sync::{input_restore_row, integrate_input_row, InputIntegration};
+
+    // ------------------------------------------------------------------
+    // The entity manifest: what a publish owes each peer, and every path that zeroes a generation.
+    // ------------------------------------------------------------------
+
+    /// A rebuild that reproduced the published table publishes NOTHING to a peer that is current,
+    /// which is the saving. The same publish still owes a joiner the whole table, which is the case
+    /// a naive "nothing changed, return early" would strand.
+    #[test]
+    fn a_publish_that_changed_nothing_owes_a_current_peer_nothing_and_a_joiner_the_table() {
+        // Nothing changed: base and current are the same generation, so no delta exists to send.
+        assert_eq!(manifest_owed(7, 7, 7), ManifestOwed::Nothing);
+        assert_eq!(manifest_owed(0, 7, 7), ManifestOwed::Full, "a joiner");
+        assert_eq!(
+            manifest_owed(3, 7, 7),
+            ManifestOwed::Full,
+            "and a straggler"
+        );
+
+        // A session that has published nothing owes a joiner nothing either: generation 0 is the
+        // empty table on both sides, and the client's table starts empty.
+        assert_eq!(manifest_owed(0, 0, 0), ManifestOwed::Nothing);
+    }
+
+    /// A publish that DID change the table: the peers holding the base take the one delta, and
+    /// everybody else takes the whole table addressed to them alone.
+    #[test]
+    fn a_publish_that_changed_the_table_sends_one_delta_and_a_full_to_the_rest() {
+        assert_eq!(manifest_owed(7, 7, 8), ManifestOwed::Delta);
+        assert_eq!(
+            manifest_owed(8, 7, 8),
+            ManifestOwed::Nothing,
+            "already there"
+        );
+        assert_eq!(manifest_owed(0, 7, 8), ManifestOwed::Full, "a joiner");
+        assert_eq!(
+            manifest_owed(6, 7, 8),
+            ManifestOwed::Full,
+            "behind the base"
+        );
+        assert_eq!(manifest_owed(9, 7, 8), ManifestOwed::Full, "ahead of it");
+
+        // A server that coalesced several dirty ticks into one delta still names the base it
+        // diffed against, so the peers holding that base take the delta.
+        assert_eq!(manifest_owed(7, 7, 19), ManifestOwed::Delta);
+        assert_eq!(manifest_owed(18, 7, 19), ManifestOwed::Full);
+    }
+
+    /// The generation cannot be reached, but if it ever saturated the table must degrade to full
+    /// frames rather than wrap onto a number a peer already believes it holds.
+    #[test]
+    fn a_saturated_generation_degrades_to_full_tables() {
+        assert_eq!(u64::MAX.saturating_add(1), u64::MAX);
+        assert_eq!(
+            manifest_owed(u64::MAX, u64::MAX, u64::MAX),
+            ManifestOwed::Nothing
+        );
+        assert_eq!(manifest_owed(3, u64::MAX, u64::MAX), ManifestOwed::Full);
+    }
+
+    /// **Every path that can desynchronize a peer has to zero its generation**, and a reviewer's
+    /// whole job on this change is confirming that. Three paths, and this pins the two a live
+    /// connection takes plus the state the third arrives in.
+    #[test]
+    fn every_break_in_the_manifest_stream_resolves_to_a_full_table() {
+        // A RECONNECT. A dropped peer is removed from `peers`, so the rejoiner is seated on a fresh
+        // `PeerState` — this is the state it starts in, and it is owed the whole table.
+        let fresh = PeerState::default();
+        assert_eq!(fresh.manifest_generation, 0);
+        assert_eq!(
+            manifest_owed(fresh.manifest_generation, 8, 9),
+            ManifestOwed::Full
+        );
+
+        // A REKEY on a live connection, and a WANT_MANIFEST NACK: both run `forget_manifest`, and
+        // both leave the peer owed the whole table on the very next publish — including one that
+        // changed nothing, since `send_manifest_if_dirty` is re-entered for the NACK.
+        let mut held = PeerState {
+            manifest_generation: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            manifest_owed(held.manifest_generation, 8, 9),
+            ManifestOwed::Delta
+        );
+        held.forget_manifest();
+        assert_eq!(held.manifest_generation, 0);
+        assert_eq!(
+            manifest_owed(held.manifest_generation, 8, 9),
+            ManifestOwed::Full
+        );
+        assert_eq!(
+            manifest_owed(held.manifest_generation, 9, 9),
+            ManifestOwed::Full
+        );
+    }
+
+    /// The manifest NACK rides the same flags byte as the delta-base NACK and is independent of it.
+    /// A client that lost both on one tick raises both, and the server reads each on its own.
+    #[test]
+    fn the_two_client_nacks_share_a_byte_and_nothing_else() {
+        let both = FrameHeader::FLAG_WANT_FULL | FrameHeader::FLAG_WANT_MANIFEST;
+
+        let mut peer = PeerState {
+            manifest_generation: 4,
+            ..Default::default()
+        };
+        peer.acked_base.insert(11, 100);
+        if both & FrameHeader::FLAG_WANT_FULL != 0 {
+            peer.note_nack();
+        }
+        if both & FrameHeader::FLAG_WANT_MANIFEST != 0 {
+            peer.forget_manifest();
+        }
+        assert!(
+            peer.want_full,
+            "the delta-base NACK still asks for full rows"
+        );
+        assert!(peer.acked_base.is_empty());
+        assert_eq!(peer.manifest_generation, 0);
+
+        // And a manifest NACK on its own leaves the delta bases alone: they are unrelated failures.
+        let mut manifest_only = PeerState {
+            manifest_generation: 4,
+            ..Default::default()
+        };
+        manifest_only.acked_base.insert(11, 100);
+        if FrameHeader::FLAG_WANT_MANIFEST & FrameHeader::FLAG_WANT_FULL != 0 {
+            manifest_only.note_nack();
+        }
+        manifest_only.forget_manifest();
+        assert!(!manifest_only.want_full);
+        assert_eq!(manifest_only.acked_base.len(), 1);
+        assert_eq!(manifest_only.manifest_generation, 0);
+    }
 
     // ------------------------------------------------------------------
     // Membership: how a gathered row reaches the filter, and where a peer's own world comes from.
@@ -4989,6 +8028,17 @@ mod tests {
 
     fn seat_of(peer: i32, seat: SeatIndex) -> SeatId {
         SeatId { peer, seat }
+    }
+
+    /// One seat's inferred pair, unambiguous: the shape `collect_observers` produces for a seat
+    /// driving exactly one anchored body.
+    fn observed(center: [f32; 3], membership: MembershipId) -> PeerObserver {
+        PeerObserver {
+            center,
+            membership,
+            ambiguous: false,
+            membership_conflict: false,
+        }
     }
 
     /// The case the feature exists for. A channel with no anchor has no distance to be culled by, so
@@ -5090,19 +8140,21 @@ mod tests {
         assert_eq!(located.center, [1.0, 2.0, 3.0]);
     }
 
-    /// The observers `update_interest` would build for one connection, from a row set.
-    fn observers_for(
+    /// Everything `update_interest` resolves for one connection, from a row set: the observers, the
+    /// seat label each belongs to, the source, and whether any seat's anchor was an arbitrary pick.
+    fn resolve_for(
         cfg: &AoiConfig,
         rows: &[EntityRow],
         peer: i32,
         anchor: PeerAnchor,
         declared: MembershipId,
-    ) -> Vec<SeatObserver> {
+        closed_when_unanchored: bool,
+    ) -> ResolvedSeats {
         let mut observers = Vec::new();
         OrbitNet::collect_observers(rows, &mut observers);
         let mut owned = Vec::new();
         owned_rows_into(rows, &mut owned);
-        let mut seats = Vec::new();
+        let mut seats = ResolvedSeats::default();
         seat_observers_into(
             cfg,
             owned_rows_of(&owned, peer),
@@ -5112,10 +8164,23 @@ mod tests {
                 membership: declared,
                 tracked: None,
                 last: None,
+                closed_when_unanchored,
             },
             &mut seats,
         );
         seats
+    }
+
+    /// The observers alone, under the default OPEN policy — the shape every case predating the
+    /// policy asserts against.
+    fn observers_for(
+        cfg: &AoiConfig,
+        rows: &[EntityRow],
+        peer: i32,
+        anchor: PeerAnchor,
+        declared: MembershipId,
+    ) -> Vec<SeatObserver> {
+        resolve_for(cfg, rows, peer, anchor, declared, false).observers
     }
 
     fn radius_cfg(enter_radius: f32) -> AoiConfig {
@@ -5148,8 +8213,8 @@ mod tests {
 
         let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
         let mut connection = ConnectionInterest::new();
-        let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
-        connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut leaves);
+        let (mut scratch, mut delta) = (SeatScratch::default(), InterestDelta::default());
+        connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut delta);
         assert_eq!(
             connection.iter().collect::<Vec<_>>(),
             vec![1, 2, 3],
@@ -5179,15 +8244,15 @@ mod tests {
 
         let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
         let mut connection = ConnectionInterest::new();
-        let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
-        connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut leaves);
+        let (mut scratch, mut delta) = (SeatScratch::default(), InterestDelta::default());
+        connection.update_linear_into(&cfg, &seats, &candidates, &mut scratch, &mut delta);
         assert_eq!(
             connection.iter().collect::<Vec<_>>(),
             vec![1, 2],
             "the far row stays culled while the arriving seat has nowhere to observe from"
         );
         assert!(
-            leaves.is_empty(),
+            delta.leaves.is_empty(),
             "and nothing the connection already held left"
         );
     }
@@ -5262,6 +8327,331 @@ mod tests {
         assert_eq!(seats.len(), 1);
         assert_eq!(seats[0].center, [5.0, 6.0, 7.0]);
         assert_eq!(seats[0].membership, 3, "the declared world, not a body's");
+    }
+
+    // ------------------------------------------------------------------
+    // "Declare nothing, receive nothing": the opt-in CLOSED policy and the carve-out that bounds it.
+    // ------------------------------------------------------------------
+
+    /// THE CASE THE POLICY EXISTS FOR. A connection that declared no anchor and drives no rollback
+    /// row gets no viewpoint at all, and an empty viewpoint set makes nothing relevant.
+    ///
+    /// Under OPEN — today's behaviour and still the default — the same connection is handed one
+    /// unlocatable observer in every world, which makes every candidate uncullable, and `apply_cap`
+    /// keeps every uncullable entry regardless of `aoi_max_entities`. So it receives the whole
+    /// session with the nearest-N cap not bounding it.
+    #[test]
+    fn a_closed_connection_that_drives_nothing_gets_no_viewpoint() {
+        let cfg = radius_cfg(50.0);
+        let rows = [
+            row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row(2, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+
+        // Peer 7 is in the session and drives none of it: a spectator that declared nothing.
+        let open = resolve_for(
+            &cfg,
+            &rows,
+            7,
+            PeerAnchor::Inferred,
+            MEMBERSHIP_GLOBAL,
+            false,
+        );
+        assert_eq!(open.observers.len(), 1, "OPEN still fails open");
+        assert!(open.observers[0].center[0].is_nan());
+
+        let closed = resolve_for(
+            &cfg,
+            &rows,
+            7,
+            PeerAnchor::Inferred,
+            MEMBERSHIP_GLOBAL,
+            true,
+        );
+        assert!(
+            closed.observers.is_empty(),
+            "no viewpoint is the whole mechanism — the filter reads it as an empty set"
+        );
+        assert!(closed.labels.is_empty(), "and it belongs to no seat");
+        assert_eq!(
+            closed.source, ANCHOR_SOURCE_INFERRED,
+            "the inference ran and produced nothing; it is not 'no connection'"
+        );
+
+        // What that means on the wire: the connection's interest is empty, so every row is culled.
+        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        let mut connection = ConnectionInterest::new();
+        let (mut scratch, mut delta) = (SeatScratch::default(), InterestDelta::default());
+        connection.update_linear_into(
+            &cfg,
+            &closed.observers,
+            &candidates,
+            &mut scratch,
+            &mut delta,
+        );
+        assert_eq!(connection.iter().collect::<Vec<_>>(), Vec::<u64>::new());
+    }
+
+    /// **THE CARVE-OUT, AND IT IS THE JOINING-PLAYER PROTECTION.** A connection whose seat exists but
+    /// has not RESOLVED a centre yet keeps the connection-wide fail-open under CLOSED as well.
+    ///
+    /// A player's body takes ticks to spawn and to produce its first state row. Closing that window
+    /// would deny the player their own avatar for every one of those ticks — the exact failure
+    /// fail-open exists to prevent — and it would do it to a player who did nothing but join.
+    #[test]
+    fn a_closed_connection_with_an_unresolved_seat_still_fails_open() {
+        let cfg = radius_cfg(50.0);
+        let rows = [
+            // Seated on 42, no state row yet: the connection drives a row, it just cannot be located.
+            row_seat(1, 42, 0, None, MEMBERSHIP_GLOBAL),
+            row(2, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+        let closed = resolve_for(
+            &cfg,
+            &rows,
+            42,
+            PeerAnchor::Inferred,
+            MEMBERSHIP_GLOBAL,
+            true,
+        );
+        assert_eq!(
+            closed.observers.len(),
+            1,
+            "never empty for a seated connection"
+        );
+        assert!(
+            closed.observers[0].center[0].is_nan(),
+            "and it refuses nothing while the body spawns"
+        );
+        assert_eq!(
+            closed.labels,
+            vec![None],
+            "one viewpoint, for every seat on it"
+        );
+    }
+
+    /// A DECLARATION IS AN ANSWER, so the policy never reaches a connection that made one — including
+    /// one whose declared centre has not resolved. That half is a measurement that failed, and the
+    /// policy is about connections nothing in the session has anything to say about.
+    #[test]
+    fn a_declared_anchor_ignores_the_closed_policy() {
+        let cfg = radius_cfg(50.0);
+        let rows = [row(1, 0, Some([900.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL)];
+
+        let fixed = resolve_for(&cfg, &rows, 7, PeerAnchor::Fixed([1.0, 2.0, 3.0]), 4, true);
+        assert_eq!(fixed.observers.len(), 1);
+        assert_eq!(fixed.observers[0].center, [1.0, 2.0, 3.0]);
+        assert_eq!(fixed.observers[0].membership, 4);
+        assert_eq!(fixed.source, ANCHOR_SOURCE_FIXED);
+
+        // A tracked entity that has never resolved: no centre, so no distance culling — but the peer
+        // stays in the world it was declared into, and it keeps its viewpoint.
+        let tracked = resolve_for(&cfg, &rows, 7, PeerAnchor::Entity(9), 4, true);
+        assert_eq!(
+            tracked.observers.len(),
+            1,
+            "a failed measurement is not an absent declaration"
+        );
+        assert!(tracked.observers[0].center[0].is_nan());
+        assert_eq!(tracked.observers[0].membership, 4);
+    }
+
+    /// The policy value that is in force, and the direction an unknown one falls in. OPEN takes
+    /// nothing away from anybody, so it is the safe answer for a number this build does not know.
+    #[test]
+    fn an_unknown_unanchored_policy_clamps_to_open() {
+        assert_eq!(clamp_unanchored_policy(UNANCHORED_OPEN), UNANCHORED_OPEN);
+        assert_eq!(
+            clamp_unanchored_policy(UNANCHORED_CLOSED),
+            UNANCHORED_CLOSED
+        );
+        for junk in [2i64, 7, -1, i64::MIN, i64::MAX] {
+            assert_eq!(
+                clamp_unanchored_policy(junk),
+                UNANCHORED_OPEN,
+                "policy {junk} is not a policy, and withholding nothing is the safe reading"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Reporting the pick: which seats are ambiguous, and which are misconfigured.
+    // ------------------------------------------------------------------
+
+    /// The lowest-id pick does not move, and it is no longer silent: the row that survived the dedup
+    /// carries the fact that rows were dropped beside it.
+    ///
+    /// Two anchored bodies in the SAME world is the QUIET tier — a game swapping one body for another
+    /// on a seat holds both for the frame the swap takes, so it is reported and not logged.
+    #[test]
+    fn a_seat_with_two_anchored_bodies_is_reported_ambiguous() {
+        let rows = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), 5),
+            row_seat(2, 42, 0, Some([20.0, 0.0, 0.0]), 5),
+            // A second seat with one body: not ambiguous, and unaffected by the first seat's mess.
+            row_seat(3, 42, 1, Some([30.0, 0.0, 0.0]), 5),
+        ];
+        let mut observers = Vec::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+
+        let seats = OrbitNet::observers_of(&observers, 42);
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].1.center, [10.0, 0.0, 0.0], "still the lowest id");
+        assert!(seats[0].1.ambiguous, "and the pick is reported as a pick");
+        assert!(
+            !seats[0].1.membership_conflict,
+            "one world, so nothing is misconfigured and nothing is logged"
+        );
+        assert!(!seats[1].1.ambiguous, "the unambiguous seat is untouched");
+
+        // The connection carries the flag up, because a game asks about a connection.
+        let resolved = resolve_for(
+            &radius_cfg(50.0),
+            &rows,
+            42,
+            PeerAnchor::Inferred,
+            MEMBERSHIP_GLOBAL,
+            false,
+        );
+        assert!(resolved.ambiguous);
+        assert_eq!(resolved.labels, vec![Some(0), Some(1)]);
+    }
+
+    /// The LOUD tier, flagged separately: the dropped rows disagreed about the WORLD.
+    ///
+    /// That is the misconfiguration worth a log line. Inside one world the pick costs a radius
+    /// centred on one of two bodies the same seat drives; across worlds it costs the seat its whole
+    /// membership, and everything only that seat held leaves the connection's interest on any tick
+    /// the pick changes.
+    #[test]
+    fn a_seat_whose_bodies_disagree_about_the_world_is_flagged_separately() {
+        let rows = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), 5),
+            row_seat(2, 42, 0, Some([20.0, 0.0, 0.0]), 6),
+        ];
+        let mut observers = Vec::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+        let seat = OrbitNet::observers_of(&observers, 42)[0].1;
+        assert_eq!(seat.membership, 5, "the lowest-id row still decides");
+        assert!(seat.ambiguous);
+        assert!(
+            seat.membership_conflict,
+            "and the disagreement is its own flag"
+        );
+
+        // A body declaring no world at all disagrees with one that does: MEMBERSHIP_GLOBAL is a
+        // value, and a seat half in every world and half in world 5 has no defined world.
+        let mixed = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+            row_seat(2, 42, 0, Some([20.0, 0.0, 0.0]), 5),
+        ];
+        OrbitNet::collect_observers(&mixed, &mut observers);
+        assert!(
+            OrbitNet::observers_of(&observers, 42)[0]
+                .1
+                .membership_conflict
+        );
+    }
+
+    /// **A seat whose second body has no resolved anchor is NOT ambiguity.** An unanchored row is
+    /// skipped before the dedup ever sees it, so nothing was dropped — the seat has exactly one
+    /// candidate for its centre, and the pick was not a pick.
+    ///
+    /// Warning there would fire on every body a game spawns beside an existing one, in the window
+    /// before that body has a state row.
+    #[test]
+    fn a_seats_unanchored_second_body_is_not_ambiguity() {
+        let rows = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), 5),
+            row_seat(2, 42, 0, None, 6), // no state row yet, and it declares a different world
+        ];
+        let mut observers = Vec::new();
+        OrbitNet::collect_observers(&rows, &mut observers);
+        let seat = OrbitNet::observers_of(&observers, 42)[0].1;
+        assert_eq!(seat.center, [10.0, 0.0, 0.0]);
+        assert_eq!(seat.membership, 5);
+        assert!(
+            !seat.ambiguous,
+            "nothing was dropped, so nothing was picked between"
+        );
+        assert!(
+            !seat.membership_conflict,
+            "and a world nothing could be measured in cannot disagree with one that could"
+        );
+    }
+
+    /// ONCE PER SEAT PER EPISODE. The warning fires on the tick a conflict appears, is silent while
+    /// it persists, and is armed again once the seat stops colliding — so the same mistake after a
+    /// map change is reported rather than swallowed.
+    #[test]
+    fn an_anchor_conflict_warns_once_then_rearms_when_it_clears() {
+        let conflicted = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), 5),
+            row_seat(2, 42, 0, Some([20.0, 0.0, 0.0]), 6),
+        ];
+        let fixed = [
+            row_seat(1, 42, 0, Some([10.0, 0.0, 0.0]), 5),
+            row_seat(2, 42, 0, Some([20.0, 0.0, 0.0]), 5),
+        ];
+
+        let mut warned = std::collections::HashSet::new();
+        let mut observers = Vec::new();
+        let mut owed = Vec::new();
+
+        OrbitNet::collect_observers(&conflicted, &mut observers);
+        anchor_conflicts_owed(&mut warned, &observers, &mut owed);
+        assert_eq!(owed, vec![seat_of(42, 0)], "the tick it appears");
+
+        anchor_conflicts_owed(&mut warned, &observers, &mut owed);
+        assert!(owed.is_empty(), "and silent for every tick it persists");
+
+        // The game declares the same world on both bodies: the seat stops colliding.
+        OrbitNet::collect_observers(&fixed, &mut observers);
+        anchor_conflicts_owed(&mut warned, &observers, &mut owed);
+        assert!(
+            owed.is_empty(),
+            "a seat that stopped colliding is not re-warned"
+        );
+        assert!(
+            warned.is_empty(),
+            "it is dropped from the set, which is what re-arms it"
+        );
+
+        // Reintroduced after a map change. A set that only ever grew would report this to nobody.
+        OrbitNet::collect_observers(&conflicted, &mut observers);
+        anchor_conflicts_owed(&mut warned, &observers, &mut owed);
+        assert_eq!(
+            owed,
+            vec![seat_of(42, 0)],
+            "the second episode is its own report"
+        );
+
+        // A seat whose rows leave the session entirely also stops colliding.
+        observers.clear();
+        anchor_conflicts_owed(&mut warned, &observers, &mut owed);
+        assert!(owed.is_empty());
+        assert!(
+            warned.is_empty(),
+            "a seat with no rows left holds no warning"
+        );
+    }
+
+    /// `is_located` reads the sentinel by the rule the filter reads it by. A NaN is never equal to
+    /// itself, so a diagnostic that compared against `UNLOCATABLE_CENTRE` would report every peer as
+    /// located.
+    #[test]
+    fn an_unlocatable_centre_is_recognised_by_finiteness_not_by_equality() {
+        assert!(!is_located(UNLOCATABLE_CENTRE));
+        assert!(
+            is_located([0.0; 3]),
+            "the origin is a position like any other"
+        );
+        assert!(is_located([1.0, -2.0, 3.0]));
+        assert!(
+            !is_located([1.0, f32::NAN, 3.0]),
+            "one bad component is enough"
+        );
+        assert!(!is_located([f32::INFINITY, 0.0, 0.0]));
     }
 
     // ------------------------------------------------------------------
@@ -5472,6 +8862,344 @@ mod tests {
         assert_eq!(shared, fresh, "the patch was not restored");
     }
 
+    // ------------------------------------------------------------------
+    // The path the session picks, and the equivalence that licenses picking it.
+    // ------------------------------------------------------------------
+
+    /// The config `aoi_config` derives at a given radius. The cell size is a quarter of the radius,
+    /// which is what both tables in `orbitnet_core::interest`'s header were measured at: a query
+    /// rectangle is then 11 cells a side whatever the radius is.
+    fn grid_cfg(radius: f32) -> AoiConfig {
+        AoiConfig {
+            cell_size: (radius / 4.0).max(1.0),
+            enter_radius: radius,
+            exit_factor: AOI_EXIT_FACTOR,
+            max_entities: 0,
+        }
+    }
+
+    /// Everything `update_interest` pools for one connection, so one test tick is one call.
+    ///
+    /// The path is **pinned** rather than selected, which is the whole point: the send loop picks it
+    /// from the session's occupancy, and the two paths have to agree whichever way that lands.
+    #[derive(Default)]
+    struct InterestHarness {
+        grid: InterestGrid,
+        candidates: Vec<InterestCandidate>,
+        owned: Vec<(SeatId, u32)>,
+        overrides: Vec<InterestCandidate>,
+        interest: ConnectionInterest,
+        scratch: SeatScratch,
+        delta: InterestDelta,
+    }
+
+    impl InterestHarness {
+        /// One tick of the pass for one connection, composed the way `update_interest` composes it:
+        /// the shared list rebuilt, the grid rebuilt once when the pinned path reads it, the seats
+        /// resolved, then `filter_connection`.
+        fn tick(&mut self, path: InterestPath, cfg: &AoiConfig, rows: &[EntityRow], peer: i32) {
+            self.candidates.clear();
+            self.candidates.extend(rows.iter().map(candidate_for_row));
+            owned_rows_into(rows, &mut self.owned);
+            if path == InterestPath::Grid {
+                self.grid.rebuild(cfg, &self.candidates);
+            }
+            let seats = resolve_for(
+                cfg,
+                rows,
+                peer,
+                PeerAnchor::Inferred,
+                MEMBERSHIP_GLOBAL,
+                false,
+            );
+            let pass = InterestPass {
+                path,
+                grid: &self.grid,
+                cfg,
+                rows,
+            };
+            filter_connection(
+                &pass,
+                owned_rows_of(&self.owned, peer),
+                &seats.observers,
+                &mut self.candidates,
+                &mut self.overrides,
+                &mut self.interest,
+                &mut self.scratch,
+                &mut self.delta,
+            );
+        }
+
+        /// The union as the send loop reads it: ascending by id, with each member's distance.
+        fn members(&self) -> Vec<(u64, f32)> {
+            self.interest.iter_with_distance().collect()
+        }
+    }
+
+    /// One connection on two seats, over the three shapes the shared candidate list distinguishes:
+    /// rows the connection drives (anchored and not), rows nobody drives, and rows in a world
+    /// neither seat is in.
+    fn mixed_rows() -> Vec<EntityRow> {
+        vec![
+            row_seat(1, 42, 0, Some([0.0; 3]), 5), // seat 0's body: its centre and its world
+            row_seat(2, 42, 1, Some([200.0, 0.0, 0.0]), 6), // seat 1's, 200 m away in world 6
+            row_seat(3, 42, 1, None, 9),           // driven, no anchor, a world of its own
+            row(4, 0, Some([10.0, 0.0, 0.0]), 5),  // near seat 0, in seat 0's world
+            row(5, 0, Some([205.0, 0.0, 0.0]), 6), // near seat 1, in seat 1's world
+            row(6, 0, Some([12.0, 0.0, 0.0]), 7),  // near seat 0, in a world neither is in
+            row(7, 0, None, 4),                    // positionless, in a world neither is in
+            row(8, 0, None, MEMBERSHIP_GLOBAL),    // positionless, every world
+            row(9, 0, Some([2000.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // outside every radius
+            row(10, 0, Some([30.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL), // near seat 0
+        ]
+    }
+
+    /// A world too wide for the flat pass to be the cheap answer: `count` unowned, anchored, global
+    /// bodies spread along X over ±`half_extent`.
+    fn sprawl(count: u64, half_extent: f32) -> Vec<EntityRow> {
+        (0..count)
+            .map(|i| {
+                let t = i as f32 / (count - 1) as f32 * 2.0 - 1.0;
+                row(
+                    i + 1,
+                    0,
+                    Some([t * half_extent, 0.0, 0.0]),
+                    MEMBERSHIP_GLOBAL,
+                )
+            })
+            .collect()
+    }
+
+    /// The same sprawl with the first `owned` rows driven by peer 42 — the overrides a grid tick
+    /// would have to scan per hit.
+    fn owned_sprawl(owned: usize) -> Vec<EntityRow> {
+        let mut rows = sprawl(600, 900.0);
+        for row in rows.iter_mut().take(owned) {
+            row.owner = 42;
+        }
+        rows
+    }
+
+    /// **THE EQUIVALENCE THE AUTOMATIC PATH RESTS ON, at the wiring.** The core suite asserts the
+    /// two paths agree over a randomised walk; this asserts the send loop hands them the same tick,
+    /// which is the half a core test cannot see — the override list and the patched shared list have
+    /// to carry the same facts about the same connection.
+    ///
+    /// Members, per-member distances **and** the ids the leave list clears from the delta
+    /// bookkeeping, row for row. The leave half is the one that costs bandwidth when it is wrong: a
+    /// leave clears `last_sent` and `acked_base`, so a leave one path reports and the other does not
+    /// is a full block for a body that never went anywhere.
+    #[test]
+    fn both_interest_paths_agree_on_members_distances_and_leaves() {
+        let cfg = grid_cfg(50.0);
+        let mut rows = mixed_rows();
+        let mut linear = InterestHarness::default();
+        let mut grid = InterestHarness::default();
+
+        linear.tick(InterestPath::Linear, &cfg, &rows, 42);
+        grid.tick(InterestPath::Grid, &cfg, &rows, 42);
+        assert_eq!(
+            linear.members(),
+            vec![
+                (1, 0.0),    // seat 0's own body: an override, never culled
+                (2, 0.0),    // seat 1's own body, and an override to seat 0 as well
+                (3, 0.0),    // driven with no anchor: an override, so its world is not consulted
+                (4, 100.0),  // 10 m from seat 0, in seat 0's world
+                (5, 25.0),   // 5 m from seat 1, in seat 1's world
+                (8, 0.0),    // positionless and global: always, at every distance
+                (10, 900.0), // 30 m from seat 0
+            ],
+            "the flat pass admitted the wrong set"
+        );
+        assert_eq!(
+            grid.members(),
+            linear.members(),
+            "the index disagreed with the flat pass on members or distances"
+        );
+        assert!(linear.delta.leaves.is_empty() && grid.delta.leaves.is_empty());
+        // The first tick of a fresh connection enters everything it holds — what seeds a joining
+        // peer's mirrored set, and it must come out of both paths identically.
+        assert_eq!(linear.delta.enters, vec![1, 2, 3, 4, 5, 8, 10]);
+        assert_eq!(grid.delta.enters, linear.delta.enters);
+
+        // A body walks out of seat 0's radius. What leaves is what the caller clears its delta
+        // bookkeeping from, so the two paths have to name the same id.
+        rows[9].anchor = Some([900.0, 0.0, 0.0]);
+        linear.tick(InterestPath::Linear, &cfg, &rows, 42);
+        grid.tick(InterestPath::Grid, &cfg, &rows, 42);
+        assert_eq!(
+            linear.delta.leaves,
+            vec![10],
+            "the flat pass reported the wrong leave"
+        );
+        assert_eq!(
+            grid.delta.leaves, linear.delta.leaves,
+            "the index cleared different delta bookkeeping"
+        );
+        assert!(
+            linear.delta.enters.is_empty() && grid.delta.enters.is_empty(),
+            "a body walking out is not a body walking in"
+        );
+        assert_eq!(grid.members(), linear.members());
+
+        // And the shared list is peer-independent again on both: the flat pass restored what it
+        // patched, and the grid path never patched it at all.
+        let fresh: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        assert_eq!(
+            linear.candidates, fresh,
+            "the flat pass did not restore the shared list"
+        );
+        assert_eq!(
+            grid.candidates, fresh,
+            "the grid path patched a list it does not read"
+        );
+    }
+
+    /// **A MID-SESSION PATH SWITCH MUST EMIT NO LEAVES.** The enter radius is a live setting a game
+    /// may change at runtime, and changing it moves the cell size and therefore the verdict, so a
+    /// session can flip path on any tick.
+    ///
+    /// Both paths compute the same members from the same state, so the diff against the same set
+    /// reports nothing. A spurious leave here clears `last_sent` and `acked_base` for every entity
+    /// on that peer, which is a full-state burst for a world that did not move — the exact failure
+    /// the leave list exists to prevent.
+    #[test]
+    fn switching_the_path_mid_session_reports_no_leaves() {
+        let cfg = grid_cfg(50.0);
+        let rows = mixed_rows();
+        let mut peer = InterestHarness::default();
+
+        peer.tick(InterestPath::Linear, &cfg, &rows, 42);
+        let settled = peer.members();
+        assert!(!settled.is_empty(), "nothing to lose is not a test");
+
+        peer.tick(InterestPath::Grid, &cfg, &rows, 42);
+        assert!(
+            peer.delta.is_empty(),
+            "the flip onto the index reported a transition"
+        );
+        assert_eq!(
+            peer.members(),
+            settled,
+            "and it moved a member or a distance"
+        );
+
+        peer.tick(InterestPath::Linear, &cfg, &rows, 42);
+        assert!(peer.delta.is_empty(), "the flip back reported a transition");
+        assert_eq!(peer.members(), settled);
+    }
+
+    /// **The cap and the wire order survive the grid's iteration.** `InterestGrid::query_within`
+    /// walks a `HashMap`, so the order its hits arrive in is unspecified. Two normalisations make
+    /// that unobservable and both have to hold at the wiring: the cap breaks a distance tie by
+    /// ascending id, and `commit` sorts by id before it stores, so the union is a `BTreeMap` either
+    /// way. Five bodies at one distance and a cap of two is the case that can only be answered by
+    /// the tie-break.
+    #[test]
+    fn the_cap_and_the_wire_order_survive_the_grids_iteration() {
+        let cfg = AoiConfig {
+            max_entities: 2,
+            ..grid_cfg(50.0)
+        };
+        let rows = vec![
+            row(1, 42, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
+            row(11, 0, Some([10.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+            row(12, 0, Some([-10.0, 0.0, 0.0]), MEMBERSHIP_GLOBAL),
+            row(13, 0, Some([0.0, 0.0, 10.0]), MEMBERSHIP_GLOBAL),
+            row(14, 0, Some([0.0, 0.0, -10.0]), MEMBERSHIP_GLOBAL),
+            row(15, 0, Some([0.0, 10.0, 0.0]), MEMBERSHIP_GLOBAL),
+        ];
+        let mut linear = InterestHarness::default();
+        let mut grid = InterestHarness::default();
+        linear.tick(InterestPath::Linear, &cfg, &rows, 42);
+        grid.tick(InterestPath::Grid, &cfg, &rows, 42);
+
+        assert_eq!(
+            linear.members(),
+            vec![(1, 0.0), (11, 100.0), (12, 100.0)],
+            "the lowest two ids of the tie, plus the connection's own uncapped row"
+        );
+        assert_eq!(
+            grid.members(),
+            linear.members(),
+            "the index broke the tie by its bucket walk"
+        );
+    }
+
+    /// **RADIUS 0 MUST NEVER SELECT THE GRID**, and the refusal has no hysteresis: a session already
+    /// on the index that drops its radius to zero is off it on the same tick.
+    ///
+    /// A membership-only session still runs the pass — refusing an overlapping world is the only
+    /// culling it asked for — and it has no distance to index at all, so a rebuild would buy it
+    /// nothing. The first half is the same list at a shipped radius, so the refusal is not vacuous.
+    #[test]
+    fn a_session_with_no_radius_never_selects_the_grid() {
+        let rows = sprawl(600, 900.0);
+        let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+        let owned: Vec<(SeatId, u32)> = Vec::new();
+        let mut selector = PathSelector::new();
+        let mut scratch = OccupancyScratch::default();
+
+        assert_eq!(
+            select_interest_path(
+                &mut selector,
+                &grid_cfg(256.0),
+                &candidates,
+                &owned,
+                &[42],
+                &mut scratch
+            ),
+            InterestPath::Grid,
+            "a world 29 cells a side against an 11-cell query rectangle earns the index"
+        );
+        assert_eq!(
+            select_interest_path(
+                &mut selector,
+                &grid_cfg(0.0),
+                &candidates,
+                &owned,
+                &[42],
+                &mut scratch
+            ),
+            InterestPath::Linear,
+            "a membership-only session has no distance to index"
+        );
+    }
+
+    /// **A connection driving many bodies keeps the linear path.** The override list is scanned once
+    /// per grid hit — that is what lets a connection's own rows shadow the shared index — so its
+    /// cost is `overrides × hits` on the path whose whole purpose is to cut the hits. The flat pass
+    /// folds the same rows in for free.
+    ///
+    /// One rebuild serves the whole tick, so the count the selector is given is the largest any
+    /// connection will hand it: one connection over the bound keeps the tick on the flat pass.
+    #[test]
+    fn a_connection_driving_many_bodies_keeps_the_linear_path() {
+        for (owned_rows, expected) in [
+            (GRID_MAX_OVERRIDES, InterestPath::Grid),
+            (GRID_MAX_OVERRIDES + 1, InterestPath::Linear),
+        ] {
+            let rows = owned_sprawl(owned_rows);
+            let candidates: Vec<InterestCandidate> = rows.iter().map(candidate_for_row).collect();
+            let mut owned = Vec::new();
+            owned_rows_into(&rows, &mut owned);
+            let mut selector = PathSelector::new();
+            let mut scratch = OccupancyScratch::default();
+            assert_eq!(
+                select_interest_path(
+                    &mut selector,
+                    &grid_cfg(256.0),
+                    &candidates,
+                    &owned,
+                    &[42],
+                    &mut scratch
+                ),
+                expected,
+                "{owned_rows} overrides on one connection"
+            );
+        }
+    }
+
     /// The seat's own world comes from the same row its interest centre does: the LOWEST-id owned row
     /// on that seat that resolved an anchor. Rows arrive sorted by id, and a seat driving more than
     /// one body must not have either answer decided by `HashMap` iteration order.
@@ -5486,13 +9214,7 @@ mod tests {
             row(4, 43, Some([30.0, 0.0, 0.0]), 8),
             row(5, 0, Some([40.0, 0.0, 0.0]), 9),
         ];
-        let mut observers = vec![(
-            seat_of(999, 9),
-            PeerObserver {
-                center: [7.0; 3],
-                membership: 1,
-            },
-        )];
+        let mut observers = vec![(seat_of(999, 9), observed([7.0; 3], 1))];
         OrbitNet::collect_observers(&rows, &mut observers);
 
         let peer = OrbitNet::observers_of(&observers, 42)[0].1;
@@ -5567,7 +9289,7 @@ mod tests {
     /// delta base.
     fn peer_holding(id: u64) -> PeerState {
         let mut peer = PeerState::default();
-        let (mut scratch, mut leaves) = (SeatScratch::default(), Vec::new());
+        let (mut scratch, mut delta) = (SeatScratch::default(), InterestDelta::default());
         peer.interest.update_linear_into(
             &AoiConfig::default(),
             &[SeatObserver {
@@ -5576,7 +9298,7 @@ mod tests {
             }],
             &[InterestCandidate::anchored(id, [1.0, 0.0, 0.0])],
             &mut scratch,
-            &mut leaves,
+            &mut delta,
         );
         peer.last_sent.insert(id, 400);
         peer.last_full.insert(id, 390);
@@ -5645,6 +9367,441 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // The per-peer relevancy delta: what fills it, what rides, and what retires it.
+    // ------------------------------------------------------------------
+
+    /// A slot table naming every id these tests use, at slot `i` for `ids[i]`, so
+    /// `build_interest_section` can resolve them.
+    fn table_naming(ids: &[u64]) -> SlotTable {
+        table_binding(
+            &ids.iter()
+                .enumerate()
+                .map(|(index, &id)| (index as u16, id))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The same, with the slots named outright — for the manifest-rebuild cases, where an entity has
+    /// to KEEP the slot it had while another releases one.
+    fn table_binding(pairs: &[(u16, u64)]) -> SlotTable {
+        let mut slots = SlotTable::new();
+        for &(slot, id) in pairs {
+            slots.bind(slot, id);
+        }
+        slots
+    }
+
+    /// One frame's worth of section, with the flag decision beside it.
+    fn section_for(
+        slots: &SlotTable,
+        peer: &mut PeerState,
+        current: u64,
+    ) -> (bool, Vec<u16>, Vec<u16>) {
+        let (mut left, mut entered) = (Vec::new(), Vec::new());
+        let carries = build_interest_section(slots, peer, true, current, &mut left, &mut entered);
+        (carries, left, entered)
+    }
+
+    /// A veto is a leave that happens between updates, so it has to be queued where it is declared.
+    /// Exactly one, and only for an entity this connection actually held — vetoing something it was
+    /// never sent announces a departure that never happened.
+    #[test]
+    fn a_veto_queues_exactly_one_leave() {
+        let mut peer = peer_holding(7);
+        peer.set_entity_hidden(7, true);
+        assert_eq!(peer.interest_pending.leaves, vec![7]);
+        assert!(peer.interest_pending.enters.is_empty());
+
+        // A second veto of the same entity queues nothing further: it is no longer in the set.
+        peer.set_entity_hidden(7, true);
+        assert_eq!(peer.interest_pending.leaves, vec![7], "still one leave");
+
+        // And a veto of an entity this peer never held announces nothing at all.
+        let mut stranger = peer_holding(7);
+        stranger.set_entity_hidden(9, true);
+        assert!(
+            stranger.interest_pending.is_empty(),
+            "a veto on a body this connection was never sent is not a departure"
+        );
+    }
+
+    /// Retracting a veto queues NOTHING. The entity re-enters through the enter radius on the next
+    /// update, and that update is what reports it — announcing it at the retraction would name a
+    /// body the filter may still refuse.
+    #[test]
+    fn a_retraction_queues_no_enter_until_the_next_update() {
+        let mut peer = peer_holding(7);
+        peer.set_entity_hidden(7, true);
+        peer.set_entity_hidden(7, false);
+        assert_eq!(peer.interest_pending.leaves, vec![7]);
+        assert!(
+            peer.interest_pending.enters.is_empty(),
+            "the retraction announced an enter the filter had not granted"
+        );
+
+        // The next update is what grants it, and the enter replaces the pending leave rather than
+        // racing it — the receiver applies a net difference, not a history.
+        let (mut scratch, mut delta) = (SeatScratch::default(), InterestDelta::default());
+        peer.interest.update_linear_into(
+            &AoiConfig::default(),
+            &[SeatObserver {
+                center: [0.0; 3],
+                membership: MEMBERSHIP_GLOBAL,
+            }],
+            &[InterestCandidate::anchored(7, [1.0, 0.0, 0.0])],
+            &mut scratch,
+            &mut delta,
+        );
+        assert_eq!(delta.enters, vec![7]);
+        peer.note_interest_enter(7);
+        assert!(peer.interest_pending.leaves.is_empty());
+        assert_eq!(peer.interest_pending.enters, vec![7]);
+    }
+
+    /// A despawn is the other leave no `leaves` list can name: the entity is out of the candidate
+    /// list, so the next update diffs a union it has already been taken out of.
+    #[test]
+    fn a_despawn_queues_a_leave_on_every_peer_holding_it() {
+        let mut holders = [peer_holding(7), peer_holding(7)];
+        let mut stranger = PeerState::default();
+        stranger.last_sent.insert(7, 400);
+
+        for peer in &mut holders {
+            assert!(peer.forget_entity(7), "this connection held it");
+            assert_eq!(peer.interest_pending.leaves, vec![7]);
+            assert!(!peer.interest.contains(7), "and it is out of the set");
+            assert!(!peer.last_sent.contains_key(&7), "with its delta chain");
+        }
+        assert!(
+            !stranger.forget_entity(7),
+            "a connection the entity was never relevant to is told nothing"
+        );
+        assert!(stranger.interest_pending.is_empty());
+        assert!(!stranger.last_sent.contains_key(&7), "cleared either way");
+    }
+
+    /// **CULLING OFF SENDS NOTHING.** The interest pass does not run without a radius or a declared
+    /// membership, so a peer's set describes a tick the session has moved on from. A gate that
+    /// diffed against it would announce a leave for every entity in a session replicating all of
+    /// them to everybody.
+    #[test]
+    fn culling_off_queues_nothing_and_sends_no_section() {
+        let slots = table_naming(&[7]);
+        let mut peer = peer_holding(7);
+        // Something IS pending — from a veto declared before the radius was turned off — so the
+        // test proves the gate rather than an empty queue.
+        peer.set_entity_hidden(7, true);
+        assert_eq!(peer.interest_pending.leaves, vec![7]);
+
+        let (mut left, mut entered) = (Vec::new(), Vec::new());
+        let carries =
+            build_interest_section(&slots, &mut peer, false, 100, &mut left, &mut entered);
+        assert!(!carries, "a session that culls nothing raises no flag");
+        assert!(left.is_empty() && entered.is_empty());
+        assert_eq!(
+            interest_delta_reserve(left.len() + entered.len()),
+            0,
+            "and it takes nothing off the byte budget"
+        );
+        assert!(
+            peer.interest_delta_tick.is_none(),
+            "nothing rode, so nothing is waiting to be acknowledged"
+        );
+    }
+
+    /// The section rides an unreliable datagram, so it is re-sent until the peer's ack reaches the
+    /// tick it FIRST rode on. The stamp does not move on a re-send: what an ack has to reach is the
+    /// frame whose arrival proves the client applied these entries.
+    #[test]
+    fn a_pending_delta_rides_again_until_the_peer_acks_the_tick_it_first_rode_on() {
+        let slots = table_naming(&[7, 8]);
+        let mut peer = peer_holding(7);
+        peer.note_interest_leave(7);
+        peer.note_interest_enter(8);
+
+        let (carries, left, entered) = section_for(&slots, &mut peer, 100);
+        assert!(carries);
+        assert_eq!((left, entered), (vec![0u16], vec![1u16]));
+        peer.interest_delta_tick = Some(100); // what the send path stamps
+
+        // Re-sent verbatim on the next tick, and the stamp holds still.
+        let (carries, left, entered) = section_for(&slots, &mut peer, 101);
+        assert!(carries);
+        assert_eq!((left, entered), (vec![0u16], vec![1u16]));
+        assert_eq!(peer.interest_delta_tick, Some(100));
+
+        // An ack that has not reached the stamp changes nothing.
+        peer.newest_ack = 99;
+        let (carries, _, _) = section_for(&slots, &mut peer, 102);
+        assert!(
+            carries,
+            "an ack for an older frame proves nothing about this"
+        );
+
+        // An ack that reaches it retires the prefix, and there is nothing left to send.
+        peer.newest_ack = 100;
+        let (carries, left, entered) = section_for(&slots, &mut peer, 103);
+        assert!(!carries);
+        assert!(left.is_empty() && entered.is_empty());
+        assert!(peer.interest_pending.is_empty());
+        assert!(peer.interest_seeded, "and the connection counts as seeded");
+    }
+
+    /// The retry bound. Past [`INTEREST_DELTA_RETRY_TICKS`] an ack can no longer confirm the frame
+    /// anyway, so the prefix is dropped unconfirmed rather than reserving budget for ever. What is
+    /// lost is those events; the rest of the pending delta takes the next frame.
+    #[test]
+    fn an_unacked_prefix_is_given_up_on_at_the_retry_bound() {
+        let slots = table_naming(&[7, 8]);
+        let mut peer = peer_holding(7);
+        peer.note_interest_leave(7);
+        let (carries, _, _) = section_for(&slots, &mut peer, 100);
+        assert!(carries);
+        peer.interest_delta_tick = Some(100);
+        // A second event, queued behind the prefix that is already in flight.
+        peer.note_interest_enter(8);
+
+        let (carries, left, entered) =
+            section_for(&slots, &mut peer, 100 + INTEREST_DELTA_RETRY_TICKS - 1);
+        assert!(carries, "still inside the window");
+        assert_eq!((left, entered), (vec![0u16], Vec::new()));
+
+        // At the bound the prefix goes, and the event queued behind it takes the next frame.
+        let (carries, left, entered) =
+            section_for(&slots, &mut peer, 100 + INTEREST_DELTA_RETRY_TICKS);
+        assert!(carries);
+        assert_eq!(left, Vec::<u16>::new(), "the unconfirmed leave was dropped");
+        assert_eq!(entered, vec![1u16], "and the one behind it rides");
+        assert_eq!(peer.interest_pending.leaves, Vec::<u64>::new());
+    }
+
+    /// An id is named in at most ONE half, and the newer transition is the one that survives. That
+    /// is what makes the receiver's "remove each `left`, add each `entered`" apply correct whatever
+    /// order it walks them in, and correct whether or not the intermediate frame landed.
+    #[test]
+    fn the_newer_transition_replaces_the_older_rather_than_racing_it() {
+        let mut peer = PeerState::default();
+        peer.note_interest_enter(7);
+        peer.note_interest_leave(7);
+        assert_eq!(peer.interest_pending.leaves, vec![7]);
+        assert!(peer.interest_pending.enters.is_empty());
+
+        peer.note_interest_enter(7);
+        assert_eq!(peer.interest_pending.enters, vec![7]);
+        assert!(peer.interest_pending.leaves.is_empty());
+    }
+
+    /// A burst larger than one frame — a joining peer, whose first update enters everything it can
+    /// see — is spread over frames rather than eating the byte budget in one. Nothing is dropped.
+    #[test]
+    fn a_burst_larger_than_one_frame_is_spread_over_frames() {
+        let ids: Vec<u64> = (1..=(INTEREST_DELTA_PER_FRAME as u64 + 5)).collect();
+        let slots = table_naming(&ids);
+        let mut peer = PeerState::default();
+        for &id in &ids {
+            peer.note_interest_enter(id);
+        }
+
+        let (carries, left, entered) = section_for(&slots, &mut peer, 100);
+        assert!(carries && left.is_empty());
+        assert_eq!(entered.len(), INTEREST_DELTA_PER_FRAME, "one frame's worth");
+        peer.interest_delta_tick = Some(100);
+
+        peer.newest_ack = 100;
+        let (carries, _, entered) = section_for(&slots, &mut peer, 101);
+        assert!(carries);
+        assert_eq!(entered.len(), 5, "and the remainder on the next frame");
+    }
+
+    /// **A LEAVE WHOSE CAUSE IS AN UNREGISTER NAMES A SLOT THE TABLE HAS RELEASED.** It is retired
+    /// here rather than carried, because the client's own manifest rebuild emits that leave — the
+    /// two produce exactly one event between them, and the mirrored set is what guarantees it.
+    ///
+    /// An ENTER whose slot has not arrived is the opposite case and is HELD: its slot is inside
+    /// another entity's reuse quarantine and lands shortly. The walk stops there, so the prefix
+    /// stays contiguous from the front.
+    #[test]
+    fn an_unnameable_leave_is_retired_and_an_unnameable_enter_is_held() {
+        let slots = table_naming(&[7]); // 9 is not in the table
+        let mut peer = PeerState::default();
+        peer.note_interest_leave(9);
+        peer.note_interest_leave(7);
+        let (carries, left, _) = section_for(&slots, &mut peer, 100);
+        assert!(carries);
+        assert_eq!(left, vec![0u16], "only the one the table can still name");
+        assert_eq!(
+            peer.interest_pending.leaves,
+            vec![7],
+            "and the unnameable one is gone from the queue for good"
+        );
+
+        let mut peer = PeerState::default();
+        peer.note_interest_enter(9);
+        peer.note_interest_enter(7);
+        let (carries, _, entered) = section_for(&slots, &mut peer, 100);
+        assert!(!carries || entered.is_empty());
+        assert_eq!(entered, Vec::<u16>::new(), "the walk stopped at the first");
+        assert_eq!(
+            peer.interest_pending.enters,
+            vec![9, 7],
+            "and both are still queued for the tick the slot lands"
+        );
+    }
+
+    /// **THE SEND-PATH OVERRUN THIS RESERVE EXISTS TO STOP.** The admit loop fills the body to its
+    /// budget, and the section is appended afterwards; without taking the reserve off the budget
+    /// FIRST, a full frame plus a maximal section is a datagram past the path MTU, which fragments,
+    /// and a lost fragment costs the whole frame.
+    #[test]
+    fn a_full_frame_plus_a_maximal_interest_delta_still_fits_the_budget() {
+        let budget = MAX_FRAME_PAYLOAD;
+        let left: Vec<u16> = (0..INTEREST_DELTA_PER_FRAME as u16).collect();
+        let entered: Vec<u16> = (1000..1000 + INTEREST_DELTA_PER_FRAME as u16).collect();
+        let reserve = interest_delta_reserve(left.len() + entered.len());
+        assert_eq!(reserve, 3 + 2 * 2 * INTEREST_DELTA_PER_FRAME);
+
+        // The admit loop spends every byte it is allowed to, and the last block lands exactly on
+        // the line.
+        let mut body = Writer::with_capacity(budget);
+        body.bytes(&vec![0u8; budget - reserve]);
+        assert_eq!(body.len(), budget - reserve);
+        encode_interest_delta(&left, &entered, &mut body);
+        assert!(
+            body.len() <= budget,
+            "a full frame plus its section overran the budget by {}",
+            body.len() - budget
+        );
+
+        // And the reserve is not merely large enough on average: it is exact at every count one
+        // frame can carry.
+        for count in 0..=(2 * INTEREST_DELTA_PER_FRAME) {
+            let slots: Vec<u16> = (0..count as u16).collect();
+            let mut writer = Writer::new();
+            encode_interest_delta(&slots, &[], &mut writer);
+            assert!(
+                writer.len() <= interest_delta_reserve(count.max(1)),
+                "the reserve underestimated a section of {count} slots"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The client half: the mirrored set, and the two things that can shrink it.
+    // ------------------------------------------------------------------
+
+    /// A client's mirrored set and the events it queued, as one thing a test can drive.
+    #[derive(Default)]
+    struct Mirror {
+        held: std::collections::HashSet<u64>,
+        events: Vec<(i32, u64, bool)>,
+    }
+
+    impl Mirror {
+        fn apply(&mut self, slots: &SlotTable, left: &[u16], entered: &[u16]) {
+            let section = InterestDeltaSection {
+                left: left.to_vec(),
+                entered: entered.to_vec(),
+            };
+            apply_interest_section(slots, &mut self.held, &mut self.events, 4, &section);
+        }
+
+        fn rebuild(&mut self, slots: &SlotTable) {
+            retire_unnamed_interest(slots, &mut self.held, &mut self.events, 4);
+        }
+
+        fn take(&mut self) -> Vec<(i32, u64, bool)> {
+            std::mem::take(&mut self.events)
+        }
+    }
+
+    /// A re-sent section announces nothing the second time. That is what makes the server's
+    /// re-send-until-acked free, and it is the whole reason the apply is a set operation.
+    #[test]
+    fn re_applying_an_interest_section_announces_nothing() {
+        let slots = table_naming(&[11, 12]);
+        let mut mirror = Mirror::default();
+
+        mirror.apply(&slots, &[], &[0, 1]);
+        assert_eq!(mirror.take(), vec![(4, 11, true), (4, 12, true)]);
+
+        mirror.apply(&slots, &[], &[0, 1]);
+        assert!(mirror.take().is_empty(), "a repeat is free");
+
+        mirror.apply(&slots, &[0], &[]);
+        assert_eq!(mirror.take(), vec![(4, 11, false)]);
+        mirror.apply(&slots, &[0], &[]);
+        assert!(mirror.take().is_empty(), "and so is a repeated leave");
+    }
+
+    /// **A LEAVE WHOSE CAUSE IS AN UNREGISTER NAMES A SLOT THE TABLE IS ABOUT TO RELEASE.** The
+    /// client resolves against its LIVE table and drops an unbound slot silently — the alternative
+    /// is announcing whatever entity that slot is rebound to next.
+    #[test]
+    fn a_section_naming_an_unbound_slot_is_dropped_silently() {
+        let slots = table_naming(&[11]);
+        let mut mirror = Mirror::default();
+        mirror.apply(&slots, &[], &[0]);
+        mirror.take();
+
+        // Slot 9 is bound to nothing. Neither half acts on it, and neither errors.
+        mirror.apply(&slots, &[9], &[9]);
+        assert!(mirror.take().is_empty());
+        assert_eq!(mirror.held.len(), 1, "and the set is untouched");
+    }
+
+    /// **ONE SIGNAL COVERS BOTH CAUSES**, and an entity culled and unregistered on the same tick
+    /// fires it EXACTLY ONCE — whichever of the two arrives second finds nothing to remove.
+    #[test]
+    fn a_cull_and_an_unregister_on_one_tick_fire_exactly_once() {
+        let bound = table_naming(&[11, 12]);
+        // 11 has unregistered and slot 0 is released; 12 KEEPS the slot it was bound to.
+        let released = table_binding(&[(1, 12)]);
+
+        // The section lands first, then the manifest rebuild that drops the same entity.
+        let mut mirror = Mirror::default();
+        mirror.apply(&bound, &[], &[0, 1]);
+        mirror.take();
+        mirror.apply(&bound, &[0], &[]);
+        mirror.rebuild(&released);
+        assert_eq!(
+            mirror.take(),
+            vec![(4, 11, false)],
+            "the cull announced it; the rebuild found nothing left to announce"
+        );
+
+        // And the other order, which is the one a reliable manifest overtaking an unreliable
+        // snapshot actually produces. The section then names a slot the table has released.
+        let mut mirror = Mirror::default();
+        mirror.apply(&bound, &[], &[0, 1]);
+        mirror.take();
+        mirror.rebuild(&released);
+        mirror.apply(&released, &[0], &[]);
+        assert_eq!(
+            mirror.take(),
+            vec![(4, 11, false)],
+            "the rebuild announced it; the section named a slot nothing binds"
+        );
+    }
+
+    /// A manifest rebuild announces only what LEFT it. An entity still named keeps its place, and an
+    /// entity the mirror never held is not announced as leaving.
+    #[test]
+    fn a_manifest_rebuild_announces_only_what_it_stopped_naming() {
+        let slots = table_naming(&[11, 12, 13]);
+        let mut mirror = Mirror::default();
+        mirror.apply(&slots, &[], &[0, 1]);
+        mirror.take();
+
+        mirror.rebuild(&slots);
+        assert!(mirror.take().is_empty(), "nothing stopped being named");
+
+        // 11 and 13 unregister. Only 11 was in this peer's interest.
+        mirror.rebuild(&table_binding(&[(1, 12)]));
+        assert_eq!(mirror.take(), vec![(4, 11, false)]);
+        assert_eq!(mirror.held.iter().copied().collect::<Vec<_>>(), vec![12]);
+    }
+
+    // ------------------------------------------------------------------
     // A declared observer, and what it overrides.
     // ------------------------------------------------------------------
 
@@ -5652,7 +9809,7 @@ mod tests {
     const THERE: [f32; 3] = [900.0, 0.0, -900.0];
 
     fn body_in(center: [f32; 3], membership: MembershipId) -> Option<PeerObserver> {
-        Some(PeerObserver { center, membership })
+        Some(observed(center, membership))
     }
 
     /// The default, and the whole rule before a peer could declare one: both facts off the body the
@@ -6163,6 +10320,125 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // The BELIEF ceiling: what the server is willing to believe about a link, as distinct from what
+    // it measured. Read `PeerState::rtt_believed_ms` for why the clamp is at the read.
+    // ------------------------------------------------------------------
+
+    /// The shipped ceiling, in the `f32` the peer-state read takes.
+    const CEILING_MS: f32 = RTT_BELIEVED_MAX_MS_DEFAULT as f32;
+
+    #[test]
+    fn a_lagged_but_advancing_ack_is_believed_only_to_the_ceiling() {
+        // The companion to `a_deliberately_lagged_ack_still_inflates_the_estimate`, same 16-tick lag.
+        // That test pins the residual: the inflated figure is measured and stored, because nothing on
+        // the wire can tell this peer from an honest one 267 ms away. This one pins the containment:
+        // what the server BELIEVES about the link is the ceiling, and that is what the rewind reads.
+        let mut peer = peer_with(&[3, 3, 3]);
+        for i in 0..(RTT_WINDOW as u64 * 2) {
+            let ack = i + 10;
+            peer.note_ack(ack, ack + 16, TICK_MS); // full-rate advance, constant 16-tick lag
+        }
+        let raw = peer.rtt_ms().unwrap();
+        assert!(
+            (raw - 16.0 * TICK_MS as f32).abs() < 0.1,
+            "the raw estimate still reports the inflated figure: {raw} ms"
+        );
+        assert!(
+            raw > CEILING_MS,
+            "16 ticks at 60 Hz is 267 ms, which must be above the ceiling or this proves nothing"
+        );
+        assert_eq!(
+            peer.rtt_believed_ms(CEILING_MS),
+            Some(CEILING_MS),
+            "the believed figure is the ceiling, not the claim"
+        );
+    }
+
+    #[test]
+    fn an_honest_link_under_the_ceiling_is_untouched() {
+        // The ceiling binds AT the ceiling and nowhere below it. A peer measured at 50 ms is believed
+        // at 50 ms, and a peer measured at exactly the ceiling is believed in full -- the cap is a
+        // minimum against the ceiling, not a rounding of everything toward it.
+        let peer = peer_with(&[3, 3, 3]);
+        assert!((peer.rtt_ms().unwrap() - 3.0 * TICK_MS as f32).abs() < 0.1);
+        assert_eq!(
+            peer.rtt_believed_ms(CEILING_MS),
+            peer.rtt_ms(),
+            "an honest link reads exactly as measured"
+        );
+        let at_ceiling = peer_with(&[15]); // 15 ticks at 60 Hz is 250 ms, the ceiling itself
+        assert_eq!(at_ceiling.rtt_believed_ms(CEILING_MS), at_ceiling.rtt_ms());
+    }
+
+    #[test]
+    fn the_raw_estimate_survives_the_ceiling_for_diagnostics() {
+        // Clamping the STORED sample would make every peer above the ceiling report the same figure,
+        // and a scoreboard ping would tell each of them the same lie. The window keeps what it
+        // measured, so the two reads answer differently at the same instant, from the same peer.
+        let peer = peer_with(&[60]); // 1000 ms
+        let raw = peer.rtt_ms().unwrap();
+        assert!(
+            (raw - 60.0 * TICK_MS as f32).abs() < 0.1,
+            "the raw read is the honest number a diagnostic wants: {raw} ms"
+        );
+        assert_eq!(peer.rtt_believed_ms(CEILING_MS), Some(CEILING_MS));
+        assert!(
+            raw > peer.rtt_believed_ms(CEILING_MS).unwrap(),
+            "the two reads disagree, which is the whole point of keeping both"
+        );
+    }
+
+    #[test]
+    fn a_peer_with_no_estimate_answers_neither() {
+        // "No sample yet" is a different state from "a perfect link", and the ceiling must not turn
+        // one into the other: a caller reading 0.0 for a fresh joiner would hand it the shallowest
+        // rewind in the session at the moment its link is least settled.
+        let peer = PeerState::default();
+        assert_eq!(peer.rtt_ms(), None);
+        assert_eq!(peer.rtt_believed_ms(CEILING_MS), None);
+        assert_eq!(
+            peer.rtt_believed_ms(0.0),
+            None,
+            "a ceiling of zero still answers 'no estimate' rather than 0 ms"
+        );
+    }
+
+    #[test]
+    fn the_ceiling_gauge_counts_only_peers_above_it() {
+        // The gauge is a count of peers the ceiling is CURRENTLY BINDING ON, so every other state has
+        // to be excluded by construction: at the ceiling is believed in full, no sample is no
+        // measurement, and an unsynced peer is not in the session the `peers` figure counts.
+        let synced = |mut p: PeerState| -> PeerState {
+            p.synced = true;
+            p
+        };
+        let peers = [
+            synced(peer_with(&[60])),     // 1000 ms -- above
+            synced(peer_with(&[30])),     // 500 ms  -- above
+            synced(peer_with(&[15])),     // 250 ms  -- exactly at the ceiling, believed in full
+            synced(peer_with(&[3])),      // 50 ms   -- below
+            synced(PeerState::default()), // no sample at all
+            peer_with(&[60]),             // above, but never handshook
+        ];
+        assert_eq!(rtt_at_ceiling_peers(peers.iter(), CEILING_MS), 2);
+        assert_eq!(
+            rtt_at_ceiling_peers(peers.iter(), RTT_SAMPLE_MAX_MS),
+            0,
+            "a ceiling nothing can reach binds on nobody"
+        );
+        assert_eq!(
+            rtt_at_ceiling_peers(peers.iter(), 0.0),
+            4,
+            "and a ceiling of zero binds on every synced peer that has a sample at all"
+        );
+        assert_eq!(
+            rtt_at_ceiling_peers(std::iter::empty::<&PeerState>(), CEILING_MS),
+            0,
+            "an empty session reports 0 rather than dividing by anything"
+        );
+    }
+
     // A peer holding a server-minted secret, as one does from its handshake onward.
     fn peer_with_salt(salt: u8) -> PeerState {
         PeerState {
@@ -6312,12 +10588,16 @@ mod tests {
     // Resume: which dropped sessions a rejoiner may claim, and for how long.
     // ------------------------------------------------------------------
 
+    /// The resume token a held record was minted with. Every claim in this section quotes it, because a
+    /// claim that does not is refused before any of the rules under test are reached.
+    const HELD_TOKEN: u64 = 0x5ec0_ffee_1234_5678;
+
     #[test]
     fn a_rejoiner_claims_the_session_it_dropped_and_learns_its_old_peer_id() {
         let mut table = ResumeTable::default();
-        assert!(table.hold(0xabcd, 7, 1_000));
+        assert!(table.hold(0xabcd, 7, 1_000, HELD_TOKEN));
         assert!(table.holds(0xabcd));
-        assert_eq!(table.claim(0xabcd), Some(7));
+        assert_eq!(table.claim(0xabcd, HELD_TOKEN), Some(7));
         assert!(!table.holds(0xabcd), "claiming spends the session");
     }
 
@@ -6326,9 +10606,10 @@ mod tests {
     #[test]
     fn identity_zero_is_never_held_and_never_claimed() {
         let mut table = ResumeTable::default();
-        assert!(!table.hold(0, 7, 1_000));
+        assert!(!table.hold(0, 7, 1_000, HELD_TOKEN));
         assert!(!table.holds(0));
-        assert_eq!(table.claim(0), None);
+        assert_eq!(table.claim(0, HELD_TOKEN), None);
+        assert_eq!(table.claim(0, 0), None, "nor with no token at all");
     }
 
     /// Resuming is once. A second connection carrying a token the first already spent is a newcomer, or
@@ -6336,17 +10617,61 @@ mod tests {
     #[test]
     fn a_second_claimant_of_one_token_is_a_newcomer() {
         let mut table = ResumeTable::default();
-        table.hold(9, 3, 1_000);
-        assert_eq!(table.claim(9), Some(3));
-        assert_eq!(table.claim(9), None);
+        table.hold(9, 3, 1_000, HELD_TOKEN);
+        assert_eq!(table.claim(9, HELD_TOKEN), Some(3));
+        assert_eq!(table.claim(9, HELD_TOKEN), None);
     }
 
     #[test]
     fn an_unheld_token_is_a_newcomer() {
         let mut table = ResumeTable::default();
-        table.hold(1, 4, 1_000);
-        assert_eq!(table.claim(2), None);
+        table.hold(1, 4, 1_000, HELD_TOKEN);
+        assert_eq!(table.claim(2, HELD_TOKEN), None);
         assert!(table.holds(1), "and the held session is untouched");
+    }
+
+    /// **A WRONG QUOTE MUST NOT SPEND SOMEBODY ELSE'S WINDOW.** Refusing the claim closes the takeover;
+    /// refusing it and consuming the record would turn one forged hello into a denial of service — the real
+    /// player comes back inside the grace window and finds nothing to resume — which is worse than the
+    /// takeover the token exists to refuse.
+    #[test]
+    fn a_mismatched_claim_is_refused_and_leaves_the_held_session_in_place() {
+        let mut table = ResumeTable::default();
+        table.hold(0xabcd, 7, 1_000, HELD_TOKEN);
+        assert_eq!(
+            table.claim(0xabcd, HELD_TOKEN ^ 1),
+            None,
+            "one bit is wrong"
+        );
+        assert_eq!(table.claim(0xabcd, 0), None, "and quoting nothing is wrong");
+        assert!(table.holds(0xabcd), "the window is still open");
+        assert_eq!(
+            table.claim(0xabcd, HELD_TOKEN),
+            Some(7),
+            "and the player it belongs to still resumes"
+        );
+    }
+
+    /// A record minted with no token grants on the identity alone. It is what a session held for a
+    /// connection this server issued no token to looks like, and refusing it would refuse a resume nobody
+    /// could ever satisfy.
+    #[test]
+    fn a_record_with_no_token_accepts_any_quote() {
+        let mut table = ResumeTable::default();
+        table.hold(4, 6, 1_000, 0);
+        assert_eq!(table.token_of(4), 0);
+        assert_eq!(table.claim(4, 0xdead_beef), Some(6));
+    }
+
+    /// The token on record is what `handle_hello` reads to decide the grant, so it has to answer for a held
+    /// session and answer `0` — rather than some other session's token — for anything else.
+    #[test]
+    fn the_token_on_record_is_readable_and_zero_for_an_unheld_identity() {
+        let mut table = ResumeTable::default();
+        table.hold(11, 2, 1_000, HELD_TOKEN);
+        assert_eq!(table.token_of(11), HELD_TOKEN);
+        assert_eq!(table.token_of(12), 0, "an identity nothing is held for");
+        assert_eq!(table.token_of(0), 0, "and identity zero is never held");
     }
 
     /// The window is inclusive at its deadline, and a session past it is gone from the table as well as
@@ -6354,7 +10679,7 @@ mod tests {
     #[test]
     fn a_session_expires_at_its_deadline_and_is_reported_once() {
         let mut table = ResumeTable::default();
-        table.hold(5, 2, 1_000);
+        table.hold(5, 2, 1_000, HELD_TOKEN);
         assert!(table.expire(999).is_empty(), "not due yet");
         assert_eq!(table.expire(1_000), vec![(5, 2)]);
         assert!(table.expire(2_000).is_empty(), "and not reported again");
@@ -6366,18 +10691,20 @@ mod tests {
     #[test]
     fn several_expiries_are_reported_in_a_stable_order() {
         let mut table = ResumeTable::default();
-        table.hold(30, 3, 100);
-        table.hold(10, 1, 100);
-        table.hold(20, 2, 100);
+        table.hold(30, 3, 100, HELD_TOKEN);
+        table.hold(10, 1, 100, HELD_TOKEN);
+        table.hold(20, 2, 100, HELD_TOKEN);
         assert_eq!(table.expire(100), vec![(10, 1), (20, 2), (30, 3)]);
     }
 
-    /// A player who drops, rejoins, and drops again gets a window measured from the SECOND drop.
+    /// A player who drops, rejoins, and drops again gets a window measured from the SECOND drop, and the
+    /// token that comes with it is the one the second connection was holding.
     #[test]
     fn re_holding_a_session_restarts_its_window() {
         let mut table = ResumeTable::default();
-        table.hold(8, 2, 1_000);
-        table.hold(8, 5, 4_000);
+        table.hold(8, 2, 1_000, HELD_TOKEN);
+        table.hold(8, 5, 4_000, HELD_TOKEN ^ 0xff);
+        assert_eq!(table.token_of(8), HELD_TOKEN ^ 0xff, "the newer token");
         assert!(table.expire(1_000).is_empty(), "the first deadline is gone");
         assert_eq!(
             table.expire(4_000),
@@ -6394,19 +10721,277 @@ mod tests {
         );
         assert!(!hold_on_drop(0xabcd, 30_000, false), "not a server");
         assert!(!hold_on_drop(0xabcd, 0, true), "resume switched off");
-        // Also the GHOST case: a stale connection whose token was taken by the returning player's
-        // handshake carries identity 0 by the time its disconnect lands, so it re-opens no window.
+        // Also the GHOST case: a stale connection whose identity was taken by a GRANTED resume carries
+        // identity 0 by the time its disconnect lands, so it re-opens no window. A ghost whose resume was
+        // REFUSED keeps its identity, and its own drop opens the real window.
         assert!(!hold_on_drop(0, 30_000, true), "no identity");
     }
 
     #[test]
     fn teardown_forgets_every_held_session() {
         let mut table = ResumeTable::default();
-        table.hold(1, 1, 1_000);
-        table.hold(2, 2, 1_000);
+        table.hold(1, 1, 1_000, HELD_TOKEN);
+        table.hold(2, 2, 1_000, HELD_TOKEN);
         table.clear();
         assert!(table.expire(u64::MAX).is_empty());
         assert!(!table.holds(1));
+    }
+
+    // ------------------------------------------------------------------
+    // The resume decision: which claims on an identity a server grants, and what a refusal leaves behind.
+    // ------------------------------------------------------------------
+
+    /// An unknown policy number falls onto ALWAYS, which is the OPPOSITE direction from the seat-release
+    /// clamp and deliberately so: there the safe answer takes nothing away, here the safe answer refuses
+    /// nobody. ALWAYS is token-gated, so falling onto it forfeits nothing the token was closing, while
+    /// falling onto a stricter policy would lock honest players out of their own bodies.
+    #[test]
+    fn an_unknown_resume_policy_number_reads_back_as_always() {
+        assert_eq!(RESUME_ALWAYS, 0, "and the default is the unset value");
+        assert_eq!(clamp_resume_policy(3), RESUME_ALWAYS);
+        assert_eq!(clamp_resume_policy(-1), RESUME_ALWAYS);
+        assert_eq!(clamp_resume_policy(i64::MAX), RESUME_ALWAYS);
+        assert_eq!(clamp_resume_policy(RESUME_ALWAYS), RESUME_ALWAYS);
+        assert_eq!(
+            clamp_resume_policy(RESUME_ONLY_IF_DROPPED),
+            RESUME_ONLY_IF_DROPPED
+        );
+        assert_eq!(clamp_resume_policy(RESUME_NEVER), RESUME_NEVER);
+    }
+
+    /// The whole grant matrix, written out rather than derived, because it is the rule the facade doc and
+    /// `docs/protocol.md` both paraphrase.
+    #[test]
+    fn the_resume_grant_matrix_is_what_the_documentation_says() {
+        const TOKEN: u64 = 0x1234_5678_9abc_def0;
+        // (policy, presented, on record, incumbent is live, granted)
+        let table = [
+            // Nothing on record: a first-time join, granted under everything but NEVER.
+            (RESUME_ALWAYS, 0, 0, false, true),
+            (RESUME_ONLY_IF_DROPPED, 0, 0, false, true),
+            (RESUME_NEVER, 0, 0, false, false),
+            // A dropped incumbent, token quoted correctly: the case resume exists for.
+            (RESUME_ALWAYS, TOKEN, TOKEN, false, true),
+            (RESUME_ONLY_IF_DROPPED, TOKEN, TOKEN, false, true),
+            (RESUME_NEVER, TOKEN, TOKEN, false, false),
+            // A LIVE incumbent, token quoted correctly: the fast reconnect ALWAYS exists for, and the
+            // one case ONLY_IF_DROPPED refuses.
+            (RESUME_ALWAYS, TOKEN, TOKEN, true, true),
+            (RESUME_ONLY_IF_DROPPED, TOKEN, TOKEN, true, false),
+            (RESUME_NEVER, TOKEN, TOKEN, true, false),
+            // The observer: it has the identity and not the token. Refused under every policy, which is
+            // the whole point of the token.
+            (RESUME_ALWAYS, 0, TOKEN, false, false),
+            (RESUME_ALWAYS, TOKEN ^ 1, TOKEN, false, false),
+            (RESUME_ALWAYS, TOKEN ^ 1, TOKEN, true, false),
+            (RESUME_ONLY_IF_DROPPED, TOKEN ^ 1, TOKEN, false, false),
+            (RESUME_NEVER, TOKEN ^ 1, TOKEN, false, false),
+            // A quoted token against a record that has none grants on the identity alone.
+            (RESUME_ALWAYS, TOKEN, 0, false, true),
+            (RESUME_ALWAYS, TOKEN, 0, true, true),
+            (RESUME_ONLY_IF_DROPPED, TOKEN, 0, true, false),
+            // A policy number this build does not know behaves as ALWAYS.
+            (7, TOKEN, TOKEN, true, true),
+            (7, TOKEN ^ 1, TOKEN, false, false),
+        ];
+        for (policy, presented, on_record, live, granted) in table {
+            let want = if granted {
+                ResumeGrant::Resume
+            } else {
+                ResumeGrant::Newcomer
+            };
+            assert_eq!(
+                resume_grant(policy, presented, on_record, live),
+                want,
+                "policy {policy}, presented {presented:#x}, on record {on_record:#x}, live {live}"
+            );
+        }
+    }
+
+    /// A connected peer holding the identity, as the ghost of a client that relaunched.
+    fn incumbent(session_id: u64, token: u64) -> PeerState {
+        PeerState {
+            synced: true,
+            session_id,
+            resume_token: token,
+            ..Default::default()
+        }
+    }
+
+    /// **THE DEFECT, PINNED.** A peer that merely observed another's session id quotes it with no token and
+    /// takes nothing: the incumbent keeps its identity, and the observer is seated anonymously rather than
+    /// under a name that belongs to somebody else.
+    #[test]
+    fn an_observer_quoting_an_identity_without_its_token_takes_nothing() {
+        const ID: u64 = 0xabcd;
+        const TOKEN: u64 = 0x5ec0_ffee_0000_0001;
+        let mut peers = HashMap::new();
+        peers.insert(7, incumbent(ID, TOKEN));
+        let mut resume = ResumeTable::default();
+
+        let seat = seat_hello(&mut peers, &mut resume, RESUME_ALWAYS, 9, ID, 0);
+        assert_eq!(seat.grant, ResumeGrant::Newcomer);
+        assert_eq!(seat.resumed_from, 0, "nothing was taken over");
+        assert_eq!(seat.session_id, 0, "and the claimant is anonymous");
+        assert_eq!(
+            peers[&7].session_id, ID,
+            "the player who was playing keeps its identity"
+        );
+        assert_eq!(peers[&7].resume_token, TOKEN, "and its token");
+    }
+
+    /// The case ALWAYS exists for, and it still works: the returning player quotes the token it was issued
+    /// and takes its own body back from the ghost, before the transport has noticed the old socket is gone.
+    #[test]
+    fn the_player_holding_the_token_resumes_past_a_live_ghost() {
+        const ID: u64 = 0xabcd;
+        const TOKEN: u64 = 0x5ec0_ffee_0000_0002;
+        let mut peers = HashMap::new();
+        peers.insert(7, incumbent(ID, TOKEN));
+        let mut resume = ResumeTable::default();
+
+        let seat = seat_hello(&mut peers, &mut resume, RESUME_ALWAYS, 9, ID, TOKEN);
+        assert_eq!(seat.grant, ResumeGrant::Resume);
+        assert_eq!(
+            seat.resumed_from, 7,
+            "and the game is told which connection"
+        );
+        assert_eq!(seat.session_id, ID);
+        assert_eq!(seat.token_on_record, TOKEN, "carried onto the new seat");
+        assert_eq!(
+            peers[&7].session_id, 0,
+            "the ghost's identity is taken, so its late disconnect opens no window"
+        );
+    }
+
+    /// **UNDER `ONLY_IF_DROPPED` THE SUPERSEDE STEP MUST NOT RUN.** The incumbent keeps its identity, so
+    /// its own disconnect still opens a real window; running it backwards would leave the ghost holding
+    /// identity `0`, `hold_on_drop` would refuse to hold anything for it, and the player would lose the
+    /// session to a peer that was just told it could not have it.
+    #[test]
+    fn a_refused_resume_leaves_the_incumbents_identity_alone() {
+        const ID: u64 = 0xabcd;
+        const TOKEN: u64 = 0x5ec0_ffee_0000_0003;
+        let mut peers = HashMap::new();
+        peers.insert(7, incumbent(ID, TOKEN));
+        let mut resume = ResumeTable::default();
+
+        // The honest player, with the right token, refused only because the incumbent is still connected.
+        let seat = seat_hello(
+            &mut peers,
+            &mut resume,
+            RESUME_ONLY_IF_DROPPED,
+            9,
+            ID,
+            TOKEN,
+        );
+        assert_eq!(seat.grant, ResumeGrant::Newcomer);
+        assert_eq!(seat.session_id, 0, "seated as an anonymous newcomer");
+        assert_eq!(seat.resumed_from, 0);
+        assert_eq!(peers[&7].session_id, ID, "the incumbent keeps its identity");
+        assert!(
+            hold_on_drop(peers[&7].session_id, 30_000, true),
+            "so its own drop still opens a window the player can come back to"
+        );
+    }
+
+    /// The other half of the `ONLY_IF_DROPPED` story: once the drop the policy was waiting for lands, the
+    /// same claim is granted.
+    #[test]
+    fn only_if_dropped_grants_the_claim_once_the_incumbent_has_gone() {
+        const ID: u64 = 0xabcd;
+        const TOKEN: u64 = 0x5ec0_ffee_0000_0004;
+        let mut peers: HashMap<i32, PeerState> = HashMap::new();
+        let mut resume = ResumeTable::default();
+        resume.hold(ID, 7, 1_000, TOKEN);
+
+        let seat = seat_hello(
+            &mut peers,
+            &mut resume,
+            RESUME_ONLY_IF_DROPPED,
+            9,
+            ID,
+            TOKEN,
+        );
+        assert_eq!(seat.grant, ResumeGrant::Resume);
+        assert_eq!(seat.resumed_from, 7);
+        assert_eq!(seat.session_id, ID);
+        assert!(!resume.holds(ID), "and the window is spent");
+    }
+
+    /// A refused claim on a HELD identity must not be seated under it either. Its own later drop would
+    /// re-hold the record with the wrong token, which takes the identity from the player it belongs to for
+    /// good — a worse outcome than the takeover being refused here.
+    #[test]
+    fn a_refused_claim_on_a_held_identity_is_seated_anonymously() {
+        const ID: u64 = 0xabcd;
+        const TOKEN: u64 = 0x5ec0_ffee_0000_0005;
+        let mut peers: HashMap<i32, PeerState> = HashMap::new();
+        let mut resume = ResumeTable::default();
+        resume.hold(ID, 7, 1_000, TOKEN);
+
+        let seat = seat_hello(&mut peers, &mut resume, RESUME_ALWAYS, 9, ID, TOKEN ^ 1);
+        assert_eq!(seat.grant, ResumeGrant::Newcomer);
+        assert_eq!(seat.session_id, 0);
+        assert!(
+            resume.holds(ID),
+            "and the wrong quote spent nobody else's window"
+        );
+    }
+
+    /// A refusal with NOTHING on record keeps the identity. That is a first-time joiner under NEVER: no
+    /// resume is granted, but taking its identity away would leave a game under that policy with no roster
+    /// key at all while protecting nobody.
+    #[test]
+    fn a_first_time_joiner_under_never_still_carries_its_identity() {
+        const ID: u64 = 0xabcd;
+        let mut peers: HashMap<i32, PeerState> = HashMap::new();
+        let mut resume = ResumeTable::default();
+
+        let seat = seat_hello(&mut peers, &mut resume, RESUME_NEVER, 9, ID, 0);
+        assert_eq!(seat.grant, ResumeGrant::Newcomer, "nothing was resumed");
+        assert_eq!(seat.session_id, ID, "but the identity is seated");
+        assert_eq!(seat.resumed_from, 0);
+    }
+
+    /// A hello is RETRIED until the welcome lands, so the same identity re-enters for the connection that
+    /// already holds it. The sender is excluded from the incumbent scan, so a retry does not supersede
+    /// itself, does not report a resume it already reported, and leaves the seat where it was.
+    #[test]
+    fn a_retried_hello_does_not_supersede_the_connection_that_sent_it() {
+        const ID: u64 = 0xabcd;
+        const TOKEN: u64 = 0x5ec0_ffee_0000_0006;
+        let mut peers = HashMap::new();
+        peers.insert(9, incumbent(ID, TOKEN));
+        let mut resume = ResumeTable::default();
+
+        let seat = seat_hello(&mut peers, &mut resume, RESUME_ALWAYS, 9, ID, TOKEN);
+        assert_eq!(seat.grant, ResumeGrant::Resume);
+        assert_eq!(seat.resumed_from, 0, "it took over from nobody");
+        assert_eq!(seat.session_id, ID);
+        assert_eq!(peers[&9].session_id, ID, "and kept its own identity");
+    }
+
+    /// A peer that claims no identity resumes nothing, whatever it quotes. `0` is what an anonymous joiner
+    /// sends, and a token cannot conjure an identity out of it.
+    #[test]
+    fn an_anonymous_hello_is_seated_anonymously_whatever_it_quotes() {
+        let mut peers = HashMap::new();
+        peers.insert(7, incumbent(0xabcd, 0x5ec0_ffee_0000_0007));
+        let mut resume = ResumeTable::default();
+
+        let seat = seat_hello(
+            &mut peers,
+            &mut resume,
+            RESUME_ALWAYS,
+            9,
+            0,
+            0x5ec0_ffee_0000_0007,
+        );
+        assert_eq!(seat.session_id, 0);
+        assert_eq!(seat.resumed_from, 0);
+        assert_eq!(seat.token_on_record, 0);
+        assert_eq!(peers[&7].session_id, 0xabcd, "and nobody was superseded");
     }
 
     #[test]
@@ -6424,5 +11009,459 @@ mod tests {
             session_directions(MODE_SERVER)
         );
         assert_eq!(session_directions(MODE_OFFLINE), None);
+    }
+
+    // ------------------------------------------------------------------
+    // The session secret: which key a session actually seals with.
+    //
+    // The draw itself needs Godot's `Crypto` and is not reachable here. Everything DOWNSTREAM of the
+    // draw is: `session_key_from` is the whole of what a secret changes, and both ends call it.
+    // ------------------------------------------------------------------
+
+    /// A nonce as `mint_session_key` would hand one over, without the Godot RNG.
+    fn nonce_bytes(seed: u8) -> [u8; KEY_LEN] {
+        let mut out = [0u8; KEY_LEN];
+        for (index, byte) in out.iter_mut().enumerate() {
+            *byte = seed.wrapping_mul(31).wrapping_add(index as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn two_sessions_under_one_secret_derive_different_keys() {
+        // THE CROSS-SESSION REPLAY PROPERTY, and the reason the secret is a derivation input rather
+        // than the key. `SessionAuth` restarts its sequence counter at 1 on every join and the replay
+        // window only ever knows the session in front of it, so two joins landing on one key would make
+        // every datagram captured in the first a valid, unreplayed datagram in the second.
+        let secret = compress_secret(b"a secret the lobby handed both ends");
+        let first = session_key_from(Some(&secret), nonce_bytes(1));
+        let second = session_key_from(Some(&secret), nonce_bytes(2));
+        assert_ne!(first, second, "a fresh nonce is a fresh key");
+        // The trap, named: seating the secret AS the key is the shorter implementation, and it is what
+        // makes the two sessions above identical.
+        assert_ne!(first, secret);
+        assert_ne!(second, secret);
+
+        // And the replay it would have allowed, run end to end. A datagram sealed in the first session
+        // does not open in the second.
+        let mut captured = b"input for tick 1".to_vec();
+        SessionAuth::new(first)
+            .seal(Direction::ToServer, &mut captured)
+            .unwrap();
+        assert_eq!(
+            SessionAuth::new(second).open(Direction::ToServer, &captured),
+            Err(AuthError::BadTag),
+            "the next session refuses what the last one sealed"
+        );
+        assert!(
+            SessionAuth::new(first)
+                .open(Direction::ToServer, &captured)
+                .is_ok(),
+            "the negative control: it opens under the session that sealed it"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_secret_seals_exactly_the_bytes_it_did_before() {
+        // THE COMPATIBILITY PROMISE. With no secret set, the handshake's 16 bytes are the session key,
+        // verbatim, exactly as they were before a secret was a thing — so a session that configures
+        // nothing puts identical bytes on the wire.
+        let nonce = nonce_bytes(7);
+        assert_eq!(session_key_from(None, nonce), nonce);
+
+        let mut derived_path = b"snapshot".to_vec();
+        SessionAuth::new(session_key_from(None, nonce))
+            .seal(Direction::ToClient, &mut derived_path)
+            .unwrap();
+        let mut old_path = b"snapshot".to_vec();
+        SessionAuth::new(nonce)
+            .seal(Direction::ToClient, &mut old_path)
+            .unwrap();
+        assert_eq!(
+            derived_path, old_path,
+            "sequence number and tag both, byte for byte"
+        );
+    }
+
+    #[test]
+    fn a_peer_with_a_different_secret_derives_a_key_that_opens_nothing() {
+        // What refuses a peer that does not hold the secret, once it is past the handshake: its key is
+        // not the session's, so nothing it sends verifies and nothing sent to it does either.
+        let nonce = nonce_bytes(3);
+        let ours = session_key_from(Some(&compress_secret(b"the right secret")), nonce);
+        let theirs = session_key_from(Some(&compress_secret(b"the wrong secret")), nonce);
+        assert_ne!(ours, theirs, "the same nonce, a different secret");
+        let mut datagram = b"input".to_vec();
+        SessionAuth::new(theirs)
+            .seal(Direction::ToServer, &mut datagram)
+            .unwrap();
+        assert_eq!(
+            SessionAuth::new(ours).open(Direction::ToServer, &datagram),
+            Err(AuthError::BadTag)
+        );
+    }
+
+    #[test]
+    fn a_retried_hello_derives_the_same_key_and_keeps_its_replay_window() {
+        // A hello is retried until the welcome lands, so `handle_hello` runs again for a peer already
+        // seated. It compares DERIVED KEY against derived key, and a repeated nonce derives the same
+        // one — which is what makes the comparison answer "unchanged" and leave the window alone.
+        // Re-deriving into a fresh `SessionAuth` on every retry would reset the window instead, and
+        // anything captured from that peer could then be replayed by sending one copy of its handshake.
+        let secret = compress_secret(b"a secret the lobby handed both ends");
+        let nonce = nonce_bytes(11);
+        let seated = session_key_from(Some(&secret), nonce);
+        assert_eq!(
+            session_key_from(Some(&secret), nonce),
+            seated,
+            "the retry's nonce is the same nonce, so the comparison sees no rekey"
+        );
+
+        let mut window = SessionAuth::new(seated);
+        let mut first = b"input".to_vec();
+        SessionAuth::new(seated)
+            .seal(Direction::ToServer, &mut first)
+            .unwrap();
+        assert!(window.open(Direction::ToServer, &first).is_ok());
+        assert_eq!(
+            window.open(Direction::ToServer, &first),
+            Err(AuthError::Replayed),
+            "the window that survived the retry still refuses the repeat"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Seat release: the stored policy, and the queue the drop path drains.
+    //
+    // What is reachable without a SceneTree is everything the two release paths DECIDE with. The
+    // walk itself is not: it binds `OrbitRollbackSynchronizer` instances, which hold a `Base<Node>`
+    // and cannot be constructed here, so the drain's position in `run_frame` is pinned by reading
+    // the function rather than by a test.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_unknown_policy_number_reads_back_as_hold() {
+        // The property is an i64 and a project file can hold anything. Falling onto HOLD is what
+        // stops an unrecognised number selecting whichever policy sits at that index in some other
+        // build — the failure that takes a live player's body away.
+        assert_eq!(clamp_seat_release_policy(3), SEAT_RELEASE_HOLD);
+        assert_eq!(clamp_seat_release_policy(-1), SEAT_RELEASE_HOLD);
+        assert_eq!(clamp_seat_release_policy(i64::MAX), SEAT_RELEASE_HOLD);
+        assert_eq!(clamp_seat_release_policy(SEAT_RELEASE_HOLD), 0);
+    }
+
+    #[test]
+    fn a_known_policy_number_survives_the_clamp() {
+        // The negative control for the test above: a clamp that answered HOLD for everything would
+        // satisfy it while switching the feature off.
+        assert_eq!(
+            clamp_seat_release_policy(SEAT_RELEASE_ON_EXPIRY),
+            SEAT_RELEASE_ON_EXPIRY
+        );
+        assert_eq!(
+            clamp_seat_release_policy(SEAT_RELEASE_ON_DROP),
+            SEAT_RELEASE_ON_DROP
+        );
+    }
+
+    #[test]
+    fn the_stored_number_and_the_selected_policy_cannot_disagree() {
+        // Two functions read the same number, and a game reads one of them back while this node acts
+        // on the other. They are pinned against each other rather than each against a literal.
+        for stored in [-2, 0, 1, 2, 3, 99] {
+            let expected = match clamp_seat_release_policy(stored) {
+                SEAT_RELEASE_ON_EXPIRY => SeatReleasePolicy::OnExpiry,
+                SEAT_RELEASE_ON_DROP => SeatReleasePolicy::OnDrop,
+                _ => SeatReleasePolicy::Hold,
+            };
+            assert_eq!(seat_release_policy_of(stored), expected, "stored {stored}");
+        }
+    }
+
+    #[test]
+    fn the_default_stored_policy_is_hold() {
+        // The default-drift guard on the backend side. `OrbitNet::init` cannot be called here, so
+        // what is pinned is the constant it seeds the field from.
+        assert_eq!(SEAT_RELEASE_HOLD, 0);
+        assert_eq!(
+            seat_release_policy_of(SEAT_RELEASE_HOLD),
+            SeatReleasePolicy::Hold
+        );
+    }
+
+    #[test]
+    fn the_default_policy_queues_no_drop_at_all() {
+        // Why `_on_peer_disconnected` consults the policy before pushing: under HOLD the queue is
+        // never written, so a session that sets nothing allocates nothing and cannot grow a backlog
+        // while its tick loop is stopped.
+        let policy = seat_release_policy_of(SEAT_RELEASE_HOLD);
+        assert!(!releases_seats(policy, SeatReleaseEvent::Dropped, false));
+    }
+
+    #[test]
+    fn a_repeated_drop_of_one_peer_id_is_queued_once() {
+        let mut pending = Vec::new();
+        queue_seat_release(&mut pending, 7);
+        queue_seat_release(&mut pending, 9);
+        queue_seat_release(&mut pending, 7);
+        assert_eq!(pending, vec![7, 9], "the second 7 is the same walk");
+    }
+
+    #[test]
+    fn the_queue_keeps_the_order_the_drops_arrived_in() {
+        // Two connections dropping in one frame release in the order the transport reported them, so
+        // the announcement a game sees does not depend on a hash iteration order.
+        let mut pending = Vec::new();
+        for peer in [4, 2, 9] {
+            queue_seat_release(&mut pending, peer);
+        }
+        assert_eq!(pending, vec![4, 2, 9]);
+    }
+
+    #[test]
+    fn the_two_paths_release_once_between_them() {
+        // A held connection produces a drop AND, a grace window later, an expiry. Whichever policy is
+        // chosen, exactly one of the two acts — which is what keeps the expiry from reaching seats the
+        // drop already let go of.
+        for stored in [
+            SEAT_RELEASE_HOLD,
+            SEAT_RELEASE_ON_EXPIRY,
+            SEAT_RELEASE_ON_DROP,
+        ] {
+            let policy = seat_release_policy_of(stored);
+            let on_drop = releases_seats(policy, SeatReleaseEvent::Dropped, false);
+            let on_expiry = releases_seats(policy, SeatReleaseEvent::Expired, false);
+            assert!(!(on_drop && on_expiry), "policy {stored} released twice");
+        }
+    }
+
+    #[test]
+    fn a_recycled_peer_id_releases_nothing_on_either_path() {
+        // The guard both call sites re-ask at the moment they act. An id that names a live connection
+        // is a newcomer holding the number a departed session was last seen under.
+        for stored in [
+            SEAT_RELEASE_HOLD,
+            SEAT_RELEASE_ON_EXPIRY,
+            SEAT_RELEASE_ON_DROP,
+        ] {
+            let policy = seat_release_policy_of(stored);
+            assert!(!releases_seats(policy, SeatReleaseEvent::Dropped, true));
+            assert!(!releases_seats(policy, SeatReleaseEvent::Expired, true));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The input receive path: a row carrying a non-finite float never enters history.
+    //
+    // The whole rule is reachable without a SceneTree. `integrate_input_row` and
+    // `input_restore_row` are free functions over `ColumnarHistory` and `FreshnessLedger`, and
+    // `resim_input_from` is the planner decision the receive loop makes with the answer — so the
+    // three steps a received row takes are driven here in the order `handle_client_input` drives
+    // them. Only the property walk that writes the row onto the game's input node needs an engine.
+    // ------------------------------------------------------------------
+
+    /// One unannotated `Vec3` input property — the exposure the refusal exists for. With no `@`
+    /// quantizer between the wire and history, whatever bit pattern arrives is what gets stored.
+    fn move_schema() -> SchemaBuilder {
+        let mut schema = SchemaBuilder::new();
+        schema.push("move", PropKind::Vec3, PropRole::Input);
+        schema
+    }
+
+    /// One native input row: three little-endian `f32` lanes, 12 bytes.
+    fn move_row(x: f32, y: f32, z: f32) -> Vec<u8> {
+        let mut row = Vec::with_capacity(12);
+        for lane in [x, y, z] {
+            row.extend_from_slice(&lane.to_le_bytes());
+        }
+        row
+    }
+
+    /// The receive loop's fold over one row's answer, as `handle_client_input` runs it: a landed row
+    /// marks the planner at the horizon-clamped tick, and every other answer marks nothing.
+    fn fold_into_planner(
+        planner: &mut ResimPlanner,
+        entity: u64,
+        outcome: InputIntegration,
+        current: u64,
+    ) {
+        if let InputIntegration::Landed(tick) = outcome {
+            if let Some(from) = resim_input_from(tick, current) {
+                planner.mark(entity, from);
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_finite_input_row_is_refused_and_the_body_coasts_on_the_previous_row() {
+        let schema = move_schema();
+        let mut history = ColumnarHistory::new(schema.row_stride(), 64);
+        let mut ledger = FreshnessLedger::with_capacity(64);
+        let mut planner = ResimPlanner::new();
+        let mut latest: i64 = -1;
+        let current = 20u64;
+        let entity = 7u64;
+
+        // Tick 10 is honest: it lands, stamps authoritative, and marks the planner. The baseline the
+        // refusal below is measured against.
+        let honest = move_row(1.0, 2.0, 3.0);
+        let outcome = integrate_input_row(
+            schema.props(),
+            &mut history,
+            &mut ledger,
+            &mut latest,
+            10,
+            &honest,
+        );
+        assert_eq!(outcome, InputIntegration::Landed(10));
+        fold_into_planner(&mut planner, entity, outcome, current);
+        assert!(planner.is_dirty());
+        planner.clear();
+
+        // Tick 11 from the same sender poisons one lane of the same property.
+        let poisoned = move_row(1.0, f32::NAN, 3.0);
+        let outcome = integrate_input_row(
+            schema.props(),
+            &mut history,
+            &mut ledger,
+            &mut latest,
+            11,
+            &poisoned,
+        );
+        assert_eq!(outcome, InputIntegration::NonFinite);
+        assert!(
+            history.row(11).is_none(),
+            "the refused row never entered history"
+        );
+        assert_eq!(
+            latest, 10,
+            "and it did not advance the newest-received-input frontier"
+        );
+        fold_into_planner(&mut planner, entity, outcome, current);
+        assert!(
+            !planner.is_dirty(),
+            "no resim starts from a tick whose row was refused"
+        );
+
+        // What the restore then hands the game: the previous honest row, with the tick stamped
+        // Extrapolated — the same path, and the same answer, a lost datagram gets.
+        let restored =
+            input_restore_row(&history, &mut ledger, 11).expect("a row at or before tick 11");
+        assert_eq!(
+            restored,
+            honest.as_slice(),
+            "the body coasts on its last honest intent rather than on an invented zero row"
+        );
+        assert_eq!(ledger.confidence(11), Confidence::Extrapolated);
+        assert!(
+            !ledger.begin_sim(11),
+            "an extrapolated tick is not fresh, so no one-shot fires on the refused tick"
+        );
+
+        // THE NEGATIVE CONTROL, and it matters more than the assertions above: a check that refused
+        // every row would satisfy all of them. The next good row, for a later tick, still lands,
+        // still stamps authoritative, and still marks the planner.
+        let next = move_row(4.0, 5.0, 6.0);
+        let outcome = integrate_input_row(
+            schema.props(),
+            &mut history,
+            &mut ledger,
+            &mut latest,
+            12,
+            &next,
+        );
+        assert_eq!(outcome, InputIntegration::Landed(12));
+        assert_eq!(history.row(12), Some(next.as_slice()));
+        assert_eq!(ledger.confidence(12), Confidence::Authoritative);
+        assert_eq!(latest, 12);
+        fold_into_planner(&mut planner, entity, outcome, current);
+        assert_eq!(
+            planner.global_window(current, 64),
+            Some(ResimRange {
+                from: 12,
+                to: current
+            }),
+            "the good row plans a resim from its own tick"
+        );
+    }
+
+    #[test]
+    fn every_non_finite_pattern_is_refused_and_an_absurd_finite_one_is_not() {
+        // Range, rate and plausibility stay the game's job, inside `_rollback_tick`. Narrowing the
+        // refusal to non-finite floats is the whole of what the backend now checks, so a movement
+        // axis of 1e9 has to land: a check that also refused implausible values would break every
+        // game that clamps for itself.
+        let schema = move_schema();
+        let mut tick = 100u64;
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut history = ColumnarHistory::new(schema.row_stride(), 64);
+            let mut ledger = FreshnessLedger::with_capacity(64);
+            let mut latest: i64 = -1;
+            let refused = integrate_input_row(
+                schema.props(),
+                &mut history,
+                &mut ledger,
+                &mut latest,
+                tick,
+                &move_row(0.0, 0.0, poison),
+            );
+            assert_eq!(
+                refused,
+                InputIntegration::NonFinite,
+                "{poison} must be refused"
+            );
+            let landed = integrate_input_row(
+                schema.props(),
+                &mut history,
+                &mut ledger,
+                &mut latest,
+                tick,
+                &move_row(0.0, 0.0, 1.0e9),
+            );
+            assert_eq!(
+                landed,
+                InputIntegration::Landed(tick),
+                "an absurd but finite axis is the game's problem, not the backend's"
+            );
+            tick += 1;
+        }
+    }
+
+    #[test]
+    fn a_row_of_the_wrong_stride_is_ignored_rather_than_reported_as_poison() {
+        // The gate order, and it is observable: `row_is_finite` answers false for a row shorter than
+        // the schema's native extent, so a short row reaching the finiteness check before the stride
+        // check would be counted as poison and would warn about the wrong thing. A sender whose
+        // schema disagrees is what the entity manifest's per-entity hash reports, by name.
+        let schema = move_schema();
+        let mut history = ColumnarHistory::new(schema.row_stride(), 64);
+        let mut ledger = FreshnessLedger::with_capacity(64);
+        let mut latest: i64 = -1;
+        for short in [Vec::new(), move_row(1.0, 2.0, 3.0)[..8].to_vec()] {
+            assert_eq!(
+                integrate_input_row(
+                    schema.props(),
+                    &mut history,
+                    &mut ledger,
+                    &mut latest,
+                    5,
+                    &short,
+                ),
+                InputIntegration::Ignored,
+            );
+        }
+        assert!(history.row(5).is_none());
+        // The negative control: the full-width row at the same tick still lands.
+        assert_eq!(
+            integrate_input_row(
+                schema.props(),
+                &mut history,
+                &mut ledger,
+                &mut latest,
+                5,
+                &move_row(1.0, 2.0, 3.0),
+            ),
+            InputIntegration::Landed(5),
+        );
     }
 }

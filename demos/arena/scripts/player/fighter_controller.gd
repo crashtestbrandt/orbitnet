@@ -54,15 +54,23 @@ func _write_frames(delta: float) -> void:
 	if net == null or net.world == null or net.is_observing():
 		return
 	var seats: PackedInt32Array = net.local_seats()
+	# EVERY LOCAL SEAT'S SHOT IN ONE PACKET. Both fighters behind one connection fire in the same frame on the
+	# same channel, so the requests are collected here and flushed once rather than sent as they are found --
+	# which is the whole reason `request_batch` exists. A connection driving one seat sends what it always did.
+	var firing: PackedInt32Array = PackedInt32Array()
 	for index: int in seats.size():
 		if index >= ArenaConfig.MAX_SEATS_PER_PEER:
 			break
-		_write_frame(index, seats[index], delta)
+		if _write_frame(index, seats[index], delta):
+			firing.push_back(seats[index])
+	net.world.request_shots(firing)
 
-func _write_frame(index: int, seat: int, delta: float) -> void:
+## Writes one seat's replicated input frame. Answers whether that seat wants to fire this frame, so the caller
+## can coalesce every local seat's request into one packet.
+func _write_frame(index: int, seat: int, delta: float) -> bool:
 	var fighter: FighterBody = net.world.fighter_at(seat)
 	if fighter == null or fighter.input == null:
-		return
+		return false
 	var keys: Array[Key] = KEYS_A if index == 0 else KEYS_B
 	var forward: float = _axis(keys[0], keys[1])
 	var strafe: float = _axis(keys[3], keys[2])
@@ -76,8 +84,7 @@ func _write_frame(index: int, seat: int, delta: float) -> void:
 	fighter.input.set_firing(firing)
 	# THE SHOT IS A COMMAND, NOT AN INPUT BIT. A shot discovered inside `_rollback_tick` would be replayed on
 	# every resim and fire again each time; the bit above exists so the readout can show a held trigger.
-	if firing and fighter.is_alive():
-		net.world.request_shot(seat)
+	return firing and fighter.is_alive()
 
 static func _axis(positive: Key, negative: Key) -> float:
 	var value: float = 0.0

@@ -31,12 +31,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT="$ROOT/demos/arena"
 GODOT="${GODOT:-$ROOT/tools/godot-quiet.sh}"
-RUN_S="${ARENA_PROBE_RUN_S:-20}"
+# Seconds each peer runs. The probe's phases key on the SESSION TICK, and the verdict fires at tick 620 --
+# about 21 s of session at this demo's 30 Hz. This has to outlast that on the LAST process to start, which is
+# the observer, five seconds behind the server: 26 s leaves roughly eight seconds of margin for a slow boot on
+# a loaded runner. Too tight and a slow start turns into "no verdict at all", which reads as a hang rather
+# than as the timing problem it is.
+RUN_S="${ARENA_PROBE_RUN_S:-26}"
 RESUME_S="${ARENA_PROBE_RESUME_S:-7}"
 WATCHDOG_S="${ARENA_PROBE_WATCHDOG_S:-150}"
 PORT_A="${ARENA_PROBE_PORT_A:-47810}"
 PORT_B="${ARENA_PROBE_PORT_B:-47811}"
 PORT_C="${ARENA_PROBE_PORT_C:-47812}"
+PORT_D="${ARENA_PROBE_PORT_D:-47813}"
 # The arena the observer declares itself into. Deterministic so the gate does not have to guess.
 WATCH_ARENA="${ARENA_PROBE_WATCH:-3}"
 
@@ -164,15 +170,21 @@ fi
 
 # 4. The veto kept a cloaked enemy from the client that must not see it.
 #
-#    THE READING IS THE CLOAK FLAG, NOT A STALLED TICK COUNTER. `get_last_known_state()` ceasing to advance is
-#    the client-side signal for a STATE channel; on the ROLLBACK lane a withheld body's reading keeps
-#    advancing on the client anyway, so the probe prints it and asserts on it nowhere. What a withheld peer
-#    can observe for certain is that it never learned the flag -- the cloak bit rides in `net_flags`, in the
-#    rows the veto is refusing.
+#    THREE READINGS, AND EACH ONE CLOSES A WAY THE OTHER TWO COULD PASS VACUOUSLY.
 #
-#    BOTH HALVES MATTER. An entity that was never being sent also never carries a flag, so the first half is
-#    that it WAS arriving before it cloaked.
+#    * `early_rise` -- the fighter WAS arriving before it cloaked. An entity that was never sent also never
+#      stops, and never carries a flag either.
+#    * `watched_rise` -- its rows then stopped dead. This is the veto stated as the rows themselves, and it
+#      is assertable because both lanes now publish a RECEIPT tick: one writer, on the receive path, so it
+#      does not move for a withheld body. It used to be read off the frontier, which also counts ticks the
+#      reading peer authored and therefore rises on a server whatever the wire did.
+#    * `sees_cloak` -- the peer never learned the FLAG. The cloak bit rides in `net_flags`, inside the rows
+#      the veto is refusing, so this is the fact the game is actually about; keeping it means a veto that
+#      stopped the rows for some other reason still has to explain itself.
+#
+#    The client's own body is the positive control for the middle one, and it is checked in section 3 above.
 early_rise="$(field "$CLIENT_A" 'early_rise=-?[0-9]+' 'early_rise=')"
+watched_rise="$(field "$CLIENT_A" 'watched_rise=-?[0-9]+' '.*watched_rise=')"
 sees_settled="$(field "$CLIENT_A" 'settled=[01]' '.*settled=')"
 hidden_peak="$(field "$SERVER_A" 'hidden_peak=[0-9]+' '.*hidden_peak=')"
 if [ -z "$sees_settled" ] || [ -z "$hidden_peak" ]; then
@@ -185,9 +197,16 @@ elif [ -z "$early_rise" ] || [ "$early_rise" -le 0 ]; then
 elif [ "${sees_settled:-1}" != "0" ]; then
 	fail "the withheld peer LEARNED that the fighter cloaked -- the cloak flag rides in the rows the veto is
        supposed to be refusing, so this peer is still being sent them"
+elif [ -z "$watched_rise" ] || [ "$watched_rise" -ne 0 ]; then
+	# THE ROWS THEMSELVES, asserted directly. Both lanes publish a RECEIPT tick now -- the newest row this peer
+	# decoded, one writer, on the receive path -- so a withheld body's reading does not move. It used to be
+	# read off the frontier, which also counts ticks the reading peer authored and therefore rises on a server
+	# whatever the wire did; that is why this line could not exist before.
+	fail "the withheld fighter kept delivering rows to this peer (+$watched_rise ticks after the cloak)"
 else
 	echo "arena-probe: the fighter was arriving (+$early_rise ticks), then cloaked without this peer ever"
-	echo "arena-probe: learning it, and $hidden_peak entity-peer pair(s) were withheld"
+	echo "arena-probe: learning it, its rows stopped dead (+0 ticks), and $hidden_peak entity-peer pair(s)"
+	echo "arena-probe: were withheld"
 fi
 
 # 5. A peer acknowledging a frame it was not provably sent. A clean session sits at exactly 0.
@@ -257,7 +276,12 @@ echo "arena-probe: #26 reading -- own-body last-known-tick rise: dedicated=${own
 newlog server-c; SERVER_C="$LOG"
 newlog client-c1; CLIENT_C1="$LOG"
 newlog client-c2; CLIENT_C2="$LOG"
+newlog server-d; SERVER_D="$LOG"
+newlog client-d1; CLIENT_D1="$LOG"
+newlog client-d2; CLIENT_D2="$LOG"
 SESSION_ID="${ARENA_PROBE_SESSION:-987654321}"
+# A different identity for pass D, so the two runs cannot borrow each other's state through a stray process.
+FORGED_ID="${ARENA_PROBE_FORGED_SESSION:-123456789}"
 
 echo "arena-probe: pass C -- resume on port $PORT_C"
 spawn "$SERVER_C" --dedicated="$PORT_C" --quit-after="$((RESUME_S * 2 + 10))"; SPID_C=$SPAWNED
@@ -267,8 +291,19 @@ spawn "$CLIENT_C1" --join="127.0.0.1:$PORT_C" --seats=2 --session="$SESSION_ID" 
 arm_watchdog
 wait "$C1" 2>/dev/null
 sleep 2
+
+# THE TOKEN THE SERVER ISSUED THIS IDENTITY, read out of the first process's log.
+#
+# An identity alone reclaims nothing: the server mints a token per identity, sends it in the welcome, and a
+# rejoiner must quote it back -- which is what stops a peer that merely READ somebody's session id from taking
+# their body. A real game persists the value; a relaunched demo process has no store, so the shell carries it
+# the way a save file would. An empty read means the first client never reached PLAYING, and the resume
+# assertions below fail on their own rather than being skipped here.
+RESUME_TOKEN="$(field "$CLIENT_C1" 'ARENA-TOKEN=[0-9]+' 'ARENA-TOKEN=')"
+echo "arena-probe: the first process was issued resume token ${RESUME_TOKEN:-none}"
+
 spawn "$CLIENT_C2" --join="127.0.0.1:$PORT_C" --seats=2 --session="$SESSION_ID" \
-	--quit-after="$RESUME_S"; C2=$SPAWNED
+	--resume-token="${RESUME_TOKEN:-0}" --quit-after="$RESUME_S"; C2=$SPAWNED
 arm_watchdog
 wait "$C2" 2>/dev/null
 wait "$SPID_C" 2>/dev/null
@@ -289,8 +324,44 @@ else
 fi
 
 # =====================================================================================================
+# PASS D -- THE NEGATIVE CONTROL FOR PASS C. A peer presenting the same identity WITHOUT the token the server
+# issued must be seated as a newcomer, and the seats must stay held.
+#
+# Pass C on its own cannot distinguish "the token was checked and matched" from "nothing checks the token": a
+# server that ignored it entirely would pass every assertion there. This is the run that tells them apart, and
+# it is the case the identity was forgeable in -- reading somebody's session id off a roster broadcast, a kill
+# feed or a log line and presenting it.
+echo "arena-probe: pass D -- a forged identity on port $PORT_D"
+spawn "$SERVER_D" --dedicated="$PORT_D" --quit-after="$((RESUME_S * 2 + 10))"; SPID_D=$SPAWNED
+sleep 3
+spawn "$CLIENT_D1" --join="127.0.0.1:$PORT_D" --seats=2 --session="$FORGED_ID" \
+	--quit-after="$RESUME_S"; D1=$SPAWNED
+arm_watchdog
+wait "$D1" 2>/dev/null
+sleep 2
+# The same identity, and a token this server never issued. `--resume-token=0` would be a client that simply
+# never learned one, which is the same refusal by a different route; a wrong non-zero value is the forgery.
+spawn "$CLIENT_D2" --join="127.0.0.1:$PORT_D" --seats=2 --session="$FORGED_ID" \
+	--resume-token=1 --quit-after="$RESUME_S"; D2=$SPAWNED
+arm_watchdog
+wait "$D2" 2>/dev/null
+wait "$SPID_D" 2>/dev/null
+
+echo "=== PASS D / SERVER ==="
+grep -aE "ARENA: peer" "$SERVER_D" || echo "(no output)"
+
+if ! grep -aq "dropped -- holding seats" "$SERVER_D"; then
+	fail "pass D: the server did not hold the departing peer's seats, so the forgery had nothing to take"
+elif grep -aq "resumed seats" "$SERVER_D"; then
+	fail "pass D: an identity presented WITHOUT its token was given the seats back -- the token is not checked"
+else
+	echo "arena-probe: an identity presented without its token reclaimed nothing"
+fi
+
+# =====================================================================================================
 if [ "$ok" -eq 1 ]; then
-	echo "arena-probe PASSED (dedicated boot, membership, veto, seats, declared anchor, resume, rewind)."
+	echo "arena-probe PASSED (dedicated boot, membership, veto, seats, declared anchor, resume, the token that"
+	echo "       gates it, and rewind)."
 	exit 0
 fi
 echo "arena-probe FAILED." >&2

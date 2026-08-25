@@ -152,3 +152,61 @@ func test_a_plain_int_array_is_accepted() -> void:
 		0, OrderValidator.VERB_MOVE, {"ids": plain, "point": Vector3.ZERO}, _all_alive())
 	assert_true(result.accepted, "a plain Array of ints is a valid id list")
 	assert_eq(result.ids.size(), 1, "and is converted rather than rejected")
+
+# --- the code the refusal travels as ---------------------------------------------------------------
+#
+# NetCommand reads an int verdict of 0 as acceptance and any other value as a refusal carrying that value,
+# and only the int form reaches the client that asked. So Code.OK being 0 is a wire contract, not a style
+# choice -- an enum that started at 1 would announce every accepted order as a refusal.
+
+func test_the_accepting_code_is_zero() -> void:
+	assert_eq(OrderValidator.Code.OK as int, 0,
+		"NetCommand reads 0 as acceptance, so an enum starting at 1 would refuse every order it accepted")
+
+func test_each_rule_refuses_under_its_own_code() -> void:
+	var alive: PackedByteArray = _all_alive()
+	assert_eq(OrderValidator.validate(-1, OrderValidator.VERB_MOVE,
+		{"ids": [_own_id(0)], "point": Vector3.ZERO}, alive).code,
+		OrderValidator.Code.NO_SEAT as int, "an unseated sender")
+	assert_eq(OrderValidator.validate(0, &"detonate",
+		{"ids": [_own_id(0)], "point": Vector3.ZERO}, alive).code,
+		OrderValidator.Code.UNKNOWN_VERB as int, "an unknown verb")
+	assert_eq(OrderValidator.validate(0, OrderValidator.VERB_MOVE,
+		{"point": Vector3.ZERO}, alive).code,
+		OrderValidator.Code.MALFORMED_IDS as int, "a missing id list")
+	assert_eq(OrderValidator.validate(0, OrderValidator.VERB_MOVE,
+		{"ids": [_own_id(0)], "point": Vector3(NAN, 0.0, 0.0)}, alive).code,
+		OrderValidator.Code.POINT_NOT_FINITE as int, "a non-finite point")
+	assert_eq(OrderValidator.validate(0, OrderValidator.VERB_MOVE,
+		{"ids": [_own_id(1)], "point": Vector3.ZERO}, alive).code,
+		OrderValidator.Code.FOREIGN_ID as int, "a unit belonging to another seat")
+
+func test_an_accepted_order_carries_the_accepting_code() -> void:
+	var result: OrderValidator.Result = OrderValidator.validate(
+		0, OrderValidator.VERB_MOVE, {"ids": [_own_id(0)], "point": Vector3.ZERO}, _all_alive())
+	assert_eq(result.code, OrderValidator.Code.OK as int,
+		"acceptance is the same value NetCommand reads as applied")
+
+func test_a_refusal_reaching_the_client_names_no_unit_and_no_seat() -> void:
+	# THE REASON STAYS ON THE SERVER. `result.reason` names ids and seats, which is server-side knowledge about
+	# units the asker may not own; the client is told the code and says its own sentence. A describe() that
+	# leaked an id would hand a probing client exactly the ownership answer rule 1 refuses to give it.
+	var refused: OrderValidator.Result = OrderValidator.validate(
+		0, OrderValidator.VERB_MOVE, {"ids": [_own_id(1)], "point": Vector3.ZERO}, _all_alive())
+	assert_true(refused.reason.contains("%d" % _own_id(1)),
+		"the server's own reason names the offending id")
+	var told: String = OrderValidator.describe(refused.code)
+	assert_true(told.length() > 0, "the client is still told something")
+	assert_false(told.contains("%d" % _own_id(1)), "but never the id it probed for")
+
+func test_every_code_describes_itself_and_acceptance_describes_nothing() -> void:
+	var codes: Array[int] = [
+		OrderValidator.Code.NO_SEAT, OrderValidator.Code.UNKNOWN_VERB,
+		OrderValidator.Code.MALFORMED_IDS, OrderValidator.Code.TOO_MANY_IDS,
+		OrderValidator.Code.POINT_NOT_FINITE, OrderValidator.Code.ID_OUT_OF_RANGE,
+		OrderValidator.Code.FOREIGN_ID, OrderValidator.Code.RATE_LIMITED,
+		OrderValidator.Code.FOREIGN_CHANNEL]
+	for code: int in codes:
+		assert_true(OrderValidator.describe(code).length() > 0,
+			"code %d says something a player can read" % code)
+	assert_eq(OrderValidator.describe(OrderValidator.Code.OK), "", "and acceptance explains nothing")

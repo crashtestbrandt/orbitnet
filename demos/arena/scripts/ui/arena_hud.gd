@@ -21,12 +21,18 @@ var _veto: bool = true
 var _aoi_radius: float = ArenaConfig.AOI_RADIUS_M
 var _watch_arena: int = ArenaConfig.FIRST_ARENA_ID
 var _watch_seat: int = -1
+## The most recent shot refusal in words. Empty until one arrives.
+var _last_refusal: String = ""
 
 func build(session: ArenaNet, input_controller: FighterController, watch: int) -> void:
 	name = "ArenaHud"
 	net = session
 	controller = input_controller
 	_watch_arena = watch if ArenaConfig.is_arena(watch) else ArenaConfig.FIRST_ARENA_ID
+	if net != null and net.world != null:
+		var shots: NetCommand = net.world.shot_channel()
+		if shots != null and not shots.rejected.is_connected(_on_shot_rejected):
+			shots.rejected.connect(_on_shot_rejected)
 	set_anchors_preset(Control.PRESET_FULL_RECT)
 	mouse_filter = Control.MOUSE_FILTER_IGNORE
 
@@ -46,6 +52,12 @@ func build(session: ArenaNet, input_controller: FighterController, watch: int) -
 func _process(_delta: float) -> void:
 	if _label != null:
 		_label.text = _compose()
+
+# The refusal arrives as a ShotValidator.Verdict, not a sentence. `tag` names the request that failed, which
+# this readout does not need -- but a game with several requests outstanding cancels exactly the one that
+# failed rather than guessing by verb.
+func _on_shot_rejected(_verb: StringName, code: int, _tag: int) -> void:
+	_last_refusal = ShotValidator.describe(code as ShotValidator.Verdict)
 
 # --- the readout -----------------------------------------------------------------------------------
 func _compose() -> String:
@@ -83,13 +95,16 @@ func _compose() -> String:
 	lines.push_back("")
 
 	lines.push_back(_interest_line())
+	lines.push_back(_events_line())
 	lines.push_back(_arena_line())
 	lines.push_back(_veto_line())
 	lines.push_back(_anchor_line())
 	lines.push_back("")
 
 	lines.push_back(_rewind_line())
+	lines.push_back(_rtt_line())
 	lines.push_back(_interp_line())
+	lines.push_back(_shot_line())
 	lines.push_back("")
 
 	lines.push_back(_score_line())
@@ -129,6 +144,29 @@ func _blocks_line() -> String:
 		wire["blocks_admitted_s"], wire["blocks_deferred_s"], wire["blocks_culled_s"],
 		wire["unproven_acks_s"], wire["stale_blocks_s"]]
 
+## What the token proof does NOT settle, and the bound that stands in for it.
+##
+## An acknowledgement that quotes the right token proves the peer received the frame it names. It does not
+## prove the peer received nothing NEWER -- a client advancing its ack at full rate while holding a constant
+## lag quotes a real token every time and is measured at that lag, indistinguishable from a peer behind a
+## traffic shaper. No wire field closes that, so the containment is a CEILING on what the server will believe,
+## and `at ceiling` is the only server-side signal an operator gets: which connections are asking for the
+## deepest window in the session.
+func _rtt_line() -> String:
+	if not Net.is_server():
+		return "RTT     measured on the server; a client never learns what window it was granted"
+	var wire: Dictionary[String, float] = Net.bandwidth_metrics()
+	var believed: float = Net.rtt_believed_max_ms()
+	var line: String = "RTT     believe at most %.0f ms   at ceiling=%d peer(s)" % [
+		believed, int(wire["rtt_at_ceiling_peers"])]
+	# One worked pair, so the two readings are visible as two rather than described as two.
+	for peer: int in multiplayer.get_peers():
+		var raw: float = Net.peer_rtt_raw_ms(peer)
+		if raw >= 0.0:
+			line += "   peer %d raw=%.0f believed=%.0f" % [peer, raw, Net.peer_rtt_ms(peer)]
+			break
+	return line
+
 ## Which lanes are actually marshalling in bulk, asked of the backend rather than of the lever.
 ##
 ## THE TWO ANSWERS CAN DISAGREE, which is why this is a readout rather than an echo of `_bulk`. A hook is
@@ -141,6 +179,19 @@ func _marshal_line() -> String:
 	return "MARSHAL state=%d/%d  input=%d/%d fighters   (one crossing per lane per tick, %d+%d props)" % [
 		counts.x, ArenaConfig.SEAT_COUNT, counts.y, ArenaConfig.SEAT_COUNT,
 		FighterBody.STATE_PROPS.size(), FighterBody.INPUT_PROPS.size()]
+
+## The same fact as the line above, arriving as EVENTS instead of as a poll.
+##
+## `INTEREST` counts bodies whose rows are recent; this counts the transitions the server told this peer about.
+## The two answer the same question and only one of them is an EDGE -- a moment a game can act on once, rather
+## than a threshold it has to re-derive every frame and de-duplicate by hand. A server holds every entity by
+## construction and is told nothing, and says so.
+func _events_line() -> String:
+	if Net.is_server():
+		return "EVENTS  interest runs here, so this peer is told nothing -- a client is the one being filtered"
+	var log: InterestLog = net.interest_log
+	return "EVENTS  entered=%d  left=%d  holding=%d entities   (Net.entity_left_interest / _entered_interest)" % [
+		log.entered(), log.left(), log.held()]
 
 ## What this peer is actually being sent.
 ##
@@ -209,6 +260,23 @@ func _rewind_line() -> String:
 		meter.mean_ticks(NetLagComp.Band.MID),
 		meter.mean_ticks(NetLagComp.Band.FAR),
 		spread, meter.hits(), meter.shots(), meter.hit_rate() * 100.0]
+
+## What the shot channel said back, and what batching saved.
+##
+## THE REFUSAL REACHES THE PEER THAT ASKED. A shot is a NetCommand, and its validator states a reason code
+## rather than a bare `false`, so a client that pulled the trigger while cooling reads "still cooling" instead
+## of watching a dead trigger. The reason is derived on the client from the code -- the code crosses the wire,
+## the sentence does not.
+func _shot_line() -> String:
+	if net.world == null:
+		return "SHOTS   no world"
+	var batched: String = ""
+	if net.world.batched_packets() > 0:
+		batched = "   batched %d requests -> %d packets" % [
+			net.world.batched_requests(), net.world.batched_packets()]
+	if _last_refusal == "":
+		return "SHOTS   no refusal yet%s" % batched
+	return "SHOTS   refused: %s%s" % [_last_refusal, batched]
 
 ## How far behind the server's present each peer draws its remote bodies, in net ticks -- that peer's OWN
 ## measured send cadence, not the session's mean. Half of the rewind window above is this number.

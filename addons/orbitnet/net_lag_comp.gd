@@ -62,9 +62,33 @@ static var delay_ms: float = 50.0
 ## and the estimate is the MINIMUM of a recent window. What survives all three is a peer that acknowledges a
 ## frame OLDER than the newest it holds. That reads as a slow link, is believed, and is indistinguishable from a
 ## player who put a traffic shaper in front of their connection and is honestly that far away. Neither case can
-## be told apart, and neither needs to be: both get at most this many milliseconds of rewind, which is what the
-## worst supported legitimate link already receives. Lowering this number is the only lever that narrows either.
-## See `consume_ack` and `note_ack` in `orbit_net.rs` for the three rules and what they do not cover.
+## be told apart, and neither needs to be. See `consume_ack` and `note_ack` in `orbit_net.rs` for the three
+## rules and what they do not cover.
+##
+## THERE ARE TWO CEILINGS, AND THEY BOUND DIFFERENT THINGS.
+##
+##   * THIS ONE BOUNDS THE REWIND DEPTH: the deepest window any shot in this game is resolved at, and -- through
+##     [method retain_ticks] -- how long the ring keeps a recorded tick, which is what makes the corpse-linger
+##     margin hold at every tick rate. It is applied HERE, to a window already built, and it applies whatever
+##     the round trip handed in was.
+##   * THE BACKEND ONE BOUNDS WHAT THE SERVER BELIEVES ABOUT A LINK: `rtt_believed_max_ms`, the cap on the
+##     round-trip figure the server reports for a peer at all. Every consumer of that figure gets the bounded
+##     one -- this rewind, a diagnostic, a game's own matchmaking or routing rule -- not only the shots
+##     resolved through here.
+##
+## Neither subsumes the other. Lowering only this one still lets a fabricated round trip reach everything else
+## that asks the server what a peer's link is doing; lowering only the backend one still lets a shot ask for
+## more history than the ring retains. THEY DO NOT COMPOUND: the backend caps the figure, this caps the window
+## built from it, and a shooter under both is touched by neither.
+##
+## [NetLagComp] does not set the backend ceiling and does not read it. That knob lives on the session facade,
+## for the same reason `rtt_ms` is a parameter here rather than a lookup: this file names no session type.
+##
+## WHAT NEITHER CEILING CLOSES, plainly: a client that advances its ack at full rate behind a constant lag
+## still reads as a slow link, up to whichever ceiling binds first. No wire field closes that -- the round trip
+## is the only quantity the server can derive, so a deliberate lag and an honest one are the same measurement.
+## Lowering either number narrows the residual and narrows the honest slow link by exactly as much, which is
+## why both default to the delay the worst supported legitimate link already receives.
 static var max_delay_ms: float = 250.0
 
 ## Whether a shot is rewound by its own shooter's measured round trip, or by the flat [member delay_ms] every
@@ -329,9 +353,13 @@ static func rewind_ticks_for(ms: float, tick_hz: float, ring_size: int = _RING_S
 	var clamped_ms: float = clampf(ms, 0.0, max_delay_ms)
 	return clampi(roundi(clamped_ms * 0.001 * tick_hz), 0, maxi(ring_size - 1, 0))
 
-## The rewind window ONE SHOOTER has earned, in milliseconds, given what the server measured about their round
+## The rewind window ONE SHOOTER has earned, in milliseconds, given what the server BELIEVES about their round
 ## trip (`rtt_ms`, from [method Net.peer_rtt_ms]) at `tick_hz`. Pure, so the whole per-shooter policy is a unit
 ## test rather than a session.
+##
+## `rtt_ms` ARRIVES ALREADY BOUNDED by the backend's belief ceiling -- see [member max_delay_ms] for the two
+## ceilings and what each one bounds. Nothing here depends on that: this formula answers any figure it is
+## handed, and [member max_delay_ms] answers an absurd one whether or not the backend saw it first.
 ##
 ## **interpolation + THE WHOLE ROUND TRIP.** The intuitive formula uses `rtt/2`, and half is the wrong half. The
 ## rewind is measured from the server's PRESENT tick back to the world as the shooter saw it, and that span is

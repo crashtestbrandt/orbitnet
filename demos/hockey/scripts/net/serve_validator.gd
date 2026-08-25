@@ -20,15 +20,41 @@ class_name ServeValidator
 ## The verb this channel carries.
 const VERB_SERVE: StringName = &"serve"
 
-## A validation outcome. `reason` is written for a human reading the HUD's rejection line, because a demo that
-## never shows you a refused request has not shown you the security model.
+## Why a serve was refused. `OK` is 0 because that is what [NetCommand] reads as acceptance: a validator
+## returning an int states the reason, and 0 states that there is none.
+##
+## THE CODE CROSSES THE WIRE, THE STRING DOES NOT. A refusal reaches the requesting client as this int and the
+## client turns it into words with [method describe]. Sending the sentence instead would put presentation
+## bytes on a reliable channel and hand the server the client's language.
+enum Code {
+	OK = 0,
+	NO_SEAT = 1,
+	PUCK_LIVE = 2,
+}
+
+## A validation outcome. `code` is what the requester is told; `reason` is the same fact in words, for a human
+## reading the HUD's rejection line -- because a demo that never shows you a refused request has not shown you
+## the security model.
 class Result extends RefCounted:
 	var accepted: bool = false
+	var code: int = Code.OK
 	var reason: String = ""
 
-	func _init(ok: bool, why: String) -> void:
-		accepted = ok
-		reason = why
+	func _init(why: int) -> void:
+		code = why
+		accepted = why == Code.OK
+		reason = "" if accepted else ServeValidator.describe(why)
+
+## One sentence per refusal code, for a HUD. Static and pure, so the client that receives the code says the
+## same words the server would have.
+static func describe(code: int) -> String:
+	match code:
+		Code.NO_SEAT:
+			return "the sender holds no seat"
+		Code.PUCK_LIVE:
+			return "the puck is live"
+		_:
+			return ""
 
 ## Whether `sender_seat` may serve right now.
 ##
@@ -39,9 +65,9 @@ static func validate(sender_seat: int, puck_at_rest: bool, faceoff_ticks_left: i
 	if not HockeyConfig.is_valid_seat(sender_seat):
 		# Resolved from the sender id, so this means "the peer that asked holds no seat" -- a spectator, or a
 		# peer whose disconnect is still in flight. Never a claim the payload made about itself.
-		return Result.new(false, "the sender holds no seat")
+		return Result.new(Code.NO_SEAT)
 	if faceoff_ticks_left > 0:
-		return Result.new(true, "")
+		return Result.new(Code.OK)
 	if puck_at_rest:
-		return Result.new(true, "")
-	return Result.new(false, "the puck is live")
+		return Result.new(Code.OK)
+	return Result.new(Code.PUCK_LIVE)

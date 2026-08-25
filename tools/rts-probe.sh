@@ -12,7 +12,7 @@
 #   3. Each peer saw the order's sequence number reach every unit it named.
 #   4. The two peers agree about where seat 0's army is, by CENTROID, within a couple of metres.
 #      Deliberately not a per-unit hash: peers observe different ticks by construction.
-#   5. A forged foreign-seat order changed nothing.
+#   5. A forged foreign-seat order changed nothing, AND the client was told it was refused.
 #   6. The worst refresh interval of an actively-moving unit stayed under bound -- i.e. no unit is starving
 #      past the send budget.
 #
@@ -81,6 +81,7 @@ client_sig="$(field "$CLIENT_LOG" 'RTS-PROBE sig=-?[0-9]+' 'RTS-PROBE sig=')"
 host_centroid="$(grep -aoE 'RTS-PROBE centroid=-?[0-9.]+ -?[0-9.]+' "$HOST_LOG" | tail -1 | sed 's/RTS-PROBE centroid=//')"
 client_centroid="$(grep -aoE 'RTS-PROBE centroid=-?[0-9.]+ -?[0-9.]+' "$CLIENT_LOG" | tail -1 | sed 's/RTS-PROBE centroid=//')"
 client_forged="$(field "$CLIENT_LOG" 'RTS-PROBE forged_rejected=[01]' 'RTS-PROBE forged_rejected=')"
+client_forged_code="$(field "$CLIENT_LOG" 'RTS-PROBE forged_refusal_code=-*[0-9]*' 'RTS-PROBE forged_refusal_code=')"
 
 ok=1
 fail() { echo "rts-probe: $1"; ok=0; }
@@ -125,6 +126,15 @@ if [ "$client_forged" != "1" ]; then
 	fail "the client's forged foreign-seat order was NOT rejected"
 else
 	echo "rts-probe: a forged foreign-seat order was refused"
+fi
+
+# The client must be TOLD, not merely ignored. Nothing happening is what a refusal and a dropped packet look
+# like from the client's side, so the reply carrying the server's reason code is what separates them. 9 is
+# OrderValidator.Code.FOREIGN_CHANNEL.
+if [ "$client_forged_code" != "9" ]; then
+	fail "the client was not told why its forged order was refused (code '$client_forged_code', wanted 9)"
+else
+	echo "rts-probe: and the client was told why (code 9, the wrong channel)"
 fi
 
 if [ "$ok" -eq 1 ]; then

@@ -13,9 +13,10 @@ class_name HockeyHud
 ## measured below that spacing, so the floor is printed beside the number rather than left for a reader to
 ## mistake for noise.
 ##
-## THE REJECTION LINE IS HONEST ABOUT WHERE IT WORKS. `RinkDirector.serve_rejected` fires on the peer that
-## APPLIED the command -- the server -- because the library carries no rejected-command feedback back to the
-## requester. On a client the line says so instead of staying suspiciously empty.
+## THE REJECTION LINE WORKS ON THE PEER THAT ASKED. [signal NetCommand.rejected] fires on the peer that refused
+## the command and on the client that requested it, so a client pressing SPACE at a live puck reads the reason
+## rather than watching a dead key. The reason is derived on the client from the [ServeValidator.Code] the
+## refusal carried: the code crosses the wire, the sentence does not.
 
 const SPARK_SAMPLES: int = 160
 const PANEL_WIDTH: float = 470.0
@@ -64,8 +65,10 @@ func build(session: HockeyNet, director: RinkDirector, input: MalletController, 
 	add_child(_label)
 
 	if rink != null:
-		rink.serve_rejected.connect(_on_serve_rejected)
 		rink.goal_scored.connect(_on_goal)
+		var serves: NetCommand = rink.serve_channel()
+		if serves != null:
+			serves.rejected.connect(_on_serve_rejected)
 
 func _process(_delta: float) -> void:
 	if net == null:
@@ -134,6 +137,7 @@ func _compose() -> String:
 		restore_ms, sim_ms, record_ms])
 	lines.push_back(_wire_line())
 	lines.push_back(_marshal_line())
+	lines.push_back(_predicted_line())
 	lines.push_back("")
 
 	lines.push_back(_lane_line())
@@ -212,11 +216,28 @@ func _score_line() -> String:
 	return "SCORE   team0 %d  -  %d team1      puck: %s%s" % [
 		rink.scoreboard.goals(0), rink.scoreboard.goals(1), state, _last_goal]
 
+## Whether this peer's own mallet is in its rollback loop at all.
+##
+## THE SILENT ONE. A mallet the loop skips still applies the rows it receives, so it moves, and every other
+## number on this panel reads normally while the player's own mouse takes a full round trip to reach it. The
+## rink builds its 32 mallets before the roster arrives, so on a client every one of them registers as
+## unpredicted; `MalletBody.set_owner_peer()` is what re-declares it on the tick a seat is handed over. This
+## line is here so the flag is visible rather than inferred from how the mallet feels.
+func _predicted_line() -> String:
+	if rink == null or net == null:
+		return "PREDICT no rink"
+	var seat: int = net.local_seat()
+	if seat < 0 or seat >= rink.mallets.size():
+		return "PREDICT this peer holds no seat, so it predicts no mallet"
+	var mine: MalletBody = rink.mallets[seat]
+	if mine == null:
+		return "PREDICT no mallet at seat %d" % seat
+	return "PREDICT own mallet seat %d: %s   (the puck is predicted on every peer)" % [
+		seat, "in the rollback loop" if mine.is_predicted() else "NOT PREDICTED -- a round trip behind"]
+
 func _serve_line() -> String:
 	if _last_rejection != "":
 		return "SERVE   refused: %s" % _last_rejection
-	if Net.is_client() and not Net.is_server():
-		return "SERVE   refusals are only visible on the host -- the library carries no rejected-command reply"
 	return "SERVE   press SPACE while the puck is dead; a live puck refuses the request"
 
 func _meter() -> ReconcileMeter:
@@ -228,8 +249,11 @@ func _tick_seconds() -> float:
 	var dt: float = Net.net_tick_dt()
 	return dt if dt > 0.0 else 1.0 / float(HockeyConfig.NET_TICK_HZ)
 
-func _on_serve_rejected(seat: int, reason: String) -> void:
-	_last_rejection = "%s (seat %d)" % [reason, seat]
+# The refusal arrives as a code, not a sentence. `tag` names the request that was refused, which this demo has
+# no use for -- one serve is in flight at a time -- but a game with several requests outstanding cancels
+# exactly the one that failed instead of guessing by verb.
+func _on_serve_rejected(_verb: StringName, code: int, _tag: int) -> void:
+	_last_rejection = ServeValidator.describe(code)
 
 func _on_goal(team: int, sequence: int) -> void:
 	_last_goal = "   goal #%d to team %d" % [sequence, team]

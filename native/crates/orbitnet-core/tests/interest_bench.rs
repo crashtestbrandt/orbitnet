@@ -1,26 +1,33 @@
-//! Interest-pass cost measurement — the decision harness for adopting the grid.
+//! Interest-pass cost measurement — where the grid's threshold comes from.
 //!
-//! This file exists to answer one question with a number rather than an opinion: **is adopting
-//! [`InterestGrid`] actually faster than the linear scan it replaces, at the entity counts a real
-//! session runs?** Both core paths compute the same sets and report the same leaves, so wiring the
-//! grid in is only worth doing if it is faster; otherwise it is a refactor wearing an
-//! optimisation's clothes.
+//! This file answers one question with a number rather than an opinion: **at what occupancy is
+//! [`InterestGrid`] actually faster than the flat pass, at the entity counts a real session runs?**
+//! Both core paths compute the same sets and report the same leaves, so which one to run is a cost
+//! decision — and the tables these sweeps produce are what fix the constants
+//! [`PathSelector`] applies. The decision and the recorded tables live in `interest.rs`'s module
+//! header, next to the code they govern.
 //!
-//! Five variants are timed over the same synthetic session. The three the decision rests on:
+//! Six variants are timed over the same synthetic session. The four the decision rests on:
 //!
-//! * `scan/shared` — **what ships**. One candidate list per tick, with the rows a peer drives
-//!   patched in and out around that peer's [`PeerInterest::update_linear_into`] call.
+//! * `scan/shared` — the flat pass, and what a session below the threshold runs. One candidate
+//!   list per tick, with the rows a peer drives patched in and out around that peer's
+//!   [`PeerInterest::update_linear_into`] call.
 //! * `scan/peer` — the shape that shipped before: a fresh list per peer, because a peer's own body
 //!   is `always` to that peer alone and the list was rebuilt around it. O(P·N) per tick on top of
 //!   the filter. Kept because the gap between the two columns is what deleting it bought.
 //! * `grid` — [`InterestGrid`] rebuilt once per tick plus [`PeerInterest::update_grid_into`] per
 //!   peer, the own body handed over as the `also` override. Cell size derived from the radius.
+//! * `auto` — **what a caller runs**: [`InterestOccupancy::measure`] over the same shared list, then
+//!   whichever of the two paths [`PathSelector::select`] answers with. The `path` column reports the
+//!   choice, and the cost of measuring is charged to this variant rather than hidden.
 //!
-//! Reading the three together is the point. `scan/shared` against `grid` is the adoption question —
+//! Reading the four together is the point. `scan/shared` against `grid` is the adoption question —
 //! both share one list per tick, so the ratio is the index against the flat pass and nothing else.
-//! `scan/peer` against `scan/shared` is there because that gap once read as a grid win: measured
-//! against the old shape the grid appeared to win a multi-world session, and what it was actually
-//! deleting was the rebuild.
+//! `auto` against `scan/shared` is what a session actually pays once the choice is automatic: it
+//! should track whichever of the two is faster on that row, plus the measurement. `scan/peer`
+//! against `scan/shared` is there because that gap once read as a grid win: measured against the old
+//! shape the grid appeared to win a multi-world session, and what it was actually deleting was the
+//! rebuild.
 //!
 //! Two more are kept because they are what the earlier restructure was measured against:
 //!
@@ -30,8 +37,7 @@
 //! * `prepass` — one pass over the entities per tick builds the `peer → anchor` map, then the same
 //!   linear distance pass per peer.
 //!
-//! Three sweeps: by session scale, by arena extent, and by world count. The decision and the result
-//! tables live in `interest.rs`'s module header, next to the code they govern.
+//! Three sweeps: by session scale, by arena extent, and by world count.
 //!
 //! What this harness deliberately does NOT measure is the half that dominates in the real backend:
 //! `legacy` calls `input_owner_peer()` — a Godot `get_multiplayer_authority()` round trip — once
@@ -52,6 +58,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use orbitnet_core::history::BodyId;
+use orbitnet_core::interest::{InterestOccupancy, InterestPath, OccupancyScratch, PathSelector};
 use orbitnet_core::{
     AoiConfig, InterestCandidate, InterestGrid, MembershipId, PeerInterest, MEMBERSHIP_GLOBAL,
 };
@@ -287,6 +294,9 @@ struct Buffers {
     observers: HashMap<i32, Observer>,
     scratch: Vec<(BodyId, f32)>,
     leaves: Vec<BodyId>,
+    /// The per-world bounds accumulator `auto` reuses, so its measurement is timed doing the
+    /// measuring rather than allocating a map per tick.
+    occupancy: OccupancyScratch,
 }
 
 /// The shape the backend ran before the list was shared: the prepass, then per peer a fresh
@@ -330,8 +340,8 @@ fn tick_scan_per_peer(
     total
 }
 
-/// **The shipped shape**: one candidate list per tick, with the peer's own body patched in and out
-/// around each call (`orbit_net.rs`'s `update_interest`).
+/// **The flat pass on a shared list**: one candidate list per tick, with the peer's own body patched
+/// in and out around each call. This is what `auto` runs on a row the rule answers `Linear` for.
 ///
 /// Sharing the list is what separates the two savings a grid adoption would otherwise collect at
 /// once. Dropping the per-peer rebuild needs no grid — the rows that vary per peer can be swapped
@@ -400,6 +410,68 @@ fn tick_grid(
     total
 }
 
+/// **What a caller runs.** The same shared list, measured once per tick, with [`PathSelector`]
+/// deciding whether this tick's peers are filtered through the grid or the flat pass.
+///
+/// Everything the two paths need is already here, so switching costs nothing but the branch: the
+/// per-peer sets carry across untouched, because both paths compute the same members from the same
+/// state. `overrides` is `1` — every peer hands its own body over, which is the one fact a shared
+/// grid cannot hold.
+///
+/// Returns the set total and the path it ran, so the row can report which one the session picked.
+fn tick_auto(
+    scene: &Scene,
+    grid: &mut InterestGrid,
+    sets: &mut HashMap<i32, PeerInterest>,
+    buf: &mut Buffers,
+    cfg: &AoiConfig,
+    selector: &mut PathSelector,
+) -> (usize, InterestPath) {
+    scene.candidates_into(&mut buf.candidates);
+    scene.observers_into(&mut buf.observers);
+    let occupancy = InterestOccupancy::measure(&buf.candidates, &mut buf.occupancy);
+    let path = selector.select(cfg, occupancy, 1);
+    if path == InterestPath::Grid {
+        grid.rebuild(cfg, &buf.candidates);
+    }
+    let mut total = 0;
+    for &peer in &scene.peers {
+        let Some(&observer) = buf.observers.get(&peer) else {
+            continue;
+        };
+        let set = sets.entry(peer).or_default();
+        match path {
+            InterestPath::Grid => {
+                let own = [InterestCandidate::always(scene.entities[observer.index].0)];
+                set.update_grid_into(
+                    grid,
+                    cfg,
+                    observer.center,
+                    observer.membership,
+                    &own,
+                    &mut buf.scratch,
+                    &mut buf.leaves,
+                );
+            }
+            InterestPath::Linear => {
+                let shared = buf.candidates[observer.index];
+                buf.candidates[observer.index] = InterestCandidate::always(shared.id);
+                set.update_linear_into(
+                    cfg,
+                    observer.center,
+                    observer.membership,
+                    &buf.candidates,
+                    &mut buf.scratch,
+                    &mut buf.leaves,
+                );
+                buf.candidates[observer.index] = shared;
+            }
+        }
+        total += set.len();
+    }
+    (total, path)
+}
+
 /// The cell size both sweeps derive from the query radius: a scan rectangle of ~11x11 cells at the
 /// exit radius, rather than the 21x21 the fixed 32 m default would produce.
 fn grid_cfg(radius: f32, max_entities: usize) -> AoiConfig {
@@ -416,44 +488,74 @@ fn micros_per_tick(ticks: u32, elapsed_ns: u128) -> f64 {
     elapsed_ns as f64 / f64::from(ticks) / 1000.0
 }
 
-/// One row of the three-variant comparison: the timings, and the set sizes that prove all three
-/// computed the same membership.
+/// One row of the four-variant comparison: the timings, the path the rule picked, and the set sizes
+/// that prove all four computed the same membership.
 struct CoreRow {
     per_peer_ns: u128,
     shared_ns: u128,
     grid_ns: u128,
+    auto_ns: u128,
+    /// How many of the ticks `auto` ran through the grid. `0` or every tick, unless the session sat
+    /// inside the selector's hysteresis band while its occupancy moved.
+    auto_grid_ticks: u32,
     set_sum: usize,
 }
 
 impl CoreRow {
+    /// Which path the row picked: every tick one way, every tick the other, or a session that moved.
+    fn path_label(&self, ticks: u32) -> &'static str {
+        if self.auto_grid_ticks == 0 {
+            "scan"
+        } else if self.auto_grid_ticks == ticks {
+            "grid"
+        } else {
+            "mixed"
+        }
+    }
+
     fn print(&self, label: &str, ticks: u32, peers: usize) {
         let per_peer = micros_per_tick(ticks, self.per_peer_ns);
         let shared = micros_per_tick(ticks, self.shared_ns);
         let grid = micros_per_tick(ticks, self.grid_ns);
+        let auto = micros_per_tick(ticks, self.auto_ns);
         let mean_set = self.set_sum as f64 / f64::from(ticks) / peers as f64;
         // `rebuild` is what sharing one list bought; `vs shipped` is what adopting the grid
-        // would buy on top of it, and only the second decides anything.
+        // would buy on top of it; `auto` is what the rule actually collects, measurement included.
         println!(
-            "{label} {mean_set:>7.0} | {per_peer:>13.1} {shared:>13.1} {grid:>11.1} | \
-             {:>8.2}x {:>10.2}x",
+            "{label} {mean_set:>7.0} | {per_peer:>13.1} {shared:>13.1} {grid:>11.1} \
+             {auto:>11.1} | {:>8.2}x {:>10.2}x {:>9.2}x {:>6}",
             per_peer / shared,
             shared / grid,
+            shared / auto,
+            self.path_label(ticks),
         );
     }
 }
 
 fn print_core_header(first: &str) {
     println!(
-        "{first:>8} {:>7} | {:>13} {:>13} {:>11} | {:>9} {:>11}",
-        "in-set", "scan/peer us/t", "scan/shared", "grid us/t", "rebuild", "vs shipped"
+        "{first:>8} {:>7} | {:>13} {:>13} {:>11} {:>11} | {:>9} {:>11} {:>10} {:>6}",
+        "in-set",
+        "scan/peer us/t",
+        "scan/shared",
+        "grid us/t",
+        "auto us/t",
+        "rebuild",
+        "vs shipped",
+        "auto/ship",
+        "path"
     );
 }
 
-/// Time the three core variants over the same session, and refuse to report if they disagree.
+/// Time the four core variants over the same session, and refuse to report if they disagree.
 ///
 /// `build` is called once per variant so each starts from an identical scene and walks the same
-/// jitter — the three timings then describe the same work, which is the only thing that makes the
+/// jitter — the four timings then describe the same work, which is the only thing that makes the
 /// ratios mean anything.
+///
+/// `auto` is held to the same agreement check as the rest. It runs whichever path the rule picks,
+/// so a row where it disagrees is either a path that computes a different set or a rule that
+/// switched between two paths that do — and both are the failure this harness exists to refuse.
 fn core_row(build: impl Fn() -> Scene, ticks: u32, cfg: &AoiConfig) -> CoreRow {
     let mut buf = Buffers::default();
 
@@ -488,6 +590,21 @@ fn core_row(build: impl Fn() -> Scene, ticks: u32, cfg: &AoiConfig) -> CoreRow {
     }
     let grid_ns = started.elapsed().as_nanos();
 
+    scene = build();
+    let mut grid = InterestGrid::new();
+    let mut selector = PathSelector::new();
+    let mut sets: HashMap<i32, PeerInterest> = HashMap::new();
+    let mut auto_sum = 0usize;
+    let mut auto_grid_ticks = 0u32;
+    let started = Instant::now();
+    for _ in 0..ticks {
+        scene.step();
+        let (total, path) = tick_auto(&scene, &mut grid, &mut sets, &mut buf, cfg, &mut selector);
+        auto_sum += total;
+        auto_grid_ticks += u32::from(path == InterestPath::Grid);
+    }
+    let auto_ns = started.elapsed().as_nanos();
+
     assert_eq!(
         per_peer_sum, shared_sum,
         "patching the shared list in place changed the sets"
@@ -496,11 +613,17 @@ fn core_row(build: impl Fn() -> Scene, ticks: u32, cfg: &AoiConfig) -> CoreRow {
         per_peer_sum, grid_sum,
         "the grid and the scan computed different sets"
     );
+    assert_eq!(
+        per_peer_sum, auto_sum,
+        "the selected path computed different sets from the scan"
+    );
     assert!(grid_sum > 0, "the scene produced no interest at all");
     CoreRow {
         per_peer_ns,
         shared_ns,
         grid_ns,
+        auto_ns,
+        auto_grid_ticks,
         set_sum: grid_sum,
     }
 }

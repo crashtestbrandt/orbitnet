@@ -91,15 +91,33 @@ the payload is parsed.
 
 This is the single most transferable trick in the demo, and a yaw scalar is wrong **twice over**:
 
-1. **A GDScript `float` is an f64.** `"facing@half"` would silently fall back to lossless and save nothing —
-   `@half` is valid only for `Vector3`/`Vector2`/`f32`, and an invalid pairing degrades quietly rather than
-   erroring.
+1. **A GDScript `float` is an f64.** `"facing@half"` falls back to lossless and saves nothing — `@half`
+   applies to `Vector3` and `Vector2` only. The fallback is reported: it warns, it is an error in a checked
+   build, and `quantizer_fallbacks()` lists it so a boot check can fail on one.
 2. **Interpolating an angle across the ±π wrap sweeps the long way round.** A unit facing roughly south spins
    a full rotation every time it wobbles.
 
 `(sin, cos)` costs 4 bytes as halves, interpolates correctly *because it is a point on a circle*, and rides
 along in a `Vector3` that had a spare component anyway. `hp01` takes that component for the same reason: a
 bare `float` hp cannot be narrowed at all, but as a normalized third component it costs 2 bytes.
+
+### One crossing per row, in both directions
+
+The RTS demo's own reason for a bulk hook is not the rollback loop — its units are on the state lane and there
+is no replay multiplier there. **The multiplier is the entity count**, which is what a state lane is for:
+
+- the **server** captures 96 rows a tick, at one `Object.get` per property;
+- a **client** lands up to 48 rows a tick, at one `Object.set` per property — 144 crossings for three
+  properties, every tick, on the peer with the least to spare.
+
+`UnitBody` declares `set_bulk_capture()` and `set_bulk_apply()`, which makes each of those one call. The
+`RTS-MARSHAL` boot line reports how many channels actually resolved a hook, **asked of the backend rather than
+echoed from the call site** — a hook is resolved by name on the channel's root, and a name that did not resolve
+leaves the channel on the walk with nothing erroring.
+
+`bulk_marshal_test.gd` pins the slot correspondence, including the negative control: a round trip alone passes
+even when both hooks agree on the wrong order, so the three values are made mutually distinguishable and each
+slot is asserted to carry its own.
 
 ### Where 96 comes from
 
@@ -121,8 +139,9 @@ linearly. That is the experiment, which is why the number lives in `RtsConfig` w
 
 Measuring that from the outside takes care: "ticks since this unit last changed" counts a **stationary** unit
 as starving, which it is not. The probe records the gap between *consecutive updates* of a unit known to be
-moving, which is the round-robin interval and nothing else. A per-entity staleness counter belongs in the
-library — it is one of the [filed gaps](../README.md#limits).
+moving, which is the round-robin interval and nothing else. The library's own per-entity reading is
+`NetStateHandle.last_received_state()` — the tick of the newest row this peer decoded, with one writer on the
+receive path — and `is_receiving()` is the same reading with the two fail-open short-circuits applied.
 
 ## Determinism is not needed, and that is the point
 
@@ -196,6 +215,24 @@ cases are unit-testable with no session. Four rules:
    never compares equal to anything, and surfaces far from where it entered.
 
 Plus a per-sender token bucket, checked *first* as the cheapest rejection.
+
+**A refusal reaches the peer that asked**, and there are two halves to why the demo bothers. The validator
+returns an `OrderValidator.Code` rather than `false`, which is what makes `NetCommand` reply at all; and the
+**code** crosses the wire while the **sentence** does not. `Result.reason` names the ids and seats involved,
+which is what a server log wants and what a client must never be handed — it is server-side knowledge about
+units the asker may not own, which is exactly the ownership answer rule 1 refuses to give. `describe(code)`
+is a pure static function the client calls for itself, and a unit case asserts it names no id.
+
+That reply is also what fixed the order-RTT measurement. A refused order changes no sequence number, so the
+measurement had nothing to stop on and gave up after four seconds — blocking the next sample for that whole
+window and folding every refusal into the percentile as a four-second reading. It now cancels on the reply,
+keyed on the tag `request()` returned, so a second order issued before the first resolves cannot be cancelled
+by an older refusal.
+
+The rate-limit branch replies too, and the alternative is worth stating: a refusal is one reliable packet per
+request, so answering a throttled client is strictly 1:1 with what it already sent and amplifies nothing.
+Returning `false` there instead makes it silent, which is the right choice for a channel a client can ask on
+far faster than it can be answered.
 
 `ScoutPolicy` is the other pure one — which enemy units a seat can currently see, with the same 1.25× exit
 hysteresis the backend's own interest band uses, reporting only what CHANGED. The session layer turns those
@@ -351,9 +388,10 @@ later `seat released -- peer N did not return`, and the next joiner takes seat 1
   lets one connection drive several owned bodies, each with its own interest anchor, which is what local
   split-screen needs. `SeatRoster` refusing a second seat to the same peer is a rule about *this game*;
   [arena-demo.md](arena-demo.md#split-screen-is-what-a-seat-is-for) is where several are shown.
-- **No bulk marshalling.** The commander cursor is one `Vector3` and the units are on the state lane, so there
-  is no replay multiplier to divide — [hockey-demo.md](hockey-demo.md#bulk-marshalling-which-this-demo-is-the-case-for)
-  is the case for it.
+- **No bulk marshalling on the ROLLBACK lane.** The commander cursor is one `Vector3`, so there is no replay
+  multiplier worth dividing — [hockey-demo.md](hockey-demo.md#bulk-marshalling-which-this-demo-is-the-case-for)
+  is the case for that half. The units *do* use the capture and apply hooks, because on a state lane the
+  multiplier is the entity count; see [above](#one-crossing-per-row-in-both-directions).
 - **No lag compensation.** Orders are adjudicated, not traced; there is no hitscan to rewind for.
 
 ## What a 16-bit slot removed from the budget

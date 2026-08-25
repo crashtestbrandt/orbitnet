@@ -49,6 +49,9 @@ var world: MatchDirector = null
 var roster: SeatRoster = SeatRoster.new()
 ## THIS peer's view of where it is watching from, when it is observing.
 var observer: ObserverDesk = ObserverDesk.new()
+## The client half of interest filtering as EVENTS. Held here rather than in a view, because it is a fact about
+## the SESSION -- what this connection is being sent -- and every view that wants it wants the same answer.
+var interest_log: InterestLog = InterestLog.new()
 
 ## How many seats this peer asks for, and whether it wants them in different arenas. Read at join time.
 var wanted_seats: int = 1
@@ -128,6 +131,9 @@ func _host(port: int, dedicated: bool) -> bool:
 	Net.set_mode(Net.Mode.SERVER if dedicated else Net.Mode.HOST)
 	_apply_interest_settings()
 	world.bind_net_all()                                  # RULE 1, second half
+	# AFTER bind_net_all(), so the seed reads a session that already holds its entities. Attaching before them
+	# would seed an empty set and then report every one of them arriving, which is churn that did not happen.
+	interest_log.attach(multiplayer.get_unique_id())
 	_set_state(State.PLAYING)
 	local_seats_changed.emit(_local_seats)
 	_broadcast_roster()
@@ -150,6 +156,7 @@ func join(target: String) -> bool:
 	_connect_peer_signals()
 	Net.set_mode(Net.Mode.CLIENT)
 	world.bind_net_all()                                  # RULE 1, second half
+	interest_log.attach(multiplayer.get_unique_id())
 	_set_state(State.CONNECTING)
 	print("ARENA: joining %s:%d (%s)" % [
 		_address_of(target), _port_of(target), NetTransport.preferred_kind_name()])
@@ -162,6 +169,9 @@ func leave() -> void:
 		multiplayer.multiplayer_peer = null
 	Net.set_mode(Net.Mode.OFFLINE)
 	Net.set_net_tick_coupled()   # RULE 3
+	# An entity id is session-global, so a set carried across sessions would report the next session's first
+	# admissions as entities that had been absent.
+	interest_log.reset()
 	roster.clear()
 	_observers.clear()
 	_held_sessions.clear()

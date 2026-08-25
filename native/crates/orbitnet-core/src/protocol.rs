@@ -28,12 +28,13 @@
 /// | 4 | The hot-frame header carries `ack_token`: a server-minted per-frame value the client quotes back, so an ack names a frame the peer provably received. |
 /// | 5 | Every block names its entity by a **dense 16-bit session slot** ([`crate::slots`]) instead of the 64-bit id, and the entity manifest distributes the slot bindings for both lanes. |
 /// | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster ([`crate::seats`]) to clients. |
+/// | 7 | A snapshot frame may carry a trailing **interest-delta section** ([`crate::codec::InterestDeltaSection`]), announced by `FrameHeader::FLAG_INTEREST_DELTA`, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token** ([`crate::codec::Handshake::resume_token`]), which is what a claim on a session identity has to quote. The entity manifest carries a leading **generation** and states a **change** rather than the whole table ([`crate::codec::ManifestDelta`], frame kind `0x08`); a client that cannot apply one asks for the whole table with `FrameHeader::FLAG_WANT_MANIFEST`. |
 ///
 /// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
 /// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
 /// documented absent-value behaviour, a newer peer reads it when it is there. Anything that shifts an
 /// existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
-pub const PROTOCOL_VERSION: u32 = 0x0006_0000;
+pub const PROTOCOL_VERSION: u32 = 0x0007_0000;
 
 /// Extract the major component of a protocol version.
 #[must_use]
@@ -327,7 +328,7 @@ mod tests {
 
     #[test]
     fn protocol_major_is_extracted() {
-        assert_eq!(protocol_major(PROTOCOL_VERSION), 6);
+        assert_eq!(protocol_major(PROTOCOL_VERSION), 7);
         assert_eq!(protocol_major(0x0007_0201), 7);
     }
 
@@ -462,5 +463,98 @@ mod tests {
     fn empty_schema_hashes_to_the_offset_basis() {
         assert_eq!(SchemaBuilder::new().hash(), 0x811c_9dc5);
         assert_eq!(SchemaBuilder::new().row_stride(), 0);
+    }
+
+    /// The whole `(quantizer, kind)` table, written out rather than derived from `valid_for`, so
+    /// widening or narrowing a quantizer has to change this list too.
+    ///
+    /// It is the authority the two annotation diagnostics quote and the docs paraphrase, and a doc
+    /// page that paraphrases it wrongly is how a game budgets for savings it never gets.
+    #[test]
+    fn quantizers_are_defined_only_for_the_kinds_they_encode() {
+        // (kind, @ss3 applies, @half applies)
+        let table = [
+            (PropKind::Bool, false, false),
+            (PropKind::I32, false, false),
+            (PropKind::I64, false, false),
+            (PropKind::F32, false, true),
+            (PropKind::F64, false, false),
+            (PropKind::Vec3, false, true),
+            (PropKind::Quat, true, false),
+            (PropKind::Vec2, false, true),
+            (PropKind::Basis, true, false),
+            (PropKind::Transform, false, false),
+        ];
+        for (kind, ss3, half) in table {
+            assert!(
+                QuantKind::None.valid_for(kind),
+                "lossless applies to every kind, including {kind:?}"
+            );
+            assert_eq!(QuantKind::Ss3.valid_for(kind), ss3, "@ss3 on {kind:?}");
+            assert_eq!(QuantKind::Half.valid_for(kind), half, "@half on {kind:?}");
+        }
+    }
+
+    /// A GDScript `float` is an f64 and an `int` an i64, so `"hp@half"` is the pairing a game
+    /// reaches for first and the one that cannot work. It must fall back rather than misencode.
+    #[test]
+    fn an_invalid_pairing_is_downgraded_to_lossless_at_the_native_stride() {
+        let mut schema = SchemaBuilder::new();
+        schema.push_quantized("hp", PropKind::F64, PropRole::State, QuantKind::Half);
+        schema.push_quantized(
+            "net_orient",
+            PropKind::Quat,
+            PropRole::State,
+            QuantKind::Half,
+        );
+        schema.push_quantized("net_pos", PropKind::Vec3, PropRole::State, QuantKind::Half);
+        let props = schema.props();
+        assert_eq!(
+            props[0].quant,
+            QuantKind::None,
+            "@half does not apply to an f64"
+        );
+        assert_eq!(
+            props[1].quant,
+            QuantKind::None,
+            "nor to a quaternion, which wants @ss3"
+        );
+        assert_eq!(
+            props[2].quant,
+            QuantKind::Half,
+            "and the one valid pairing keeps it"
+        );
+
+        // THE HISTORY ROW IS NATIVE STRIDE EITHER WAY. Quantization is a wire encoding; the
+        // offsets that masks, delta bases and the mispredict compare all read are assigned from
+        // the native widths, so a downgraded pairing shifts nothing.
+        assert_eq!(props[0].offset, 0);
+        assert_eq!(props[1].offset, 8, "the f64 kept its full 8-byte slot");
+        assert_eq!(props[2].offset, 24, "and the quaternion its full 16");
+        assert_eq!(schema.row_stride(), 8 + 16 + 12);
+    }
+
+    /// The byte costs a valid pairing actually buys, pinned here because they are the numbers the
+    /// diagnostics quote and the ones a game sizes its budget against.
+    #[test]
+    fn a_valid_pairing_narrows_the_wire_and_leaves_the_row_alone() {
+        use crate::quant::wire_stride;
+        let table = [
+            (PropKind::Vec3, QuantKind::Half, 12, 6),
+            (PropKind::Vec2, QuantKind::Half, 8, 4),
+            (PropKind::F32, QuantKind::Half, 4, 2),
+            (PropKind::Quat, QuantKind::Ss3, 16, 6),
+            (PropKind::Basis, QuantKind::Ss3, 36, 6),
+        ];
+        for (kind, quant, native, wire) in table {
+            assert_eq!(kind.stride(), native, "{kind:?} history stride");
+            assert_eq!(wire_stride(kind, quant), wire, "{kind:?} under {quant:?}");
+        }
+
+        // An invalid pairing costs the native width on the wire as well as in the row: there is
+        // no encoding to fall back to that is narrower than the bytes themselves.
+        assert_eq!(wire_stride(PropKind::F64, QuantKind::Half), 8);
+        assert_eq!(wire_stride(PropKind::Quat, QuantKind::Half), 16);
+        assert_eq!(wire_stride(PropKind::Vec3, QuantKind::Ss3), 12);
     }
 }

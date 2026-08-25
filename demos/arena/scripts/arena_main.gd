@@ -18,7 +18,16 @@ class_name ArenaMain
 ##   --watch=N           which arena an observer declares itself into. Deterministic, so a probe does not have
 ##                       to guess which one it will be given
 ##   --session=N         pin this peer's session identity, so a RESTARTED process reclaims its seats
+##   --resume-token=N    the token the SERVER issued this identity on a previous join. An identity alone no
+##                       longer reclaims seats: the server mints a token per identity and a rejoiner must
+##                       quote it back, which is what stops a peer that merely READ somebody's session id off
+##                       a roster broadcast from taking their body. A real game persists it beside the
+##                       identity; this demo has no store, so the value comes from the command line and the
+##                       process prints its own on `ARENA-TOKEN=`
 ##   --props=N           state-lane props per arena, overriding the configured count (slot-table pressure)
+##   --wire-log          print one greppable ARENA-WIRE line per second: total egress, the entity count and
+##                       what the send rota did with it. A headless server has no HUD, and total egress is
+##                       exactly what a slot-table or an interest change moves
 ##   --arena-probe       attach the automated gate (tools/instr/arena_probe.gd)
 ##   --bench             attach netbench's harness with this demo's BenchSubject
 ##   --quit-after=SEC    exit after N seconds (probes and smoke runs)
@@ -38,12 +47,19 @@ var fighters_view: FighterRenderer = null
 ## definite rather than wherever a HUD happened to start.
 var _watch_arena: int = ArenaConfig.FIRST_ARENA_ID
 
+## Whether to print the per-second ARENA-WIRE line, and its accumulator. See _log_wire().
+var _wire_log: bool = false
+var _wire_timer: float = 0.0
+## Whether the resume token this server issued has been printed. Once per process. See _log_resume_token().
+var _token_logged: bool = false
+
 func _ready() -> void:
 	# One greppable line per boot, in the shape every probe and smoke script keys on. Cheap, and it turns
 	# "did it even start" into a question with an answer.
 	print("ARENA-BOOT godot=%s mode=%s seats=%d" % [
 		Engine.get_version_info().get("string", "?"), _mode_summary(), _int_flag("--seats=", 1)])
 
+	_wire_log = _has_flag("--wire-log")
 	_watch_arena = _int_flag("--watch=", ArenaConfig.FIRST_ARENA_ID)
 	if not ArenaConfig.is_arena(_watch_arena):
 		_watch_arena = ArenaConfig.FIRST_ARENA_ID
@@ -84,6 +100,11 @@ func _start_session() -> void:
 	var session: int = _int_flag("--session=", 0)
 	if session != 0:
 		Net.set_session_id(session)
+	# BEFORE THE HANDSHAKE, like the identity, and for the same reason: the token rides the hello, and the
+	# hello is the first thing a client sends.
+	var token: int = _int_flag("--resume-token=", 0)
+	if token != 0:
+		Net.set_resume_token(token)
 	# A build exported with the dedicated-server preset boots authoritative with NO argument. That is the
 	# property that makes a server image deployable: an operator runs the binary, not a command line.
 	if OS.has_feature("dedicated_server"):
@@ -124,10 +145,51 @@ func _build_views() -> void:
 	add_child(hud)
 	hud.build(net, controller, _watch_arena)
 
+## THE TOKEN THIS SERVER ISSUED THIS IDENTITY, printed once, as soon as it exists.
+##
+## POLLED RATHER THAN PRINTED AT `PLAYING`, and the difference is a real one. `PLAYING` is the TRANSPORT being
+## up; the token rides OrbitNet's own welcome, which is a reliable control frame the server sends after its
+## handshake -- so reading it on the state change reads a zero and prints it as if it were the answer.
+##
+## A real game persists this beside the session id. A demo has no store, so it prints it and a relaunched
+## process is handed the value its predecessor was given. Without it an identity alone reclaims nothing, which
+## is the whole point of the token: reading somebody's session id off a roster broadcast must not be enough to
+## take their body.
+func _log_resume_token() -> void:
+	if _token_logged or Net.is_server() or Net.is_offline():
+		return
+	var token: int = Net.resume_token()
+	if token == 0:
+		return
+	_token_logged = true
+	print("ARENA-TOKEN=%d session=%d" % [token, Net.session_id()])
+
+## One WIRE line per second, for a run nobody is watching.
+##
+## `Net.bandwidth_metrics()["tx_bytes_s"]` counts EVERY datagram this peer sent -- the unreliable snapshots and
+## the reliable control frames alike -- which is what makes it the number a change to the entity manifest or to
+## the interest filter moves. A HUD reads it every frame; a dedicated server has no HUD, and the run that
+## matters most for those two (`just arena-slots`, tens of thousands of entities) is headless by construction.
+func _log_wire(delta: float) -> void:
+	_wire_timer += delta
+	if _wire_timer < 1.0:
+		return
+	_wire_timer = 0.0
+	var wire: Dictionary[String, float] = Net.bandwidth_metrics()
+	print("ARENA-WIRE tick=%d peers=%d entities=%d tx=%.0f B/s in %.0f dg/s rx=%.0f B/s "
+		% [Net.current_tick(), int(wire["peers"]), int(wire["interest_entities"]),
+			wire["tx_bytes_s"], wire["tx_datagrams_s"], wire["rx_bytes_s"]]
+		+ "admitted=%.0f/s deferred=%.0f/s culled=%.0f/s interest=%.2f ms"
+		% [wire["blocks_admitted_s"], wire["blocks_deferred_s"], wire["blocks_culled_s"],
+			wire["interest_ms"]])
+
 ## The cameras follow the seats this peer drives, or the arena it is observing.
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if net == null:
 		return
+	if _wire_log:
+		_log_wire(delta)
+	_log_resume_token()
 	if views != null:
 		_aim_cameras()
 	if net.is_observing():
@@ -166,6 +228,7 @@ func _on_session_state(state: ArenaNet.State) -> void:
 	# no server to send it to until the session is up. A listen host takes the same path and answers itself.
 	if state == ArenaNet.State.PLAYING and _has_flag("--observe") and not net.is_observing():
 		net.request_observe(true)
+
 
 func _on_local_seats(seats: PackedInt32Array) -> void:
 	print("ARENA-SEATS %s" % seats)

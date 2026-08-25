@@ -45,19 +45,27 @@ pub mod seats;
 pub mod slots;
 pub mod tick;
 
-pub use auth::{AuthError, Direction, ReceiveBudget, ReplayWindow, SessionAuth, KEY_LEN};
+pub use auth::{
+    compress_secret, confirm_tag, derive_session_key, AuthError, Direction, ReceiveBudget,
+    ReplayWindow, SessionAuth, KEY_LEN,
+};
 pub use clock::ClockEstimator;
 pub use codec::{CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
 pub use columnar::ColumnarHistory;
 pub use freshness::{Confidence, FreshnessLedger, MemoRing};
 pub use history::{plan_cost, BodyId, BodyResim, DirtyWindow, ResimPlanner, ResimRange, TickRing};
 pub use interest::{
-    membership_matches, AoiConfig, ConnectionInterest, InterestCandidate, InterestGrid,
-    MembershipId, PeerInterest, SeatObserver, SeatScratch, MEMBERSHIP_GLOBAL,
+    membership_matches, AoiConfig, ConnectionInterest, InterestCandidate, InterestDelta,
+    InterestGrid, InterestOccupancy, InterestPath, MembershipId, OccupancyScratch, PathSelector,
+    PeerInterest, SeatObserver, SeatScratch, GRID_ENTER_SPANS, GRID_LEAVE_SPANS,
+    GRID_MAX_OVERRIDES, MEMBERSHIP_GLOBAL,
 };
 pub use pacing::{CoupledSlew, LeadTracker, SlewDecision};
 pub use priority::{Band, Candidate, WEIGHT_ONE, WEIGHT_OWNED};
 pub use protocol::{PropKind, PropRole, PropSchema, QuantKind, SchemaBuilder, PROTOCOL_VERSION};
-pub use seats::{SeatId, SeatIndex, SeatRoster};
+pub use quant::row_is_finite;
+pub use seats::{
+    releases_seats, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SeatRoster,
+};
 pub use slots::{SlotError, SlotTable, MAX_SLOTS, SLOT_QUARANTINE_TICKS};
 pub use tick::{TickAccumulator, TickRate, TickStep};

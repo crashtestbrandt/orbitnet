@@ -15,6 +15,11 @@
 //! presentation layer binds to — a split-screen viewport to open, a camera to release. [`SeatRoster`]
 //! holds the last announced set and reports the transitions against a freshly gathered one.
 //!
+//! **Releasing a seat when a connection ends is a POLICY, and this module holds only the
+//! predicate.** [`releases_seats`] answers whether one drop or one expiry frees the seats behind it,
+//! given the [`SeatReleasePolicy`] the game chose. Nothing here acts on the answer, and the answer
+//! for a game that chose nothing is `false` on every event.
+//!
 //! Everything here is plain data: no Godot, no scene tree, no allocation past the caller's own
 //! buffers.
 
@@ -165,6 +170,100 @@ impl SeatRoster {
     }
 }
 
+/// What a game wants done with a connection's seats once that connection ends.
+///
+/// **Opt-in, and [`Hold`](SeatReleasePolicy::Hold) is the default because the existing behaviour is
+/// the default.** A connection whose transport is gone keeps its seats: the bodies behind it hold
+/// the authority they were given until the game changes it. That is what the reconnect grace window
+/// is for — a player whose wifi drops a burst of packets comes back to the body they left — and a
+/// session that freed the body on every transient drop would despawn players for a hiccup. Choosing
+/// anything else is the game saying its own rules differ.
+///
+/// What a policy buys the game that does want a release is **one call instead of a second table**.
+/// The alternative is a peer-to-bodies map maintained beside the roster the backend already derives
+/// from ownership, and two tables that answer "which bodies does this connection drive" are two
+/// things that can disagree — while only one of them, ownership, is what the anti-forgery check on
+/// received input reads.
+///
+/// The policy decides nothing on its own. [`releases_seats`] is the whole rule, and the caller acts
+/// on the answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SeatReleasePolicy {
+    /// Never release. The bodies keep the peer they were given, through the drop and past the
+    /// expiry, until the game changes it itself. The default, and the behaviour of every session
+    /// that sets no policy.
+    #[default]
+    Hold,
+    /// Release when a held session's grace window closes with nobody having claimed it back. A drop
+    /// on its own changes nothing, so a player who reconnects inside the window finds the body where
+    /// they left it.
+    OnExpiry,
+    /// Release the moment the transport connection is gone, without waiting for the window. For a
+    /// game with no reconnect story: the seat opens to the next joiner immediately, and a player who
+    /// comes back is a new player.
+    OnDrop,
+}
+
+/// Which connection-ending event is being reported.
+///
+/// The two are **sequential, not alternative**: a held session drops first and expires later, so a
+/// single connection going away for good produces one of each. That is why a policy has to say which
+/// of the two it acts on, and why acting on both would release twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeatReleaseEvent {
+    /// The transport connection went away. Reported for every drop, whether or not the session
+    /// behind it is being held open.
+    Dropped,
+    /// A held session's grace window closed with nobody claiming it.
+    Expired,
+}
+
+/// Whether `event` releases the seats of the connection it names, under `policy`.
+///
+/// | `peer_is_live` | policy | on `Dropped` | on `Expired` |
+/// | --- | --- | --- | --- |
+/// | `true` | any | no | no |
+/// | `false` | [`Hold`](SeatReleasePolicy::Hold) | no | no |
+/// | `false` | [`OnDrop`](SeatReleasePolicy::OnDrop) | **yes** | no |
+/// | `false` | [`OnExpiry`](SeatReleasePolicy::OnExpiry) | no | **yes** |
+///
+/// [`OnDrop`](SeatReleasePolicy::OnDrop) answers `false` on `Expired` because **the release already
+/// happened at the drop**. The expiry that follows names seats this policy let go a grace window
+/// ago, so a second release there can only reach seats something else has been given since.
+///
+/// **`peer_is_live == true` releases nothing, whatever the policy says.** This is the guard the rest
+/// of the rule rests on, and the reason is that **transport peer ids are reused**:
+///
+/// - An expiry names the id the session was **last connected under**, and that connection ended up
+///   to a whole grace window ago — 30 seconds by default.
+/// - Nothing reserves an id for a peer that is gone. The transport hands the next arrival whatever
+///   id is free, and 30 seconds is long enough for a newcomer to be holding the one the expiry
+///   names.
+/// - Releasing on that id would take a **live player's** body away, and nothing would report a
+///   problem: the id is valid, the seats behind it are real, and the release does exactly what it
+///   was asked to do. The player watches their body stop answering.
+///
+/// So the caller passes whether that id currently belongs to a connected peer, and the guard is
+/// checked before the policy is consulted at all — one rule rather than one per path. The cost is a
+/// **missed** release when an id was recycled: that body keeps an owner who no longer plays until
+/// the game changes it, which is exactly [`Hold`](SeatReleasePolicy::Hold) and is the direction that
+/// is safe to be wrong in.
+#[must_use]
+pub fn releases_seats(
+    policy: SeatReleasePolicy,
+    event: SeatReleaseEvent,
+    peer_is_live: bool,
+) -> bool {
+    if peer_is_live {
+        return false;
+    }
+    match policy {
+        SeatReleasePolicy::Hold => false,
+        SeatReleasePolicy::OnDrop => event == SeatReleaseEvent::Dropped,
+        SeatReleasePolicy::OnExpiry => event == SeatReleaseEvent::Expired,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +388,64 @@ mod tests {
         let mut ids = vec![seat(2, 0), seat(1, 9), seat(1, 0)];
         ids.sort_unstable();
         assert_eq!(ids, vec![seat(1, 0), seat(1, 9), seat(2, 0)]);
+    }
+
+    #[test]
+    fn the_default_seat_release_policy_holds_the_seats() {
+        // The behaviour a session gets by setting nothing, pinned so the opt-in stays opt-in.
+        assert_eq!(SeatReleasePolicy::default(), SeatReleasePolicy::Hold);
+    }
+
+    #[test]
+    fn holding_releases_on_neither_the_drop_nor_the_expiry() {
+        use SeatReleaseEvent::{Dropped, Expired};
+        assert!(!releases_seats(SeatReleasePolicy::Hold, Dropped, false));
+        assert!(!releases_seats(SeatReleasePolicy::Hold, Expired, false));
+    }
+
+    #[test]
+    fn releasing_on_drop_frees_at_the_drop_and_not_again_at_the_expiry() {
+        // The expiry names seats this policy let go a grace window earlier.
+        use SeatReleaseEvent::{Dropped, Expired};
+        assert!(releases_seats(SeatReleasePolicy::OnDrop, Dropped, false));
+        assert!(!releases_seats(SeatReleasePolicy::OnDrop, Expired, false));
+    }
+
+    #[test]
+    fn releasing_on_expiry_waits_for_the_window_and_frees_nothing_at_the_drop() {
+        use SeatReleaseEvent::{Dropped, Expired};
+        assert!(!releases_seats(SeatReleasePolicy::OnExpiry, Dropped, false));
+        assert!(releases_seats(SeatReleasePolicy::OnExpiry, Expired, false));
+    }
+
+    #[test]
+    fn a_live_peer_id_releases_nothing_under_any_policy_because_ids_are_reused() {
+        // The guard, as its own rule: an expiry names an id that dropped up to a grace window ago,
+        // and a newcomer can already be holding it. Releasing then takes a live player's body.
+        use SeatReleaseEvent::{Dropped, Expired};
+        assert!(!releases_seats(SeatReleasePolicy::Hold, Dropped, true));
+        assert!(!releases_seats(SeatReleasePolicy::Hold, Expired, true));
+        assert!(!releases_seats(SeatReleasePolicy::OnDrop, Dropped, true));
+        assert!(!releases_seats(SeatReleasePolicy::OnDrop, Expired, true));
+        assert!(!releases_seats(SeatReleasePolicy::OnExpiry, Dropped, true));
+        assert!(!releases_seats(SeatReleasePolicy::OnExpiry, Expired, true));
+    }
+
+    #[test]
+    fn the_live_peer_guard_and_not_a_blanket_no_is_what_silences_those_rows() {
+        // Negative control for the test above, deliberately repeating its two releasing rows with
+        // the id no longer live: without them, a `releases_seats` that answered `false` everywhere
+        // would satisfy the guard test.
+        assert!(releases_seats(
+            SeatReleasePolicy::OnDrop,
+            SeatReleaseEvent::Dropped,
+            false
+        ));
+        assert!(releases_seats(
+            SeatReleasePolicy::OnExpiry,
+            SeatReleaseEvent::Expired,
+            false
+        ));
     }
 
     #[test]

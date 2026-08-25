@@ -174,6 +174,9 @@ func set_bulk_marshalling(on: bool) -> void:
 		return
 	_handle.set_bulk_capture(HockeyConfig.MARSHAL_OUT if on else "")
 	_handle.set_bulk_restore(HockeyConfig.MARSHAL_IN if on else "")
+	# The apply direction shares the restore method, which is safe only because this body declares no cosmetic
+	# entries -- an apply hook reads the CAPTURE slots, and those are the restore slots plus the cosmetics.
+	_handle.set_bulk_apply(HockeyConfig.MARSHAL_IN if on else "")
 	_handle.process_settings()
 
 ## Whether the state lane is actually marshalling in bulk. Asked rather than assumed: a name that does not

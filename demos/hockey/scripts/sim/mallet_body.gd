@@ -90,6 +90,9 @@ func set_bulk_marshalling(on: bool) -> void:
 		return
 	_handle.set_bulk_capture(HockeyConfig.MARSHAL_OUT if on else "")
 	_handle.set_bulk_restore(HockeyConfig.MARSHAL_IN if on else "")
+	# The apply direction shares the restore method, which is safe only because this body declares no cosmetic
+	# entries -- an apply hook reads the CAPTURE slots, and those are the restore slots plus the cosmetics.
+	_handle.set_bulk_apply(HockeyConfig.MARSHAL_IN if on else "")
 	_handle.process_settings()
 
 ## Whether each lane is actually marshalling in bulk, state first. Reported per lane rather than as one
@@ -129,6 +132,14 @@ func _rollback_tick(delta: float, _tick: int, _is_fresh: bool) -> void:
 ## authority agrees everywhere: a peer that missed the update would keep predicting (or keep refusing to
 ## predict) the wrong body, and the backend would start rejecting its input frames as unauthorized. Peer 0
 ## means "nobody", which parks the mallet and resolves authority to the server.
+##
+## PREDICTION IS RE-DECLARED HERE, and it is the half an authority write does not cover. A client builds its
+## rink before the roster arrives, so every mallet registers with `predict = false` -- which does not merely
+## defer prediction, it EXEMPTS the mallet from the rollback loop. Without `set_predicted()` the seat this
+## player is about to be given would sit out the loop for the whole session: its authoritative rows would
+## still land, so the mallet would move and every readout would look ordinary, while the player's own mouse
+## took a full round trip to reach it. The PUCK hides this, because it is registered `predict = true` on every
+## peer and is the number this demo reports.
 func set_owner_peer(peer: int) -> void:
 	owner_peer = peer
 	if peer > 0:
@@ -137,8 +148,8 @@ func set_owner_peer(peer: int) -> void:
 		input.nin_target = TableGeometry.home_point(seat)
 	if Net.is_offline() or _handle == null:
 		return
-	input.set_multiplayer_authority(peer if peer > 0 else 1)
-	_handle.process_authority()
+	_handle.set_input_authority(peer if peer > 0 else 1)
+	_handle.set_predicted(Net.is_server() or (peer > 0 and peer == multiplayer.get_unique_id()))
 
 ## Write this frame's requested point. Called only on the peer that OWNS this mallet; on anyone else the input
 ## node is not writable and the backend would ignore it anyway.
@@ -157,6 +168,15 @@ func team() -> int:
 ## Whether this mallet's owner is currently mis-predicting. Diagnostics for the HUD.
 func is_predicting() -> bool:
 	return _handle != null and _handle.is_predicting()
+
+## Whether THIS peer simulates this mallet in its rollback loop, as opposed to applying the rows it receives.
+##
+## Not the same question as [method is_predicting], which asks whether the owner is currently MISPREDICTING.
+## This one is the switch, and it is the one that is silent when it is wrong: a mallet left out of the loop
+## still applies its authoritative rows, so it moves and every other readout looks ordinary while its own
+## player's mouse takes a full round trip to reach it. See [method set_owner_peer].
+func is_predicted() -> bool:
+	return _handle != null and _handle.is_predicted()
 
 # --- internals -------------------------------------------------------------------------------------
 # Whether THIS peer has this mallet's input frames at all.

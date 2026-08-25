@@ -133,7 +133,7 @@ func _on_pre_tick(_tick: int) -> void:
     input_node.jump = Input.is_action_pressed("jump")
 ```
 
-### Four things to get right
+### Five things to get right
 
 1. **`add_child` before you register.** The entity id hashes the node's *path*.
 2. **Name every replicated node explicitly.** `add_child(Node3D.new())` yields `@Node3D@27` — an allocation
@@ -141,6 +141,17 @@ func _on_pre_tick(_tick: int) -> void:
 3. **The property set must be identical on every peer.** The schema is positional and hash-checked.
 4. **`predict` ≠ `is_multiplayer_authority()`.** It is true on the server (simulates everything) *and* on the
    owning client (predicts its own), false on a client watching someone else's body.
+5. **`predict` is read once, and ownership moves.** If your world is built before the roster arrives — which it
+   is, for every client that builds its scene and then joins — every body registers with `predict = false`, and
+   that does not merely defer prediction: it **exempts the body from the rollback loop**. An exempt body still
+   applies the rows it receives, so it moves and every readout looks ordinary while the player's own input is a
+   full round trip late. Call `NetRollbackHandle.set_predicted()` whenever ownership changes:
+
+   ```gdscript
+   func set_owner_peer(peer: int) -> void:
+       handle.assign_seat(peer, seat)
+       handle.set_predicted(Net.is_server() or peer == multiplayer.get_unique_id())
+   ```
 
 ## 5. Non-predicted things: the state lane
 

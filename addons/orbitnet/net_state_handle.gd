@@ -15,10 +15,16 @@ var _sync: Node = null   # the backend state synchronizer node (created + owned 
 # process, and the question was being asked once per replicated body per render frame -- a ClassDB method-bind
 # lookup, which is exactly the per-frame engine chatter CLAUDE.md names as the net-probe's timing hazard.
 var _reports_last_state: bool = false
+# The same once-only resolution for the two RECEIPT questions, and for the same reason: is_receiving() is
+# called once per replicated channel per frame. [NetRollbackHandle] carries the identical pair.
+var _reports_last_received: bool = false
+var _reports_authors_state: bool = false
 
 func _init(sync: Node) -> void:
 	_sync = sync
 	_reports_last_state = sync != null and sync.has_method(&"get_last_known_state")
+	_reports_last_received = sync != null and sync.has_method(&"get_last_received_state")
+	_reports_authors_state = sync != null and sync.has_method(&"authors_state")
 
 ## Whether a real synchronizer backs this handle (false OFFLINE / inert).
 func is_active() -> bool:
@@ -30,17 +36,28 @@ func is_active() -> bool:
 ## The property itself is unchanged in GDScript -- only its wire encoding is:
 ##
 ##   add_state(unit, "position@half")   # Vector3: 12 B -> 6 B  (three IEEE-754 binary16 components)
-##   add_state(unit, "basis@ss3")       # Quaternion/Basis: smallest-three, 16 B -> 8 B
+##   add_state(unit, "quaternion@ss3")  # Quaternion: 16 B -> 6 B  (smallest-three)
 ##   add_state(unit, "hp")              # no suffix: lossless
 ##
-## `@half` is valid for Vector3, Vector2 and f32 ONLY; `@ss3` for Quaternion and Basis ONLY. An invalid
-## (quantizer, type) pairing does NOT error -- it SILENTLY falls back to lossless, so a suffix that looks
-## like it is saving bytes may be saving none. That matters most for scalars, because of the next paragraph.
+## The whole pairing table, and what each pairing costs on the wire:
+##
+## | Suffix | Valid for | Native -> wire |
+## | --- | --- | --- |
+## | `@half` | Vector3 | 12 B -> 6 B |
+## | `@half` | Vector2 | 8 B -> 4 B |
+## | `@half` | f32 | 4 B -> 2 B (unreachable from GDScript; see below) |
+## | `@ss3` | Quaternion | 16 B -> 6 B |
+## | `@ss3` | Basis | 36 B -> 6 B (rotation only -- scale and shear are discarded) |
+##
+## AN INVALID PAIRING, AND AN UNRECOGNIZED SUFFIX, ARE REPORTED. The backend drops the annotation, ships the
+## property lossless, and raises a diagnostic naming this channel and the entry -- an ERROR in the editor and
+## in any run from source, a warning in an exported build. [method quantizer_fallbacks] lists every such entry
+## so a boot check can fail on it instead of a log line scrolling past.
 ##
 ## A GDScript `float` is an f64 and a GDScript `int` is an i64 -- that is what the language actually stores,
 ## and the backend records them at full width deliberately, since narrowing a float here would round every
 ## replayed value and quietly break a bit-exact resimulation. There is therefore NO way to narrow a bare
-## scalar from GDScript: `"hp@half"` is an f64 on the wire, 8 bytes, exactly as if the suffix were absent.
+## scalar from GDScript: `"hp@half"` is an f64 on the wire, 8 bytes, and the suffix is reported and dropped.
 ## The idiom is to PACK scalars into a Vector3 and quantize that -- three normalized scalars in one
 ## `Vector3 @half` cost 6 bytes total instead of 24. The RTS demo's `net_aux` packs (cos, sin, hp01) that
 ## way; see docs/protocol.md.
@@ -134,9 +151,14 @@ func set_priority(weight: int) -> void:
 
 ## The tick of the newest authoritative row this channel has received (-1 before any, -1 OFFLINE).
 ##
-## The client half of interest culling: it stops the updates but never removes the node -- no spawner
-## carries a spatial visibility filter -- so a client that wants to stop drawing a body frozen at its last pose
-## has to notice for itself that the rows stopped. Compare against `Net.current_tick()`.
+## The client half of interest culling: it stops the updates but never removes the node, so a client that wants
+## to stop drawing a body frozen at its last pose has to decide for itself what that means. Compare against
+## `Net.current_tick()`.
+##
+## A THRESHOLD, WHICH IS THE RIGHT SHAPE FOR A FADE AND THE WRONG ONE FOR AN EDGE. "How stale is this" is a
+## continuous quantity and a threshold is how you read one; "it stopped being sent" is a moment, and
+## [signal Net.entity_left_interest] is where that moment is published. Use the signal to act once, and this
+## to draw.
 ## A BACKEND THAT CANNOT ANSWER REPORTS THE PRESENT, so the staleness rule fails OPEN. The cdylib is committed by
 ## a bot in a commit separate from the Rust sources (CLAUDE.md), so new GDScript legitimately runs against an
 ## older binary that has no such method -- a PR branch before the bot lands, a bisect, any tree that has not run
@@ -163,10 +185,105 @@ func last_known_state() -> int:
 func reports_last_known_state() -> bool:
 	return _reports_last_state
 
+## The tick of the newest authoritative row this peer RECEIVED for this channel. -1 when inert, -1 before the
+## first row, and -1 for the whole session on the authority, which receives none.
+##
+## THE RECEIPT, and it is a different reading from [method last_known_state] even on this lane, where the two
+## happen to agree today. That one fails open and reports the present against a backend that cannot answer;
+## this one has a single source -- the wire -- and stays honest. [NetRollbackHandle] carries the same four
+## methods with the same meanings, so one game helper spans both lanes; on that lane the difference is not
+## cosmetic, because its `get_last_known_state()` is also raised by the authoring peer's own simulation.
+##
+## It counts a row that arrived too old to apply: it still proves the channel is being sent here.
+##
+## -1 IS A SENTINEL, NOT A FAIL-OPEN. A backend too old to answer reports -1 and says so through
+## [method reports_last_received_state]. The fail-open lives one level up, in [method is_receiving]. The
+## sentinel and the fail-open are deliberately different answers to the same unknown -- a staleness rule
+## degrades rather than blanking the world, while a caller quoting the tick is handed -1 rather than a number
+## nothing measured.
+func last_received_state() -> int:
+	if _sync == null or not _reports_last_received:
+		return -1
+	return _sync.get_last_received_state()
+
+## Whether THIS PEER AUTHORS this channel, and therefore receives no rows for it. False when inert, and false
+## on a backend too old to answer.
+##
+## The disambiguator for [method last_received_state]: on the authoring peer that reading is -1 for the whole
+## session, which on its own is indistinguishable from "culled since it spawned". [method is_receiving] checks
+## this first for exactly that reason.
+func authors_state() -> bool:
+	if _sync == null or not _reports_authors_state:
+		return false
+	return _sync.authors_state()
+
+## Whether [method last_received_state] reports a MEASURED tick rather than the sentinel a backend too old to
+## answer produces. False when inert, and false on that older backend.
+##
+## Resolved once at construction. Check it wherever the reading is used as EVIDENCE -- a probe asserting that
+## rows reach a client, a HUD claiming a channel is live, a bug report quoting a tick -- because -1 alone
+## cannot say which of "no row yet" and "cannot measure" produced it.
+func reports_last_received_state() -> bool:
+	return _reports_last_received
+
+## Whether rows for this channel are still arriving, within `within_ticks` of the current tick. THE CALL A GAME
+## MAKES; the three reads above are the parts it is built from.
+##
+## IT FAILS OPEN -- true in every case where the answer is not known to be no:
+##
+## | Case | Answer |
+## | --- | --- |
+## | inert (OFFLINE) | true -- there is no wire to stop |
+## | [method authors_state] | true -- the authority receives nothing and never will |
+## | a backend too old to answer | true -- a binary mismatch degrades a rule, it never blanks the world |
+## | `Net.current_tick() - last_received_state() <= within_ticks` | true -- a row landed recently enough |
+## | a measuring peer that has never received a row | false -- the only known no |
+##
+## `within_ticks` IS A QUESTION ABOUT THE SEND ROTA, NOT ABOUT THE NETWORK. Entities are served stalest-first
+## inside a per-tick byte budget, so a channel far down a busy rota waits several ticks between rows with
+## nothing wrong anywhere. Size the window against that rota -- the default 24 ticks is about half a second at
+## 50 Hz -- rather than against a round trip.
+func is_receiving(within_ticks: int = 24) -> bool:
+	if _sync == null:
+		return true
+	if authors_state():
+		return true
+	if not _reports_last_received:
+		return true
+	var tick: int = last_received_state()
+	if tick < 0:
+		return false
+	return Net.current_tick() - tick <= within_ticks
+
 ## Re-read the synchronizer's configuration after its state set changes.
 func process_settings() -> void:
 	if _sync != null:
 		_sync.process_settings()
+
+## Every declared entry whose `@` quantizer suffix is NOT IN FORCE, verbatim. Empty is the healthy answer.
+##
+## Three ways an entry lands here, and all three ship the property wider than the entry claims:
+##
+## | Cause | What the property does |
+## | --- | --- |
+## | the suffix is neither `@half` nor `@ss3` | ships lossless |
+## | the pairing is invalid for the resolved type (`"hp@half"` on a GDScript float) | ships lossless |
+## | the entry did not resolve at all -- a mistyped path | does not ship |
+##
+## ASSERT ON IT RATHER THAN READING THE LOG. Each of these also raises a diagnostic, but a dropped suffix is
+## a BANDWIDTH bug: the game runs, the frames decode, and the only symptom is a wire two to six times wider
+## than the property list says. Call this once after [method process_settings] in a boot check and fail CI on
+## a non-empty result.
+##
+## Empty when the handle is inert, and empty on a backend too old to answer -- so a boot check written against
+## a newer addon than the loaded cdylib PASSES rather than blocking a bisect. Both are the same fail-open the
+## rest of this handle takes: a binary mismatch degrades a diagnostic, it never stops the game.
+func quantizer_fallbacks() -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"quantizer_fallbacks"):
+		return PackedStringArray()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant.
+	var dropped: PackedStringArray = _sync.quantizer_fallbacks()
+	return dropped
 
 ## This channel's stable replication id (0 when inert, or before process_settings() resolves a root inside the
 ## tree). See [method NetRollbackHandle.entity_id] -- same token, same caveat that it is a hash and not a
@@ -186,13 +303,36 @@ func entity_id() -> int:
 ## What it buys: the authority captures every channel whose state it owns, once per tick, at one `Object.get`
 ## per property. A fat channel is 41 of them. This makes it one call.
 ##
-## NO RESTORE HOOK ON THIS LANE, and none is needed: applying a row here is the receive path, which runs once
-## per received block rather than once per replayed tick, so there is no replay multiplier to divide.
+## NO RESTORE HOOK ON THIS LANE, because it has no rollback restore. Its apply is the receive path, and that
+## has a direction of its own -- [method set_bulk_apply].
 ##
 ## Call BEFORE process_settings(); the hook resolves with the property list.
 func set_bulk_capture(method: String) -> void:
 	if _sync != null:
 		_sync.set(&"bulk_capture_method", method)
+
+## Declare the game method that APPLIES a received row for this channel in one call, replacing the
+## per-property walk.
+##
+## THE APPLY ORDER IS THE CAPTURE ORDER, NOT A RESTORE ORDER. On this lane the two are always the same list --
+## every entry is replicated and applied, and there is no cosmetic role for them to differ by -- but a body's
+## state lane DOES differ, so a method shared with [NetRollbackHandle] must be written against
+## [method bulk_apply_order] there. See [method NetRollbackHandle.set_bulk_apply].
+##
+## Signature: `func <method>(lane: int, values: Array) -> void`, declared on the channel's ROOT, with `lane`
+## always [constant LANE_STATE]. Read the slots and write your own fields; do not resize the array.
+##
+## WHAT IT SAVES, HONESTLY: one call instead of one `Object.set` per replicated property, and it runs once per
+## DELIVERED BLOCK rather than once per replayed tick, so there is no replay multiplier and below roughly
+## twenty delivered blocks a tick the saving is noise. Its multiplier is the number of channels a frame
+## delivers, bounded by the receive byte budget rather than by the roster. It matters most on a peer that
+## SIMULATES NOTHING -- a spectator's rollback loop returns on an empty plan, so this is the only property walk
+## its frame runs and no other hook reaches it.
+##
+## Call BEFORE process_settings(); the hook resolves with the property list.
+func set_bulk_apply(method: String) -> void:
+	if _sync != null:
+		_sync.set(&"bulk_apply_method", method)
 
 ## The declared entries the bulk capture hook marshals, in the order its array carries them. Empty when the
 ## channel has no hook, when the handle is inert, or on a backend too old to answer.
@@ -210,3 +350,20 @@ func uses_bulk_capture() -> bool:
 	if _sync == null or not _sync.has_method(&"uses_bulk_capture"):
 		return false
 	return _sync.uses_bulk_capture(LANE_STATE)
+
+## The declared entries the bulk apply hook marshals, in the order its array carries them -- the same list
+## [method bulk_capture_order] publishes, since this lane has one role and no restored subset. Empty when the
+## channel has no hook, when the handle is inert, or on a backend too old to answer.
+func bulk_apply_order() -> PackedStringArray:
+	if _sync == null or not _sync.has_method(&"bulk_apply_order"):
+		return PackedStringArray()
+	# ASSIGNED to a typed local rather than returned straight through: the call answers a Variant.
+	var order: PackedStringArray = _sync.bulk_apply_order(LANE_STATE)
+	return order
+
+## Whether this channel DECLARES an apply hook for its receive path. Reports the declaration, so a method name
+## that does not resolve reads false and leaves the channel on the walk.
+func uses_bulk_apply() -> bool:
+	if _sync == null or not _sync.has_method(&"uses_bulk_apply"):
+		return false
+	return _sync.uses_bulk_apply(LANE_STATE)

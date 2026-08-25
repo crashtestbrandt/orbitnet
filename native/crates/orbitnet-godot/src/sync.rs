@@ -15,15 +15,25 @@
 //! peers derive the same id because the `MultiplayerSpawner` guarantees identical node names —
 //! the invariant any node-path-derived identity scheme leans on, made explicit.
 //!
-//! **Bulk marshalling** is opt-in per synchronizer: declare `bulk_capture_method` (and, on the
-//! rollback lane, `bulk_restore_method`) and the lane moves its whole row through one
-//! `Object::call` instead of one `Object::get` / `Object::set` per property. Because that call is
-//! game code, it is **staged** rather than made in place — `stage_capture` and `restore_tick` fill
-//! or drain the hook's preallocated array with the synchronizer bound, and `OrbitNet` runs the
-//! staged calls with every `bind` dropped, the same surrender phase 2 makes for `_rollback_tick`.
-//! Every lane that declares no hook keeps the walk, and the row it records is the same bytes
-//! either way: the hook supplies `Variant`s, and the encode, the offsets and the quantized
-//! canonicalization stay in `binding`.
+//! **Bulk marshalling** is opt-in per synchronizer: declare `bulk_capture_method`,
+//! `bulk_apply_method` (and, on the rollback lane, `bulk_restore_method`) and the lane moves its
+//! whole row through one `Object::call` instead of one `Object::get` / `Object::set` per property.
+//! Because that call is game code, it is **staged** rather than made in place — `stage_capture`,
+//! `restore_tick`, `record_tick` and the two pending-row applies fill or drain the hook's
+//! preallocated array with the synchronizer bound, and `OrbitNet` runs the staged calls with every
+//! `bind` dropped, the same surrender phase 2 makes for `_rollback_tick`. Every lane that declares
+//! no hook keeps the walk, and the row it records is the same bytes either way: the hook supplies
+//! `Variant`s, and the encode, the offsets and the quantized canonicalization stay in `binding`.
+//!
+//! The three directions cover four walks, and the **apply** direction covers the two that used to
+//! be documented here as deliberate omissions:
+//!
+//! | Direction | Walk | Where |
+//! | --- | --- | --- |
+//! | capture | live values into the row | `capture_local_input`, `record_tick`, `capture_frontier` |
+//! | restore | the row onto the restored roles | `restore_tick` |
+//! | apply | a received row onto every role | `apply_pending_display`, `apply_pending` |
+//! | apply | the quantized write-back | `record_tick`, gated on two or more quantized properties |
 
 use godot::classes::Node;
 use godot::prelude::*;
@@ -33,8 +43,8 @@ use orbitnet_core::codec::{
 };
 use orbitnet_core::seats::SeatIndex;
 use orbitnet_core::{
-    ColumnarHistory, Confidence, FreshnessLedger, MembershipId, MemoRing, PropKind, PropRole,
-    PropSchema, SchemaBuilder, MEMBERSHIP_GLOBAL,
+    row_is_finite, ColumnarHistory, Confidence, FreshnessLedger, MembershipId, MemoRing, PropKind,
+    PropRole, PropSchema, SchemaBuilder, MEMBERSHIP_GLOBAL,
 };
 
 use crate::binding::{self, PropBinding};
@@ -191,6 +201,133 @@ pub enum StateIntegration {
     Stale,
 }
 
+/// What integrating one received **input** row concluded.
+///
+/// Three answers rather than an `Option<u64>`, because the caller has to tell a row that changed
+/// nothing apart from a row that was **refused**. The first is the ordinary case and is silent; the
+/// second is counted and named in the log once per peer, because a silently dropped row is
+/// indistinguishable from packet loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputIntegration {
+    /// Nothing was written. The row was the wrong stride, its tick has rotated out of the history
+    /// ring, or it is byte-identical to the row already stored for that tick.
+    ///
+    /// **The common answer.** A block carries `INPUT_REDUNDANCY` ticks of input so a single lost
+    /// datagram costs nothing, and typically only one of those ticks is new.
+    Ignored,
+    /// The row was stored at this tick and stamped [`Confidence::Authoritative`]. The caller marks
+    /// the resim planner with the oldest such tick in the block.
+    Landed(u64),
+    /// The row carried a non-finite float and was refused. Nothing was written, so the caller does
+    /// with it exactly what it does with [`Self::Ignored`] — no planner mark, no resim — and counts
+    /// it. See [`integrate_input_row`].
+    NonFinite,
+}
+
+/// Integrate one decoded input row into an entity's input history.
+///
+/// A free function over the runtime state it touches, rather than a method, so the whole
+/// receive-path rule is reachable from a unit test with no `SceneTree` — the same reason
+/// `orbit_net`'s `classify_rx` is a free function.
+/// [`OrbitRollbackSynchronizer::integrate_remote_input`] is the only caller.
+///
+/// The order of the gates is load-bearing:
+///
+/// | Gate | Answer |
+/// | --- | --- |
+/// | wrong stride, or a tick the ring has rotated past | `Ignored` |
+/// | byte-identical to the row already stored at that tick | `Ignored` |
+/// | any float lane non-finite | `NonFinite` |
+/// | otherwise | `Landed(tick)` |
+///
+/// **The finiteness check runs after the novelty compare**, so it is paid only on rows that would
+/// actually be stored. It also has to run after the stride gate: [`row_is_finite`] answers `false`
+/// for a row shorter than the schema's native extent, so a short row reached before the stride gate
+/// would be reported as poison rather than as the wrong stride.
+///
+/// The stride is read off `history` rather than off the schema. They are the same number — the
+/// history is constructed with `SchemaBuilder::row_stride()` of the same schema `props` comes from
+/// — and `ColumnarHistory::write_row` is what the row has to fit.
+///
+/// # Why a non-finite float is refused when a value out of range is not
+///
+/// **Range, rate and plausibility stay the game's job**, inside `_rollback_tick`, and a client is
+/// free to send a movement axis of 10<sup>9</sup>. A non-finite float is different in kind: it is a
+/// **poison value** that breaks the simulation for every peer rather than only for its sender.
+///
+/// - `PropRole::Input` is **restored**, so the poisoned row is written onto the game's input node
+///   before every replayed tick and the resim runs through it.
+/// - The non-finite state that results is recorded into state history and goes back out on the
+///   **state lane to every peer**.
+/// - A non-finite position **has no grid cell**, so the interest filter classifies that body as
+///   uncullable and it then replicates to every peer in every world for as long as the pose stays
+///   non-finite. One poisoned float is a wire-cost regression as well as a simulation one.
+///
+/// # What was already covered
+///
+/// Both quantizers are total over poison, so an `@`-annotated property could never carry one in:
+/// the half-float decode maps an exponent of 31 to `0.0`, and the smallest-three decode
+/// renormalizes and clamps. The exposure is the **unannotated** float property, which is what a
+/// plain `float` or `Vector3` input property gets by default.
+///
+/// # Dropped, never sanitized
+///
+/// A refused row leaves the tick with no row, which is the state a lost datagram leaves.
+/// [`input_restore_row`] resolves it to the closest row at or before and stamps the tick
+/// [`Confidence::Extrapolated`], so the body coasts on its last honest intent down the same
+/// well-exercised path. Zeroing the offending lane would invent intent the player did not author.
+///
+/// # Not folded into the shared row decoder
+///
+/// `quant::decode_row` is shared with the state lane and with masked deltas, where the sender **is**
+/// the authority. Checking there would cost bytes-per-row on a lane that does not need it, and it
+/// would change that lane's behaviour.
+pub(crate) fn integrate_input_row(
+    props: &[PropSchema],
+    history: &mut ColumnarHistory,
+    ledger: &mut FreshnessLedger,
+    latest_remote_input_tick: &mut i64,
+    tick: u64,
+    row: &[u8],
+) -> InputIntegration {
+    if row.len() != history.stride() || history.is_stale(tick) {
+        return InputIntegration::Ignored;
+    }
+    if history.row(tick) == Some(row) {
+        return InputIntegration::Ignored;
+    }
+    if !row_is_finite(props, row) {
+        return InputIntegration::NonFinite;
+    }
+    history.write_row(tick, row);
+    ledger.set_confidence(tick, Confidence::Authoritative);
+    *latest_remote_input_tick =
+        (*latest_remote_input_tick).max(i64::try_from(tick).unwrap_or(i64::MAX));
+    InputIntegration::Landed(tick)
+}
+
+/// The input row a tick restores from, stamping the ledger when that row is a carry-forward.
+///
+/// **A tick with no row of its own is [`Confidence::Extrapolated`], not
+/// [`Confidence::Authoritative`].** The row applied is the newest one at or before the tick, which
+/// is the whole of what a missing tick resolves to — a lost datagram, a row a redundancy window
+/// never reached, and a row refused by [`integrate_input_row`] all land here identically. Returns
+/// `None` when history holds nothing at or before the tick, and the caller then applies nothing.
+///
+/// Free, like [`integrate_input_row`] and for the same reason: the stamping rule is the one the
+/// refusal path leans on, so it is gated by a test rather than only by a probe.
+pub(crate) fn input_restore_row<'h>(
+    history: &'h ColumnarHistory,
+    ledger: &mut FreshnessLedger,
+    tick: u64,
+) -> Option<&'h [u8]> {
+    let (input_tick, row) = history.closest_at_or_before(tick)?;
+    if input_tick != tick {
+        ledger.set_confidence(tick, Confidence::Extrapolated);
+    }
+    Some(row)
+}
+
 /// Rollback state + input replication for one entity.
 #[derive(GodotClass)]
 #[class(base=Node)]
@@ -311,11 +448,59 @@ pub struct OrbitRollbackSynchronizer {
     /// replicated but never restored, so they are absent here and present there. A lane that
     /// declares no cosmetics has identical lists.
     ///
-    /// **It covers the rollback loop, not the receive path.** Applying a received row still walks
-    /// the properties: that runs once per received block, not once per replayed tick, and it is the
-    /// path that must also land cosmetics.
+    /// **It covers the rollback loop only.** The receive path and the quantized write-back have
+    /// their own direction — see [`Self::bulk_apply_method`], whose order is the CAPTURE order.
     #[export]
     bulk_restore_method: GString,
+
+    /// Bulk **apply** hook: the name of a game method that lands a whole lane's values in one
+    /// crossing, or empty for the per-property walk.
+    ///
+    /// **The apply order is the CAPTURE order, not the restore order.** The two differ by exactly
+    /// this lane's `Cosmetic` entries — captured and replicated, never restored — so a game that
+    /// passes its restore method here, on a body that declares cosmetics, reads shifted slots and
+    /// writes wrong values with nothing erroring. Read [`Self::bulk_apply_order`]. A body that
+    /// declares no cosmetics has three identical lists and cannot hit this.
+    ///
+    /// Signature: `func <name>(lane: int, values: Array) -> void`, lanes as on the other two
+    /// directions, declared on the root, reading the slots and writing the game's own fields — the
+    /// same direction the restore hook runs in.
+    ///
+    /// It covers **two** walks, and they are worth different amounts:
+    ///
+    /// | Walk | Crossings without / with | Multiplier |
+    /// | --- | --- | --- |
+    /// | the receive apply ([`Self::apply_pending_display`]) | `S + C` / `1` | delivered blocks per tick |
+    /// | the quantized write-back ([`Self::record_tick`]) | `Q` / `1` | replayed ticks × planned entities |
+    ///
+    /// **Be honest about the receive apply: there is no replay multiplier.** It runs once per
+    /// delivered block, so below roughly twenty blocks a tick the saving is noise. What makes it
+    /// worth having is the peer it runs on — a peer that simulates nothing plans no entities, its
+    /// rollback loop returns on an empty plan, and this walk is then its **entire** per-tick
+    /// crossing count with no other hook reaching it. Its multiplier is the entity count, bounded
+    /// by the receive byte budget rather than by the roster.
+    ///
+    /// **The write-back does carry the multiplier.** A body of 41 props with 8 quantized among
+    /// them, replaying 12 ticks, pays 96 `Object::set` calls a frame on the walk and 12 calls
+    /// through the hook.
+    ///
+    /// **The write-back is gated on two or more quantized properties**, counted once at resolve
+    /// time. A lane with zero or one keeps the targeted walk, which writes only what changed and is
+    /// already one crossing or none. [`Self::uses_bulk_apply`] reports the DECLARATION, not which
+    /// of the two paths ran.
+    ///
+    /// **A gated write-back hands back the whole row, not the quantized entries alone.** Every
+    /// value in it that carries no quantizer is the value capture just read, encoded and decoded
+    /// losslessly, so writing it back changes nothing; what it costs is the assignments the game
+    /// makes inside its own hook, and what it saves is `Q` script-boundary crossings.
+    ///
+    /// **Both lanes resolve one, and only the state lane runs one today.** The input lane has no
+    /// receive apply — a received input row lands in the ring and reaches the game through the
+    /// restore direction — and no quantized write-back. It resolves and publishes its order anyway,
+    /// so one game method can serve every lane and every direction of a body, and so
+    /// [`Self::bulk_apply_order`] answers for `lane` rather than for one lane.
+    #[export]
+    bulk_apply_method: GString,
 
     // --- resolved at process_settings ---
     entity_id: u64,
@@ -324,14 +509,23 @@ pub struct OrbitRollbackSynchronizer {
     input_schema: SchemaBuilder,
     input_bindings: Vec<PropBinding>,
     unresolved: PackedStringArray,
+    /// Declared entries whose `@` quantizer annotation is not in force. See
+    /// [`Self::quantizer_fallbacks`].
+    quant_fallbacks: PackedStringArray,
     rollback_nodes: Vec<Gd<Node>>,
     /// The resolved `membership_property`, or `None` when unset or unresolvable.
     membership: Option<(Gd<Node>, StringName)>,
     /// Resolved bulk hooks, `None` where the lane keeps the per-property walk.
     state_capture_hook: Option<binding::BulkHook>,
     state_restore_hook: Option<binding::BulkHook>,
+    state_apply_hook: Option<binding::BulkHook>,
     input_capture_hook: Option<binding::BulkHook>,
     input_restore_hook: Option<binding::BulkHook>,
+    input_apply_hook: Option<binding::BulkHook>,
+    /// Whether the state lane's quantized write-back routes through the apply hook: a resolved hook
+    /// AND two or more quantized properties. Decided once at resolve time, so the hot path reads a
+    /// bool rather than counting bindings. See [`Self::bulk_apply_method`].
+    state_writeback_bulk: bool,
     /// Whether the last staged bulk capture is the one `record_tick` / `capture_local_input`
     /// should read. Cleared as it is consumed, so a phase that never staged the call falls back to
     /// the walk rather than encoding a stale array.
@@ -368,6 +562,19 @@ pub struct OrbitRollbackSynchronizer {
     auth_rows: Option<ColumnarHistory>,
     /// Newest authoritative state tick known (received on clients, broadcast tick on the server).
     latest_state_tick: i64,
+    /// Newest tick this peer has **decoded off the wire** for this entity, `-1` before the first row.
+    ///
+    /// **The receipt.** It exists beside `latest_state_tick` because that field has two writers —
+    /// [`Self::integrate_authoritative_row`] (a wire row) and [`Self::record_tick`], which raises it to this
+    /// peer's own simulated frontier for every entity whose state it authors. On a server or a listen-server
+    /// host it therefore rises every tick with no row in sight, so it cannot answer "am I still being sent
+    /// this entity". This one has ONE writer, in [`Self::apply_state_block`], and stays `-1` forever on the
+    /// peer that authors the state.
+    ///
+    /// **Monotonic within the session.** A reordered older row cannot pull the reading back and make a live
+    /// entity read as culled. Every site that clears `latest_state_tick` clears this too: session ticks
+    /// restart near 0, so a value carried over from the previous session reads as "receiving" forever.
+    latest_received_tick: i64,
     /// Newest received-and-not-yet-integrated authoritative row (owner reconcile path).
     pending_state: Option<(u64, Vec<u8>)>,
     /// Newest received row awaiting the next tick boundary (display path).
@@ -400,18 +607,23 @@ impl INode for OrbitRollbackSynchronizer {
             membership_property: GString::new(),
             bulk_capture_method: GString::new(),
             bulk_restore_method: GString::new(),
+            bulk_apply_method: GString::new(),
             entity_id: 0,
             state_schema: SchemaBuilder::new(),
             state_bindings: Vec::new(),
             input_schema: SchemaBuilder::new(),
             input_bindings: Vec::new(),
             unresolved: PackedStringArray::new(),
+            quant_fallbacks: PackedStringArray::new(),
             rollback_nodes: Vec::new(),
             membership: None,
             state_capture_hook: None,
             state_restore_hook: None,
+            state_apply_hook: None,
             input_capture_hook: None,
             input_restore_hook: None,
+            input_apply_hook: None,
+            state_writeback_bulk: false,
             state_capture_staged: false,
             input_capture_staged: false,
             input_local: false,
@@ -424,6 +636,7 @@ impl INode for OrbitRollbackSynchronizer {
             history_limit: 128,
             auth_rows: None,
             latest_state_tick: -1,
+            latest_received_tick: -1,
             pending_state: None,
             pending_display: None,
             latest_auth_sim_tick: 0,
@@ -605,10 +818,49 @@ impl OrbitRollbackSynchronizer {
         self.entity_id as i64
     }
 
-    /// The tick of the newest authoritative state known for this entity (-1 before any).
+    /// The newest authoritative state tick this peer **knows** for this entity, from either source
+    /// (-1 before any).
+    ///
+    /// **A frontier over two writers**, which is what stops it answering whether rows are arriving.
+    ///
+    /// | Writer | Raises it to |
+    /// | --- | --- |
+    /// | `integrate_authoritative_row` | the tick of a row decoded off the wire |
+    /// | `record_tick` | this peer's own simulated tick, whenever it authors the state |
+    ///
+    /// So on a client that receives this entity it is the newest row's tick, and on a server or a
+    /// listen-server host it rises every tick for every entity that peer authors, with no row
+    /// involved. **Ask [`Self::get_last_received_state`] whether rows are still arriving**; a cull, a
+    /// membership change or a per-peer veto stops the rows and this number keeps advancing.
+    ///
+    /// Left as it is deliberately. Existing callers read it as "the newest state I hold", which is
+    /// what both writers produce and what a display or a diagnostic wants.
     #[func]
     fn get_last_known_state(&self) -> i64 {
         self.latest_state_tick
+    }
+
+    /// The tick of the newest authoritative row this peer **decoded off the wire** for this entity.
+    ///
+    /// - `-1` before the first row arrives.
+    /// - `-1` forever on the peer that authors this entity's state, which receives none. Pair it with
+    ///   [`Self::authors_state`] before reading a `-1` as "the rows stopped".
+    /// - Counts a row the rollback ring then discarded as too old, and a duplicate: both prove the
+    ///   entity is still being sent here.
+    ///
+    /// Monotonic within a session, and reset with the session.
+    #[func]
+    fn get_last_received_state(&self) -> i64 {
+        self.latest_received_tick
+    }
+
+    /// Whether this peer **authors** this entity's state, and so receives no rows for it.
+    ///
+    /// The disambiguator for [`Self::get_last_received_state`]: on the authority that reading is `-1`
+    /// for the whole session, which is indistinguishable from "culled since spawn" without this.
+    #[func]
+    fn authors_state(&self) -> bool {
+        self.owns_state()
     }
 
     /// The world this body is currently in, `0` meaning every world (diagnostics and tests).
@@ -682,6 +934,24 @@ impl OrbitRollbackSynchronizer {
         self.unresolved.clone()
     }
 
+    /// Declared entries whose `@` quantizer annotation is **not in force**, verbatim.
+    ///
+    /// Three ways in, and all three ship the property wider than the entry claims: an annotation
+    /// that is neither `@ss3` nor `@half`, a pairing the resolved type does not support, and an
+    /// entry that did not resolve at all (which is in [`Self::unresolved_properties`] as well).
+    ///
+    /// **Published so a boot check can fail instead of a log line scrolling past.** Each of these
+    /// also raises a diagnostic, but a dropped annotation is a bandwidth bug: the game runs, the
+    /// frames decode, and the only symptom is a wire two to six times wider than the property
+    /// list says. Assert this is empty once, after `process_settings()`, in a CI smoke scene.
+    ///
+    /// Empty is the healthy answer, and an entity that declares no annotations reports empty for
+    /// that reason rather than for any other.
+    #[func]
+    fn quantizer_fallbacks(&self) -> PackedStringArray {
+        self.quant_fallbacks.clone()
+    }
+
     /// The declared entries a bulk **capture** hook marshals for `lane`, in the order its array
     /// carries them: every property of the lane, state entries then cosmetic entries.
     ///
@@ -725,6 +995,37 @@ impl OrbitRollbackSynchronizer {
         match lane {
             LANE_INPUT => self.input_restore_hook.is_some(),
             _ => self.state_restore_hook.is_some(),
+        }
+    }
+
+    /// The declared entries a bulk **apply** hook marshals for `lane`, in array order.
+    ///
+    /// **The capture order, not the restore order** — every property of the lane, `Cosmetic`
+    /// entries included, because a received row lands all of them. Assert against this and not
+    /// against [`Self::bulk_restore_order`]: the two differ by exactly the cosmetics, and reading
+    /// the wrong one shifts every slot after the first cosmetic entry with nothing erroring.
+    ///
+    /// Empty when the lane has no hook.
+    #[func]
+    fn bulk_apply_order(&self, lane: i64) -> PackedStringArray {
+        match lane {
+            LANE_INPUT => hook_order(&self.input_apply_hook, self.input_schema.props()),
+            _ => hook_order(&self.state_apply_hook, self.state_schema.props()),
+        }
+    }
+
+    /// Whether `lane` **declares** an apply hook. See [`Self::uses_bulk_capture`].
+    ///
+    /// **The declaration, not which path ran.** The state lane's write-back is additionally gated
+    /// on carrying two or more quantized properties, so a lane can report `true` here and still
+    /// canonicalize through the targeted walk — while its receive apply, which is ungated, goes
+    /// through the hook. Reporting the gate instead would make this answer "is my method name
+    /// resolved" with a number about something else.
+    #[func]
+    fn uses_bulk_apply(&self, lane: i64) -> bool {
+        match lane {
+            LANE_INPUT => self.input_apply_hook.is_some(),
+            _ => self.state_apply_hook.is_some(),
         }
     }
 
@@ -800,16 +1101,28 @@ impl OrbitRollbackSynchronizer {
         self.state_bindings.clear();
         self.input_bindings.clear();
         self.unresolved = PackedStringArray::new();
+        self.quant_fallbacks = PackedStringArray::new();
         self.rollback_nodes.clear();
         self.membership = None;
         self.state_capture_hook = None;
         self.state_restore_hook = None;
+        self.state_apply_hook = None;
         self.input_capture_hook = None;
         self.input_restore_hook = None;
+        self.input_apply_hook = None;
+        self.state_writeback_bulk = false;
         self.state_capture_staged = false;
         self.input_capture_staged = false;
 
         let state_root = self.resolved_root();
+        // Built BEFORE the entries resolve, because every diagnostic they raise names it. A
+        // session with dozens of entities otherwise reports which entry is wrong and not which of
+        // the fifty nodes declaring it.
+        let label = format!("OrbitRollbackSynchronizer {}", self.base().get_path());
+
+        // All three lanes accumulate into ONE report: the two lists it carries are per
+        // synchronizer, not per lane, and a game asserting on them wants the body's whole story.
+        let mut report = binding::EntryReport::default();
 
         // EVERY entry — input included — is a state-root-relative path, because that is how the
         // entries are authored (add_input computes the path from the root). input_authority_node
@@ -822,7 +1135,8 @@ impl OrbitRollbackSynchronizer {
             PropRole::State,
             &mut self.state_schema,
             &mut self.state_bindings,
-            &mut self.unresolved,
+            &mut report,
+            &label,
         );
         binding::resolve_entries(
             state_root.as_ref(),
@@ -830,7 +1144,8 @@ impl OrbitRollbackSynchronizer {
             PropRole::Cosmetic,
             &mut self.state_schema,
             &mut self.state_bindings,
-            &mut self.unresolved,
+            &mut report,
+            &label,
         );
         binding::resolve_entries(
             state_root.as_ref(),
@@ -838,21 +1153,30 @@ impl OrbitRollbackSynchronizer {
             PropRole::Input,
             &mut self.input_schema,
             &mut self.input_bindings,
-            &mut self.unresolved,
+            &mut report,
+            &label,
         );
+        self.unresolved = report.unresolved;
+        self.quant_fallbacks = report.fallbacks;
 
-        let label = format!("OrbitRollbackSynchronizer {}", self.base().get_path());
         self.membership =
             resolve_membership(state_root.as_ref(), &self.membership_property, &label);
 
         // Bulk hooks resolve AFTER the schemas, because the slot lists are the schemas' own
-        // orders: capture marshals every property of a lane, restore only the roles the loop
-        // writes back. Both resolve against the state root, the node every declared entry is
-        // already relative to.
+        // orders: capture and apply marshal every property of a lane, restore only the roles the
+        // loop writes back. All three resolve against the state root, the node every declared entry
+        // is already relative to.
+        //
+        // THE APPLY SLOTS ARE THE CAPTURE SLOTS. A lane's cosmetics are captured, replicated and
+        // applied on receipt; they are only absent from the RESTORE list. Resolving apply over
+        // `restored()` would hand a receiving peer an array one slot short of the row it decoded,
+        // silently, on the one path that has to land cosmetics.
         let capture = self.bulk_capture_method.clone();
         let restore = self.bulk_restore_method.clone();
+        let apply = self.bulk_apply_method.clone();
         let capture_target = binding::hook_target(state_root.as_ref(), &capture, &label);
         let restore_target = binding::hook_target(state_root.as_ref(), &restore, &label);
+        let apply_target = binding::hook_target(state_root.as_ref(), &apply, &label);
         let state_all: Vec<usize> = (0..self.state_bindings.len()).collect();
         let input_all: Vec<usize> = (0..self.input_bindings.len()).collect();
         let state_restored = self.state_schema.restored();
@@ -885,6 +1209,26 @@ impl OrbitRollbackSynchronizer {
             input_restored,
             &label,
         );
+        // The apply hook is resolved over the FULL list of each lane, the same list capture uses,
+        // so one game method can serve every direction on a body that declares no cosmetics.
+        self.state_apply_hook = binding::resolve_hook(
+            apply_target.as_ref(),
+            &apply,
+            LANE_STATE,
+            (0..self.state_bindings.len()).collect(),
+            &label,
+        );
+        self.input_apply_hook = binding::resolve_hook(
+            apply_target.as_ref(),
+            &apply,
+            LANE_INPUT,
+            (0..self.input_bindings.len()).collect(),
+            &label,
+        );
+        // The write-back gate, decided here and read as a bool per replayed tick. Two quantized
+        // properties is where one hook call stops being more crossings than the targeted walk.
+        self.state_writeback_bulk =
+            self.state_apply_hook.is_some() && binding::quantized_count(&self.state_bindings) >= 2;
 
         // Gather the rollback-aware nodes to simulate: the root plus every descendant that
         // implements _rollback_tick. `owned=false` so runtime-added children (the input carrier)
@@ -916,20 +1260,7 @@ impl OrbitRollbackSynchronizer {
 
         self.process_authority();
 
-        if !self.unresolved.is_empty() {
-            godot_warn!(
-                "OrbitRollbackSynchronizer {}: {} declared propert{} did not resolve: {:?} — \
-                 unresolved entries silently fall off the wire, so fix the path or the type.",
-                self.base().get_path(),
-                self.unresolved.len(),
-                if self.unresolved.len() == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                self.unresolved
-            );
-        }
+        binding::warn_unresolved(&label, &self.unresolved);
 
         let capacity = self.history_limit.max(2);
         self.state_history = ColumnarHistory::new(self.state_schema.row_stride(), capacity);
@@ -938,6 +1269,7 @@ impl OrbitRollbackSynchronizer {
         self.memo = MemoRing::with_capacity(capacity * 2);
         self.auth_rows = None;
         self.latest_state_tick = -1;
+        self.latest_received_tick = -1;
         self.latest_auth_sim_tick = 0;
         self.latest_remote_input_tick = -1;
         self.pending_state = None;
@@ -971,6 +1303,7 @@ impl OrbitRollbackSynchronizer {
         self.memo = MemoRing::with_capacity(limit * 2);
         self.auth_rows = None;
         self.latest_state_tick = -1;
+        self.latest_received_tick = -1;
         self.latest_auth_sim_tick = 0;
         self.latest_remote_input_tick = -1;
         self.pending_state = None;
@@ -1182,12 +1515,15 @@ impl OrbitRollbackSynchronizer {
         }
     }
 
-    /// Integrate one received input row (server side). Returns the tick if it was novel and in
-    /// the past — the caller marks the resim planner with it.
     /// Decode one WIRE input row and integrate it (server side).
-    pub(crate) fn integrate_remote_wire_row(&mut self, tick: u64, wire: &[u8]) -> Option<u64> {
+    ///
+    /// A row of the wrong wire stride, or one the shared decoder cannot read, is
+    /// [`InputIntegration::Ignored`] — the sender disagrees with this entity's schema, which the
+    /// entity manifest's per-entity hash reports by name and which is not this path's job to
+    /// diagnose.
+    pub(crate) fn integrate_remote_wire_row(&mut self, tick: u64, wire: &[u8]) -> InputIntegration {
         if wire.len() != self.input_wire_stride() {
-            return None;
+            return InputIntegration::Ignored;
         }
         let mut native = std::mem::take(&mut self.scratch_wire);
         native.clear();
@@ -1197,26 +1533,23 @@ impl OrbitRollbackSynchronizer {
         let result = if decoded.is_some() {
             self.integrate_remote_input(tick, &native)
         } else {
-            None
+            InputIntegration::Ignored
         };
         self.scratch_wire = native;
         result
     }
 
-    pub(crate) fn integrate_remote_input(&mut self, tick: u64, row: &[u8]) -> Option<u64> {
-        if row.len() != self.input_schema.row_stride() || self.input_history.is_stale(tick) {
-            return None;
-        }
-        let novel = self.input_history.row(tick) != Some(row);
-        if !novel {
-            return None;
-        }
-        self.input_history.write_row(tick, row);
-        self.ledger.set_confidence(tick, Confidence::Authoritative);
-        self.latest_remote_input_tick = self
-            .latest_remote_input_tick
-            .max(i64::try_from(tick).unwrap_or(i64::MAX));
-        Some(tick)
+    /// Integrate one decoded input row (server side). [`InputIntegration::Landed`] carries the tick
+    /// the caller marks the resim planner with; every other answer wrote nothing.
+    pub(crate) fn integrate_remote_input(&mut self, tick: u64, row: &[u8]) -> InputIntegration {
+        integrate_input_row(
+            self.input_schema.props(),
+            &mut self.input_history,
+            &mut self.ledger,
+            &mut self.latest_remote_input_tick,
+            tick,
+            row,
+        )
     }
 
     /// Encode this entity's state block for one peer.
@@ -1315,6 +1648,16 @@ impl OrbitRollbackSynchronizer {
         let result = if !applied {
             StateIntegration::NoBase
         } else {
+            // THE RECEIPT, written here and nowhere else.
+            //
+            // - **Before the integration**, so a row the rollback ring discards as too old, and a duplicate
+            //   the integration returns `Stale` for, both still count. The question this answers is "is this
+            //   peer still being sent this entity", and every one of those rows is a yes.
+            // - **Not on the `NoBase` path**, where nothing decoded. That block NACKs and the sender answers
+            //   with a full row, so the reading recovers within a round trip rather than staying silent.
+            self.latest_received_tick = self
+                .latest_received_tick
+                .max(i64::try_from(meta.tick).unwrap_or(i64::MAX));
             // Recorded BEFORE the integration decides what to do with it, because that decision is
             // about the simulation and this record is not.
             self.keep_auth_row(meta.tick, &out);
@@ -1401,9 +1744,28 @@ impl OrbitRollbackSynchronizer {
     }
 
     /// Apply the newest buffered display row (called at the tick-batch boundary).
-    pub(crate) fn apply_pending_display(&mut self) {
+    ///
+    /// **The receive apply, and on a peer that simulates nothing it is the only property walk it
+    /// runs.** Such a peer plans no entities, so the rollback loop returns on an empty plan and
+    /// neither the capture nor the restore hook is reached; this walk is its whole per-tick
+    /// crossing count. A lane with an apply hook decodes into the hook's array here, with the
+    /// synchronizer bound, and appends the call to `out` for the caller to run with every `bind`
+    /// dropped.
+    ///
+    /// **Cosmetics land here**, which is why the hook is resolved over every binding rather than
+    /// over the restored subset.
+    pub(crate) fn apply_pending_display(&mut self, out: &mut Vec<binding::HookCall>) {
         if let Some((_, row)) = self.pending_display.take() {
-            binding::apply_row(&self.state_bindings, &row, false);
+            let staged = match self.state_apply_hook.as_mut() {
+                Some(hook) => binding::stage_restore_from_row(hook, &self.state_bindings, &row),
+                None => None,
+            };
+            match staged {
+                Some(call) => out.push(call),
+                // No hook, a freed node, or an array the game resized. The row still has to land,
+                // so the walk answers rather than a lane that silently stops applying.
+                None => binding::apply_row(&self.state_bindings, &row, false),
+            }
         }
     }
 
@@ -1427,7 +1789,7 @@ impl OrbitRollbackSynchronizer {
             }
         }
         if !self.input_bindings.is_empty() {
-            if let Some((input_tick, row)) = self.input_history.closest_at_or_before(tick) {
+            if let Some(row) = input_restore_row(&self.input_history, &mut self.ledger, tick) {
                 let staged = match self.input_restore_hook.as_mut() {
                     Some(hook) => binding::stage_restore_from_row(hook, &self.input_bindings, row),
                     None => None,
@@ -1435,9 +1797,6 @@ impl OrbitRollbackSynchronizer {
                 match staged {
                     Some(call) => out.push(call),
                     None => binding::apply_row(&self.input_bindings, row, true),
-                }
-                if input_tick != tick {
-                    self.ledger.set_confidence(tick, Confidence::Extrapolated);
                 }
             }
         }
@@ -1464,7 +1823,14 @@ impl OrbitRollbackSynchronizer {
     /// Reads the bulk hook's array when [`Self::stage_capture`] armed one for this tick, and walks
     /// the properties otherwise. Either way the row that lands is the same bytes: the hook supplies
     /// `Variant`s, and the encode, the offsets and the canonicalization below are unchanged.
-    pub(crate) fn record_tick(&mut self, simulated_tick: u64) {
+    ///
+    /// **The quantized write-back stages through the apply hook when the lane is gated on** —
+    /// `state_writeback_bulk`, which is a resolved apply hook plus two or more quantized
+    /// properties. `Q` `Object::set` calls become one `Object::call`, and this walk carries the
+    /// replay multiplier: a body of 41 props with 8 quantized, replaying 12 ticks, pays 96 setter
+    /// crossings a frame on the walk and 12 through the hook. A lane below the gate, or one whose
+    /// hook cannot run this tick, keeps [`binding::apply_quantized_row`].
+    pub(crate) fn record_tick(&mut self, simulated_tick: u64, out: &mut Vec<binding::HookCall>) {
         let next = simulated_tick + 1;
         self.scratch_state.resize(self.state_schema.row_stride(), 0);
         let mut row = std::mem::take(&mut self.scratch_state);
@@ -1480,8 +1846,21 @@ impl OrbitRollbackSynchronizer {
         self.state_history.write_row(next, &row);
         // Quantized-state write-back: forward simulation must continue from the canonical
         // (wire-representable) value the row holds, or replay-from-row would diverge from the
-        // forward pass on every peer.
-        binding::apply_quantized_row(&self.state_bindings, &row);
+        // forward pass on every peer. Through the apply hook when this lane is gated on, and the
+        // hook is handed the WHOLE set because one array is one call where the walk is one call per
+        // quantized property.
+        let staged = if self.state_writeback_bulk {
+            match self.state_apply_hook.as_mut() {
+                Some(hook) => binding::stage_restore_from_row(hook, &self.state_bindings, &row),
+                None => None,
+            }
+        } else {
+            None
+        };
+        match staged {
+            Some(call) => out.push(call),
+            None => binding::apply_quantized_row(&self.state_bindings, &row),
+        }
         self.scratch_state = row;
         if self.owns_state() && self.ledger.confidence(simulated_tick) == Confidence::Authoritative
         {
@@ -1544,6 +1923,7 @@ impl OrbitRollbackSynchronizer {
             rows.clear();
         }
         self.latest_state_tick = -1;
+        self.latest_received_tick = -1;
         self.latest_auth_sim_tick = 0;
         self.latest_remote_input_tick = -1;
         self.pending_state = None;
@@ -1618,21 +1998,44 @@ pub struct OrbitStateSynchronizer {
     /// this lane has only one, and the argument is there so a game can point both synchronizers at
     /// the same method. Fill every slot in the order [`Self::bulk_capture_order`] publishes.
     ///
-    /// **No restore hook, deliberately.** This lane's apply is the receive path: it runs once per
-    /// received block rather than once per replayed tick, so there is no replay multiplier for a
-    /// hook to divide. Capture runs once per tick per owned channel on the authority, and the
-    /// property count is what makes it worth removing — the history-depth note above sizes a fat
-    /// channel at 41 `i64` props.
+    /// **No restore hook on this lane**, because it has no rollback restore. Its apply is the
+    /// receive path, and that has a direction of its own — [`Self::bulk_apply_method`].
+    ///
+    /// Capture runs once per tick per owned channel on the authority, and the property count is
+    /// what makes it worth removing — the history-depth note above sizes a fat channel at 41 `i64`
+    /// props.
     #[export]
     bulk_capture_method: GString,
+
+    /// Bulk **apply** hook: the name of a game method that lands a received row in one crossing,
+    /// or empty for the per-property walk.
+    ///
+    /// Signature: `func <name>(lane: int, values: Array) -> void`, `lane` always [`LANE_STATE`],
+    /// declared on the root, reading the slots and writing the game's own fields. The order is
+    /// [`Self::bulk_apply_order`], which is the capture order — this lane has one role and no
+    /// restored subset, so the two lists are always identical here.
+    ///
+    /// **What it is worth, plainly.** It replaces `S` `Object::set` calls with one, and it runs
+    /// once per delivered block rather than once per replayed tick, so there is no replay
+    /// multiplier: below roughly twenty delivered blocks a tick the saving is noise. Its multiplier
+    /// is the number of channels a frame delivers, bounded by the receive byte budget rather than
+    /// by the roster. It matters most on a peer that simulates nothing, where it is the only
+    /// property walk the frame runs.
+    #[export]
+    bulk_apply_method: GString,
 
     entity_id: u64,
     schema: SchemaBuilder,
     bindings: Vec<PropBinding>,
     unresolved: PackedStringArray,
+    /// Declared entries whose `@` quantizer annotation is not in force. See
+    /// [`Self::quantizer_fallbacks`].
+    quant_fallbacks: PackedStringArray,
     state_local: bool,
     /// The resolved `bulk_capture_method`, or `None` when the channel keeps the per-property walk.
     capture_hook: Option<binding::BulkHook>,
+    /// The resolved `bulk_apply_method`, or `None` when the receive apply keeps the walk.
+    apply_hook: Option<binding::BulkHook>,
     /// Whether the last staged bulk capture is the one [`Self::capture_frontier`] should read.
     capture_staged: bool,
     /// The resolved `anchor_property`, or `None` when unset, unresolvable or not a `Vector3`.
@@ -1642,6 +2045,17 @@ pub struct OrbitStateSynchronizer {
     /// The authority's captured frontier row, and each receiver's newest applied tick/row.
     history: ColumnarHistory,
     latest_tick: i64,
+    /// Newest tick this peer has **decoded off the wire** for this channel, `-1` before the first row.
+    ///
+    /// The twin of `OrbitRollbackSynchronizer::latest_received_tick`, and it exists on this lane for the
+    /// same reason even though `latest_tick` happens to answer the same question here today. That field is
+    /// also written by [`Self::capture_frontier`], and it is receive-only on a client purely because the
+    /// caller only reaches capture in the server modes. This one is receive-only by construction, so one
+    /// game helper can ask both lanes the same question and get an answer with the same meaning.
+    ///
+    /// Cleared wherever `latest_tick` is: session ticks restart near 0, so a value carried over from the
+    /// previous session reads as "receiving" forever.
+    latest_received_tick: i64,
     pending: Option<(u64, Vec<u8>)>,
     scratch: Vec<u8>,
 }
@@ -1658,17 +2072,21 @@ impl INode for OrbitStateSynchronizer {
             membership_property: GString::new(),
             priority: 1,
             bulk_capture_method: GString::new(),
+            bulk_apply_method: GString::new(),
             entity_id: 0,
             schema: SchemaBuilder::new(),
             bindings: Vec::new(),
             unresolved: PackedStringArray::new(),
+            quant_fallbacks: PackedStringArray::new(),
             state_local: false,
             capture_hook: None,
+            apply_hook: None,
             capture_staged: false,
             anchor: None,
             membership: None,
             history: ColumnarHistory::new(0, 1),
             latest_tick: -1,
+            latest_received_tick: -1,
             pending: None,
             scratch: Vec::new(),
         }
@@ -1714,25 +2132,47 @@ impl OrbitStateSynchronizer {
         self.schema = SchemaBuilder::new();
         self.bindings.clear();
         self.unresolved = PackedStringArray::new();
+        self.quant_fallbacks = PackedStringArray::new();
         self.capture_hook = None;
+        self.apply_hook = None;
         self.capture_staged = false;
 
         let root = self.resolved_root();
+        // Built BEFORE the entries resolve, because every diagnostic they raise names it.
+        let label = format!("OrbitStateSynchronizer {}", self.base().get_path());
+        let mut report = binding::EntryReport::default();
         binding::resolve_entries(
             root.as_ref(),
             &self.properties,
             PropRole::State,
             &mut self.schema,
             &mut self.bindings,
-            &mut self.unresolved,
+            &mut report,
+            &label,
         );
-        // After the schema, because the slot list is the schema's own order.
-        let label = format!("OrbitStateSynchronizer {}", self.base().get_path());
+        self.unresolved = report.unresolved;
+        self.quant_fallbacks = report.fallbacks;
+        // The same message the rollback lane raises. This lane used to raise none: it collected
+        // the list into a getter nothing was obliged to read, so a mistyped path here was visible
+        // only to somebody who already suspected it.
+        binding::warn_unresolved(&label, &self.unresolved);
+        // After the schema, because the slot list is the schema's own order. Both directions
+        // marshal every binding: this lane has one role, so its capture order and its apply order
+        // are the same list.
         let capture = self.bulk_capture_method.clone();
-        let target = binding::hook_target(root.as_ref(), &capture, &label);
+        let apply = self.bulk_apply_method.clone();
+        let capture_target = binding::hook_target(root.as_ref(), &capture, &label);
+        let apply_target = binding::hook_target(root.as_ref(), &apply, &label);
         let slots: Vec<usize> = (0..self.bindings.len()).collect();
         self.capture_hook =
-            binding::resolve_hook(target.as_ref(), &capture, LANE_STATE, slots, &label);
+            binding::resolve_hook(capture_target.as_ref(), &capture, LANE_STATE, slots, &label);
+        self.apply_hook = binding::resolve_hook(
+            apply_target.as_ref(),
+            &apply,
+            LANE_STATE,
+            (0..self.bindings.len()).collect(),
+            &label,
+        );
         if let Some(root) = &root {
             if root.is_inside_tree() {
                 let path = root.get_path().to_string();
@@ -1751,6 +2191,7 @@ impl OrbitStateSynchronizer {
             .unwrap_or(false);
         self.history = ColumnarHistory::new(self.schema.row_stride(), STATE_HISTORY_DEPTH);
         self.latest_tick = -1;
+        self.latest_received_tick = -1;
         self.pending = None;
 
         if self.entity_id != 0 {
@@ -1786,6 +2227,20 @@ impl OrbitStateSynchronizer {
         self.unresolved.clone()
     }
 
+    /// Declared entries whose `@` quantizer annotation is **not in force**, verbatim.
+    ///
+    /// The same reading as `OrbitRollbackSynchronizer::quantizer_fallbacks`, so one game helper
+    /// spans both lanes: an annotation that is neither `@ss3` nor `@half`, a pairing the resolved
+    /// type does not support, or an entry that did not resolve at all.
+    ///
+    /// **Published so a boot check can fail instead of a log line scrolling past.** A dropped
+    /// annotation is a bandwidth bug — the game runs, the frames decode, and the only symptom is a
+    /// wire wider than the property list claims.
+    #[func]
+    fn quantizer_fallbacks(&self) -> PackedStringArray {
+        self.quant_fallbacks.clone()
+    }
+
     /// The declared entries the bulk capture hook marshals, in the order its array carries them.
     /// Empty when the channel has no hook. `lane` is accepted and ignored — this lane has only one.
     #[func]
@@ -1801,6 +2256,25 @@ impl OrbitStateSynchronizer {
         self.capture_hook.is_some()
     }
 
+    /// The declared entries the bulk apply hook marshals, in the order its array carries them.
+    /// Empty when the channel has no hook. `lane` is accepted and ignored, as on the capture side.
+    ///
+    /// Identical to [`Self::bulk_capture_order`] on this lane: every entry is `State`-role, so
+    /// there is no restored subset for the two to differ by.
+    #[func]
+    fn bulk_apply_order(&self, lane: i64) -> PackedStringArray {
+        let _ = lane;
+        hook_order(&self.apply_hook, self.schema.props())
+    }
+
+    /// Whether this channel **declares** an apply hook for its receive path. Reports the
+    /// declaration, so a name that did not resolve reads false.
+    #[func]
+    fn uses_bulk_apply(&self, lane: i64) -> bool {
+        let _ = lane;
+        self.apply_hook.is_some()
+    }
+
     /// The tick of the newest authoritative row this channel has (-1 before any).
     ///
     /// The twin of `OrbitRollbackSynchronizer::get_last_known_state`, and the client half of the
@@ -1811,6 +2285,26 @@ impl OrbitStateSynchronizer {
     #[func]
     fn get_last_known_state(&self) -> i64 {
         self.latest_tick
+    }
+
+    /// The tick of the newest row this peer **decoded off the wire** for this channel.
+    ///
+    /// - `-1` before the first row arrives.
+    /// - `-1` forever on the authority, which receives none. Pair it with [`Self::authors_state`]
+    ///   before reading a `-1` as "the rows stopped".
+    /// - Counts a row that arrived too old to apply: it still proves the channel is being sent here.
+    ///
+    /// The same reading as `OrbitRollbackSynchronizer::get_last_received_state`, so one game helper
+    /// spans both lanes.
+    #[func]
+    fn get_last_received_state(&self) -> i64 {
+        self.latest_received_tick
+    }
+
+    /// Whether this peer **authors** this channel, and so receives no rows for it.
+    #[func]
+    fn authors_state(&self) -> bool {
+        self.owns_state()
     }
 
     /// Whether this channel declares a resolvable interest anchor (diagnostics and tests).
@@ -2042,6 +2536,11 @@ impl OrbitStateSynchronizer {
             StateIntegration::NoBase
         } else {
             let tick_i = i64::try_from(meta.tick).unwrap_or(i64::MAX);
+            // THE RECEIPT, and it is written on BOTH decoded branches — the stale/duplicate one below
+            // included. A row that arrived is a row that arrived, whatever the apply then does with it.
+            // Not written on the `NoBase` path above, where nothing decoded: that block NACKs and the
+            // sender answers with a full row, so the reading recovers within a round trip.
+            self.latest_received_tick = self.latest_received_tick.max(tick_i);
             if tick_i <= self.latest_tick {
                 // A row too old to apply is still kept, because the sender promotes `acked_base`
                 // off the frame ack and the next masked delta may name this tick as its base.
@@ -2062,9 +2561,21 @@ impl OrbitStateSynchronizer {
     }
 
     /// Apply the newest buffered row (called at the tick-batch boundary).
-    pub(crate) fn apply_pending(&mut self) {
+    ///
+    /// **The receive apply.** A channel with an apply hook decodes into the hook's array here, with
+    /// the synchronizer bound, and appends the call to `out` for the caller to run with every
+    /// `bind` dropped. A channel without one walks its properties, which is also what a freed node
+    /// or a resized array falls back to, so the row lands either way.
+    pub(crate) fn apply_pending(&mut self, out: &mut Vec<binding::HookCall>) {
         if let Some((_, row)) = self.pending.take() {
-            binding::apply_row(&self.bindings, &row, false);
+            let staged = match self.apply_hook.as_mut() {
+                Some(hook) => binding::stage_restore_from_row(hook, &self.bindings, &row),
+                None => None,
+            };
+            match staged {
+                Some(call) => out.push(call),
+                None => binding::apply_row(&self.bindings, &row, false),
+            }
         }
     }
 
@@ -2074,6 +2585,7 @@ impl OrbitStateSynchronizer {
     pub(crate) fn reset_session(&mut self) {
         self.history.clear();
         self.latest_tick = -1;
+        self.latest_received_tick = -1;
         self.pending = None;
     }
 }

@@ -8,8 +8,8 @@
 //! **A block names its entity by a dense 16-bit session slot, not by the 64-bit entity id.** The id
 //! is an FNV-1a hash spread across the whole 64-bit range, so writing it as a varint cost 9.5 bytes
 //! on average — a third of a full block and nearly half of a delta. [`crate::slots`] states what
-//! replaced it and what distributing a slot table costs; [`encode_manifest`] is the channel that
-//! distributes it.
+//! replaced it and what distributing a slot table costs; [`encode_manifest_full`] and
+//! [`encode_manifest_delta`] are the channel that distributes it.
 //!
 //! The decoder is the one piece of this crate that reads bytes chosen by a remote peer, so it is
 //! written to be total: every read is bounds-checked and returns [`CodecError`] rather than
@@ -18,8 +18,9 @@
 //! become memory unsafety either.
 
 use core::fmt;
+use std::collections::BTreeMap;
 
-use crate::auth::KEY_LEN;
+use crate::auth::{confirm_tag, derive_session_key, KEY_LEN};
 use crate::columnar::changed_mask;
 use crate::protocol::{protocol_major, PropSchema, PROTOCOL_VERSION};
 use crate::seats::SeatIndex;
@@ -54,9 +55,16 @@ pub enum CodecError {
         /// This peer's version.
         ours: u32,
     },
-    /// The peer's handshake carried no session key, so nothing it sends afterwards can be
+    /// The peer's handshake carried no 16-byte session nonce, so nothing it sends afterwards can be
     /// authenticated. An older build, or a truncated handshake.
-    MissingSessionKey,
+    MissingSessionNonce,
+    /// This peer holds a **session secret** and the remote handshake could not confirm the same one:
+    /// its [`Handshake::confirm`] tag is absent, or it is a tag over some other secret.
+    ///
+    /// One side configured a secret and the other did not, or the two were handed different bytes.
+    /// See [`Handshake::check_compatibility`] for which direction of that misconfiguration this
+    /// reports and which one cannot be reported at all.
+    SecretMismatch,
 }
 
 impl fmt::Display for CodecError {
@@ -73,10 +81,16 @@ impl fmt::Display for CodecError {
                 version_string(*theirs),
                 version_string(*ours)
             ),
-            CodecError::MissingSessionKey => write!(
+            CodecError::MissingSessionNonce => write!(
                 f,
-                "OrbitNet handshake carried no session key, so no datagram from this peer can be \
+                "OrbitNet handshake carried no session nonce, so no datagram from this peer can be \
                  authenticated. The peer is an older build, or its handshake was truncated."
+            ),
+            CodecError::SecretMismatch => write!(
+                f,
+                "OrbitNet handshake could not confirm this session's shared secret. This peer holds \
+                 one and the joining peer proved a different one, or none at all. Both ends must be \
+                 handed the same secret before they start."
             ),
         }
     }
@@ -111,7 +125,17 @@ pub enum FrameKind {
     Welcome = 0x06,
     /// Entity schema manifest, server to client. Reliable — lets a client validate that its
     /// locally built entity schema matches the server's before misapplying a single byte.
+    ///
+    /// **The whole table, carrying the generation it stands at.** See [`encode_manifest_full`].
     EntityManifest = 0x07,
+    /// A change to the entity manifest, server to client. Reliable, and **ordered against the
+    /// [`FrameKind::EntityManifest`] frames on the same channel**, which is what a delta needs and a
+    /// snapshot does not.
+    ///
+    /// Restating the whole table on every change cost one republish per net tick per peer, of
+    /// ~22.5 bytes per named entity. See [`ManifestDelta`] for the layout and for what a delta gives
+    /// up against the complete table it replaces.
+    EntityManifestDelta = 0x08,
 }
 
 impl FrameKind {
@@ -124,6 +148,7 @@ impl FrameKind {
             0x04 => Ok(FrameKind::Pong),
             0x06 => Ok(FrameKind::Welcome),
             0x07 => Ok(FrameKind::EntityManifest),
+            0x08 => Ok(FrameKind::EntityManifestDelta),
             other => Err(CodecError::UnknownFrameKind(other)),
         }
     }
@@ -454,6 +479,35 @@ impl FrameHeader {
     /// frame and the server responds with full blocks.
     pub const FLAG_WANT_FULL: u8 = 1 << 0;
 
+    /// Server → client: an [`InterestDeltaSection`] follows the entity blocks.
+    ///
+    /// **The flag bits are per direction, and this one is SERVER-TO-CLIENT only.** A client never
+    /// sets it and a server never reads it; bit 2 is claimed in the other direction. Bit 0 above is
+    /// the exception that is read on both sides.
+    ///
+    /// **A trailing section is invisible to a peer that does not know about it**, which is what
+    /// makes it safe to append to the hot frame. A receiver reads exactly `entity_count` blocks and
+    /// stops, so an older build never looks at the bytes after them and never notices the bit. It is
+    /// still a major bump, because a peer that skips the section skips the events too and a game
+    /// built on them would silently receive none.
+    pub const FLAG_INTEREST_DELTA: u8 = 1 << 1;
+
+    /// Client → server: "the entity manifest stream broke for me; send the whole table again."
+    ///
+    /// **CLIENT-TO-SERVER only**, the mirror of [`FrameHeader::FLAG_INTEREST_DELTA`] one bit up. A
+    /// server never sets it and a client never reads it.
+    ///
+    /// It reuses the shape [`FrameHeader::FLAG_WANT_FULL`] already established — a bit on an input
+    /// frame the client is sending anyway — so the repair path for a manifest costs **no frame kind
+    /// and no bytes**. A client raises it when it cannot apply a [`ManifestDelta`]: the delta names a
+    /// base generation it does not hold, or the frame did not decode. The server answers by clearing
+    /// what it believes that peer holds, which makes that peer's next publish a full table.
+    ///
+    /// **The raise is self-sustaining**, so losing the input frame that carried it costs one tick:
+    /// the client zeroed its own generation at the same moment, so the next delta fails its base
+    /// check as well and raises the bit again.
+    pub const FLAG_WANT_MANIFEST: u8 = 1 << 2;
+
     /// Append this header to `writer`.
     pub fn encode(&self, writer: &mut Writer) {
         writer.u8(self.kind.tag());
@@ -506,6 +560,10 @@ impl FrameHeader {
 /// **It is the one datagram OrbitNet does not authenticate, because it is what establishes the key
 /// everything else is authenticated with.** [`crate::auth`] states exactly what that buys and what it
 /// does not.
+///
+/// Its 16-byte [`Self::session_nonce`] is that key when no session secret is configured, and only a
+/// nonce when one is — in which case [`Self::confirm`] carries the proof that the sender holds the same
+/// secret. The offsets and widths are identical either way; the regime is a local decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handshake {
     /// The sender's packed protocol version.
@@ -523,24 +581,70 @@ pub struct Handshake {
     /// it is adequate for is the thing it exists for: a player whose link dropped getting their own entity
     /// back instead of a stranger's.
     pub session_id: u64,
-    /// The key every other datagram of this session is authenticated with.
+    /// The 16 bytes this session's key is **taken from or derived with**, minted fresh by the joining
+    /// peer on every join and carried in the clear.
     ///
-    /// Minted by the client, one per session, and **carried in the clear** — so it authenticates a
-    /// datagram's membership in a session rather than a peer's identity. All zeroes is refused by
-    /// [`Handshake::check_compatibility`]: it is what a peer that sent no key at all decodes to.
-    pub session_key: [u8; KEY_LEN],
+    /// It is one field with two regimes, and which one is in force is a local decision neither end
+    /// puts on the wire:
+    ///
+    /// | Regime | What these bytes are | What an on-path observer learns |
+    /// | --- | --- | --- |
+    /// | no session secret configured | the session key itself | everything the client knows |
+    /// | a session secret configured | a **nonce**, fed with the secret to [`crate::auth::derive_session_key`] | the nonce, and nothing else |
+    ///
+    /// It is named for the nonce because that is the role that survives both regimes: a fresh draw per
+    /// join, which is what keeps sequence numbers from restarting under a key an observer already has.
+    ///
+    /// All zeroes is refused by [`Handshake::check_compatibility`] under either regime: it is what a
+    /// peer that sent no bytes at all decodes to, and under a secret it is also the one nonce a lazy
+    /// caller would reuse across joins.
+    pub session_nonce: [u8; KEY_LEN],
+    /// The **server-minted resume token** this peer was handed the last time it presented
+    /// [`Self::session_id`], quoted back to prove the identity is its own. `0` quotes none.
+    ///
+    /// **The identity names the player; this is what a claim on that identity has to quote.** The server mints
+    /// it once per identity, sends it in [`Welcome::resume_token`], and matches it for equality against the
+    /// token on the record a rejoiner is claiming. A presented value that does not match the record answers
+    /// no resume.
+    ///
+    /// **What it closes**: a peer that merely OBSERVED another peer's session id — off a roster broadcast, a
+    /// kill feed, a log line, a screenshot — cannot take that player's body, because it never saw the token.
+    ///
+    /// **What it does not close**: an on-path observer, who reads the welcome and can then quote the token
+    /// verbatim. That is the same boundary [`Self::session_nonce`] already has under a session with no
+    /// secret, and closing it needs a secret both ends already hold.
+    ///
+    /// The client persists it BESIDE the session id. A process that stored one and not the other presents a
+    /// `0` here and is seated as a newcomer.
+    pub resume_token: u64,
+    /// Proof the sender holds this session's **shared secret**: [`crate::auth::confirm_tag`] over
+    /// [`Self::session_nonce`] and [`Self::protocol_version`], under the key the secret derives. `0` is
+    /// the absent value and means "this peer configured no secret".
+    ///
+    /// **A trailing, optional field.** It is what turns the one signalable misconfiguration into a
+    /// readable rejection at the handshake instead of a session that silently drops every datagram;
+    /// [`Handshake::check_compatibility`] is where that refusal happens.
+    ///
+    /// **It proves possession of the secret, not identity.** Everyone the game handed the secret to can
+    /// produce a valid tag over any nonce they like, and the pair `(nonce, confirm)` is in the clear, so
+    /// an on-path observer can copy it. What that observer still cannot do is derive the key — which is
+    /// the whole of what a secret buys.
+    pub confirm: u64,
 }
 
 impl Handshake {
-    /// Build a handshake for this build at `tickrate`. Carries no session identity and no key; see
-    /// [`Handshake::with_session`] and [`Handshake::with_key`].
+    /// Build a handshake for this build at `tickrate`. Carries no session identity, no nonce, no resume
+    /// token and no confirmation; see [`Handshake::with_session`], [`Handshake::with_nonce`],
+    /// [`Handshake::with_resume_token`] and [`Handshake::with_confirm`].
     #[must_use]
     pub fn local(tickrate: u16) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             tickrate,
             session_id: 0,
-            session_key: [0; KEY_LEN],
+            session_nonce: [0; KEY_LEN],
+            resume_token: 0,
+            confirm: 0,
         }
     }
 
@@ -551,33 +655,58 @@ impl Handshake {
         self
     }
 
-    /// The same handshake, carrying the session key.
+    /// The same handshake, carrying the session nonce — which is the session key itself when no secret
+    /// is configured. See [`Self::session_nonce`] for the two regimes.
     #[must_use]
-    pub fn with_key(mut self, session_key: [u8; KEY_LEN]) -> Self {
-        self.session_key = session_key;
+    pub fn with_nonce(mut self, session_nonce: [u8; KEY_LEN]) -> Self {
+        self.session_nonce = session_nonce;
+        self
+    }
+
+    /// The same handshake, quoting the resume token a server issued for this identity.
+    #[must_use]
+    pub fn with_resume_token(mut self, resume_token: u64) -> Self {
+        self.resume_token = resume_token;
+        self
+    }
+
+    /// The same handshake, proving possession of the session secret. `0` proves none.
+    ///
+    /// The tag is [`crate::auth::confirm_tag`] over [`Self::session_nonce`] and this handshake's own
+    /// [`Self::protocol_version`], under [`crate::auth::derive_session_key`]'s output — so a caller
+    /// builds the rest of the handshake first and tags the version it is actually sending.
+    #[must_use]
+    pub fn with_confirm(mut self, confirm: u64) -> Self {
+        self.confirm = confirm;
         self
     }
 
     /// Encode, including the leading magic.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(MAGIC.len() + 14 + KEY_LEN);
+        let mut writer = Writer::with_capacity(MAGIC.len() + 30 + KEY_LEN);
         writer.bytes(&MAGIC);
         writer.u32(self.protocol_version);
         writer.u16(self.tickrate);
         writer.u64(self.session_id);
-        writer.bytes(&self.session_key);
+        writer.bytes(&self.session_nonce);
+        writer.u64(self.resume_token);
+        writer.u64(self.confirm);
         writer.into_inner()
     }
 
     /// Decode, validating the magic.
     ///
     /// **Everything after the protocol version decodes best-effort**, to a zero tick rate, no session
-    /// identity and an all-zero key. That is not laxity: `handle_hello` answers a decode error by
-    /// returning, so a peer whose handshake is short — an older build, a truncated frame — would be
-    /// dropped in silence with no rejection message at all. Decoding it far enough to reach
-    /// [`Handshake::check_compatibility`] is what produces the operator-readable version mismatch, and
-    /// the same check refuses the all-zero key a short handshake leaves behind.
+    /// identity, an all-zero nonce, a `0` resume token and a `0` confirmation. That is not laxity:
+    /// `handle_hello` answers a decode error by returning, so a peer whose handshake is short — an older
+    /// build, a truncated frame — would be dropped in silence with no rejection message at all. Decoding
+    /// it far enough to reach [`Handshake::check_compatibility`] is what produces the operator-readable
+    /// version mismatch, and the same check refuses the all-zero nonce a short handshake leaves behind.
+    ///
+    /// A `0` [`Self::resume_token`] is the absent value and is refused a resume, not a decode: quoting no
+    /// token is what a first-time joiner does. A `0` [`Self::confirm`] is refused nothing either, unless
+    /// the reading peer holds a secret — see [`Handshake::check_compatibility`].
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(buf);
         if reader.bytes(MAGIC.len())? != MAGIC {
@@ -586,37 +715,80 @@ impl Handshake {
         let protocol_version = reader.u32()?;
         let tickrate = reader.u16().unwrap_or(0);
         let session_id = reader.u64().unwrap_or(0);
-        let mut session_key = [0u8; KEY_LEN];
+        let mut session_nonce = [0u8; KEY_LEN];
         if let Ok(bytes) = reader.bytes(KEY_LEN) {
-            session_key.copy_from_slice(bytes);
+            session_nonce.copy_from_slice(bytes);
         }
+        let resume_token = reader.u64().unwrap_or(0);
+        let confirm = reader.u64().unwrap_or(0);
         Ok(Self {
             protocol_version,
             tickrate,
             session_id,
-            session_key,
+            session_nonce,
+            resume_token,
+            confirm,
         })
     }
 
-    /// Check a remote handshake against ours.
+    /// Check a remote handshake against ours, under the session secret this peer holds (`None` for a
+    /// peer that holds none).
     ///
-    /// Protocol major must match exactly and the remote must carry a session key. A differing tick rate
-    /// is deliberately *not* an error here — it is a policy decision for the caller, since some games
-    /// legitimately let peers run at different rates. Nor is a differing session identity: every client
-    /// mints its own.
+    /// Three rules, in the order an operator can act on them:
     ///
-    /// **The key is checked on `remote` only.** The local handshake in this call is a version reference
-    /// built by [`Handshake::local`], and the server never mints a key of its own — the client's is the
-    /// session's.
-    pub fn check_compatibility(&self, remote: &Handshake) -> Result<(), CodecError> {
+    /// 1. **Protocol major must match exactly.** Reported first, because a peer one major behind by
+    ///    definition sends nothing else this build can read.
+    /// 2. **The remote must carry a non-zero [`Self::session_nonce`].** All zeroes is what a peer that sent
+    ///    none decodes to, and under a secret it is also the one nonce that would repeat across joins.
+    /// 3. **A peer holding a secret must see a [`Self::confirm`] tag over that secret.** `secret` is the
+    ///    already-folded 16 bytes from [`crate::auth::compress_secret`]; the tag is recomputed from the
+    ///    remote's own nonce and version and compared.
+    ///
+    /// A differing tick rate is deliberately *not* an error — it is a policy decision for the caller,
+    /// since some games legitimately let peers run at different rates. Nor is a differing session
+    /// identity: every client mints its own.
+    ///
+    /// **[`Handshake::resume_token`] is not checked here either.** A wrong or absent token costs the peer its
+    /// resume and nothing more: it is seated as a newcomer. Every honest first-time joiner quotes `0`, so
+    /// refusing the connection over the token would lock all of them out.
+    ///
+    /// **The nonce and the confirmation are checked on `remote` only.** The local handshake in this call is
+    /// a version reference built by [`Handshake::local`], and the accepting side mints neither — a
+    /// session's nonce is the joiner's.
+    ///
+    /// **Only one direction of a secret misconfiguration is reportable, and this is it.** A peer holding a
+    /// secret against a joiner holding none refuses the join here, with a message that says so, instead of
+    /// seating a session whose every datagram then fails its tag. The reverse — a joiner holding a secret
+    /// against a peer holding none — cannot be reported at all: the reply is sealed under a key the joiner
+    /// will not derive, so nothing the accepting side sends can reach it. That case's symptom is a join
+    /// that never completes.
+    ///
+    /// **The tag is bound to `remote.protocol_version`, not ours.** Rule 1 has already established that the
+    /// two agree on major, and minor and patch are legitimately allowed to differ — so tagging against our
+    /// own version would refuse every honest peer one patch away.
+    pub fn check_compatibility(
+        &self,
+        remote: &Handshake,
+        secret: Option<&[u8; KEY_LEN]>,
+    ) -> Result<(), CodecError> {
         if protocol_major(remote.protocol_version) != protocol_major(self.protocol_version) {
             return Err(CodecError::ProtocolMismatch {
                 theirs: remote.protocol_version,
                 ours: self.protocol_version,
             });
         }
-        if remote.session_key == [0u8; KEY_LEN] {
-            return Err(CodecError::MissingSessionKey);
+        if remote.session_nonce == [0u8; KEY_LEN] {
+            return Err(CodecError::MissingSessionNonce);
+        }
+        if let Some(secret) = secret {
+            let key = derive_session_key(secret, &remote.session_nonce);
+            let expected = confirm_tag(&key, &remote.session_nonce, remote.protocol_version);
+            // XOR then one test against zero, so nothing branches on the tag's CONTENTS — the same
+            // property `crate::auth` folds a difference down for on the receive path. A comparison that
+            // returned at the first differing byte would leak how much of a guessed tag was right.
+            if (remote.confirm ^ expected) != 0 {
+                return Err(CodecError::SecretMismatch);
+            }
         }
         Ok(())
     }
@@ -915,26 +1087,43 @@ pub struct Welcome {
     pub server_tick: u64,
     /// The server's configured tick rate in hertz.
     pub tickrate: u16,
+    /// The **resume token** this server issued for the identity the peer's handshake carried, or `0` for a
+    /// peer it seated without one.
+    ///
+    /// Minted once per identity and re-sent on every welcome that identity is granted, so the retried
+    /// handshake a lost welcome provokes gets the same value rather than a fresh one.
+    ///
+    /// **The client stores it beside the session id and quotes it back in
+    /// [`Handshake::resume_token`].** A `0` here means "this connection holds no identity of ours" — a
+    /// peer that claimed none, or one whose resume was refused — and the client keeps whatever it already
+    /// had rather than overwriting a live token with nothing.
+    pub resume_token: u64,
 }
 
 impl Welcome {
     /// Encode, with the frame kind tag leading.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(16);
+        let mut writer = Writer::with_capacity(24);
         writer.u8(FrameKind::Welcome.tag());
         writer.u32(self.protocol_version);
         writer.varint(self.server_tick);
         writer.u16(self.tickrate);
+        writer.u64(self.resume_token);
         writer.into_inner()
     }
 
     /// Decode the payload after the kind tag has been consumed.
+    ///
+    /// **[`Self::resume_token`] decodes best-effort to `0`**, the same rule the handshake's own trailing
+    /// fields follow: a frame that stops before it yields the documented absent value rather than an error,
+    /// and a welcome that failed to decode would leave a joining client unsynced with nothing to say why.
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         Ok(Self {
             protocol_version: reader.u32()?,
             server_tick: reader.varint()?,
             tickrate: reader.u16()?,
+            resume_token: reader.u64().unwrap_or(0),
         })
     }
 }
@@ -1004,24 +1193,41 @@ impl Pong {
 /// One entity's row in a [`FrameKind::EntityManifest`] frame: its slot binding, its schema
 /// fingerprints, and the seat that drives it.
 ///
-/// **The manifest carries the whole slot table, both lanes, every time.** It covered the rollback
-/// lane only while it was purely a schema check, because a state-lane entity has no input schema to
-/// disagree about. It is now also the only channel that tells a client what a wire slot names, and
-/// state-lane blocks carry slots too, so it has to name every replicated entity.
-///
-/// It is a **complete snapshot rather than a diff**, which is what makes a receiver's table
-/// self-repairing: rebuilding from each manifest drops the binding of every entity that has
-/// unregistered since the last one, with no removal record to lose.
+/// **The manifest names every replicated entity, both lanes.** It covered the rollback lane only
+/// while it was purely a schema check, because a state-lane entity has no input schema to disagree
+/// about. It is now also the only channel that tells a client what a wire slot names, and state-lane
+/// blocks carry slots too, so it has to name every replicated entity.
 ///
 /// **THE SEAT ROSTER RIDES HERE RATHER THAN ON A FRAME OF ITS OWN.** A seat exists because some
 /// entity says it is driven by that connection under that label ([`crate::seats`]), so the roster is
 /// a projection of this table and cannot disagree with it. A separate frame would be a second source
 /// of truth arriving on its own schedule, and the two would differ for exactly as long as one of
-/// them was in flight. The complete-snapshot rule then carries over for free: a receiver rebuilds
-/// the roster from each manifest, so a seat that went away needs no removal record.
+/// them was in flight.
+///
+/// # What one row costs, from the encoder rather than from an estimate
+///
+/// | Field | Bytes |
+/// | --- | --- |
+/// | `slot` | 2, fixed |
+/// | `id`, an LEB128 varint over a full-width FNV-1a hash | **9.5 on average**, uniform over 2<sup>64</sup> |
+/// | `state_hash` | 4 |
+/// | `input_hash` | 4 |
+/// | `owner`, a varint over a small positive peer id | 1 |
+/// | `seat` | 2 |
+/// | **one row** | **~22.5** |
+///
+/// That is what made restating the whole table on every change untenable: the table is rebuilt and
+/// broadcast whenever anything dirties it — a registration, an unregistration, a slot reconcile, a
+/// seat or authority write, or any hello — and it is flushed once per frame that advanced a tick, so
+/// the ceiling was one whole-table republish per net tick per peer. At 8,000 named entities that is
+/// ~180 kB per peer per republish, against an unreliable hot lane of ~36 kB/s per peer.
+/// [`ManifestDelta`] is what a change costs instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManifestEntry {
     /// The dense session slot this entity's blocks are named by on the wire.
+    ///
+    /// **The key of the whole table.** Both halves of a [`ManifestDelta`] name a row by its slot: a
+    /// removal is a bare slot, and an addition replaces whatever the receiver held at that slot.
     pub slot: u16,
     /// Stable entity id (the FNV-1a hash of the synchronizer root's node path).
     pub id: u64,
@@ -1045,18 +1251,204 @@ pub struct ManifestEntry {
     pub seat: SeatIndex,
 }
 
-/// Encode an entity manifest frame.
+/// A change to the entity manifest, stated against the exact table it was computed from.
+///
+/// ```text
+/// kind 0x08 | base_generation varint | generation varint
+///           | removed_count varint | R x slot u16
+///           | added_count varint   | A x entry     (the ManifestEntry layout, unchanged)
+/// ```
+///
+/// **One record covers three cases**, because binding a slot already replaces both directions
+/// ([`crate::slots::SlotTable::bind`]): a slot that was not bound, a slot reissued to a different
+/// entity, and a row whose `owner`, `seat` or schema hash changed on a slot that stayed bound are
+/// all one `added` row. Applying an `added` row is therefore **idempotent**, and a receiver needs no
+/// case analysis to apply one.
+///
+/// **`generation` is sent explicitly rather than implied as `base_generation + 1`**, so a server may
+/// coalesce several dirty ticks into one delta and a receiver still lands on the number the server
+/// holds.
+///
+/// # What a delta gives up, and what replaces it
+///
+/// Rebuilding from a complete table was **self-repairing**: it retired the binding of every entity
+/// that had unregistered since the last frame, with no removal record to lose. A delta reintroduces
+/// a removal record. A receiver that misses one keeps a slot bound to an entity the server has
+/// unregistered; past [`crate::slots::SLOT_QUARANTINE_TICKS`] that slot is reissued, and the stale
+/// receiver applies the new entity's rows to the old one — silently, with every block decoding
+/// cleanly.
+///
+/// Three things stand in for the complete table, and all three are needed:
+///
+/// | Guarantee | What it covers |
+/// | --- | --- |
+/// | The manifest channel is **reliable and ordered** | a removal cannot be dropped or reordered while the connection lives |
+/// | `base_generation` names the exact table this was computed from | a receiver holding any other table refuses the delta rather than half-applying it |
+/// | Every way the stream can break resolves to a **full table** | a reconnect, a rekey on a live connection, an undecodable delta, and a delta against the wrong base |
+///
+/// The generation counter is **not loss recovery** — the channel already gives that. It is what
+/// makes "this receiver is not holding the table I diffed against" detectable at all, and every
+/// path that can desynchronize a receiver has to zero it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestDelta {
+    /// The generation of the table this delta was computed against.
+    ///
+    /// A receiver holding any other generation **cannot apply it** and asks for a full table with
+    /// [`FrameHeader::FLAG_WANT_MANIFEST`].
+    pub base_generation: u64,
+    /// The generation the table stands at once this delta is applied.
+    pub generation: u64,
+    /// Slots whose binding is retired, ascending. **Two bytes each**: a row is named by its slot, so
+    /// nothing else about it has to be restated to drop it.
+    pub removed: Vec<u16>,
+    /// Rows that are in force now, ascending by slot. A new binding, a rebind of a reissued slot and
+    /// a changed row on a slot that stayed bound are all this, at the full ~22.5 bytes of a row.
+    pub added: Vec<ManifestEntry>,
+}
+
+impl ManifestDelta {
+    /// Whether a receiver holding `generation` may apply this delta.
+    ///
+    /// **The receiver's whole gate, as one named rule a test can call.** A receiver at any other
+    /// generation is not holding the table this was diffed against, so applying it would leave a
+    /// table that matches neither end. It refuses instead, zeroes its own generation, and raises
+    /// [`FrameHeader::FLAG_WANT_MANIFEST`] to be sent the whole table.
+    #[must_use]
+    pub fn applies_to(&self, generation: u64) -> bool {
+        self.base_generation == generation
+    }
+}
+
+/// Encode a whole entity manifest, at the generation it stands at.
+///
+/// ```text
+/// kind 0x07 | generation varint | count varint | count x entry
+/// ```
+///
+/// **The leading generation is what made this a major protocol bump**: it shifts the offset of every
+/// field after it, so a peer that does not know about it reads the count out of the generation's
+/// bytes and decodes garbage rather than stopping short.
+///
+/// A full table is what a receiver gets when it holds no table, or holds one this server cannot
+/// diff against. Every other publish is an [`encode_manifest_delta`].
 #[must_use]
-pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
-    let mut writer = Writer::with_capacity(4 + entries.len() * 17);
+pub fn encode_manifest_full(generation: u64, entries: &[ManifestEntry]) -> Vec<u8> {
+    let mut writer = Writer::with_capacity(12 + entries.len() * 23);
     writer.u8(FrameKind::EntityManifest.tag());
+    writer.varint(generation);
+    write_manifest_entries(entries, &mut writer);
+    writer.into_inner()
+}
+
+/// Decode a whole entity manifest after the kind tag has been consumed, answering
+/// `(generation, entries)`.
+pub fn decode_manifest_full(
+    reader: &mut Reader<'_>,
+) -> Result<(u64, Vec<ManifestEntry>), CodecError> {
+    let generation = reader.varint()?;
+    Ok((generation, read_manifest_entries(reader)?))
+}
+
+/// Encode one entity-manifest delta. See [`ManifestDelta`] for the layout and the guarantees.
+#[must_use]
+pub fn encode_manifest_delta(delta: &ManifestDelta) -> Vec<u8> {
+    let mut writer = Writer::with_capacity(24 + delta.removed.len() * 2 + delta.added.len() * 23);
+    writer.u8(FrameKind::EntityManifestDelta.tag());
+    writer.varint(delta.base_generation);
+    writer.varint(delta.generation);
+    writer.varint(delta.removed.len() as u64);
+    for &slot in &delta.removed {
+        writer.u16(slot);
+    }
+    write_manifest_entries(&delta.added, &mut writer);
+    writer.into_inner()
+}
+
+/// Decode one entity-manifest delta after the kind tag has been consumed.
+///
+/// Bounds-checked like every other decoder here, and **both counts are capped the way
+/// [`decode_manifest_full`] caps its own**: the reserve is `count.min(4096)`, never `count`, so a
+/// four-byte frame claiming `u64::MAX` records reports [`CodecError::UnexpectedEof`] when the reads
+/// run out of buffer instead of driving a remote out-of-memory. The cap bounds the *reserve* and not
+/// the record count, so a legitimate delta larger than 4096 records still decodes.
+pub fn decode_manifest_delta(reader: &mut Reader<'_>) -> Result<ManifestDelta, CodecError> {
+    Ok(ManifestDelta {
+        // Field order IS wire order: a struct literal evaluates its fields as written, and every one
+        // of these reads advances the same cursor.
+        base_generation: reader.varint()?,
+        generation: reader.varint()?,
+        removed: decode_slot_run(reader)?,
+        added: read_manifest_entries(reader)?,
+    })
+}
+
+/// The minimal delta that carries `previous` to `current`, as `(removed slots, added rows)`.
+///
+/// **Pure and order-independent.** Both tables are keyed by [`ManifestEntry::slot`], because the
+/// slot is what a removal names on the wire; neither argument has to arrive sorted, and both halves
+/// of the answer come out ascending by slot.
+///
+/// | Change | What it produces |
+/// | --- | --- |
+/// | a row on a slot that was not bound | one `added` row |
+/// | a row gone from a slot with nothing to replace it | one `removed` slot |
+/// | a slot reissued to a different entity | one `added` row — a bind replaces both directions |
+/// | `owner`, `seat` or either schema hash changed on an unmoved slot | one `added` row |
+/// | an entity that moved from one slot to another | one `removed` slot and one `added` row |
+/// | a row that did not change | **nothing** |
+///
+/// The last line is the one that matters: the frame is rebuilt whenever anything dirties it, and
+/// almost every rebuild reproduces a table identical to the one already published.
+#[must_use]
+pub fn diff_manifest(
+    previous: &[ManifestEntry],
+    current: &[ManifestEntry],
+) -> (Vec<u16>, Vec<ManifestEntry>) {
+    let mut before: BTreeMap<u16, ManifestEntry> =
+        previous.iter().map(|entry| (entry.slot, *entry)).collect();
+    let mut added: Vec<ManifestEntry> = Vec::new();
+    for entry in current {
+        // Taking the row out is what leaves `before` holding exactly the removals at the end: a slot
+        // that survived has been consumed, whether or not its row changed.
+        match before.remove(&entry.slot) {
+            Some(held) if held == *entry => {}
+            _ => added.push(*entry),
+        }
+    }
+    added.sort_unstable_by_key(|entry| entry.slot);
+    // `BTreeMap::into_keys` is already ascending, which is the order the wire wants.
+    (before.into_keys().collect(), added)
+}
+
+/// Apply `delta` to a table of rows, answering the table it reaches. The inverse of
+/// [`diff_manifest`], and pure for the same reason: the algebra is testable without a session.
+///
+/// **Removals are applied before additions**, and the order is load-bearing rather than incidental.
+/// A well-formed delta never names one slot in both halves — [`diff_manifest`] cannot produce that —
+/// but the bytes are chosen by a remote peer, and applying the removals second would drop a row the
+/// same frame had just installed.
+#[must_use]
+pub fn apply_manifest_delta(rows: &[ManifestEntry], delta: &ManifestDelta) -> Vec<ManifestEntry> {
+    let mut table: BTreeMap<u16, ManifestEntry> =
+        rows.iter().map(|entry| (entry.slot, *entry)).collect();
+    for &slot in &delta.removed {
+        table.remove(&slot);
+    }
+    for entry in &delta.added {
+        table.insert(entry.slot, *entry);
+    }
+    table.into_values().collect()
+}
+
+/// Write `count varint | count x entry`, the run both manifest frames carry.
+fn write_manifest_entries(entries: &[ManifestEntry], writer: &mut Writer) {
     writer.varint(entries.len() as u64);
     for entry in entries {
         writer.u16(entry.slot);
         // The full 64-bit id, still a varint. This is the one frame that has to carry it — a
         // receiver derives the same id from the same node path and needs the pairing to find its
-        // own entity — and it rides the reliable channel only when the registry changes, so its
-        // ~9.5 bytes are spent once per entity per change rather than once per entity per tick.
+        // own entity — and it now rides only when THAT ROW changed rather than whenever anything in
+        // the table did, so its ~9.5 bytes are spent per entity per change to that entity.
         writer.varint(entry.id);
         writer.u32(entry.state_hash);
         writer.u32(entry.input_hash);
@@ -1066,11 +1458,13 @@ pub fn encode_manifest(entries: &[ManifestEntry]) -> Vec<u8> {
         writer.varint(entry.owner.max(0) as u64);
         writer.u16(entry.seat);
     }
-    writer.into_inner()
 }
 
-/// Decode an entity manifest's payload after the kind tag has been consumed.
-pub fn decode_manifest(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, CodecError> {
+/// Read `count varint | count x entry`.
+///
+/// The reserve is `count.min(4096)` and never `count`: a one-byte count field can claim `u64::MAX`
+/// rows, and reserving for that claim is a remote out-of-memory rather than a decode error.
+fn read_manifest_entries(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, CodecError> {
     let count = reader.varint()?;
     // Each entry is at least 14 bytes; a hostile count cannot make us over-allocate.
     let cap = usize::try_from(count.min(4096)).unwrap_or(0);
@@ -1091,6 +1485,77 @@ pub fn decode_manifest(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, Co
         });
     }
     Ok(entries)
+}
+
+/// Which entities became relevant to ONE peer, and which stopped being, since the last such section
+/// that peer acknowledged.
+///
+/// **It rides the snapshot frame that peer is already receiving**, appended after the entity blocks
+/// and announced by [`FrameHeader::FLAG_INTEREST_DELTA`]. The manifest cannot carry this: that frame
+/// is a session-wide table broadcast identically to every peer, so it says "this entity exists" and
+/// never "this entity is relevant to you".
+///
+/// **Slots, not ids.** A 64-bit entity id is an FNV-1a hash spread across the whole range and costs
+/// ~9.5 bytes as a varint; a slot is a flat 2. The receiver resolves each one against the table the
+/// manifest already gave it and **ignores an unbound slot silently**, exactly as `handle_snapshot`
+/// already ignores a block naming one. That case is not rare — a leave whose cause is an unregister
+/// names a slot the very next manifest releases — and [`crate::slots`]'s 256-tick reuse quarantine
+/// is what stops a released slot naming a different entity inside the window a snapshot can be
+/// reordered by.
+///
+/// **The section is applied idempotently**: remove each `left` slot from a mirrored set, add each
+/// `entered` slot to it, and emit only on a set that actually changed. That is what makes a re-send
+/// free, which is what lets an unreliable datagram carry an event at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterestDeltaSection {
+    /// Slots that left this peer's interest, ascending.
+    pub left: Vec<u16>,
+    /// Slots that entered it, ascending.
+    pub entered: Vec<u16>,
+}
+
+/// Append an interest-delta section to `writer`.
+///
+/// Layout, in order: `varint left_count | [u16 slot]* | varint entered_count | [u16 slot]*`. Both
+/// counts are varints because they are usually one byte and never need more than three at a payload
+/// this size; every slot is a fixed 2 bytes, for the reason [`ManifestEntry::slot`] states.
+pub fn encode_interest_delta(left: &[u16], entered: &[u16], writer: &mut Writer) {
+    writer.varint(left.len() as u64);
+    for &slot in left {
+        writer.u16(slot);
+    }
+    writer.varint(entered.len() as u64);
+    for &slot in entered {
+        writer.u16(slot);
+    }
+}
+
+/// Decode an interest-delta section from the bytes after a frame's entity blocks.
+///
+/// Bounds-checked like every other decoder here: a hostile count reports
+/// [`CodecError::UnexpectedEof`] rather than driving an allocation, because the reserve is capped at
+/// the same 4096 [`decode_manifest_full`] uses and the reads that follow run out of buffer.
+pub fn decode_interest_delta(reader: &mut Reader<'_>) -> Result<InterestDeltaSection, CodecError> {
+    Ok(InterestDeltaSection {
+        // Field order IS wire order: a struct literal evaluates its fields as written, and both of
+        // these advance the same cursor.
+        left: decode_slot_run(reader)?,
+        entered: decode_slot_run(reader)?,
+    })
+}
+
+/// One `varint count | [u16 slot]*` run.
+///
+/// The capacity is `count.min(4096)` and never `count`: a two-byte frame can claim `u64::MAX` slots,
+/// and reserving for that claim is a remote out-of-memory rather than a decode error.
+fn decode_slot_run(reader: &mut Reader<'_>) -> Result<Vec<u16>, CodecError> {
+    let count = reader.varint()?;
+    let cap = usize::try_from(count.min(4096)).unwrap_or(0);
+    let mut slots = Vec::with_capacity(cap);
+    for _ in 0..count {
+        slots.push(reader.u16()?);
+    }
+    Ok(slots)
 }
 
 #[cfg(test)]
@@ -1322,28 +1787,157 @@ mod tests {
         );
     }
 
-    const TEST_KEY: [u8; KEY_LEN] = [
+    /// The 16 bytes a handshake carries. The session key itself under no secret, a nonce under one.
+    const TEST_NONCE: [u8; KEY_LEN] = [
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
         0x01,
     ];
 
+    /// A secret as a game would distribute it, already folded to the 16 bytes the derivation keys on.
+    fn test_secret() -> [u8; KEY_LEN] {
+        crate::auth::compress_secret(b"a secret the lobby handed both ends")
+    }
+
+    /// The handshake a joiner holding `secret` sends over `nonce`: the nonce in the clear, and the
+    /// confirmation over the key it derives. The two lines every caller of this scheme writes.
+    fn hello_under(secret: &[u8; KEY_LEN], nonce: [u8; KEY_LEN]) -> Handshake {
+        let hello = Handshake::local(60).with_nonce(nonce);
+        let key = derive_session_key(secret, &nonce);
+        hello.with_confirm(confirm_tag(&key, &nonce, hello.protocol_version))
+    }
+
     #[test]
     fn handshake_round_trips() {
-        let hello = Handshake::local(60).with_key(TEST_KEY);
+        let hello = Handshake::local(60).with_nonce(TEST_NONCE);
         let decoded = Handshake::decode(&hello.encode()).unwrap();
         assert_eq!(decoded, hello);
         assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(decoded.session_key, TEST_KEY);
+        assert_eq!(decoded.session_nonce, TEST_NONCE);
+        assert_eq!(decoded.confirm, 0, "a peer with no secret confirms nothing");
     }
 
     #[test]
     fn handshake_carries_a_session_identity_verbatim() {
         let hello = Handshake::local(60)
             .with_session(0xdead_beef_c0de_1234)
-            .with_key(TEST_KEY);
+            .with_nonce(TEST_NONCE);
         let decoded = Handshake::decode(&hello.encode()).unwrap();
         assert_eq!(decoded.session_id, 0xdead_beef_c0de_1234);
         assert_eq!(decoded, hello);
+    }
+
+    /// The resume token rides the handshake verbatim, all 64 bits of it. It is compared for equality
+    /// against the token on the server's record and interpreted no further, so any transformation on the
+    /// way through — a truncation to 32 bits, a sign extension — turns every honest resume into a refusal.
+    #[test]
+    fn handshake_carries_a_resume_token_verbatim() {
+        let hello = Handshake::local(60)
+            .with_session(0xdead_beef_c0de_1234)
+            .with_nonce(TEST_NONCE)
+            .with_resume_token(0xfeed_face_dead_c0de);
+        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        assert_eq!(decoded.resume_token, 0xfeed_face_dead_c0de);
+        assert_eq!(decoded, hello);
+        assert_eq!(
+            Handshake::decode(&Handshake::local(60).with_nonce(TEST_NONCE).encode())
+                .unwrap()
+                .resume_token,
+            0,
+            "a peer that quotes no token decodes to the absent value"
+        );
+    }
+
+    /// The confirmation rides the handshake verbatim too, and it is the last field on the frame. All 64
+    /// bits: it is compared against a locally recomputed tag, so any transformation on the way through
+    /// refuses every honest joiner that holds the right secret.
+    #[test]
+    fn handshake_carries_a_confirm_tag_verbatim() {
+        let secret = test_secret();
+        let hello = hello_under(&secret, TEST_NONCE).with_session(9);
+        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        assert_eq!(decoded, hello);
+        assert_eq!(
+            decoded.confirm,
+            confirm_tag(
+                &derive_session_key(&secret, &TEST_NONCE),
+                &TEST_NONCE,
+                PROTOCOL_VERSION
+            )
+        );
+        assert_ne!(decoded.confirm, 0, "a held secret produces a real tag");
+    }
+
+    /// The 16-byte field kept its offset and its width when it became a nonce, so the frame grew by
+    /// exactly the trailing confirmation and nothing moved.
+    #[test]
+    fn the_handshake_layout_is_the_declared_widths_in_the_declared_order() {
+        let bytes = hello_under(&test_secret(), TEST_NONCE)
+            .with_session(7)
+            .with_resume_token(11)
+            .encode();
+        assert_eq!(bytes.len(), MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8 + 8);
+        let nonce_at = MAGIC.len() + 4 + 2 + 8;
+        assert_eq!(&bytes[nonce_at..nonce_at + KEY_LEN], &TEST_NONCE[..]);
+        assert_eq!(
+            &bytes[nonce_at + KEY_LEN..nonce_at + KEY_LEN + 8],
+            &11u64.to_le_bytes()[..],
+            "the resume token still sits directly after the 16 bytes"
+        );
+    }
+
+    /// The token is a TRAILING field, so a frame that stops before it decodes to `0` rather than erroring.
+    /// A decode error here would be answered by `handle_hello` returning, and the peer would be dropped in
+    /// silence instead of being seated as the newcomer a tokenless hello describes.
+    #[test]
+    fn a_handshake_truncated_before_its_resume_token_decodes_to_no_token() {
+        let full = Handshake::local(60)
+            .with_session(7)
+            .with_nonce(TEST_NONCE)
+            .with_resume_token(0x0123_4567_89ab_cdef);
+        let bytes = full.encode();
+        for keep in (bytes.len() - 16)..(bytes.len() - 8) {
+            let decoded = Handshake::decode(&bytes[..keep]).unwrap();
+            assert_eq!(decoded.resume_token, 0, "keep {keep}");
+            assert_eq!(
+                decoded.session_nonce, TEST_NONCE,
+                "and every field before it survives, keep {keep}"
+            );
+        }
+        assert_eq!(
+            Handshake::decode(&bytes).unwrap().resume_token,
+            0x0123_4567_89ab_cdef,
+            "the untruncated frame still carries it"
+        );
+    }
+
+    /// The confirmation is the newest trailing field and decodes to `0` — "this peer configured no
+    /// secret" — when it is absent. `0` is refused nothing by a peer that holds no secret either, which is
+    /// what keeps a session with no secret configured on exactly the path it was on before.
+    #[test]
+    fn a_handshake_truncated_before_its_confirm_tag_decodes_to_no_confirmation() {
+        let full = hello_under(&test_secret(), TEST_NONCE)
+            .with_session(7)
+            .with_resume_token(0x0123_4567_89ab_cdef);
+        let bytes = full.encode();
+        for keep in (bytes.len() - 8)..bytes.len() {
+            let decoded = Handshake::decode(&bytes[..keep]).unwrap();
+            assert_eq!(decoded.confirm, 0, "keep {keep}");
+            assert_eq!(
+                decoded.resume_token, 0x0123_4567_89ab_cdef,
+                "and the field before it survives, keep {keep}"
+            );
+            assert!(
+                Handshake::local(60)
+                    .check_compatibility(&decoded, None)
+                    .is_ok(),
+                "a peer holding no secret does not look at it, keep {keep}"
+            );
+        }
+        assert_eq!(
+            Handshake::decode(&bytes).unwrap().confirm,
+            full.confirm,
+            "the untruncated frame still carries it"
+        );
     }
 
     /// A short handshake must reach `check_compatibility` rather than fail to decode: `handle_hello`
@@ -1351,16 +1945,45 @@ mod tests {
     /// the shape an older build's handshake arrives in.
     #[test]
     fn a_truncated_handshake_decodes_far_enough_to_be_rejected_readably() {
-        let full = Handshake::local(60).with_session(7).with_key(TEST_KEY);
+        let full = Handshake::local(60)
+            .with_session(7)
+            .with_nonce(TEST_NONCE)
+            .with_resume_token(0x0123_4567_89ab_cdef);
         let bytes = full.encode();
-        for keep in 8..bytes.len() {
+        // The last byte of the session nonce. Everything short of this leaves an all-zero nonce behind,
+        // which is what `check_compatibility` refuses by name; past it only the trailing resume token and
+        // confirmation are lost, and those cost a resume and a secret check rather than the connection.
+        let nonce_end = MAGIC.len() + 4 + 2 + 8 + KEY_LEN;
+        for keep in 8..nonce_end {
             let decoded = Handshake::decode(&bytes[..keep]).unwrap();
             assert_eq!(decoded.protocol_version, PROTOCOL_VERSION, "keep {keep}");
             let err = Handshake::local(60)
-                .check_compatibility(&decoded)
+                .check_compatibility(&decoded, None)
                 .unwrap_err();
-            assert_eq!(err, CodecError::MissingSessionKey, "keep {keep}");
-            assert!(err.to_string().contains("session key"), "{err}");
+            assert_eq!(err, CodecError::MissingSessionNonce, "keep {keep}");
+            assert!(err.to_string().contains("session nonce"), "{err}");
+        }
+        for keep in nonce_end..bytes.len() {
+            let decoded = Handshake::decode(&bytes[..keep]).unwrap();
+            assert!(
+                Handshake::local(60)
+                    .check_compatibility(&decoded, None)
+                    .is_ok(),
+                "a hello short only of its trailing fields is compatible, keep {keep}"
+            );
+            let expected_token = if keep >= nonce_end + 8 {
+                0x0123_4567_89ab_cdef
+            } else {
+                0
+            };
+            assert_eq!(
+                decoded.resume_token, expected_token,
+                "each trailing field survives exactly its own bytes, keep {keep}"
+            );
+            assert_eq!(
+                decoded.confirm, 0,
+                "and none of these reach it, keep {keep}"
+            );
         }
     }
 
@@ -1368,14 +1991,14 @@ mod tests {
     /// which is what lets every client mint its own.
     #[test]
     fn a_differing_session_identity_is_not_an_incompatibility() {
-        let ours = Handshake::local(60).with_session(1).with_key(TEST_KEY);
-        let theirs = Handshake::local(60).with_session(2).with_key(TEST_KEY);
-        assert!(ours.check_compatibility(&theirs).is_ok());
+        let ours = Handshake::local(60).with_session(1).with_nonce(TEST_NONCE);
+        let theirs = Handshake::local(60).with_session(2).with_nonce(TEST_NONCE);
+        assert!(ours.check_compatibility(&theirs, None).is_ok());
     }
 
     #[test]
     fn handshake_rejects_bad_magic() {
-        let mut bytes = Handshake::local(60).with_key(TEST_KEY).encode();
+        let mut bytes = Handshake::local(60).with_nonce(TEST_NONCE).encode();
         bytes[0] = b'X';
         assert_eq!(Handshake::decode(&bytes), Err(CodecError::BadMagic));
     }
@@ -1383,8 +2006,8 @@ mod tests {
     #[test]
     fn handshake_accepts_a_matching_peer() {
         let ours = Handshake::local(60);
-        let theirs = Handshake::local(60).with_key(TEST_KEY);
-        assert!(ours.check_compatibility(&theirs).is_ok());
+        let theirs = Handshake::local(60).with_nonce(TEST_NONCE);
+        assert!(ours.check_compatibility(&theirs, None).is_ok());
     }
 
     #[test]
@@ -1392,13 +2015,13 @@ mod tests {
         let ours = Handshake::local(60);
         let theirs = Handshake {
             protocol_version: PROTOCOL_VERSION + 1, // patch bump
-            ..Handshake::local(60).with_key(TEST_KEY)
+            ..Handshake::local(60).with_nonce(TEST_NONCE)
         };
-        assert!(ours.check_compatibility(&theirs).is_ok());
+        assert!(ours.check_compatibility(&theirs, None).is_ok());
     }
 
-    /// Version skew is reported BEFORE the missing key, so a peer one major behind — which by
-    /// definition sends no key this build can read — is told the thing it can act on.
+    /// Version skew is reported BEFORE the missing nonce, so a peer one major behind — which by
+    /// definition sends no nonce this build can read — is told the thing it can act on.
     #[test]
     fn handshake_rejects_a_major_version_gap() {
         let ours = Handshake::local(60);
@@ -1406,7 +2029,7 @@ mod tests {
             protocol_version: crate::PROTOCOL_VERSION + 0x0001_0000,
             ..Handshake::local(60)
         };
-        let err = ours.check_compatibility(&theirs).unwrap_err();
+        let err = ours.check_compatibility(&theirs, None).unwrap_err();
         assert!(matches!(err, CodecError::ProtocolMismatch { .. }));
         // The operator-facing message must name both versions.
         let text = err.to_string();
@@ -1418,9 +2041,124 @@ mod tests {
 
     #[test]
     fn differing_tickrate_is_not_a_handshake_error() {
-        let ours = Handshake::local(60).with_key(TEST_KEY);
-        let theirs = Handshake::local(30).with_key(TEST_KEY);
-        assert!(ours.check_compatibility(&theirs).is_ok());
+        let ours = Handshake::local(60).with_nonce(TEST_NONCE);
+        let theirs = Handshake::local(30).with_nonce(TEST_NONCE);
+        assert!(ours.check_compatibility(&theirs, None).is_ok());
+    }
+
+    // --- the session secret, and the one misconfiguration that can be reported ------------------
+
+    /// The happy path: both ends folded the same secret, so the joiner's tag recomputes.
+    #[test]
+    fn a_peer_holding_a_secret_accepts_a_joiner_that_confirms_the_same_one() {
+        let secret = test_secret();
+        let hello = hello_under(&secret, TEST_NONCE);
+        assert!(Handshake::local(60)
+            .check_compatibility(&hello, Some(&secret))
+            .is_ok());
+        // And across the wire, which is the only form the accepting side ever sees it in.
+        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        assert!(Handshake::local(60)
+            .check_compatibility(&decoded, Some(&secret))
+            .is_ok());
+    }
+
+    /// THE ONE SIGNALABLE MISCONFIGURATION. A server holding a secret against a client holding none
+    /// would otherwise seat a session whose every datagram fails its tag, silently — the client would see
+    /// a join that goes through and then nothing. The confirmation turns it into one readable rejection.
+    #[test]
+    fn a_peer_holding_a_secret_refuses_a_joiner_that_cannot_confirm_it() {
+        let secret = test_secret();
+        let cases = [
+            (
+                "a joiner that configured no secret at all",
+                Handshake::local(60).with_nonce(TEST_NONCE),
+            ),
+            (
+                "a joiner holding a different secret",
+                hello_under(
+                    &crate::auth::compress_secret(b"some other secret"),
+                    TEST_NONCE,
+                ),
+            ),
+            (
+                "a tag lifted from a different nonce",
+                Handshake::local(60)
+                    .with_nonce(TEST_NONCE)
+                    .with_confirm(hello_under(&secret, [0x5au8; KEY_LEN]).confirm),
+            ),
+            (
+                "a guessed tag",
+                Handshake::local(60)
+                    .with_nonce(TEST_NONCE)
+                    .with_confirm(0xffff_ffff_ffff_ffff),
+            ),
+        ];
+        for (label, hello) in cases {
+            let err = Handshake::local(60)
+                .check_compatibility(&hello, Some(&secret))
+                .unwrap_err();
+            assert_eq!(err, CodecError::SecretMismatch, "{label}");
+            assert!(err.to_string().contains("secret"), "{label}: {err}");
+        }
+    }
+
+    /// The negative control for the rule above, and the compatibility promise for every session that
+    /// configures nothing: a peer holding no secret does not look at the confirmation, whatever is in it.
+    #[test]
+    fn a_peer_holding_no_secret_ignores_the_confirm_tag_entirely() {
+        for confirm in [0u64, 1, 0xdead_beef_c0de_1234, u64::MAX] {
+            let hello = Handshake::local(60)
+                .with_nonce(TEST_NONCE)
+                .with_confirm(confirm);
+            assert!(
+                Handshake::local(60)
+                    .check_compatibility(&hello, None)
+                    .is_ok(),
+                "confirm {confirm:#x}"
+            );
+        }
+    }
+
+    /// The version is inside the tag, and the tag is recomputed against the version the REMOTE stamped
+    /// on its own frame. Major must already match to get this far, and minor and patch are legitimately
+    /// allowed to differ — so checking against our own version would refuse every honest peer one patch
+    /// away, which is the failure mode this pins.
+    #[test]
+    fn a_confirmation_is_checked_against_the_version_its_sender_stamped() {
+        let secret = test_secret();
+        let mut hello = Handshake::local(60).with_nonce(TEST_NONCE);
+        hello.protocol_version = PROTOCOL_VERSION + 1; // patch bump
+        let key = derive_session_key(&secret, &TEST_NONCE);
+        let hello = hello.with_confirm(confirm_tag(&key, &TEST_NONCE, hello.protocol_version));
+        assert!(Handshake::local(60)
+            .check_compatibility(&hello, Some(&secret))
+            .is_ok());
+        // And a peer whose version field was altered in flight no longer confirms, because the tag was
+        // taken over the version it actually sent.
+        let mut tampered = hello;
+        tampered.protocol_version = PROTOCOL_VERSION;
+        assert_eq!(
+            Handshake::local(60)
+                .check_compatibility(&tampered, Some(&secret))
+                .unwrap_err(),
+            CodecError::SecretMismatch
+        );
+    }
+
+    /// The all-zero refusal survived the field becoming a nonce, and it is checked BEFORE the
+    /// confirmation — a joiner that sent no 16 bytes is told that, not told its secret is wrong.
+    #[test]
+    fn an_all_zero_nonce_is_refused_under_a_secret_as_well() {
+        let secret = test_secret();
+        let hello = hello_under(&secret, [0u8; KEY_LEN]);
+        assert_eq!(
+            Handshake::local(60)
+                .check_compatibility(&hello, Some(&secret))
+                .unwrap_err(),
+            CodecError::MissingSessionNonce,
+            "a correctly tagged all-zero nonce is still an all-zero nonce"
+        );
     }
 
     #[test]
@@ -1696,6 +2434,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             server_tick: 4242,
             tickrate: 120,
+            resume_token: 0xfeed_face_dead_c0de,
         };
         let bytes = welcome.encode();
         let mut reader = Reader::new(&bytes);
@@ -1729,6 +2468,32 @@ mod tests {
             Ok(FrameKind::Pong)
         );
         assert_eq!(Pong::decode(&mut reader).unwrap(), pong);
+    }
+
+    /// The welcome's resume token is a TRAILING field and decodes best-effort to `0`.
+    ///
+    /// A welcome that failed to decode leaves a joining client unsynced with nothing to say why, and `0` is
+    /// the value that tells a client to KEEP whatever token it already stored rather than to forget one.
+    #[test]
+    fn a_welcome_truncated_before_its_resume_token_decodes_to_no_token() {
+        let welcome = Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            server_tick: 4242,
+            tickrate: 120,
+            resume_token: 0xfeed_face_dead_c0de,
+        };
+        let bytes = welcome.encode();
+        for keep in (bytes.len() - 8)..bytes.len() {
+            let mut reader = Reader::new(&bytes[..keep]);
+            reader.u8().unwrap();
+            let short = Welcome::decode(&mut reader).unwrap();
+            assert_eq!(short.resume_token, 0, "keep {keep}");
+            assert_eq!(
+                short.server_tick, 4242,
+                "and the fields before it, keep {keep}"
+            );
+            assert_eq!(short.tickrate, 120, "keep {keep}");
+        }
     }
 
     /// The demo's own state entity: 20 bytes of wire payload across three properties.
@@ -1865,13 +2630,16 @@ mod tests {
                 seat: 0,
             },
         ];
-        let bytes = encode_manifest(&entries);
+        let bytes = encode_manifest_full(9, &entries);
         let mut reader = Reader::new(&bytes);
         assert_eq!(
             FrameKind::from_tag(reader.u8().unwrap()),
             Ok(FrameKind::EntityManifest)
         );
-        assert_eq!(decode_manifest(&mut reader).unwrap(), entries);
+        // The generation leads the count. A build that read the count first would take it out of
+        // the generation's bytes, which is the offset shift the major bump is for.
+        assert_eq!(decode_manifest_full(&mut reader).unwrap(), (9, entries));
+        assert!(reader.is_exhausted());
     }
 
     #[test]
@@ -1904,10 +2672,10 @@ mod tests {
                 seat: 0,
             },
         ];
-        let bytes = encode_manifest(&entries);
+        let bytes = encode_manifest_full(1, &entries);
         let mut reader = Reader::new(&bytes);
         let _ = reader.u8().unwrap();
-        assert_eq!(decode_manifest(&mut reader).unwrap(), entries);
+        assert_eq!(decode_manifest_full(&mut reader).unwrap(), (1, entries));
     }
 
     #[test]
@@ -1916,7 +2684,8 @@ mod tests {
         // drives this" rather than wrapping into an id that would name somebody.
         let mut writer = Writer::new();
         writer.u8(FrameKind::EntityManifest.tag());
-        writer.varint(1);
+        writer.varint(3); // generation
+        writer.varint(1); // count
         writer.u16(5);
         writer.varint(42);
         writer.u32(1);
@@ -1926,19 +2695,609 @@ mod tests {
         let bytes = writer.into_inner();
         let mut reader = Reader::new(&bytes);
         let _ = reader.u8().unwrap();
-        let entries = decode_manifest(&mut reader).unwrap();
+        let (generation, entries) = decode_manifest_full(&mut reader).unwrap();
+        assert_eq!(generation, 3);
         assert_eq!(entries[0].owner, 0);
     }
 
     #[test]
     fn manifest_with_a_hostile_count_reports_eof_without_overallocating() {
         let mut writer = Writer::new();
+        writer.varint(0); // generation
         writer.varint(u64::MAX); // count
         let bytes = writer.into_inner();
         assert_eq!(
-            decode_manifest(&mut Reader::new(&bytes)),
+            decode_manifest_full(&mut Reader::new(&bytes)),
             Err(CodecError::UnexpectedEof)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Entity-manifest deltas: the algebra, the frame, and the chain.
+    // ------------------------------------------------------------------
+
+    /// One manifest row, with everything but the slot and the id derived so a test can state a
+    /// table as a list of pairs. `epoch` moves the mutable columns of a fraction of the rows, which
+    /// is how a row changes on a slot that did not move.
+    fn manifest_row(slot: u16, id: u64, epoch: u64) -> ManifestEntry {
+        let drives = id.is_multiple_of(7);
+        ManifestEntry {
+            slot,
+            id,
+            state_hash: (id as u32) ^ 0x5555_5555,
+            input_hash: if drives { 0x1234 } else { 0 },
+            owner: if drives { (epoch % 3 + 1) as i32 } else { 0 },
+            seat: if drives { (epoch % 2) as u16 } else { 0 },
+        }
+    }
+
+    fn manifest_rows(pairs: &[(u16, u64)]) -> Vec<ManifestEntry> {
+        pairs
+            .iter()
+            .map(|&(slot, id)| manifest_row(slot, id, 0))
+            .collect()
+    }
+
+    #[test]
+    fn a_manifest_delta_round_trips_every_shape() {
+        let added = manifest_rows(&[(0, 11), (7, 0x0f0f_0f0f_0f0f_0f0f), (u16::MAX, u64::MAX)]);
+        for delta in [
+            // Removals only: a burst of unregisters.
+            ManifestDelta {
+                base_generation: 4,
+                generation: 5,
+                removed: vec![0, 3, u16::MAX],
+                added: Vec::new(),
+            },
+            // Additions only: the ordinary spawn.
+            ManifestDelta {
+                base_generation: 5,
+                generation: 6,
+                removed: Vec::new(),
+                added: added.clone(),
+            },
+            // Both halves, and a generation that skips several — a server coalescing dirty ticks.
+            ManifestDelta {
+                base_generation: 6,
+                generation: 19,
+                removed: vec![1, 2],
+                added: added.clone(),
+            },
+            // Empty. Never published, but it has to decode: the bytes are chosen by a remote peer.
+            ManifestDelta::default(),
+        ] {
+            let bytes = encode_manifest_delta(&delta);
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(
+                FrameKind::from_tag(reader.u8().unwrap()),
+                Ok(FrameKind::EntityManifestDelta)
+            );
+            assert_eq!(decode_manifest_delta(&mut reader).unwrap(), delta);
+            assert!(reader.is_exhausted(), "the delta wrote bytes nothing reads");
+        }
+    }
+
+    /// Both counts, independently. A count field is the one place a remote peer can ask a decoder
+    /// for an allocation, so each is capped at the same 4096 reserve the full table uses.
+    #[test]
+    fn a_manifest_delta_with_hostile_counts_reports_eof_without_overallocating() {
+        // A hostile removed_count, with nothing behind it.
+        let mut writer = Writer::new();
+        writer.varint(1); // base_generation
+        writer.varint(2); // generation
+        writer.varint(u64::MAX); // removed_count
+        assert_eq!(
+            decode_manifest_delta(&mut Reader::new(writer.as_slice())),
+            Err(CodecError::UnexpectedEof)
+        );
+
+        // A well-formed removed half, then a hostile added_count.
+        let mut writer = Writer::new();
+        writer.varint(1);
+        writer.varint(2);
+        writer.varint(1);
+        writer.u16(9);
+        writer.varint(u64::MAX); // added_count
+        assert_eq!(
+            decode_manifest_delta(&mut Reader::new(writer.as_slice())),
+            Err(CodecError::UnexpectedEof)
+        );
+    }
+
+    /// Every kind of change, each asserted to produce the MINIMAL record. An over-eager diff is not
+    /// a correctness bug and is exactly the bug that makes a delta cost as much as the table.
+    #[test]
+    fn diffing_a_manifest_produces_the_minimal_record() {
+        let base = manifest_rows(&[(0, 100), (1, 200), (2, 300)]);
+
+        // Nothing changed: the case almost every rebuild hits, and the whole saving.
+        let (removed, added) = diff_manifest(&base, &base);
+        assert!(removed.is_empty() && added.is_empty());
+
+        // A row added on a slot that was not bound.
+        let mut current = base.clone();
+        current.push(manifest_row(3, 400, 0));
+        let (removed, added) = diff_manifest(&base, &current);
+        assert!(removed.is_empty());
+        assert_eq!(added, vec![manifest_row(3, 400, 0)]);
+
+        // A row removed, with nothing to replace it: two bytes, no row restated.
+        let current = manifest_rows(&[(0, 100), (2, 300)]);
+        let (removed, added) = diff_manifest(&base, &current);
+        assert_eq!(removed, vec![1]);
+        assert!(added.is_empty(), "a removal restates no row");
+
+        // A slot rebound to a different entity. ONE added row and NO removal: binding a slot
+        // already replaces both directions, so the old id needs no record of its own.
+        let current = manifest_rows(&[(0, 100), (1, 999), (2, 300)]);
+        let (removed, added) = diff_manifest(&base, &current);
+        assert!(removed.is_empty(), "a reissued slot is not a removal");
+        assert_eq!(added, vec![manifest_row(1, 999, 0)]);
+
+        // A row whose seat and owner changed on a slot that stayed bound to the same entity.
+        // 700 is divisible by 7, so `manifest_row` moves its owner and seat with the epoch.
+        let held = manifest_rows(&[(0, 100), (1, 700)]);
+        let mut moved = held.clone();
+        moved[1] = manifest_row(1, 700, 1);
+        assert_ne!(held[1].owner, moved[1].owner);
+        let (removed, added) = diff_manifest(&held, &moved);
+        assert!(removed.is_empty());
+        assert_eq!(added, vec![manifest_row(1, 700, 1)]);
+
+        // An entity that moved from one slot to another: the old slot is retired and the new row
+        // stated, because the wire names a removal by slot and nothing else identifies the old one.
+        let current = manifest_rows(&[(0, 100), (2, 300), (9, 200)]);
+        let (removed, added) = diff_manifest(&base, &current);
+        assert_eq!(removed, vec![1]);
+        assert_eq!(added, vec![manifest_row(9, 200, 0)]);
+    }
+
+    /// The argument order is not an assumption the caller has to satisfy, and both halves come out
+    /// ascending by slot — the order the wire and the receiver's table are both in.
+    #[test]
+    fn diffing_a_manifest_does_not_depend_on_the_order_it_is_handed() {
+        let previous = manifest_rows(&[(5, 500), (1, 100), (9, 900)]);
+        let current = manifest_rows(&[(9, 900), (2, 200), (1, 111)]);
+        let (removed, added) = diff_manifest(&previous, &current);
+        assert_eq!(removed, vec![5]);
+        assert_eq!(
+            added,
+            vec![manifest_row(1, 111, 0), manifest_row(2, 200, 0)],
+            "both halves ascend by slot"
+        );
+    }
+
+    /// `apply_manifest_delta` is the inverse of `diff_manifest`, which is the law the receive path
+    /// leans on: a receiver holding the table the server diffed against lands on the server's table.
+    #[test]
+    fn applying_a_delta_undoes_the_diff_that_produced_it() {
+        let previous = manifest_rows(&[(0, 100), (1, 200), (2, 300), (5, 500)]);
+        let current = manifest_rows(&[(0, 100), (1, 999), (3, 400), (5, 500)]);
+        let (removed, added) = diff_manifest(&previous, &current);
+        let delta = ManifestDelta {
+            base_generation: 1,
+            generation: 2,
+            removed,
+            added,
+        };
+        assert_eq!(apply_manifest_delta(&previous, &delta), current);
+    }
+
+    /// A slot named in both halves cannot come out of `diff_manifest` — but the bytes are chosen by
+    /// a remote peer, and applying the removals second would drop the row the same frame installed.
+    #[test]
+    fn a_delta_naming_one_slot_twice_keeps_the_row_it_added() {
+        let held = manifest_rows(&[(1, 100)]);
+        let delta = ManifestDelta {
+            base_generation: 0,
+            generation: 1,
+            removed: vec![1],
+            added: vec![manifest_row(1, 200, 0)],
+        };
+        assert_eq!(
+            apply_manifest_delta(&held, &delta),
+            vec![manifest_row(1, 200, 0)]
+        );
+    }
+
+    /// The refusal that keeps a receiver from half-applying a delta computed against a table it is
+    /// not holding — and the assertion that the refusal is load-bearing rather than cosmetic.
+    #[test]
+    fn a_delta_against_the_wrong_generation_is_refused() {
+        let held = manifest_rows(&[(1, 100), (2, 200)]);
+        let delta = ManifestDelta {
+            base_generation: 5,
+            generation: 6,
+            removed: vec![1],
+            added: vec![manifest_row(3, 300, 0)],
+        };
+        assert!(delta.applies_to(5));
+        for generation in [0u64, 4, 6, 7, u64::MAX] {
+            assert!(
+                !delta.applies_to(generation),
+                "a receiver at generation {generation} must refuse a delta based on 5"
+            );
+        }
+
+        // What a refusal has to leave behind: the table exactly as it was. The receiver never calls
+        // `apply_manifest_delta`, and this is what it would have cost if it had.
+        let mut receiver = held.clone();
+        if delta.applies_to(4) {
+            receiver = apply_manifest_delta(&receiver, &delta);
+        }
+        assert_eq!(receiver, held, "a refused delta must move nothing");
+        assert_ne!(
+            apply_manifest_delta(&held, &delta),
+            held,
+            "and the delta really would have moved it"
+        );
+    }
+
+    /// **The load-bearing one.** A few hundred ticks of real slot-table churn — spawns, despawns, a
+    /// respawn under the same id, and slot reissues past the reuse quarantine — with a receiver
+    /// driven only by deltas, asserted at every step to hold exactly the table a receiver rebuilt
+    /// from the full frame holds.
+    ///
+    /// This is the test that catches a lost removal. A delta gave up the complete table's
+    /// self-repair: a receiver that keeps a slot bound past its unregister applies the next
+    /// entity's rows to the departed one, silently, with every block decoding cleanly.
+    #[test]
+    fn a_chain_of_deltas_reaches_the_same_table_as_a_full_rebuild() {
+        use crate::slots::{SlotTable, SLOT_QUARANTINE_TICKS};
+
+        let mut server = SlotTable::new();
+        let mut registered: std::collections::BTreeSet<u64> = (1..=24u64).collect();
+
+        // The receiver driven by DELTAS, and the receiver driven by FULL tables. Both hold rows and
+        // a slot table, because a wrong row and a wrong binding fail differently.
+        let mut delta_rows: Vec<ManifestEntry> = Vec::new();
+        let mut delta_slots = SlotTable::new();
+        let mut full_slots = SlotTable::new();
+
+        let mut published: Vec<ManifestEntry> = Vec::new();
+        let mut generation = 0u64;
+        let mut held_generation = 0u64;
+
+        let mut saw_respawn = false;
+        let mut saw_reissue = false;
+        // Every id each slot has ever named, so a reissue is detectable at all.
+        let mut last_named: std::collections::BTreeMap<u16, u64> =
+            std::collections::BTreeMap::new();
+        let mut deltas = 0usize;
+        let mut delta_bytes = 0usize;
+        let mut full_bytes = 0usize;
+
+        // The run outlasts the reuse quarantine twice over, which is what makes a slot reissue —
+        // the case that makes a lost removal silent — reachable at all.
+        let ticks = SLOT_QUARANTINE_TICKS * 2 + 88;
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        for tick in 0..ticks {
+            rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let roll = rng >> 33;
+
+            // Churn. The id pool is small and node-path-derived ids are reused, so a body leaving
+            // and coming back asks for the SAME id — the respawn case.
+            match roll % 5 {
+                0 => {
+                    registered.remove(&(1 + roll % 24));
+                }
+                1 => {
+                    let id = 1 + roll % 24;
+                    if registered.insert(id) && tick > 0 {
+                        saw_respawn = true;
+                    }
+                }
+                2 => {
+                    registered.insert(100 + tick);
+                }
+                3 => {
+                    registered.remove(&(100 + tick.saturating_sub(50)));
+                }
+                _ => {}
+            }
+            // One long-lived body retired early, so its slot is well past the quarantine when the
+            // churn above asks for a name again.
+            if tick == 5 {
+                registered.remove(&7);
+            }
+            server.reconcile(&registered, tick);
+
+            // The server's table, exactly as the send path builds it: ascending by slot, with the
+            // mutable columns of a fraction of the rows moving every 50 ticks.
+            let epoch = tick / 50;
+            let mut current: Vec<ManifestEntry> = server
+                .bindings()
+                .map(|(slot, id)| manifest_row(slot, id, epoch))
+                .collect();
+            current.sort_unstable_by_key(|entry| entry.slot);
+
+            let (removed, added) = diff_manifest(&published, &current);
+            if removed.is_empty() && added.is_empty() {
+                // Nothing is published, which is the whole point: no frame, no bytes.
+                continue;
+            }
+            // A REISSUE is an added row on a slot that named a DIFFERENT entity earlier in the
+            // session — not one that names a different entity in the table published last, because
+            // the removal record retired that binding before the quarantine even started.
+            for entry in &added {
+                if last_named
+                    .insert(entry.slot, entry.id)
+                    .is_some_and(|before| before != entry.id)
+                {
+                    saw_reissue = true;
+                }
+            }
+            generation += 1;
+            let delta = ManifestDelta {
+                base_generation: generation - 1,
+                generation,
+                removed,
+                added,
+            };
+
+            // THE DELTA RECEIVER. Through the wire, because a decode bug and an apply bug are
+            // different bugs and only the round trip catches the first.
+            let bytes = encode_manifest_delta(&delta);
+            delta_bytes += bytes.len();
+            deltas += 1;
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(
+                FrameKind::from_tag(reader.u8().unwrap()),
+                Ok(FrameKind::EntityManifestDelta)
+            );
+            let decoded = decode_manifest_delta(&mut reader).unwrap();
+            assert!(decoded.applies_to(held_generation));
+            delta_rows = apply_manifest_delta(&delta_rows, &decoded);
+            for &slot in &decoded.removed {
+                delta_slots.unbind(slot);
+            }
+            for entry in &decoded.added {
+                delta_slots.bind(entry.slot, entry.id);
+            }
+            held_generation = decoded.generation;
+
+            // THE FULL RECEIVER, rebuilt from the complete table the same publish would have sent.
+            let bytes = encode_manifest_full(generation, &current);
+            full_bytes += bytes.len();
+            let mut reader = Reader::new(&bytes);
+            let _ = reader.u8().unwrap();
+            let (full_generation, entries) = decode_manifest_full(&mut reader).unwrap();
+            full_slots.clear();
+            for entry in &entries {
+                full_slots.bind(entry.slot, entry.id);
+            }
+            let full_rows = entries;
+
+            assert_eq!(full_generation, held_generation);
+            assert_eq!(
+                delta_rows, full_rows,
+                "tick {tick}: the delta chain diverged from the full rebuild"
+            );
+            assert_eq!(
+                delta_rows, current,
+                "tick {tick}: the delta chain diverged from the SERVER"
+            );
+            assert_eq!(
+                delta_slots.bindings().collect::<Vec<_>>(),
+                server.bindings().collect::<Vec<_>>(),
+                "tick {tick}: a slot binding survived its removal record"
+            );
+            assert_eq!(
+                delta_slots.bindings().collect::<Vec<_>>(),
+                full_slots.bindings().collect::<Vec<_>>()
+            );
+            published = current;
+        }
+
+        assert!(
+            saw_respawn,
+            "the churn never respawned a body under its old id"
+        );
+        assert!(
+            saw_reissue,
+            "the churn never reissued a slot past its quarantine, so the case that makes a lost \
+             removal silent was never exercised"
+        );
+        assert!(
+            deltas > 50,
+            "only {deltas} publishes — too little churn to prove anything"
+        );
+        // Measured at 273 publishes: 6,113 B as deltas against 254,265 B as whole tables, at a
+        // table of a few dozen rows. The ratio grows with the table, because a delta is priced by
+        // the change and a whole table by the session.
+        assert!(
+            delta_bytes * 20 < full_bytes,
+            "{deltas} publishes cost {delta_bytes} B as deltas against {full_bytes} B as whole \
+             tables, which is not worth the removal record a delta costs"
+        );
+    }
+
+    /// The byte costs the manifest's own doc table quotes, measured from the encoder rather than
+    /// estimated. The ratio between a row and a removal is the whole case for a delta.
+    #[test]
+    fn a_manifest_row_costs_about_twenty_two_and_a_half_bytes() {
+        // Entity ids are FNV-1a output, so they are spread over the whole 64-bit range and their
+        // LEB128 varints average 9.5 bytes. A deterministic spread stands in for that here.
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let entries: Vec<ManifestEntry> = (0..4096u16)
+            .map(|slot| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ManifestEntry {
+                    slot,
+                    id: state | 1,
+                    state_hash: 0xaaaa_bbbb,
+                    input_hash: 0xcccc_dddd,
+                    owner: 3,
+                    seat: 1,
+                }
+            })
+            .collect();
+
+        // kind (1) + generation varint (1) + count varint (2 at 4096).
+        let full = encode_manifest_full(1, &entries);
+        let per_row = (full.len() - 4) as f64 / entries.len() as f64;
+        assert!(
+            (per_row - 22.5).abs() < 0.4,
+            "one manifest row measured {per_row} bytes, not ~22.5"
+        );
+
+        // What one change costs instead, at any table size.
+        let empty = encode_manifest_delta(&ManifestDelta {
+            base_generation: 1,
+            generation: 2,
+            removed: Vec::new(),
+            added: Vec::new(),
+        });
+        assert_eq!(empty.len(), 5, "kind, two generations, two zero counts");
+        let retired = encode_manifest_delta(&ManifestDelta {
+            base_generation: 1,
+            generation: 2,
+            removed: vec![entries[0].slot],
+            added: Vec::new(),
+        });
+        assert_eq!(
+            retired.len(),
+            7,
+            "one retired binding is the framing plus 2 B"
+        );
+        let bound = encode_manifest_delta(&ManifestDelta {
+            base_generation: 1,
+            generation: 2,
+            removed: Vec::new(),
+            added: vec![entries[0]],
+        });
+        assert!(
+            bound.len() <= 5 + 23,
+            "one new binding measured {} bytes",
+            bound.len()
+        );
+
+        // AT REST a delta costs nothing at all: a rebuild that reproduces the published table
+        // publishes no frame. That is stated here rather than only in prose because it is the
+        // saving, and `send_manifest_if_dirty` is the only other place it is enforced.
+        let (removed, added) = diff_manifest(&entries, &entries);
+        assert!(removed.is_empty() && added.is_empty());
+    }
+
+    #[test]
+    fn an_interest_delta_round_trips_both_halves() {
+        let left = vec![0u16, 7, 4096, u16::MAX];
+        let entered = vec![1u16, 2, 3];
+        let mut writer = Writer::new();
+        encode_interest_delta(&left, &entered, &mut writer);
+        let bytes = writer.into_inner();
+        // varint(4) + 4x2 + varint(3) + 3x2 = 1 + 8 + 1 + 6.
+        assert_eq!(bytes.len(), 16, "two count varints and 2 bytes per slot");
+
+        let section = decode_interest_delta(&mut Reader::new(&bytes)).unwrap();
+        assert_eq!(section.left, left);
+        assert_eq!(section.entered, entered);
+    }
+
+    /// A leave-only tick is the case the empty-frame gate has to let through, and an enter-only tick
+    /// is the ordinary one. Both halves are independently empty, and an all-empty section is two
+    /// bytes — which is what the server spends once to tell a joining peer it is filtering at all.
+    #[test]
+    fn each_half_of_an_interest_delta_may_be_empty_on_its_own() {
+        for (left, entered) in [
+            (vec![9u16], Vec::new()),
+            (Vec::new(), vec![9u16]),
+            (Vec::new(), Vec::new()),
+        ] {
+            let mut writer = Writer::new();
+            encode_interest_delta(&left, &entered, &mut writer);
+            let bytes = writer.into_inner();
+            let section = decode_interest_delta(&mut Reader::new(&bytes)).unwrap();
+            assert_eq!(section.left, left);
+            assert_eq!(section.entered, entered);
+        }
+
+        let mut writer = Writer::new();
+        encode_interest_delta(&[], &[], &mut writer);
+        assert_eq!(writer.len(), 2, "an empty section is one byte per count");
+    }
+
+    /// The section rides an unreliable datagram, so a truncated one is an ordinary event rather than
+    /// an attack. Every cut reports an error instead of panicking or inventing slots.
+    #[test]
+    fn a_truncated_interest_delta_reports_eof_rather_than_panicking() {
+        let mut writer = Writer::new();
+        encode_interest_delta(&[1, 2, 3], &[4, 5], &mut writer);
+        let full = writer.into_inner();
+        for cut in 0..full.len() {
+            assert_eq!(
+                decode_interest_delta(&mut Reader::new(&full[..cut])),
+                Err(CodecError::UnexpectedEof),
+                "a section cut at {cut} decoded"
+            );
+        }
+        assert!(decode_interest_delta(&mut Reader::new(&full)).is_ok());
+    }
+
+    #[test]
+    fn an_interest_delta_with_a_hostile_count_reports_eof_without_overallocating() {
+        let mut writer = Writer::new();
+        writer.varint(u64::MAX); // left_count, with no slots behind it
+        let bytes = writer.into_inner();
+        assert_eq!(
+            decode_interest_delta(&mut Reader::new(&bytes)),
+            Err(CodecError::UnexpectedEof)
+        );
+
+        // And the same claim in the SECOND half, past a well-formed first one.
+        let mut writer = Writer::new();
+        writer.varint(1);
+        writer.u16(3);
+        writer.varint(u64::MAX);
+        let bytes = writer.into_inner();
+        assert_eq!(
+            decode_interest_delta(&mut Reader::new(&bytes)),
+            Err(CodecError::UnexpectedEof)
+        );
+    }
+
+    /// Every header flag owns a bit of its own, whichever direction it travels in. Bit 0 is the
+    /// client's `WANT_FULL` NACK, bit 1 is the server's interest-delta announcement and bit 2 is the
+    /// client's `WANT_MANIFEST` NACK, so no two can collide on one frame.
+    #[test]
+    fn every_header_flag_is_its_own_bit() {
+        assert_eq!(FrameHeader::FLAG_WANT_FULL, 1);
+        assert_eq!(FrameHeader::FLAG_INTEREST_DELTA, 2);
+        assert_eq!(FrameHeader::FLAG_WANT_MANIFEST, 4);
+        let bits = [
+            FrameHeader::FLAG_WANT_FULL,
+            FrameHeader::FLAG_INTEREST_DELTA,
+            FrameHeader::FLAG_WANT_MANIFEST,
+        ];
+        for (index, &flag) in bits.iter().enumerate() {
+            assert_eq!(
+                flag.count_ones(),
+                1,
+                "flag {index} claims more than one bit"
+            );
+            for &other in &bits[index + 1..] {
+                assert_eq!(flag & other, 0, "two flags share a bit");
+            }
+        }
+
+        // They survive the header round trip, which is where a receiver reads them from — including
+        // both client-to-server NACKs raised on one frame, which is the case a client that lost its
+        // delta base and its manifest in the same tick sends.
+        for flags in [
+            FrameHeader::FLAG_INTEREST_DELTA,
+            FrameHeader::FLAG_WANT_MANIFEST,
+            FrameHeader::FLAG_WANT_FULL | FrameHeader::FLAG_WANT_MANIFEST,
+        ] {
+            let mut header = sample_header();
+            header.flags = flags;
+            let mut writer = Writer::new();
+            header.encode(&mut writer);
+            let bytes = writer.into_inner();
+            let decoded = FrameHeader::decode(&mut Reader::new(&bytes)).unwrap();
+            assert_eq!(decoded.flags, flags);
+        }
     }
 
     #[test]
@@ -1967,11 +3326,18 @@ mod tests {
             }
             // Each of these returns Result; the assertion is simply that we get here.
             let _ = FrameHeader::decode(&mut Reader::new(&buf));
-            let _ = Handshake::decode(&buf);
+            if let Ok(hello) = Handshake::decode(&buf) {
+                // The compatibility check reads three remote-chosen fields — version, nonce and
+                // confirmation — and derives a key from the last two, so it is swept under both regimes.
+                let _ = Handshake::local(60).check_compatibility(&hello, None);
+                let _ = Handshake::local(60).check_compatibility(&hello, Some(&test_secret()));
+            }
             let _ = Welcome::decode(&mut Reader::new(&buf));
             let _ = Ping::decode(&mut Reader::new(&buf));
             let _ = Pong::decode(&mut Reader::new(&buf));
-            let _ = decode_manifest(&mut Reader::new(&buf));
+            let _ = decode_manifest_full(&mut Reader::new(&buf));
+            let _ = decode_manifest_delta(&mut Reader::new(&buf));
+            let _ = decode_interest_delta(&mut Reader::new(&buf));
             let schema = block_schema();
             let mut scratch = Vec::new();
             let mut row = vec![0u8; schema.row_stride()];

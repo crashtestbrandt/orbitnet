@@ -248,12 +248,22 @@ arena-stress SECONDS="60":
         --bench-duration={{SECONDS}} --quit-after={{SECONDS}}
 
 # Entity-slot pressure. A block names its entity by a 16-bit session slot, and the table binding slots to ids
-# is redistributed as a WHOLE TABLE each time it changes -- so a session with tens of thousands of entities
-# spends real reliable bandwidth restating bindings that did not move. PROPS is per arena; the session names
-# three times that plus the fighters and the scorecards. Past 65,536 the server refuses to replicate the
-# entity and says so, rather than wrapping an index onto a live one.
+# is distributed as a DELTA against a generation the receiver holds. PROPS is per arena; the session names
+# three times that plus the fighters and the scorecards. Past 65,536 the server refuses to replicate the entity
+# and says so, rather than wrapping an index onto a live one.
+#
+# WHAT --wire-log SHOWS, and it is the reason this recipe exists. At PROPS=8000 the session names 24,027
+# entities and one whole table is ~530 kB. A JOINING peer still costs that -- it holds no table to diff
+# against -- but every peer already in the session now costs a delta of the rows that actually moved. Measured
+# on this machine, a second client joining a session of one: 1,074 kB before the delta manifest, 557 kB after,
+# and the difference is the copy the peer that was already up to date used to be sent.
+#
+# It needs a second process to show anything: with no peer there is nobody to send a manifest to.
+#
+#   just arena-slots 8000 40 &
+#   sleep 12; godot --headless --path demos/arena -- --join=127.0.0.1 --props=8000 --quit-after=20
 arena-slots PROPS="8000" SECONDS="20":
-    "{{godot}}" --headless --path demos/arena -- --host --props={{PROPS}} --quit-after={{SECONDS}}
+    "{{godot}}" --headless --path demos/arena -- --host --props={{PROPS}} --wire-log --quit-after={{SECONDS}}
 
 arena-lint: (lint-project "demos/arena")
 

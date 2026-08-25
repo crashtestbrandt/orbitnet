@@ -46,6 +46,10 @@ var _reported: bool = false
 var _ordered_ids: PackedInt32Array = PackedInt32Array()
 var _seq_before: PackedInt32Array = PackedInt32Array()
 var _forged_seq_before: int = -1
+# The tag the forged order was submitted under, and the reason code that came back for it. -1 means no reply
+# has arrived, which for a forgery is itself a failure: the client is entitled to be told it was refused.
+var _forged_tag: int = 0
+var _forged_code: int = -1
 
 # Per-unit last-change bookkeeping for the staleness measurement.
 var _last_position: PackedVector3Array = PackedVector3Array()
@@ -101,10 +105,21 @@ func _issue_forged_order() -> void:
 	_forged_seq_before = unit.order_seq() if unit != null else 0
 	var ids: PackedInt32Array = PackedInt32Array()
 	ids.push_back(_FORGED_ID)
+	# Listen for the refusal before sending it: the reply is a reliable RPC and arrives on its own schedule,
+	# and a listener attached afterwards would be a race the probe could lose intermittently.
+	var channel: NetCommand = world.order_channel(0)
+	if channel != null and not channel.rejected.is_connected(_on_forged_rejected):
+		channel.rejected.connect(_on_forged_rejected)
 	# Seat 0's channel, submitted by the peer holding seat 1. The server resolves the sender's seat from the
 	# transport-supplied sender id, sees it does not match the channel, and refuses before parsing further.
-	world.submit_order(0, OrderValidator.VERB_MOVE, ids, Vector3(0.0, 0.0, -30.0))
+	_forged_tag = world.submit_order(0, OrderValidator.VERB_MOVE, ids, Vector3(0.0, 0.0, -30.0))
 	print("RTS-PROBE forged an order on seat 0's channel while holding seat %d" % seat)
+
+# The server's refusal, arriving on the peer that forged the order. Keyed on the TAG rather than the verb, so
+# an unrelated refusal cannot satisfy the assertion.
+func _on_forged_rejected(_verb: StringName, code: int, tag: int) -> void:
+	if tag == _forged_tag:
+		_forged_code = code
 
 # --- refresh interval --------------------------------------------------------------------------------
 # The longest GAP BETWEEN CONSECUTIVE UPDATES of a unit that is actively being updated.
@@ -185,6 +200,15 @@ func _report() -> void:
 			failures.push_back("a forged foreign-seat order was APPLIED (seq %d -> %d)"
 				% [_forged_seq_before, after])
 	print("RTS-PROBE forged_rejected=%d" % (1 if forged_ok else 0))
+
+	# 5b: THE CLIENT WAS TOLD. Nothing happening is what a refused order and a lost packet look like from the
+	# client's side, so "the sequence did not move" alone cannot tell a working refusal from a dropped one.
+	# The reply names the tag the request was submitted under and carries the server's reason code.
+	if _forged_seq_before >= 0:
+		print("RTS-PROBE forged_refusal_code=%d" % _forged_code)
+		if _forged_code != OrderValidator.Code.FOREIGN_CHANNEL:
+			failures.push_back("the forged order was refused without telling the client (code %d, wanted %d)"
+				% [_forged_code, OrderValidator.Code.FOREIGN_CHANNEL])
 
 	# 6: the refresh interval.
 	print("RTS-PROBE worst_refresh_interval_ticks=%d" % _worst_staleness)

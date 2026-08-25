@@ -127,6 +127,11 @@ func _compose() -> String:
 			controller.order_rtt_percentile(0.50), controller.order_rtt_percentile(0.95),
 			controller.order_rtt_samples(), controller.selection_size()])
 		lines.push_back("           click -> validate -> state broadcast -> observed. Not ping.")
+		# The refusal reaches the peer that ASKED, so this line works on a client. It is also what stops a
+		# refused order sitting in the RTT window for four seconds before the old timeout cancelled it.
+		var refusal: String = controller.last_refusal()
+		if refusal != "":
+			lines.push_back("           last order refused: %s" % refusal)
 	lines.push_back("")
 
 	lines.push_back("F1 net tick %d Hz    F2 remote_resim %s    F3 input_delay %d" % [

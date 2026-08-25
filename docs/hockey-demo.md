@@ -63,6 +63,14 @@ The backend's roles fall out of that:
 - **Client** — owns neither the state nor the input, but prediction is enabled and it is not exempt, so it
   simulates the puck locally and reconciles when the server's row lands.
 
+**The mallets need the switch re-declared, and the puck does not.** A client builds its rink before the roster
+arrives, so every mallet registers with `predict = false` — which does not merely defer prediction, it exempts
+the mallet from the rollback loop. `MalletBody.set_owner_peer()` calls
+[`NetRollbackHandle.set_predicted()`](../docs/api.md#prediction-is-a-switch-and-it-does-not-move-on-its-own) on
+the tick a seat is handed over. Without it a player's own mallet still moves, because an exempt body applies
+the rows it receives — it is just a full round trip behind the mouse, with nothing on screen saying so. The
+HUD's `PREDICT` line exists to make that flag visible rather than felt.
+
 ### The state set has to be the whole simulation state
 
 `net_vel` is on the wire because a restore that returned position without velocity would resume the resim from
@@ -245,10 +253,17 @@ predicted on *every* peer, so every peer replays it, and 32 mallets sit on the s
 ```gdscript
 handle.set_bulk_capture("_net_marshal_out")   # one call per lane per tick
 handle.set_bulk_restore("_net_marshal_in")
+handle.set_bulk_apply("_net_marshal_in")      # a RECEIVED row, and the quantized write-back
 ```
 
 Three state props over a twelve-tick resim is 36 property reads and 36 writes in one frame for the puck alone;
 the hook makes it 12 and 12.
+
+The **apply** direction covers the two walks the other two do not: landing a received row, and the quantized
+write-back after a record. Every state property on both bodies here carries `@half`, so the write-back is the
+larger of the two on a peer that simulates. Sharing the restore method is safe only because neither body
+declares a cosmetic entry — an apply hook reads the *capture* slots, which are the restore slots plus the
+cosmetics.
 
 **Nothing about a hook reaches the wire.** The row, the mask, the delta base and the mispredict compare all
 read the backend's own layout, so `F7` can be flipped mid-session on one peer while another keeps walking its
@@ -313,8 +328,8 @@ looks exactly like a netcode bug. `puck_physics_test.gd` asserts the derivation 
 
 - **No win condition.** The score climbs and the demo can be left running.
 - **No version handshake.** Two incompatible peers connect and misbehave rather than being refused.
-- **No rejected-command reply.** A refused serve is visible on the host only, which is a
-  [filed gap](../README.md#limits); the HUD says so rather than leaving the line suspiciously empty.
+- **No plausibility test on a serve.** The validator checks who asked and whether the puck is dead; a refusal
+  reaches the client that asked, carrying a `ServeValidator.Code` the HUD turns into a sentence.
 - **No InputMap** — raw key constants and the raw pointer, so there is no project-settings dependency to break
   across Godot versions. A real game should use one.
 - **No PR-gating probe.** The three scene-bound gates are `tools/rts-probe.sh`, `tools/server-shape-probe.sh`

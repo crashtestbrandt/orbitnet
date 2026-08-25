@@ -130,7 +130,7 @@ game**:
   and `set_membership()` is the only thing in the facade that can.
 - **A cloak is a per-peer veto.** `Net.set_entity_hidden()` withholds one fighter from the connections not on
   its team, which is a fact about a *pair* and therefore the one thing neither distance nor membership can
-  say.
+  say. A withheld client is told: `Net.entity_left_interest` fires, and the probe asserts on it.
 - **Split-screen is seats.** `--seats=2` drives two locally-predicted fighters on one connection, each with
   its own interest anchor, in two different arenas by default; the connection receives the union.
 - **An observer declares where it watches from.** No seat, no body, and therefore no inferred centre or world
@@ -138,68 +138,89 @@ game**:
   refused.
 - **The scorecard is membership only.** It replicates two integers and no position, so there is no distance to
   cull it by.
+- **`just arena-slots 8000` is the slot-table lever.** 24,027 entities in one session, and the readout that
+  shows a whole 530 kB manifest becoming a two-row delta for the peer that was already up to date.
 
 Its signature number is the **rewind depth per band** — the three ticks one shot is resolved at, one per
 distance band, beside the flat per-shooter window they refine.
 
 ## Limits
 
-Known and filed, not hidden:
+Known and filed, not hidden.
 
-- **A peer that declares nothing still has its centre and world inferred.** `Net.set_peer_anchor()` and
-  `Net.set_peer_anchor_entity()` state both outright; without one they are read off the lowest-id rollback
-  entity each of that peer's **seats** drives, so a seat driving more than one body is centred and placed by
-  whichever that is, and a peer driving none has neither and sees everything. Both demos with an `--observe`
-  mode declare instead, and admit a seatless peer rather than refusing it.
-- **A withheld ROLLBACK body's `get_last_known_state()` keeps advancing on the client.** For a state channel,
-  that number ceasing to advance is the documented client-side signal that the rows stopped — by a cull, a
-  membership or a veto alike. On the rollback lane it is not: a client's reading keeps rising for a body it is
-  no longer being sent, so a game that wants to notice has to key on a replicated value instead. The arena
-  demo keys on a flag carried in the withheld rows, and its probe asserts on that rather than on the tick.
-- **Releasing a seat is the game's call, and a dropped connection does not release its own.** A seat arrives and
-  leaves mid-session through `NetRollbackHandle.assign_seat()` / `release_seat()`, announced on both sides as
-  `Net.seat_opened` / `Net.seat_closed`. A connection whose transport is gone keeps its seats: its bodies hold
-  the authority they were given until the game changes them, the same rule `Net.peer_session_expired` states,
-  because whether to free the body, hand it back or hold it for a reconnect is the game's decision.
-- **Nothing despawns.** A culled entity — or one `Net.set_entity_hidden()` withholds — freezes at its last
-  received pose rather than leaving the scene. The rows stop; the node stays.
-- **No `NetCommand.rejected` feedback and no `request_batch`.** A refused command is invisible to the client.
-- **`@half` silently no-ops on invalid pairings** instead of warning.
-- **Bulk marshalling covers the rollback loop, not the receive path.** A synchronizer can replace the
-  per-property capture and restore walks with one call per lane per tick
-  ([api.md](docs/api.md#bulk-marshalling-one-crossing-per-lane-per-tick)), but applying a *received* row and
-  writing quantized values back are still one `Object.set` per property. Both run once per block or per tick
-  rather than once per replayed tick, so neither carries the replay multiplier the hook exists to divide.
-- **The retained interest grid is unused.** It now matches the linear path rule for rule — leaves, always-set,
-  worlds — but it measures slower at the arena sizes a session runs at today, so the linear scan is what ships.
-  It overtakes the scan past about ±600 m of occupancy. The measured tables are in `interest.rs`'s header.
-- **A session identity is client-asserted and unauthenticated.** `Net.session_id()` is what a rejoiner
-  presents to reclaim its entity, and a peer can present any value it likes, including one it watched someone
-  else use. **A presented identity beats a live connection holding it**, because a relaunched client routinely
-  arrives before the transport reports its old socket as gone — so a forged one takes a playing player's body,
-  and that player keeps its connection with no error. Anything that must not be forged needs an authenticated
-  layer above it; a game that will not accept the takeover honours `resumed_from` only after a `peer_dropped`
-  it saw as `held`.
-- **The session key crosses the wire in the clear.** Every datagram but the handshake carries a MAC and a
-  replay sequence, and the handshake carries the key they are checked with. So an attacker who cannot read
-  the session's traffic cannot forge a datagram, and one connected peer cannot forge another's — but **an
-  on-path observer who reads the handshake can do everything the client can.** Closing that needs a key
-  exchange, and therefore an asymmetric primitive `orbitnet-core` has no dependency for.
-- **A peer's reported round trip is checked, not bounded.** The server mints a token per snapshot frame from
-  a secret it never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot
-  acknowledge a frame that never reached it. It can still acknowledge a frame **older** than the newest it
-  holds, which reads as a slow link and is believed. That buys a deeper per-shooter rewind, bounded by
-  `NetLagComp.max_delay_ms` — 250 ms by default, the deepest rewind the game will grant anyone.
-- **A session can name 65,536 entities on the wire, and the manifest restates all of them.** A block carries
-  a 16-bit slot instead of the 64-bit entity id, which is where a third of a full block used to go
-  ([docs/protocol.md](docs/protocol.md#entity-slots)). Past the cap the server refuses to replicate the
-  entity and says so, rather than wrapping an index onto a live one. The slot table is distributed by the
-  entity manifest as a whole table each time it changes, so a session with tens of thousands of entities
-  churning steadily spends real reliable bandwidth restating bindings that did not move. A delta-encoded
-  manifest is the fix if that ever bites.
-- **Input values are not validated.** The backend checks who wrote a row, not what is in it: a row that
-  decodes at the right stride is stored as-is. Clamping and plausibility are the game's job inside
-  `_rollback_tick`. The full split is in
+### The addon reports; the game decides
+
+Three of these are one shape. OrbitNet now publishes a fact it used to keep to itself, and still acts on none
+of them — freeing a body, releasing a seat and refusing a resume are game decisions, and a default that made
+any of them would be wrong for somebody.
+
+- **Nothing despawns, and a client is now told which entities stopped.** A culled entity — or one
+  `Net.set_entity_hidden()` withholds — freezes at its last received pose rather than leaving the scene. The
+  per-peer diff the send path already computed rides the snapshot as a flag-guarded trailing section, two
+  bytes per changed entity on the ticks that changed and nothing at rest, and reaches the game as
+  `Net.entity_left_interest` / `Net.entity_entered_interest`. `Net.entities_in_interest()` answers the same
+  question for a handler bound mid-session. **The addon still frees nothing.** Hide rather than free: a
+  nearest-N eviction can oscillate at the boundary, and freeing turns that into spawn churn.
+- **Releasing a seat is the game's call, and a dropped connection keeps its own by default.** Its bodies hold
+  the authority they were given until the game changes them, which is what the reconnect grace window is for.
+  `Net.set_seat_release_policy()` says otherwise in one call, and `Net.release_peer_seats(peer)` does it
+  directly under any policy. Freeing the node is still yours.
+- **A peer that declares nothing still has its centre and world inferred.** Without `Net.set_peer_anchor()` or
+  `set_peer_anchor_entity()` both are read off the lowest-id rollback entity each of that peer's **seats**
+  drives — so a seat driving more than one body is placed by whichever that is, and a peer driving none has
+  neither and sees everything, uncapped, because an entity with no distance is kept uncullable and an
+  uncullable entity occupies no slot in `set_aoi_max_entities()`. The inference and its default are unchanged.
+  What is new: `Net.peer_anchor()` reports what is actually in effect, an inference whose dropped bodies
+  disagreed about the **world** warns once, and `Net.set_unanchored_policy(CLOSED)` makes "declare nothing"
+  mean "receive nothing".
+
+### Security
+
+- **A session identity is client-asserted; the token narrows what asserting one buys.** The server mints a
+  **resume token** per identity, sends it in the welcome, and a rejoiner must quote it back — so a peer that
+  merely *observed* somebody's session id, off a roster broadcast or a log line, can no longer take that
+  player's body. **An on-path observer still can**, because it reads the welcome the token travelled in. Under
+  the default policy a valid claim still beats a live connection, which is what makes a relaunched client's
+  reconnect immediate rather than waiting out a keepalive; `Net.set_resume_policy(ONLY_IF_DROPPED)` refuses
+  that, at the cost of every genuinely fast reconnect. **Persist the token beside the session id**, or a
+  restarted process cannot resume.
+- **The session key crosses the wire in the clear unless the game supplies a secret.** Every datagram but the
+  handshake carries a MAC and a replay sequence. With no secret configured the handshake carries the key they
+  are checked with: an attacker who cannot read the session's traffic cannot forge a datagram and one connected
+  peer cannot forge another's, but **an on-path observer who reads the handshake can do everything the client
+  can**. `Net.set_session_secret()` changes that — the handshake's 16 bytes become a **nonce**, the key is
+  derived from it and the secret, and an observer reading the handshake learns nothing. The secret has to come
+  from a channel the game already authenticates: a lobby, a matchmaker ticket. **None of this encrypts
+  anything**, the ceiling is still a 64-bit tag and a 128-bit key, and an on-path observer can still **replay**
+  a join it recorded — the nonce is the client's choice, so presenting it again derives the same key. It
+  authors nothing new and the captured datagrams land nowhere, but closing that too needs a value the acceptor
+  contributes and therefore a second round trip before a client may send anything.
+  An X25519 exchange was considered and declined: unauthenticated ECDH is substituted by exactly the on-path
+  attacker this bullet is about, so it would demote the adversary to passive-only in exchange for several
+  hundred lines of hand-written constant-time field arithmetic in a zero-dependency crate with no timing
+  harness to prove it stayed constant-time.
+- **A peer's reported round trip is checked, and what the server believes is bounded.** The server mints a
+  token per snapshot frame from a secret it never transmits and refuses any acknowledgement that does not quote
+  it back, so a peer cannot acknowledge a frame that never reached it. It can still acknowledge a frame
+  **older** than the newest it holds, which reads as a slow link and is believed — indistinguishable from a
+  peer behind a traffic shaper, and no wire field closes it, because `current - ack` is the whole round trip
+  whatever tick lead a client runs at. The containment is `Net.rtt_believed_max_ms`, 250 ms by default: the
+  sample is clamped **at the read**, so every acknowledgement still buys everything else it bought and only
+  the clock measurement is bounded. `Net.peer_rtt_raw_ms()` keeps a scoreboard ping honest, and
+  `bandwidth_metrics()["rtt_at_ceiling_peers"]` says how many connections are asking for the deepest window.
+
+### Scale and validation
+
+- **A session can name 65,536 entities on the wire.** A block carries a 16-bit slot rather than the 64-bit
+  entity id ([docs/protocol.md](docs/protocol.md#entity-slots)). Past the cap the server refuses to replicate
+  the entity and says so, rather than wrapping an index onto a live one. The slot table is distributed as a
+  **delta against a generation the receiver holds**, so a session whose entities churn no longer restates
+  bindings that did not move, and a joining peer no longer costs every existing peer a whole table.
+- **Input values are checked for finiteness and nothing else.** A non-finite float in a decoded input row is
+  refused before it enters history — not as game policy, but because it is a poison value that would be
+  restored onto the input node before every replayed tick, recorded into state, sent to every peer, and would
+  make the body uncullable so it replicated to all of them. **Range, rate and plausibility are still yours**,
+  inside `_rollback_tick`, on the server. The full split is in
   [docs/protocol.md](docs/protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
 
 ## Licence

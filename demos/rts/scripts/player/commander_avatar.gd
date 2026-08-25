@@ -93,11 +93,19 @@ func _rollback_tick(_delta: float, _tick: int, _is_fresh: bool) -> void:
 ## is a property of a node, so all peers must be told; a peer that missed the update would keep predicting
 ## (or keep refusing to predict) the wrong body, and the backend would start rejecting its input frames as
 ## unauthorized. Peer 0 means "nobody", which resolves to the server holding the seat.
+##
+## PREDICTION IS RE-DECLARED HERE, and it is the half an authority write does not cover. A client builds its
+## world before the roster arrives, so every commander registers with `predict = false` -- which does not
+## merely defer prediction, it EXEMPTS the avatar from the rollback loop. Without `set_predicted()` this
+## client's own cursor would sit out the loop for the whole session and every cursor move would take a full
+## round trip to reach the replicated value, while the local view kept looking correct because the controller
+## writes `cmd_cursor` directly every frame.
 func set_owner_peer(peer: int) -> void:
 	owner_peer = peer
 	if Net.is_offline() or _handle == null:
 		return
 	_handle.set_input_authority(peer if peer > 0 else 1)
+	_handle.set_predicted(Net.is_server() or (peer > 0 and peer == multiplayer.get_unique_id()))
 
 ## Write this frame's desired cursor. Called only on the peer that OWNS this commander; on anyone else the
 ## input node is not writable and the backend would ignore it anyway.
