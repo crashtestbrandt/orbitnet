@@ -54,7 +54,7 @@ func test_declarations_land_immediately_but_do_not_re_read_the_set() -> void:
 	assert_eq(stub.declared[1], "net_orient", "in the order they were declared")
 	assert_eq(stub.settings_processed, 0, "and declaring re-read nothing")
 	handle.process_settings()
-	assert_eq(stub.settings_processed, 1, "the game owes exactly one process_settings() afterwards")
+	assert_eq(stub.settings_processed, 1, "the game owes exactly one process_settings() afterward")
 	stub.free()
 
 func test_teleport_is_forwarded_and_is_not_implied_by_anything_else() -> void:

@@ -1,7 +1,7 @@
 //! OrbitNet core — the engine-agnostic half of the OrbitNet netcode addon.
 //!
 //! Nothing in this crate knows about Godot. Every type is a plain-data structure with pure
-//! behaviour, which is what lets the whole thing be exercised by `cargo test` in milliseconds
+//! behavior, which is what lets the whole thing be exercised by `cargo test` in milliseconds
 //! instead of standing up a scene tree, a physics world and two peers.
 //!
 //! The split mirrors the four costs that motivated moving off the GDScript backend (see

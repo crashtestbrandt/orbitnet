@@ -55,7 +55,7 @@ func add_input(node: Object, property: String) -> void:
 ##
 ## The problem it solves: several independent worlds inside one session, each rebased near its own coordinate
 ## origin, overlap in coordinates. Interest is a distance test, and two bodies at the same coordinates in
-## different worlds are zero metres apart, so a radius cannot separate them.
+## different worlds are zero meters apart, so a radius cannot separate them.
 ##
 ## THIS ALSO SETS THE OWNING SEAT'S OWN WORLD. A seat's world is read off the body that anchors its interest
 ## radius -- the lowest-id body whose input authority is that peer and which declares that seat. That body's
@@ -70,7 +70,7 @@ func add_input(node: Object, property: String) -> void:
 ## fail-open is per CONNECTION: a peer with no resolved seat at all still sees everything, which is what stops
 ## a joining player from arriving in an empty world.
 ##
-## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's centre and world directly, and
+## UNLESS THE PEER DECLARED ITS OWN. [method Net.set_peer_anchor] states a peer's center and world directly, and
 ## a peer that used it reads neither off any body -- which is the way out when a peer drives bodies in more than
 ## one world, or drives none at all.
 ##
@@ -115,7 +115,7 @@ func membership() -> int:
 ## lowest-id one supplies it); every distinct value is one more interest set the server maintains for that
 ## connection. The numbers need not be contiguous.
 ##
-## What it costs to skip: with two bodies at the default 0, the connection gets ONE centre -- whichever body
+## What it costs to skip: with two bodies at the default 0, the connection gets ONE center -- whichever body
 ## the id hash sorts lowest -- and the other player's surroundings are culled around a position that player is
 ## nowhere near. Visible only with a cull radius set.
 ##
@@ -201,7 +201,7 @@ func process_authority() -> void:
 ## re-resolves *who owns which lane*; it leaves the prediction switch alone.
 ##
 ## The failure that produces is silent and expensive. A body registered with `predict = false` is also
-## EXEMPTED from the rollback loop, so a seat handed to this connection afterwards is simulated by nobody
+## EXEMPTED from the rollback loop, so a seat handed to this connection afterward is simulated by nobody
 ## here: its authoritative rows still arrive and still apply, so the body moves, the readouts look ordinary,
 ## and every input the player gives it is a full round trip late. Nothing errors.
 ##

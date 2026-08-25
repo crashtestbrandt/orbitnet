@@ -281,7 +281,7 @@ pub(crate) enum InputIntegration {
 ///
 /// `quant::decode_row` is shared with the state lane and with masked deltas, where the sender **is**
 /// the authority. Checking there would cost bytes-per-row on a lane that does not need it, and it
-/// would change that lane's behaviour.
+/// would change that lane's behavior.
 pub(crate) fn integrate_input_row(
     props: &[PropSchema],
     history: &mut ColumnarHistory,
@@ -370,7 +370,7 @@ pub struct OrbitRollbackSynchronizer {
     ///
     /// The backend must not guess game semantics: a scene that considers this body worth four
     /// ordinary ones when the byte budget is tight says so here. The ownership floor is applied
-    /// separately and needs no declaration — a peer's own body is recognised by its input authority.
+    /// separately and needs no declaration — a peer's own body is recognized by its input authority.
     #[export]
     priority: i32,
 
@@ -403,14 +403,14 @@ pub struct OrbitRollbackSynchronizer {
     ///
     /// Interest is a distance test, and distance cannot separate several independent worlds inside
     /// one session when each is rebased near its own coordinate origin: two bodies at the same
-    /// coordinates in different worlds are zero metres apart. A peer only ever replicates bodies
+    /// coordinates in different worlds are zero meters apart. A peer only ever replicates bodies
     /// whose membership matches its own, whatever the radius says.
     ///
     /// **This lane has no `relevancy` export and needs none.** A rollback body always carries a
     /// position, so it is always distance-cullable; membership narrows that, it does not replace it.
     ///
     /// Unset, unresolvable, or not an int leaves the body in `MEMBERSHIP_GLOBAL` — every world, the
-    /// behaviour every rollback body had before this existed, and the fail-open direction.
+    /// behavior every rollback body had before this existed, and the fail-open direction.
     ///
     /// The entry need **not** be one of `state_properties`: it costs no wire bytes and is read live
     /// on the authority, the only peer that computes relevancy.
@@ -1359,7 +1359,7 @@ impl OrbitRollbackSynchronizer {
     /// A negative value is a game writing its own "unset" into an `int` export, and it reads as
     /// seat `0` — the same fail-onto-the-default direction the rest of these declarations take.
     /// The cost of getting it wrong is one connection's two viewpoints sharing an anchor, which is
-    /// the behaviour that predates seats, not a body deleted from somebody's world.
+    /// the behavior that predates seats, not a body deleted from somebody's world.
     pub(crate) fn seat_hint(&self) -> SeatIndex {
         self.seat.clamp(0, i32::from(SeatIndex::MAX)) as SeatIndex
     }
@@ -1706,7 +1706,7 @@ impl OrbitRollbackSynchronizer {
         // corrections keep the pose roughly plausible.
         //
         // Bodies that are exempt are unaffected, and exempt is the default: `remote_resim` is off unless a game
-        // asks for it, so no existing configuration changes behaviour here.
+        // asks for it, so no existing configuration changes behavior here.
         // Predicting path (owner reconcile, or the un-exempted remote-resim mode).
         if self.state_history.is_stale(tick) {
             // Older than the rollback ring can hold. A full block for the same tick would be just
@@ -1954,7 +1954,7 @@ pub struct OrbitStateSynchronizer {
     /// | [`RELEVANCY_ANCHORED`] (1) | culled from `anchor_property` | `membership_property`'s world |
     /// | [`RELEVANCY_MEMBERSHIP`] (2) | never culled | `membership_property`'s world |
     ///
-    /// Defaults to ALWAYS, which is the behaviour every state channel had before interest applied here — the lane
+    /// Defaults to ALWAYS, which is the behavior every state channel had before interest applied here — the lane
     /// was not culled at all. A channel only becomes cullable when it *also* names a resolvable
     /// `anchor_property` (or, for MEMBERSHIP, a resolvable `membership_property`), so declaring
     /// relevancy without one is inert rather than a way to accidentally delete a body from

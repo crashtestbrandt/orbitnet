@@ -91,7 +91,7 @@ Three probes gate PRs today, and each reaches one item on that list the other tw
 **A fourth needs a line on that list none of the three already covers.** If a probe's assertions are pure math,
 port them to a unit test and delete the redundant block. And a probe that can only ever pass is not coverage:
 the shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL)
-and the arena probe asserts a withheld entity's rows stop while its neighbours keep arriving, for exactly that
+and the arena probe asserts a withheld entity's rows stop while its neighbors keep arriving, for exactly that
 reason.
 
 An empty run is a failure, not a pass — the runner exits non-zero on no suites or no `test_*` methods.
@@ -143,7 +143,7 @@ same commit.
 Contributions are dual-licensed **MIT OR Apache-2.0**. Inbound equals outbound; **no CLA** — opening a pull
 request is the agreement.
 
-Add a dependency, add it to `THIRD_PARTY.md` with its licence in the same commit. Anything not MIT /
+Add a dependency, add it to `THIRD_PARTY.md` with its license in the same commit. Anything not MIT /
 Apache-2.0 / BSD / MPL-2.0 needs a conversation first.
 
 ## Pull requests

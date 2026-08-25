@@ -182,7 +182,7 @@ pub fn resolve_entry(root: &Gd<Node>, entry: &str) -> Option<(Gd<Node>, StringNa
     Some((target, StringName::from(prop), kind))
 }
 
-/// What one pass of [`resolve_entries`] could not honour, kept so a game can assert on it.
+/// What one pass of [`resolve_entries`] could not honor, kept so a game can assert on it.
 ///
 /// One value rather than two out-parameters because the two lists answer one question between
 /// them — "which declarations are not doing what they say" — and because a lane accumulates both
@@ -622,7 +622,7 @@ impl HookCall {
 /// Everything below is the same code for all three.
 ///
 /// **Opt-in per synchronizer.** A lane with no declared hook keeps the per-property walk, byte for
-/// byte, so nothing existing changes behaviour.
+/// byte, so nothing existing changes behavior.
 ///
 /// **The row layout is unchanged.** The hook only supplies the `Variant`s; the encode, the byte
 /// offsets and the quantized canonicalization are the same code [`capture_row`] runs. Masks, delta

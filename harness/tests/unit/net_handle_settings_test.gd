@@ -1,7 +1,7 @@
 extends UnitTest
 ## Scene-free coverage for the SETTINGS RESOLUTION on the two synchronizer handles ([NetStateHandle],
 ## [NetRollbackHandle]) -- the declarations a game makes before `process_settings()` re-reads them, and the
-## reads it makes afterwards.
+## reads it makes afterward.
 ##
 ## The handles are thin forwarders, so what is worth pinning is the places they decide something or degrade
 ## something. Three of those, and none is covered by the membership, seat, input-authority or bulk-hook
@@ -208,7 +208,7 @@ func test_state_declarations_land_immediately_but_do_not_re_read_the_schema() ->
 	assert_eq(stub.declared[0], "net_pos@half", "including the quantizer suffix, which the backend reads")
 	assert_eq(stub.settings_processed, 0, "and neither declaration re-read the schema")
 	handle.process_settings()
-	assert_eq(stub.settings_processed, 1, "the game owes exactly one process_settings() afterwards")
+	assert_eq(stub.settings_processed, 1, "the game owes exactly one process_settings() afterward")
 	stub.free()
 
 func test_rollback_declarations_keep_the_two_lanes_apart() -> void:

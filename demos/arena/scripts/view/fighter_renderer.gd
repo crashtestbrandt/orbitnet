@@ -4,14 +4,14 @@ class_name FighterRenderer
 ##
 ## THE FADE IS THE FEATURE. A fighter this peer has stopped receiving is drawn faded rather than removed, and
 ## that is not a stylistic choice -- it is what a cull looks like. The rows stop, the node stays, and it
-## freezes at its last pose; deleting it would be the demo hiding the one behaviour the interest filter has.
+## freezes at its last pose; deleting it would be the demo hiding the one behavior the interest filter has.
 ## The same fade covers all three axes, because from a client they are indistinguishable.
 ##
 ## A CLOAKED FIGHTER LOOKS THE SAME AS A CULLED ONE FROM THE OTHER TEAM, and that is the point of using a veto
 ## for it. Its own team, which is still being sent it, draws it solid with a tint.
 ##
-## ONE MESH PER FIGHTER rather than a MultiMesh: twenty-four of them, each needing its own colour and its own
-## transparency, and per-instance colour on a MultiMesh needs a custom material to read it.
+## ONE MESH PER FIGHTER rather than a MultiMesh: twenty-four of them, each needing its own color and its own
+## transparency, and per-instance color on a MultiMesh needs a custom material to read it.
 
 const TEAM_COLOURS: Array[Color] = [
 	Color(0.35, 0.62, 0.95),
@@ -63,9 +63,9 @@ func _process(_delta: float) -> void:
 		var aim: Vector3 = FighterMotion.clamp_aim(fighter.net_aim)
 		mesh.look_at(mesh.position + aim, Vector3.UP)
 		mesh.rotate_object_local(Vector3.RIGHT, PI * 0.5)
-		_materials[seat].albedo_color = _colour_for(fighter, now)
+		_materials[seat].albedo_color = _color_for(fighter, now)
 
-func _colour_for(fighter: FighterBody, now: int) -> Color:
+func _color_for(fighter: FighterBody, now: int) -> Color:
 	var base: Color = TEAM_COLOURS[fighter.team % TEAM_COLOURS.size()]
 	if fighter.is_cloaked():
 		base = base.lerp(CLOAK_TINT, 0.55)

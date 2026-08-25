@@ -10,7 +10,7 @@ class_name PacketImpairment
 ##
 ## HONEST CONDITIONING: because the relay forwards RAW datagrams between the client and the server BELOW ENet's
 ## reliability layer, a drop here forces ENet's real retransmit, a reorder exercises its ordering buffers, and a
-## delay drives the backend's clock discipline -- exactly the reference-design behaviour (Unreal/Valve/Unity all inject
+## delay drives the backend's clock discipline -- exactly the reference-design behavior (Unreal/Valve/Unity all inject
 ## at the socket layer). Dropping "reliable" traffic ABOVE reliability would be a lie (it is permanently lost with
 ## no retransmit); this core never sees or cares about reliability, it just moves bytes late/never/twice.
 ##

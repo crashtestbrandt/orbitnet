@@ -7,7 +7,7 @@ class_name MalletBody
 ## Vec3 state property as its interest anchor; this demo never turns interest management on (a 2 m table has
 ## nothing to cull) but a body whose anchor would be a velocity or a local offset is a trap worth not setting.
 ##
-## THE VELOCITY IS ON THE WIRE, and that is not an optimisation. The rollback lane's state set has to be the
+## THE VELOCITY IS ON THE WIRE, and that is not an optimization. The rollback lane's state set has to be the
 ## COMPLETE simulation state: a restore that returns position without velocity resumes the resim from the wrong
 ## basis and diverges immediately, in a way that looks like a physics bug rather than a schema one. The RTS
 ## demo never had to make this point -- its units are display-only and its cursor has no momentum.

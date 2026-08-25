@@ -197,7 +197,7 @@ func test_a_state_channel_declares_capture_and_apply() -> void:
 	stub.free()
 
 ## A binary mismatch must degrade a declaration, never abort the game -- the rule every other
-## backwards-compatibility path in the facade follows. An unanswered order query returning `null` would be a
+## backward-compatibility path in the facade follows. An unanswered order query returning `null` would be a
 ## hard runtime error at the typed local it is assigned to.
 func test_an_old_backend_reports_the_walk_rather_than_failing() -> void:
 	var stub: OldSyncStub = OldSyncStub.new()

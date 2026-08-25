@@ -3,7 +3,7 @@ class_name RinkDirector
 ## Builds the rink, owns the mallet pool and the puck, and adjudicates serve requests.
 ##
 ## A STATIC MALLET POOL, NOT SPAWN/DESPAWN. Every peer creates all HockeyConfig.SEATS mallet nodes at world
-## build, with identical names, and the node set NEVER changes afterwards. Seating sets a mallet's owning peer;
+## build, with identical names, and the node set NEVER changes afterward. Seating sets a mallet's owning peer;
 ## leaving clears it. That is a deliberate departure from "the server queue_free()s a mallet when its player
 ## quits", and the reason is entity identity:
 ##

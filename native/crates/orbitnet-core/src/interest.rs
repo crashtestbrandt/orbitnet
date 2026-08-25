@@ -17,7 +17,7 @@
 //!
 //! ## Seats
 //!
-//! A [`PeerInterest`] is one **seat's** set: one viewpoint, with one centre and one world. A
+//! A [`PeerInterest`] is one **seat's** set: one viewpoint, with one center and one world. A
 //! connection may carry several — local split-screen is two or more locally-owned bodies behind a
 //! single transport peer — and [`ConnectionInterest`] is the level above: one `PeerInterest` per
 //! seat, unioned into the set the datagram carries, with the nearest seat's distance kept per
@@ -78,7 +78,7 @@
 //! two tables below are the evidence for it.
 //! [`PeerInterest::update_grid_into`] and [`PeerInterest::update_linear_into`] apply the same rules
 //! to the same [`InterestCandidate`]s and report the same leaves — the suite asserts both over a
-//! randomised walk — so the choice between them is a cost decision, and it is the measurements
+//! randomized walk — so the choice between them is a cost decision, and it is the measurements
 //! below rather than an argument.
 //!
 //! Each row times three variants over one session (`tests/interest_bench.rs`, 240 ticks, radius
@@ -189,10 +189,10 @@ type WorldCells = HashMap<(i32, i32), CellBucket>;
 /// (no hysteresis band).
 #[derive(Debug, Clone, Copy)]
 pub struct AoiConfig {
-    /// Edge length of one grid cell in metres. Values that are non-finite or `<= 0` behave as the
+    /// Edge length of one grid cell in meters. Values that are non-finite or `<= 0` behave as the
     /// default `32.0`.
     pub cell_size: f32,
-    /// Radius in metres at which an entity enters a peer's interest set. A negative radius
+    /// Radius in meters at which an entity enters a peer's interest set. A negative radius
     /// behaves as `0.0`.
     ///
     /// The default of `256.0` covers the demo arena with margin: the 2fort CTF forts sit at
@@ -255,7 +255,7 @@ impl AoiConfig {
 /// The grid cell a coordinate falls in along one axis.
 ///
 /// The `as` cast saturates, so an absurd but finite coordinate lands in the outermost cell
-/// instead of invoking undefined behaviour.
+/// instead of invoking undefined behavior.
 fn cell_coord(value: f32, cell_size: f32) -> i32 {
     (value / cell_size).floor() as i32
 }
@@ -404,7 +404,7 @@ impl InterestGrid {
     /// Every entity `observer` may see at **any** distance: the binned ones plus
     /// [`Self::uncullable_for`]. Order is unspecified.
     ///
-    /// This is what an observer with no usable centre sees. A non-finite centre is a measurement
+    /// This is what an observer with no usable center sees. A non-finite center is a measurement
     /// that failed, and the filter fails open on it rather than blanking that peer's world.
     pub fn visible_to(&self, observer: MembershipId) -> impl Iterator<Item = BodyId> + '_ {
         self.worlds
@@ -528,17 +528,17 @@ impl InterestCandidate {
     }
 }
 
-/// How many cells of edge `cell_size` a span of `metres` covers along one axis.
+/// How many cells of edge `cell_size` a span of `meters` covers along one axis.
 ///
 /// The **alignment-independent** count: a span that straddles a cell boundary covers one more cell
 /// than this, so this is the low answer of the two the real rectangle can have. Both thresholds are
 /// whole multiples of it and the smaller multiple is 2, so a one-cell difference on an 11-cell
 /// rectangle cannot move a decision.
 ///
-/// Saturating throughout. `metres` may be a finite but absurd coordinate range, and the caller
+/// Saturating throughout. `meters` may be a finite but absurd coordinate range, and the caller
 /// squares the result, so the value is clamped to `u32::MAX` — whose square is still inside `u64`.
-fn cells_across(metres: f64, cell_size: f64) -> u64 {
-    let across = (metres / cell_size).floor() + 1.0;
+fn cells_across(meters: f64, cell_size: f64) -> u64 {
+    let across = (meters / cell_size).floor() + 1.0;
     if across.is_finite() {
         across.clamp(1.0, f64::from(u32::MAX)) as u64
     } else {
@@ -576,7 +576,7 @@ impl WorldBounds {
         self.anchored = self.anchored.saturating_add(1);
     }
 
-    /// The longer of the two XZ sides, in metres.
+    /// The longer of the two XZ sides, in meters.
     ///
     /// Subtracting two finite coordinates can still overflow to infinity at the extremes of `f32`.
     /// [`InterestOccupancy::occupied_cells`] reads that as "wider than any rectangle" and falls back
@@ -603,7 +603,7 @@ pub struct OccupancyScratch {
 /// per session. [`InterestGrid::rebuild`] bins each world separately and
 /// [`InterestGrid::query_within`]'s guard compares a scan rectangle against **one** world's occupied
 /// cell count, so a session-wide bound would describe a rectangle no query is ever measured against.
-/// Two worlds rebased on origins a hundred kilometres apart are two small worlds; measuring the
+/// Two worlds rebased on origins a hundred kilometers apart are two small worlds; measuring the
 /// session would read them as one enormous one and index a grid that buys nothing.
 ///
 /// **The widest world decides**, and ties are broken by the fuller world and then by the lower
@@ -611,7 +611,7 @@ pub struct OccupancyScratch {
 /// varied with it would make the path a session runs vary run to run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct InterestOccupancy {
-    /// Half the longer XZ side of the widest world's axis-aligned bounds, in metres. `0.0` when
+    /// Half the longer XZ side of the widest world's axis-aligned bounds, in meters. `0.0` when
     /// nothing was binnable — one body is a world of zero extent, and so is none.
     pub half_extent: f32,
     /// How many of that world's candidates [`InterestGrid::rebuild`] would put in a cell.
@@ -741,7 +741,7 @@ pub const GRID_MAX_OVERRIDES: usize = 8;
 /// The rule compares two cell counts, both taken at the caller's [`AoiConfig`]:
 ///
 /// * [`Self::span_cells`] — the cells one query rectangle covers. The grid path queries at the
-///   **exit** radius, so the rectangle is `2 × enter_radius × exit_factor` metres on a side.
+///   **exit** radius, so the rectangle is `2 × enter_radius × exit_factor` meters on a side.
 /// * [`InterestOccupancy::occupied_cells`] — the cells the widest world fills, capped by its bodies.
 ///
 /// Their ratio is what [`InterestGrid::query_within`]'s own guard tests. A rectangle larger than the
@@ -905,8 +905,8 @@ impl PeerInterest {
     ///
     /// These are [`Self::update_linear_into`]'s rules applied to the same candidates through a
     /// spatial index instead of a flat scan. The two paths are asserted to agree — members and
-    /// leaves alike — over a randomised walk in this module's suite, so choosing between them is a
-    /// cost decision and not a behaviour change. Part by part:
+    /// leaves alike — over a randomized walk in this module's suite, so choosing between them is a
+    /// cost decision and not a behavior change. Part by part:
     ///
     /// * Entities within `enter_radius` join; current members are retained until they exceed
     ///   `enter_radius * exit_factor`; members the query no longer returns (moved away, despawned,
@@ -915,7 +915,7 @@ impl PeerInterest {
     ///   separately and the query reads only the ones [`membership_matches`] admits, so an
     ///   overlapping world's entities never enter the set at any distance.
     /// * An entity [`Self::set_hidden`] vetoed for this peer is refused wherever it arrives from —
-    ///   the binned hits, the uncullable list, `also`, or the whole world an unlocatable centre
+    ///   the binned hits, the uncullable list, `also`, or the whole world an unlocatable center
     ///   admits.
     /// * [`InterestCandidate::always`] entities, and any whose position could not be binned, arrive
     ///   from [`InterestGrid::uncullable_for`] and bypass both the radius and the cap.
@@ -944,7 +944,7 @@ impl PeerInterest {
     ///
     /// `leaves` and `scratch` are both cleared on entry; `scratch` is caller-owned working storage
     /// so a warm per-peer update allocates nothing.
-    // The grid, the config, the observer's centre and world, that peer's overrides and the two
+    // The grid, the config, the observer's center and world, that peer's overrides and the two
     // caller-owned buffers. Bundling any pair of them into a struct would either allocate per peer
     // per tick or move the same arguments to a constructor.
     #[allow(clippy::too_many_arguments)]
@@ -1027,7 +1027,7 @@ impl PeerInterest {
     ///   dropped **before** the radius and before `always` is consulted, so an overlapping world's
     ///   entities never enter the set at any distance, and an always-relevant channel is bounded
     ///   to its own world. [`MEMBERSHIP_GLOBAL`] on either side matches, which is why a game that
-    ///   declares no memberships keeps the distance-only behaviour exactly.
+    ///   declares no memberships keeps the distance-only behavior exactly.
     /// * `leaves` receives every id that was a member and is not one now — radius exits, membership
     ///   refusals **and** cap evictions alike, because each is a real leave that must re-enter
     ///   through `enter_radius` like any newcomer. The caller uses this to clear its per-peer delta
@@ -1345,18 +1345,18 @@ fn push_delta(old: &BTreeMap<BodyId, f32>, fresh: &[(BodyId, f32)], delta: &mut 
 /// Where one **seat** observes from, and which world it observes in.
 ///
 /// A seat is one owned viewpoint on a connection. Local split-screen puts two or more behind a
-/// single transport peer, each with its own body, its own centre and its own world; a connection
+/// single transport peer, each with its own body, its own center and its own world; a connection
 /// with one seat — every connection in a game without split-screen — is the one-element case and is
 /// filtered exactly as it was before seats existed.
 ///
 /// The two fields fail independently, and [`ConnectionInterest::update_linear_into`] relies on it. A
 /// non-finite `center` means "this seat has no position to be culled by" and admits everything its
 /// world allows, while `membership` still refuses another world. A seat whose body has not spawned
-/// yet therefore keeps its own set open, rather than inheriting the centre of a seat it is nowhere
+/// yet therefore keeps its own set open, rather than inheriting the center of a seat it is nowhere
 /// near.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeatObserver {
-    /// The centre this seat's radius is measured from. Non-finite means no distance filter for
+    /// The center this seat's radius is measured from. Non-finite means no distance filter for
     /// this seat.
     pub center: [f32; 3],
     /// The world this seat is in, or [`MEMBERSHIP_GLOBAL`] for every world.
@@ -1380,7 +1380,7 @@ pub struct SeatScratch {
 /// One CONNECTION's interest: a hysteretic set per seat, unioned into the set the datagram carries.
 ///
 /// **The two levels exist because the two questions have different answers.** Relevancy is a
-/// property of a seat — a viewpoint, with its own centre and its own world — while a delta base, an
+/// property of a seat — a viewpoint, with its own center and its own world — while a delta base, an
 /// ack window and a byte budget are properties of the datagram, and a datagram is per connection.
 /// So each seat gets its own [`PeerInterest`] with its own hysteresis, and what the send path reads
 /// is their union.
@@ -1434,9 +1434,9 @@ impl ConnectionInterest {
 
     /// Recompute every seat's set from `candidates`, union them, and report what left the union.
     ///
-    /// Each seat is filtered by [`PeerInterest::update_linear_into`] against its own centre and its
+    /// Each seat is filtered by [`PeerInterest::update_linear_into`] against its own center and its
     /// own world, so every rule that path documents — hysteresis, the always-set, the membership
-    /// refusal, the nearest-N cap, the non-finite-centre fail-open — holds per seat here.
+    /// refusal, the nearest-N cap, the non-finite-center fail-open — holds per seat here.
     ///
     /// `candidates` is the CONNECTION's list, not the seat's: a body the connection drives is
     /// `always` to every seat on it, because the datagram that would carry it is shared. Nothing
@@ -1472,7 +1472,7 @@ impl ConnectionInterest {
     /// Recompute every seat's set from `grid`, union them, and report what left it and what joined.
     ///
     /// [`Self::update_linear_into`]'s rules, reached through a spatial index instead of a flat scan:
-    /// each seat is filtered by [`PeerInterest::update_grid_into`] against its own centre and its own
+    /// each seat is filtered by [`PeerInterest::update_grid_into`] against its own center and its own
     /// world, and everything above about the union — membership is the union, a leave is a leave from
     /// the union, the stored distance is the nearest seat's, the cap is per seat — holds here
     /// unchanged. `connection_grid_agrees_with_connection_linear_over_a_pseudo_random_walk` asserts
@@ -1548,7 +1548,7 @@ impl ConnectionInterest {
     fn commit_union(&mut self, scratch: &mut SeatScratch, delta: &mut InterestDelta) {
         // Ascending by id, then by distance, so the first entry for an id is the nearest seat's and
         // `dedup_by_key` — which keeps the FIRST of a run — is the whole of the nearest-seat rule.
-        // Every distance here is finite and non-negative: `PeerInterest` normalises the
+        // Every distance here is finite and non-negative: `PeerInterest` normalizes the
         // always-relevant `NEG_INFINITY` to `0.0` before storing it.
         scratch
             .merged
@@ -1958,7 +1958,7 @@ mod tests {
 
     #[test]
     fn a_target_at_the_longest_shot_in_the_game_stays_in_interest() {
-        // THE PLAYER-FACING GUARANTEE BEHIND THE SHIPPED RADIUS, stated as behaviour rather
+        // THE PLAYER-FACING GUARANTEE BEHIND THE SHIPPED RADIUS, stated as behavior rather
         // than as a number. `aoi_weapon_range_test.gd` checks that the shipped radius is >= the
         // longest projectile range; this checks that a body at that range is actually still in the
         // set, which is the thing a scoped sniper depends on.
@@ -1981,7 +1981,7 @@ mod tests {
         }
 
         // And the radius is what bounds it: past the hysteresis band the body does leave, which is
-        // the behaviour an arena larger than the sniper's reach is meant to get.
+        // the behavior an arena larger than the sniper's reach is meant to get.
         grid.rebuild(
             &cfg,
             &anchored(&[(1, [sniper_range * 1.25 + 1.0, 0.0, 0.0])]),
@@ -2059,7 +2059,7 @@ mod tests {
             &mut scratch,
             &mut leaves,
         );
-        // A radius of zero still admits a body at exactly the centre, which body 2 is.
+        // A radius of zero still admits a body at exactly the center, which body 2 is.
         assert_eq!(via_grid.iter().collect::<Vec<_>>(), vec![2]);
         assert_eq!(via_linear.iter().collect::<Vec<_>>(), vec![2]);
     }
@@ -2317,7 +2317,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_fails_open_on_a_non_finite_centre() {
+    fn grid_fails_open_on_a_non_finite_center() {
         let cfg = cfg(32.0, 100.0, 1.25, 1);
         let mut grid = InterestGrid::new();
         grid.rebuild(
@@ -2394,7 +2394,7 @@ mod tests {
         // measurement that chose between them was comparing different work. Everything that can
         // differ between them is varied here at once: three worlds at overlapping coordinates,
         // always-relevant channels, positions that go non-finite mid-walk, a cap that bites, an
-        // observer whose centre cannot be resolved, a per-peer override that shadows a binned body,
+        // observer whose center cannot be resolved, a per-peer override that shadows a binned body,
         // and a visibility veto that comes and goes. Members *and* leaves are compared every step,
         // because the send path's correctness rests on the leaves rather than on the set.
         let cfg = cfg(64.0, 100.0, 1.25, 12);
@@ -2661,7 +2661,7 @@ mod tests {
             "an unbinnable body stays replicated; only a binnable, distant one is culled"
         );
 
-        // A non-finite CENTRE (a peer whose own body has gone bad) must not blank the world.
+        // A non-finite CENTER (a peer whose own body has gone bad) must not blank the world.
         let mut wide = PeerInterest::new();
         wide.update_linear_into(
             &cfg,
@@ -3084,7 +3084,7 @@ mod tests {
     /// An unlocatable observer fails open on distance — it sees everything its world admits — and
     /// the veto is a declaration rather than a measurement, so it still holds there.
     #[test]
-    fn a_veto_survives_the_non_finite_centre_that_fails_distance_open() {
+    fn a_veto_survives_the_non_finite_center_that_fails_distance_open() {
         let cfg = cfg(32.0, 200.0, 1.25, 0);
         let candidates = [
             InterestCandidate::anchored(1, [10_000.0, 0.0, 0.0]),
@@ -3229,7 +3229,7 @@ mod tests {
     fn one_seat_matches_a_bare_peer_interest() {
         // The compatibility claim the whole two-level structure rests on: a connection with one
         // seat is the shape every connection had before seats existed. Walked over moving bodies
-        // and a moving centre, so hysteresis, the cap and the leave diff are all exercised.
+        // and a moving center, so hysteresis, the cap and the leave diff are all exercised.
         let cfg = cfg(32.0, 100.0, 1.25, 3);
         let mut state = 0x0BAD_5EA7u32;
         let mut connection = ConnectionInterest::new();
@@ -3459,9 +3459,9 @@ mod tests {
     }
 
     #[test]
-    fn a_seat_with_no_centre_keeps_its_own_set_relevant() {
+    fn a_seat_with_no_center_keeps_its_own_set_relevant() {
         // The failure this replaces: culling switched on and off per CONNECTION, so a seat whose
-        // body had not spawned yet inherited the other seat's centre and had its surroundings
+        // body had not spawned yet inherited the other seat's center and had its surroundings
         // culled around a position it was nowhere near.
         let cfg = cfg(32.0, 10.0, 1.25, 0);
         let candidates = [
@@ -3640,7 +3640,7 @@ mod tests {
     fn a_connection_with_no_seats_holds_nothing() {
         // A connection whose seats have not been resolved yet is not a connection that sees
         // everything: the send path gives an unlocatable connection ONE seat with a non-finite
-        // centre, which is the fail-open. An empty slice is the different statement that there is
+        // center, which is the fail-open. An empty slice is the different statement that there is
         // no viewpoint at all, and it must not quietly become the first one.
         let cfg = cfg(32.0, 100.0, 1.25, 0);
         let candidates = [InterestCandidate::always(1)];
@@ -3687,7 +3687,7 @@ mod tests {
     }
 
     impl ConnectionWalk {
-        /// `bodies` entities dealt across `worlds` worlds, spread over ±`spread` metres. Body 1 is
+        /// `bodies` entities dealt across `worlds` worlds, spread over ±`spread` meters. Body 1 is
         /// always-relevant in every world, one body in eight is an always-relevant channel within
         /// its own world, and the rest are anchored.
         fn new(bodies: u64, worlds: u64, spread: f32) -> Self {
@@ -3720,7 +3720,7 @@ mod tests {
         /// driven back and forth across the selector's band without changing anything else about the
         /// scene.
         ///
-        /// Normalising rather than multiplying by the ratio between two blocks is what makes the
+        /// Normalizing rather than multiplying by the ratio between two blocks is what makes the
         /// extent of a step exactly what the test asked for, instead of that plus however far the
         /// previous block's jitter wandered.
         fn rescale(&mut self, spread: f32) {
@@ -4289,7 +4289,7 @@ mod tests {
     #[test]
     fn occupancy_measures_the_widest_world_not_the_session() {
         // The grid's own guard is per world, so the measurement has to be. Two worlds rebased a
-        // hundred kilometres apart are two small worlds; measuring the session's bounds would read
+        // hundred kilometers apart are two small worlds; measuring the session's bounds would read
         // them as one enormous one and index a grid that saves nothing.
         let mut scratch = OccupancyScratch::default();
         let candidates = [

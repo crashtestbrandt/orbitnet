@@ -55,7 +55,7 @@ pub enum CodecError {
         /// This peer's version.
         ours: u32,
     },
-    /// The peer's handshake carried no 16-byte session nonce, so nothing it sends afterwards can be
+    /// The peer's handshake carried no 16-byte session nonce, so nothing it sends afterward can be
     /// authenticated. An older build, or a truncated handshake.
     MissingSessionNonce,
     /// This peer holds a **session secret** and the remote handshake could not confirm the same one:

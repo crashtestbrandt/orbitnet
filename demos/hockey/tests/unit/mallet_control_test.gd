@@ -30,7 +30,7 @@ func test_acceleration_is_finite() -> void:
 	assert_true(first.velocity.length() <= HockeyConfig.MALLET_ACCEL * DT + 0.0001,
 		"the first tick of a flick is bounded by the acceleration, not by the distance")
 
-func test_a_mallet_pressed_into_the_centre_line_reports_no_speed() -> void:
+func test_a_mallet_pressed_into_the_center_line_reports_no_speed() -> void:
 	# The bug this guards: a mallet held against the line keeps the velocity it was DRIVEN at while standing
 	# still, and hands all of it to the next puck that touches it.
 	var line: Vector3 = TableGeometry.clamp_to_half(
@@ -57,7 +57,7 @@ func test_coasting_respects_the_half_clamp() -> void:
 	var state: MalletControl.State = _state(Vector3(0.0, 0.0, -0.2), Vector3(0.0, 0.0, 40.0))
 	var next: MalletControl.State = MalletControl.step_coast(state, 0, DT)
 	assert_true(next.position.z <= -HockeyConfig.MALLET_RADIUS + 0.0001,
-		"dead reckoning cannot push a mallet across the centre line either")
+		"dead reckoning cannot push a mallet across the center line either")
 
 func test_a_zero_delta_changes_nothing() -> void:
 	# The tick dt is 0 while OFFLINE, and dividing by it would produce a mallet at NAN.

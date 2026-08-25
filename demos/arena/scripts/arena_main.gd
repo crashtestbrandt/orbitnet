@@ -13,7 +13,7 @@ class_name ArenaMain
 ##   --seats=N           ask for N locally-driven fighters (split-screen). 1 or 2.
 ##   --same-arena        put both seats in ONE arena. The default spreads them, which is the case worth
 ##                       seeing: a connection with a body in two worlds has no world of its own.
-##   --observe           watch without playing: no seat, no fighter, an interest centre and an ARENA declared
+##   --observe           watch without playing: no seat, no fighter, an interest center and an ARENA declared
 ##                       by the server
 ##   --watch=N           which arena an observer declares itself into. Deterministic, so a probe does not have
 ##                       to guess which one it will be given
@@ -204,9 +204,9 @@ func _aim_cameras() -> void:
 	if net.world == null:
 		return
 	if net.is_observing():
-		var centre: Vector3 = ArenaGeometry.origin_of(_observed_arena())
+		var center: Vector3 = ArenaGeometry.origin_of(_observed_arena())
 		for index: int in views.camera_count():
-			views.look_down_at(index, centre, 46.0)
+			views.look_down_at(index, center, 46.0)
 		return
 	var seats: PackedInt32Array = net.local_seats()
 	for index: int in views.camera_count():

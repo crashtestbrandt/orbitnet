@@ -24,7 +24,7 @@ class_name CommanderController
 ## for that whole window and folded every refusal into the percentile as a four-second sample.
 ## [signal NetCommand.rejected] now reaches the peer that asked, carrying the tag [method NetCommand.request]
 ## returned, so the pending entry is cleared on the reply and only the request that actually failed is
-## cancelled.
+## canceled.
 ##
 ## Controls (raw keys, no InputMap -- see CameraRig for why):
 ##   LMB drag / click      select (hold Shift to add to the selection)
@@ -106,9 +106,9 @@ func _publish_selection_hint(commander: CommanderAvatar, ground: Vector3) -> voi
 		return
 	var a: Vector3 = camera.ground_at_screen(_drag_start)
 	var b: Vector3 = camera.ground_at_screen(_drag_now)
-	var centre: Vector3 = (a + b) * 0.5
+	var center: Vector3 = (a + b) * 0.5
 	var half: float = maxf(absf(a.x - b.x), absf(a.z - b.z)) * 0.5
-	commander.set_selection_hint(_selected.size(), centre, half)
+	commander.set_selection_hint(_selected.size(), center, half)
 
 # --- input ---------------------------------------------------------------------------------------
 func _unhandled_input(event: InputEvent) -> void:
@@ -260,7 +260,7 @@ func _poll_pending_order() -> void:
 			_clear_pending()
 			return
 	# The BACKSTOP, and it is no longer the mechanism. A refused order never changes any sequence, and it used
-	# to be cancelled by this timeout alone -- four seconds of blocked measurement, and every refusal folded
+	# to be canceled by this timeout alone -- four seconds of blocked measurement, and every refusal folded
 	# into the percentile as a four-second sample. `_on_order_rejected` now cancels it on the reply, so what
 	# is left here is the case no reply covers: an order the server accepted whose units all died before any
 	# of their sequence numbers reached this client.

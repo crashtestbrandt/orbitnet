@@ -32,7 +32,7 @@
 ///
 /// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
 /// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
-/// documented absent-value behaviour, a newer peer reads it when it is there. Anything that shifts an
+/// documented absent-value behavior, a newer peer reads it when it is there. Anything that shifts an
 /// existing field's offset is a MAJOR bump, because there the older peer decodes garbage.
 pub const PROTOCOL_VERSION: u32 = 0x0007_0000;
 
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn roles_decide_restore_and_resim_behaviour() {
+    fn roles_decide_restore_and_resim_behavior() {
         assert!(PropRole::State.is_restored());
         assert!(PropRole::Input.is_restored());
         assert!(!PropRole::Cosmetic.is_restored());

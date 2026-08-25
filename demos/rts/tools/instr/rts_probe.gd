@@ -9,7 +9,7 @@ extends Node
 ##      and therefore on entity-id agreement -- the failure that is otherwise silent (the server broadcasts
 ##      entity 0x8f3a..., the client listens for 0x21bc..., nothing errors, nothing moves).
 ##   3. An order REPLICATES: the server's sequence number reaches every targeted unit on the other peer.
-##   4. The two peers agree about where the army is, by CENTROID within a couple of metres. Deliberately not
+##   4. The two peers agree about where the army is, by CENTROID within a couple of meters. Deliberately not
 ##      a per-unit position hash: peers observe different ticks by construction, so an exact comparison is
 ##      inherently flaky, whereas a centroid drifting apart means replication has genuinely failed.
 ##   5. A FORGED order -- submitted on another seat's channel -- changes nothing. The unit it named must
@@ -106,7 +106,7 @@ func _issue_forged_order() -> void:
 	var ids: PackedInt32Array = PackedInt32Array()
 	ids.push_back(_FORGED_ID)
 	# Listen for the refusal before sending it: the reply is a reliable RPC and arrives on its own schedule,
-	# and a listener attached afterwards would be a race the probe could lose intermittently.
+	# and a listener attached afterward would be a race the probe could lose intermittently.
 	var channel: NetCommand = world.order_channel(0)
 	if channel != null and not channel.rejected.is_connected(_on_forged_rejected):
 		channel.rejected.connect(_on_forged_rejected)

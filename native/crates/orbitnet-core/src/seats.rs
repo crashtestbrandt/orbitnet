@@ -34,7 +34,7 @@ pub type SeatIndex = u16;
 ///
 /// **The identity ownership could not express before.** "Which connection" is the whole answer only
 /// while a connection drives one predicted body. Local split-screen drives several — two players on
-/// one couch behind one socket — and each needs its own interest anchor, its own centre and its own
+/// one couch behind one socket — and each needs its own interest anchor, its own center and its own
 /// world, because the second player's surroundings are not the first player's.
 ///
 /// **Seat is the word the demos already use for a player side**, and this is the same idea: a seat
@@ -172,7 +172,7 @@ impl SeatRoster {
 
 /// What a game wants done with a connection's seats once that connection ends.
 ///
-/// **Opt-in, and [`Hold`](SeatReleasePolicy::Hold) is the default because the existing behaviour is
+/// **Opt-in, and [`Hold`](SeatReleasePolicy::Hold) is the default because the existing behavior is
 /// the default.** A connection whose transport is gone keeps its seats: the bodies behind it hold
 /// the authority they were given until the game changes it. That is what the reconnect grace window
 /// is for — a player whose wifi drops a burst of packets comes back to the body they left — and a
@@ -190,7 +190,7 @@ impl SeatRoster {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum SeatReleasePolicy {
     /// Never release. The bodies keep the peer they were given, through the drop and past the
-    /// expiry, until the game changes it itself. The default, and the behaviour of every session
+    /// expiry, until the game changes it itself. The default, and the behavior of every session
     /// that sets no policy.
     #[default]
     Hold,
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_default_seat_release_policy_holds_the_seats() {
-        // The behaviour a session gets by setting nothing, pinned so the opt-in stays opt-in.
+        // The behavior a session gets by setting nothing, pinned so the opt-in stays opt-in.
         assert_eq!(SeatReleasePolicy::default(), SeatReleasePolicy::Hold);
     }
 

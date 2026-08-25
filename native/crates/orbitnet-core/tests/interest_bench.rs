@@ -74,7 +74,7 @@ fn coord(state: &mut u32, half: f32) -> f32 {
     (lcg(state) >> 8) as f32 / 16_777_216.0 * (half * 2.0) - half
 }
 
-/// One synthetic session: `peers` player bodies plus filler entities, all inside `extent` metres.
+/// One synthetic session: `peers` player bodies plus filler entities, all inside `extent` meters.
 struct Scene {
     /// `(id, position)` for every replicated entity, players first.
     entities: Vec<(BodyId, [f32; 3])>,
@@ -304,7 +304,7 @@ struct Buffers {
 ///
 /// The rebuild was there because a peer's own body is `always` to it and to nobody else, and a peer
 /// with no resolved anchor reshaped every row — so the list looked peer-specific. Both facts moved
-/// (to a patch and to a non-finite centre) and the pass went with them. Retained here because a
+/// (to a patch and to a non-finite center) and the pass went with them. Retained here because a
 /// measurement that charges the scan for it reads a rebuild win as a grid win.
 fn tick_scan_per_peer(
     scene: &Scene,

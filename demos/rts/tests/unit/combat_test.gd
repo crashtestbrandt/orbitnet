@@ -91,7 +91,7 @@ func test_damage_scales_with_dt() -> void:
 func test_degenerate_dt_deals_nothing() -> void:
 	var tank: RtsConfig.Archetype = RtsConfig.archetype(RtsConfig.Kind.TANK)
 	assert_almost_eq(Combat.damage(tank, 0.0), 0.0, 0.0001, "no time, no damage")
-	assert_almost_eq(Combat.damage(tank, -1.0), 0.0, 0.0001, "and time never runs backwards into healing")
+	assert_almost_eq(Combat.damage(tank, -1.0), 0.0, 0.0001, "and time never runs backward into healing")
 	assert_almost_eq(Combat.damage(tank, NAN), 0.0, 0.0001, "a NaN dt deals nothing rather than NaN damage")
 
 # --- stand-off -------------------------------------------------------------------------------------

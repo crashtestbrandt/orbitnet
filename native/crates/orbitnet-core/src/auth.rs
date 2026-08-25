@@ -278,7 +278,7 @@ fn join_halves(low: u64, high: u64) -> [u8; KEY_LEN] {
 ///   same time, and no caller has to know which of the two shapes it is holding.
 /// - The length is inside the hash, so `b"key"` and `b"key\0"` are different secrets. A fold that
 ///   passed 16 bytes through and hashed everything else would make the boundary at 16 bytes a
-///   behaviour change nobody can see.
+///   behavior change nobody can see.
 ///
 /// The fold cannot add entropy, and takes essentially none away: it is a pseudo-random function of the
 /// whole secret, and the tag it eventually protects is 64 bits.
@@ -303,7 +303,7 @@ pub fn compress_secret(secret: &[u8]) -> [u8; KEY_LEN] {
 /// - [`SessionAuth::new`] starts every session's counter at 1, and [`ReplayWindow`] only ever knows the
 ///   session in front of it.
 /// - So under a key that does not change between joins, every datagram captured in one session is a
-///   valid, unreplayed datagram in the next. The replay defence would last exactly one session.
+///   valid, unreplayed datagram in the next. The replay defense would last exactly one session.
 /// - A fresh nonce per join is what keeps the key fresh per join, and that is the only reason the
 ///   nonce exists. A caller that reuses a nonce under one secret gets the constant-key failure back.
 ///
@@ -330,7 +330,7 @@ pub fn derive_session_key(secret: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN]) -> [u8;
 /// fails — it occupies a session slot until then.
 ///
 /// **The protocol version is inside the tag** so that a confirmation cannot be lifted out of a session
-/// of one protocol version and replayed into a session of another, where the fields it authorises mean
+/// of one protocol version and replayed into a session of another, where the fields it authorizes mean
 /// something else.
 ///
 /// Two limits:

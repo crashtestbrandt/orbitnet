@@ -49,7 +49,7 @@ wire or the interest pass.
 
 That is the arrangement membership exists for, and it is the demo's central fact:
 
-> Two fighters standing on the same spot in different arenas are **zero metres apart**. No radius can separate
+> Two fighters standing on the same spot in different arenas are **zero meters apart**. No radius can separate
 > them. A declared world can, and nothing else in the facade can.
 
 ```gdscript
@@ -107,7 +107,7 @@ datagram's limit, not the policy's.
 ## Split-screen is what a seat is for
 
 `--seats=2` gives one connection two locally-driven, locally-predicted fighters. Each is a **seat** in the
-backend's sense: its own interest anchor, its own centre, its own world, its own hysteresis band. The
+backend's sense: its own interest anchor, its own center, its own world, its own hysteresis band. The
 connection receives the **union** of its seats' sets, with the nearest seat's distance kept per entity.
 
 ```gdscript
@@ -116,7 +116,7 @@ handle.set_seat(index)             # WHICH OF THAT CONNECTION'S BODIES this one 
 ```
 
 Both are needed and they are different axes. Two fighters on one connection that both sat at seat `0` would
-share one interest centre, and the second player's surroundings would be culled around where the first was
+share one interest center, and the second player's surroundings would be culled around where the first was
 standing.
 
 **By default the two seats are in different arenas**, which is the case worth having: a connection with a body
@@ -135,28 +135,28 @@ mistake this shape makes available.
 
 ## An observer declares where it watches from
 
-A peer with no seat has no body to infer an interest centre from, and a peer with no centre is filtered in
+A peer with no seat has no body to infer an interest center from, and a peer with no center is filtered in
 nowhere — the backend falls open and sends it everything. That is why a seatless spectator used to be refused
 at the door.
 
 ```gdscript
 Net.set_peer_anchor(peer, local_point, arena_id)        # a ground point, in that arena
 Net.set_peer_anchor_entity(peer, entity_id, arena_id)   # ...or a fighter, wherever it goes
-Net.clear_peer_anchor(peer)                             # back to inference, one centre per seat
+Net.clear_peer_anchor(peer)                             # back to inference, one center per seat
 ```
 
-**The arena is the half that cannot be inferred.** An observer that declared only a centre would be watching
-one point in all three arenas at once. A declaration replaces inference on the centre *and* the world at once,
+**The arena is the half that cannot be inferred.** An observer that declared only a center would be watching
+one point in all three arenas at once. A declaration replaces inference on the center *and* the world at once,
 which is exactly what a peer with no body needs.
 
 **A peer arriving at a full table is admitted as an observer**, not disconnected. There is now something to do
 with it.
 
 **The declaration is throttled.** An observer pans continuously, and one reliable message per frame restating a
-centre that slid twenty centimetres is how a spectator costs more than a player. `ObserverDesk` decides: a
+center that slid twenty centimeters is how a spectator costs more than a player. `ObserverDesk` decides: a
 distance threshold, an interval so a lost message is still corrected, and an unconditional resend on a change
-of mode or arena — because an observer that moved its centre to the same local point in the next arena moved
-zero metres and changed everything it can see.
+of mode or arena — because an observer that moved its center to the same local point in the next arena moved
+zero meters and changed everything it can see.
 
 ## The rewind is per shooter and per target
 
@@ -212,7 +212,7 @@ fresh tick only. The result is recorded at that tick, and every replay restores 
 | Arena | The values must stay on the **rollback** lane, so the **write** is what moves |
 
 Whether a hit was fatal is therefore not known when the shot resolves. The director reads the answer off the
-fighters afterwards and credits the scorecard — which is on the state lane, so writing it outside the tick is
+fighters afterward and credits the scorecard — which is on the state lane, so writing it outside the tick is
 safe.
 
 ## Entity slots
@@ -304,7 +304,7 @@ nothing at the call site.
 | `INTEREST` | what this peer is **being sent**, against what exists. A server says so and reports what it holds |
 | `ARENAS` | fighters received per arena — the membership axis, made visible |
 | `CLOAK` | how many entity-peer pairs are withheld right now |
-| `CENTRE` | whether this peer's interest centre is inferred or declared |
+| `CENTER` | whether this peer's interest center is inferred or declared |
 | `REWIND` | the base window and all three per-band depths, and whether they differ |
 | `INTERP` | each peer's own measured send cadence, and the pooled figure it falls back to |
 
@@ -316,7 +316,7 @@ nothing at the call site.
 | **F2** | bulk marshalling on/off |
 | **F3** | the cloak veto on/off |
 | **F4** | observe / play |
-| **F5** | cycle what an observer watches: each arena's centre, then a fighter in it |
+| **F5** | cycle what an observer watches: each arena's center, then a fighter in it |
 
 F1, F3 and the seating are **server-side**; on a client they change nothing, which is the security property
 rather than a limitation — a peer cannot decide what it is allowed to receive.

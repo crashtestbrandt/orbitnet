@@ -6,14 +6,14 @@ class_name NetLagComp
 ##   * the PRESENT tick -- a live-space ray cast (NetRay), which is what S7 ships and is correct on a localhost
 ##     listen-server where RTT is ~0, OR
 ##   * a PAST tick reconstructed from the ring, so a high-ping shooter's shot is judged against where the targets
-##     were on THEIR screen (the classic "favour the shooter" rewind). LIVE since 89c -- [method _resolve_rewound]
+##     were on THEIR screen (the classic "favor the shooter" rewind). LIVE since 89c -- [method _resolve_rewound]
 ##     reconstructs the recorded per-region capsules and tests them analytically; only an un-recorded tick (or
 ##     the derived rewind depth is 0) still falls through to the present-tick cast.
 ##
 ## THE REWIND DEPTH IS PER TARGET, not per shot. A shot's window is its shooter's interpolation delay plus their
 ## round trip, and the interpolation half is how stale the target's last received row is -- which is a property of
 ## the TARGET's distance from the shooter, because the send path admits rows by priority and bands that priority by
-## distance. A contested body a few metres away and one across the map are not the same age. [method resolve_hit]
+## distance. A contested body a few meters away and one across the map are not the same age. [method resolve_hit]
 ## takes three ticks from [method rewind_band_ticks] and reconstructs each target at the one its own band earned;
 ## a caller that passes none gets one depth for the whole cast, as before.
 ##
@@ -56,7 +56,7 @@ static var delay_ms: float = 50.0
 ## a ceiling ends up worth twice what its author meant.
 ##
 ## IT IS THE CONTAINMENT ON WHAT IS LEFT, so read what it is containing rather than assuming the backend has
-## already handled it. The estimate is derived from acknowledgements the client chooses when to send. Three
+## already handled it. The estimate is derived from acknowledgments the client chooses when to send. Three
 ## backend rules narrow that: an ack must carry the frame token the server minted for the tick it names, so a
 ## peer cannot acknowledge a frame that never reached it; an ack that did not ADVANCE takes no sample at all;
 ## and the estimate is the MINIMUM of a recent window. What survives all three is a peer that acknowledges a
@@ -93,7 +93,7 @@ static var max_delay_ms: float = 250.0
 
 ## Whether a shot is rewound by its own shooter's measured round trip, or by the flat [member delay_ms] every
 ## shooter shares. An AUTHORITY knob: it changes how the server adjudicates, so a client setting it changes
-## nothing. Off restores the flat-window behaviour exactly, which is what makes a feel regression an A/B rather
+## nothing. Off restores the flat-window behavior exactly, which is what makes a feel regression an A/B rather
 ## than a bisect.
 static var per_shooter: bool = true
 
@@ -111,8 +111,8 @@ static var per_shooter: bool = true
 ## until the bytes run out -- so a body renders at the last row it RECEIVED, which is `interarrival` ticks old,
 ## not one. Measured against a real dedicated server on a two-dozen-entity arena from a LAN client: a mean of 3.4
 ## net ticks between rows for the near band, p95 of 8. At 7.5 m/s that is 0.42 m of travel the rewind did not
-## account for, against a 0.40 m hit capsule -- a dead-centre shot resolving cleanly past the body it was aimed
-## at. That is arithmetic rather than a feel judgement.
+## account for, against a 0.40 m hit capsule -- a dead-center shot resolving cleanly past the body it was aimed
+## at. That is arithmetic rather than a feel judgment.
 ##
 ## The send path publishes the figure, and **what is read is the POOLED value across every band**, not the near
 ## band's. It is refreshed once per server tick -- the per-peer figure from [method Net.interarrival_ticks] into
@@ -215,10 +215,10 @@ static var observed_interp_far_ticks: float = 0.0
 ## sends, so the near band, which supplies most of the sends, dominates it.
 static var _pooled_interp_raw: float = 0.0
 
-## The band scale the session is running, in metres -- [method Net.aoi_band_radius], refreshed once per server
+## The band scale the session is running, in meters -- [method Net.aoi_band_radius], refreshed once per server
 ## tick. Edges at `scale/3` and `2*scale/3`, the same test the send path bands a row by.
 ##
-## **0 MAKES THE PER-TARGET SPLIT INERT, and that is the required behaviour rather than a degenerate one.** The
+## **0 MAKES THE PER-TARGET SPLIT INERT, and that is the required behavior rather than a degenerate one.** The
 ## backend defaults the scale to 0 and reports the near band for every row at a non-positive scale, so an
 ## unconfigured session has no band information about anything. Every band then scales by 1.0 and every target
 ## is rewound by the pooled figure, which is what a consumer that cannot see its subject's band should get --
@@ -668,20 +668,20 @@ func _resolve_rewound(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Ve
 		# ray-vs-capsule below runs for EVERY recorded capsule in the WHOLE ZONE, for every live pellet track, every
 		# tick -- so a firefight costs O(rounds in flight x bodies x regions) and a round crossing the midfield was
 		# ray-testing every limb of every player and every AI in the arena. This rejects a capsule the segment
-		# provably cannot reach: an intersection point lies within the capsule's bounding-sphere radius of its centre
-		# AND on the segment, so if the segment's CLOSEST APPROACH to the centre already exceeds that radius there is
+		# provably cannot reach: an intersection point lies within the capsule's bounding-sphere radius of its center
+		# AND on the segment, so if the segment's CLOSEST APPROACH to the center already exceeds that radius there is
 		# no intersection. Exact and conservative -- it can only skip capsules _ray_capsule would have missed anyway,
 		# so no shot resolves differently.
 		#
 		# Ordered ahead of the liveness + exclude checks deliberately: both of those DEREFERENCE the collider (an
 		# `as`-cast, a get_rid(), and a linear scan of the exclude set), while this reads only the Sample's own value
 		# fields -- which stay valid whatever happened to the collider.
-		var to_centre: Vector3 = sample.transform.origin - origin
-		var along: float = clampf(to_centre.dot(dir), 0.0, dist)
-		# Bounding-sphere radius of a capsule of total `height` and `radius` (axis through the centre): the caps
-		# reach height/2 from the centre, and a degenerate height shorter than the caps leaves the radius itself.
+		var to_center: Vector3 = sample.transform.origin - origin
+		var along: float = clampf(to_center.dot(dir), 0.0, dist)
+		# Bounding-sphere radius of a capsule of total `height` and `radius` (axis through the center): the caps
+		# reach height/2 from the center, and a degenerate height shorter than the caps leaves the radius itself.
 		var bound: float = maxf(sample.height * 0.5, sample.radius)
-		if to_centre.distance_squared_to(dir * along) > bound * bound:
+		if to_center.distance_squared_to(dir * along) > bound * bound:
 			continue
 		# A sample holds a RAW reference to the recorded collider, and a Node reference keeps nothing alive: a
 		# death/respawn frees the body and its region hitboxes while the ring still carries the rewind window's
@@ -744,8 +744,8 @@ func _band_counterpart(tick: int, idx: int, collider: Object) -> Sample:
 	return alt
 
 # The outward surface normal of a capsule (axis = local Y) at world point `pos`: radial from the NEAREST point on
-# the capsule's axis segment (the cap centres clamp the height), which is correct for both the cylinder wall (purely
-# radial) and the hemisphere caps (from the cap centre). The capsule-centre vector the naive form used is wrong for
+# the capsule's axis segment (the cap centers clamp the height), which is correct for both the cylinder wall (purely
+# radial) and the hemisphere caps (from the cap center). The capsule-center vector the naive form used is wrong for
 # both; this matters for any future ricochet / penetration-angle / decal consumer of the rewound hit normal.
 static func _capsule_normal(pos: Vector3, xform: Transform3D, radius: float, height: float) -> Vector3:
 	var local_hit: Vector3 = xform.affine_inverse() * pos
@@ -755,15 +755,15 @@ static func _capsule_normal(pos: Vector3, xform: Transform3D, radius: float, hei
 
 # Analytic ray-vs-capsule: the nearest entry distance along `dir` (unit) within [0, dist] of a capsule at `xform`
 # (no scale) with the given radius + total height (axis = local Y), or -1.0 for a miss. Tests the infinite cylinder
-# clipped to the cap centres plus the two hemisphere spheres, and returns the smallest valid entry.
+# clipped to the cap centers plus the two hemisphere spheres, and returns the smallest valid entry.
 static func _ray_capsule(origin: Vector3, dir: Vector3, dist: float, xform: Transform3D, radius: float, height: float) -> float:
 	var inv: Transform3D = xform.affine_inverse()
 	var lo: Vector3 = inv * origin          # ray origin in capsule-local space
 	var ld: Vector3 = inv.basis * dir       # ray dir in capsule-local space (rotation only -> stays unit length)
-	var half: float = maxf(0.0, height * 0.5 - radius)   # cap-centre offset along local Y
+	var half: float = maxf(0.0, height * 0.5 - radius)   # cap-center offset along local Y
 	var r2: float = radius * radius
 	var best_t: float = -1.0
-	# Side wall: infinite cylinder of radius r around local Y, clipped to the cap-centre span.
+	# Side wall: infinite cylinder of radius r around local Y, clipped to the cap-center span.
 	var a: float = ld.x * ld.x + ld.z * ld.z
 	if a > 0.000000001:
 		var b: float = 2.0 * (lo.x * ld.x + lo.z * ld.z)
@@ -779,7 +779,7 @@ static func _ray_capsule(origin: Vector3, dir: Vector3, dist: float, xform: Tran
 	best_t = _nearest_sphere(lo, ld, Vector3(0.0, -half, 0.0), r2, dist, best_t)
 	return best_t
 
-# Nearest entry distance of a unit-dir ray vs a sphere (centre `c`, radius^2 `r2`) within [0, dist], or `current`
+# Nearest entry distance of a unit-dir ray vs a sphere (center `c`, radius^2 `r2`) within [0, dist], or `current`
 # if none is nearer. `ld` is assumed unit length (the capsule transform carries no scale).
 static func _nearest_sphere(lo: Vector3, ld: Vector3, c: Vector3, r2: float, dist: float, current: float) -> float:
 	var oc: Vector3 = lo - c

@@ -10,7 +10,7 @@
 #     PROFILE  a NetProfiles catalog name (default congested_wifi; `clean` for a control run)
 #     SECONDS  steady-state measurement window (default 20)
 #     SEED     base RNG seed for the relay + bots (default 1) -- makes a run reproducible
-#     POLICY   bot behaviour: idle|strafe|orbit|wander|strafe_fire (default strafe)
+#     POLICY   bot behavior: idle|strafe|orbit|wander|strafe_fire (default strafe)
 #     DEMO     which demo project to drive: arena|rts|hockey (default arena)
 #
 # IT DRIVES A DEMO PROJECT, NOT THE REPOSITORY ROOT. The root is not a Godot project -- OrbitNet is configured

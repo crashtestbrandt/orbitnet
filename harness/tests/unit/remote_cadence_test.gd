@@ -103,7 +103,7 @@ func test_a_body_crossing_the_radius_is_banded_per_observation() -> void:
 func test_the_default_radius_suits_an_arena_rather_than_naming_a_network_quantity() -> void:
 	# The default is a distance a fight happens inside; a game at another scale must set its own. Pinned so
 	# that changing it is a deliberate act rather than a silent re-banding of every existing reading.
-	assert_almost_eq(RemoteCadence.new().near_radius_m, 105.0, 1e-6, "the default near band, in metres")
+	assert_almost_eq(RemoteCadence.new().near_radius_m, 105.0, 1e-6, "the default near band, in meters")
 
 # --- absences -------------------------------------------------------------------------------------
 
@@ -156,14 +156,14 @@ func test_a_body_seen_once_is_seen_but_not_moving() -> void:
 
 # --- out-of-order ticks ---------------------------------------------------------------------------
 
-func test_a_tick_that_went_backwards_records_nothing_and_re_bases() -> void:
+func test_a_tick_that_went_backward_records_nothing_and_re_bases() -> void:
 	# A window straddling a hard clock resync can hand the same body an older tick than the one before. A
 	# negative interval measures nothing, so it is dropped -- and the body re-bases on the tick it was last
 	# seen at rather than staying anchored to a future one.
 	var c: RemoteCadence = RemoteCadence.new()
 	c.observe(1, _pose(0), 0, NEAR)
 	c.observe(1, _pose(1), 5, NEAR)    # baseline change
-	c.observe(1, _pose(2), 3, NEAR)    # backwards: no gap
+	c.observe(1, _pose(2), 3, NEAR)    # backward: no gap
 	assert_eq(c.near_gaps().size(), 0, "a negative interval is not recorded")
 	c.observe(1, _pose(3), 9, NEAR)
 	assert_eq(c.near_gaps().size(), 1, "the next change is measurable again")

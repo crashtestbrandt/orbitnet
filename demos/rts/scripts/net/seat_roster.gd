@@ -37,7 +37,7 @@ const OFFLINE_SENDER: int = 0
 ## The listen host / dedicated server's own peer id.
 const SERVER_PEER: int = 1
 ## "No session identity" -- what a local host and a peer that claimed none both present. Such a seat is never
-## reclaimable, which is correct: there is nothing to recognise it by.
+## reclaimable, which is correct: there is nothing to recognize it by.
 const NO_SESSION: int = 0
 
 var _seat_of_peer: Dictionary[int, int] = {}

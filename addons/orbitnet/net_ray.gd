@@ -20,9 +20,9 @@ class Hit extends RefCounted:
 	var collider: Object = null      # the struck body (a PlayerBody for a player hit; static geometry otherwise)
 	var position: Vector3 = Vector3.ZERO
 	var normal: Vector3 = Vector3.ZERO
-	var distance: float = 0.0        # metres from the muzzle to the hit point
+	var distance: float = 0.0        # meters from the muzzle to the hit point
 
-## Cast a ray from `origin` along unit `dir` for `dist` metres in `space`, excluding `exclude` (the shooter's own
+## Cast a ray from `origin` along unit `dir` for `dist` meters in `space`, excluding `exclude` (the shooter's own
 ## body RID, so a point-blank shot never self-hits). `mask` is the collision-layer mask tested against. Returns a
 ## Hit (valid=false on a miss / bad args). `space` must be queried where the physics space is UNLOCKED -- the net
 ## tick loop (the server's _rollback_tick) qualifies; never call inside _integrate_forces (the space is locked).
@@ -51,7 +51,7 @@ static func cast(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3
 	hit.distance = origin.distance_to(position)
 	return hit
 
-## Sweep a SPHERE of `radius` from `origin` along unit `dir` for `dist` metres in `space` -- the "forgiving shape
+## Sweep a SPHERE of `radius` from `origin` along unit `dir` for `dist` meters in `space` -- the "forgiving shape
 ## cast" the survival INTERACTION pickup (`take`) wants instead of a thin ray: a fat tube down the aim so a
 ## near-miss still grabs the item. `mask` restricts the cast to a layer set (the take cast masks to the dedicated
 ## WorldItem layer so station geometry is invisible to it); NEAREST contact along the sweep wins. Returns a Hit
@@ -60,7 +60,7 @@ static func cast(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3
 ## never inside _integrate_forces).
 ##
 ## HOW: cast_motion finds the first-contact fraction along the sweep (nearest, and [0,0] when already overlapping at
-## the origin -- the point-blank grab); intersect_shape at that contact centre enumerates the contacting bodies and
+## the origin -- the point-blank grab); intersect_shape at that contact center enumerates the contacting bodies and
 ## we pick the one nearest `origin`, so a true nearest-hit is returned with the collider Object in hand (get_rest_info
 ## would give only a collider_id). A clean miss (cast_motion reports the full sweep clear) short-circuits.
 static func cast_sphere(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: Vector3, dist: float, radius: float, exclude: Array[RID] = [], mask: int = 0xFFFFFFFF) -> Hit:
@@ -87,7 +87,7 @@ static func cast_sphere(space: PhysicsDirectSpaceState3D, origin: Vector3, dir: 
 	var unsafe: float = motion[1]
 	if motion[0] >= 1.0 and unsafe >= 1.0:
 		return hit   # nothing in the swept tube
-	# Re-seat the sphere at the first-contact centre and enumerate the bodies it overlaps there; the cast already
+	# Re-seat the sphere at the first-contact center and enumerate the bodies it overlaps there; the cast already
 	# stopped at the nearest contact, so the nearest-to-origin overlap is the picked item (deterministic tie-break).
 	params.transform = Transform3D(Basis(), origin + d * dist * unsafe)
 	var results: Array[Dictionary] = space.intersect_shape(params, 16)

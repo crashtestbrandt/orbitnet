@@ -36,7 +36,7 @@ The rollback lane exists for input arriving **every tick** that can be **predict
 has exactly one thing like that — the command cursor — and it is not a unit.
 
 The cursor is also the **AOI anchor**, which is not a nice-to-have: `set_aoi_radius()` finds the rollback
-entity whose *input* authority is that peer and uses its first `Vector3` state property as the centre. A peer
+entity whose *input* authority is that peer and uses its first `Vector3` state property as the center. A peer
 with **no rollback body has no anchor**, so without one, interest management cannot function at all.
 
 It also demonstrates the server-authoritative split on a **non-character** entity — the API shape people most
@@ -129,7 +129,7 @@ slot is asserted to carry its own.
 - 2 seats × 48 = **96 units**: a full refresh every 2 net ticks, i.e. ~100 ms worst-case age at 20 Hz.
 
 **This page read ≈26 B/unit and ≈46 units, and neither was ever measured.** The header was 12.5 B until the
-entity's 64-bit id came off the wire in favour of a 16-bit session slot — a hash spread across the whole
+entity's 64-bit id came off the wire in favor of a 16-bit session slot — a hash spread across the whole
 64-bit range, so its varint cost 9.5 B on average. The real figures before that change were 32.5 B/unit and
 ≈37 units per peer per tick. See [protocol.md](protocol.md#entity-slots).
 
@@ -226,7 +226,7 @@ is a pure static function the client calls for itself, and a unit case asserts i
 That reply is also what fixed the order-RTT measurement. A refused order changes no sequence number, so the
 measurement had nothing to stop on and gave up after four seconds — blocking the next sample for that whole
 window and folding every refusal into the percentile as a four-second reading. It now cancels on the reply,
-keyed on the tag `request()` returned, so a second order issued before the first resolves cannot be cancelled
+keyed on the tag `request()` returned, so a second order issued before the first resolves cannot be canceled
 by an older refusal.
 
 The rate-limit branch replies too, and the alternative is worth stating: a refusal is one reliable packet per
@@ -294,7 +294,7 @@ every peer. Fog of war is a property of the *pair*: seat 0 can see a unit that s
 instant, at the same distance. `Net.set_entity_hidden(peer, entity, true)` is the only call in the facade that
 can say that.
 
-The behaviour a veto has is exactly the one the genre wants: **the rows stop and the node stays**, frozen at
+The behavior a veto has is exactly the one the genre wants: **the rows stop and the node stays**, frozen at
 the last pose that arrived. That is the last-known-position ghost, and it costs no code.
 
 `ScoutPolicy` decides and reports only what CHANGED. Re-asserting a veto that is already in force clears that
@@ -310,17 +310,17 @@ the server sends itself none.
 
 **F7**, or `--observe` at launch.
 
-A peer with no rollback body has no interest centre, and a peer with no centre is filtered in nowhere — the
+A peer with no rollback body has no interest center, and a peer with no center is filtered in nowhere — the
 backend falls open and sends it everything. That is why this demo puts a cursor on the rollback lane at all,
 and why a seatless peer used to be refused at the door.
 
 `Net.set_peer_anchor()` removes the compulsion. An observer holds no seat, drives no commander, and has its
-centre declared for it; **F8** cycles between its own camera (`set_peer_anchor`) and following a seat's lead
+center declared for it; **F8** cycles between its own camera (`set_peer_anchor`) and following a seat's lead
 unit (`set_peer_anchor_entity`). A peer arriving at a full table is now admitted as an observer instead of
 disconnected.
 
 The declaration is throttled — an observer pans every frame, and one reliable message per frame restating a
-centre that slid twenty centimetres is how a spectator costs more than a player.
+center that slid twenty centimeters is how a spectator costs more than a player.
 
 ## Reconnection: the seat is the player's, not the connection's
 
@@ -373,7 +373,7 @@ later `seat released -- peer N did not return`, and the next joiner takes seat 1
   and the render representation are demonstrably separable. Each unit's barrel exists so replicated *facing*
   is legible — a capsule has no visible orientation, and without it the `(sin, cos)` packing looks like a
   flourish.
-- **Formation slots, not neighbour separation.** Separation is an O(n²) force loop whose output depends on
+- **Formation slots, not neighbor separation.** Separation is an O(n²) force loop whose output depends on
   iteration order; giving each unit its own destination removes the contention at the source.
 - **No win condition.** A respawn drip holds a steady state, so the demo can be left running.
 

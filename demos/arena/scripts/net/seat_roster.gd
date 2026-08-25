@@ -4,7 +4,7 @@ class_name SeatRoster
 ##
 ## THE PLURAL IS THE WHOLE DIFFERENCE FROM THE OTHER TWO DEMOS. Both of those seat one player per connection
 ## and leave every body at seat 0, which is what a connection gets for free. Here a connection may drive two,
-## and each is a seat in the backend's sense: its own interest anchor, its own centre, its own world, its own
+## and each is a seat in the backend's sense: its own interest anchor, its own center, its own world, its own
 ## hysteresis band. The connection receives the UNION of its seats' sets, with the nearest seat's distance kept
 ## per entity -- so what a split-screen player sees on the left half of the screen is not culled around where
 ## the right half is looking.
@@ -35,7 +35,7 @@ var _seats_of_session: Dictionary[int, PackedInt32Array] = {}
 ## Give `peer` up to `count` seats, or hand back the ones it already holds.
 ##
 ## `session_id` reclaims HELD seats when that identity is holding any; the caller decides whether a presented
-## identity is worth honouring. `spread` puts the second seat in the NEXT arena rather than beside the first,
+## identity is worth honoring. `spread` puts the second seat in the NEXT arena rather than beside the first,
 ## which is the case worth having a flag for: a connection with a body in two worlds has no defined world of
 ## its own until it declares one.
 ##

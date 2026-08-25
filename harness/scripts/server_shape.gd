@@ -29,7 +29,7 @@ extends Node
 ## second, independent reading.
 ##
 ## THE ROLLBACK LANE IS HERE FOR THE SERVER'S SAKE, and it predicts on the client too. A seated peer's body
-## is what gives the server an OWNED row -- the row the send path reads a peer's interest centre off, and the
+## is what gives the server an OWNED row -- the row the send path reads a peer's interest center off, and the
 ## thing a listen server has one more of than a dedicated one. The client also predicts the seat it is given,
 ## which takes one non-obvious pair of calls (see `_bind_channels` and `_apply_owners`) because a client binds
 ## before it knows its seat. Both peers COUNT their rollback ticks and assert on the count: a client that
@@ -55,10 +55,10 @@ extends Node
 ## the entity ids -- are identical everywhere. Only who OWNS them differs.
 const SEATS: int = 2
 
-## Metres of interest radius. Nothing in this world gets more than a few metres from the origin, so this culls
+## Meters of interest radius. Nothing in this world gets more than a few meters from the origin, so this culls
 ## nothing; it is set only to make the per-peer interest pass run.
 const _AOI_RADIUS_M: float = 500.0
-## Metres of band scale. Sized with the radius for the same reason -- one band, no reordering, the pass runs.
+## Meters of band scale. Sized with the radius for the same reason -- one band, no reordering, the pass runs.
 const _AOI_BAND_M: float = 250.0
 
 ## Where each peer stops sampling and prints its verdict, in seconds after the session starts. A coupled 60 Hz
@@ -75,7 +75,7 @@ class SeatInput extends Node:
 	var nin_move: Vector3 = Vector3.ZERO
 
 ## One seat's body. The rollback lane, so a seated peer contributes an OWNED row: that row is what the send
-## path reads a peer's interest centre off, and holding one is the whole of what a listen server has and a
+## path reads a peer's interest center off, and holding one is the whole of what a listen server has and a
 ## dedicated server does not.
 class SeatBody extends Node3D:
 	var sim_pos: Vector3 = Vector3.ZERO

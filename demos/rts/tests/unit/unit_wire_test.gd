@@ -35,7 +35,7 @@ func test_fields_do_not_bleed_into_each_other() -> void:
 	assert_eq(UnitBody.meta_target(meta), RtsConfig.UNIT_COUNT - 1, "the largest valid target fits")
 	assert_eq(UnitBody.meta_seq(meta), 65535, "the largest sequence fits")
 
-func test_the_sequence_wraps_rather_than_corrupting_neighbours() -> void:
+func test_the_sequence_wraps_rather_than_corrupting_neighbors() -> void:
 	# A sequence is only ever COMPARED for change, never ordered globally, so wrapping is fine -- but it must
 	# wrap inside its own field rather than carrying into the liveness bit.
 	var meta: int = UnitBody.pack_meta(true, 3, 65536 + 5)

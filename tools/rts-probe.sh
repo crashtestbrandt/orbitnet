@@ -10,7 +10,7 @@
 #      entity-id agreement. This is the assertion that catches the silent failure: with mismatched ids,
 #      nothing errors and nothing moves.
 #   3. Each peer saw the order's sequence number reach every unit it named.
-#   4. The two peers agree about where seat 0's army is, by CENTROID, within a couple of metres.
+#   4. The two peers agree about where seat 0's army is, by CENTROID, within a couple of meters.
 #      Deliberately not a per-unit hash: peers observe different ticks by construction.
 #   5. A forged foreign-seat order changed nothing, AND the client was told it was refused.
 #   6. The worst refresh interval of an actively-moving unit stayed under bound -- i.e. no unit is starving
@@ -27,7 +27,7 @@ PROJECT="$ROOT/demos/rts"
 GODOT="${GODOT:-$ROOT/tools/godot-quiet.sh}"
 WATCHDOG_S="${RTS_PROBE_WATCHDOG_S:-70}"
 RUN_S="${RTS_PROBE_RUN_S:-18}"
-# Metres of disagreement tolerated between the two peers' army centroids.
+# Meters of disagreement tolerated between the two peers' army centroids.
 CENTROID_TOLERANCE="${RTS_PROBE_CENTROID_M:-2.0}"
 
 HOST_LOG="$(mktemp "${TMPDIR:-/tmp}/rtsprobe-host.XXXXXX")"

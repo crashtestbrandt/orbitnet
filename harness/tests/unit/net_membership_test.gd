@@ -5,7 +5,7 @@ extends UnitTest
 ## What is worth testing on the handles is the RELEVANCY PROMOTION RULE and nothing else. Both handles are thin
 ## forwarders, but `NetStateHandle.set_membership()` decides a value: a channel that has already declared an
 ## anchor must stay ANCHORED (culled by distance WITHIN its world), while one still on the default ALWAYS is
-## promoted to MEMBERSHIP (one world, no distance test). Getting that backwards silently un-culls every
+## promoted to MEMBERSHIP (one world, no distance test). Getting that backward silently un-culls every
 ## anchored channel, which is a bandwidth regression no assertion elsewhere would catch.
 ##
 ## The backend synchronizer is stubbed by a plain Node carrying the same property names. The handles hold their
@@ -164,7 +164,7 @@ func test_inert_handles_report_no_entity_id() -> void:
 # - The OFFLINE / old-binary answer is a FULLY KEYED dictionary with `stale` true. A caller indexes these keys
 #   directly, and a missing key is a `nil` reaching a typed local -- an abort, not a fallback. Every other
 #   degrade path in this facade answers a zero of the right shape and these must too.
-# - `stale` is true in that answer, not false. `false` would claim "centred at the origin, in world 0" for every
+# - `stale` is true in that answer, not false. `false` would claim "centered at the origin, in world 0" for every
 #   peer in a session that never ran the pass, which is a description of a filter that is not running.
 # - The enum NUMBERS are a contract with the backend, which stores and returns the raw int.
 # - A number outside `UnanchoredPolicy` clamps to OPEN, the direction that withholds nothing from anybody.
@@ -173,7 +173,7 @@ func test_inert_handles_report_no_entity_id() -> void:
 # path is the ordinary checkout rather than a hypothetical, and these calls have no business erroring there.
 
 const ANCHOR_KEYS: Array[String] = [
-	"source", "viewpoints", "membership", "located", "centre", "open", "ambiguous", "stale",
+	"source", "viewpoints", "membership", "located", "center", "open", "ambiguous", "stale",
 ]
 
 func test_the_anchor_source_enum_matches_the_backend_numbering() -> void:
@@ -191,7 +191,7 @@ func test_the_unanchored_policy_enum_matches_the_backend_numbering() -> void:
 
 func test_an_unanswerable_peer_anchor_is_fully_keyed_and_stale() -> void:
 	# The degrade path, and the one this suite actually runs. Every key present, every value a zero of the right
-	# TYPE -- `centre` a Vector3 rather than a 0 -- so a caller's typed local takes it without a check.
+	# TYPE -- `center` a Vector3 rather than a 0 -- so a caller's typed local takes it without a check.
 	var info: Dictionary[String, Variant] = Net.peer_anchor(4)
 	for key: String in ANCHOR_KEYS:
 		assert_true(info.has(key), "key %s is present even with nothing to report" % key)
@@ -201,8 +201,8 @@ func test_an_unanswerable_peer_anchor_is_fully_keyed_and_stale() -> void:
 	assert_eq(info["source"], int(Net.AnchorSource.NONE), "no anchor came from anywhere")
 	assert_eq(info["viewpoints"], 0, "no viewpoint was resolved")
 	assert_eq(info["membership"], 0, "and no world is in effect")
-	var centre: Vector3 = info["centre"]
-	assert_eq(centre, Vector3.ZERO, "an unlocated centre reads as the zero vector, not as a stale position")
+	var center: Vector3 = info["center"]
+	assert_eq(center, Vector3.ZERO, "an unlocated center reads as the zero vector, not as a stale position")
 	var located: bool = info["located"]
 	assert_false(located, "nothing was located")
 	var open: bool = info["open"]
@@ -213,8 +213,8 @@ func test_an_unanswerable_peer_anchor_is_fully_keyed_and_stale() -> void:
 func test_an_unanswerable_seat_anchor_is_fully_keyed() -> void:
 	var info: Dictionary[String, Variant] = Net.seat_anchor(4, 1)
 	assert_eq(info.size(), 3, "the seat answer is exactly its three keys")
-	var centre: Vector3 = info["centre"]
-	assert_eq(centre, Vector3.ZERO, "no centre")
+	var center: Vector3 = info["center"]
+	assert_eq(center, Vector3.ZERO, "no center")
 	var located: bool = info["located"]
 	assert_false(located, "and it says so rather than reporting the origin as a position")
 	assert_eq(info["membership"], 0, "and no world")

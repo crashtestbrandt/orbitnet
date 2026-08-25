@@ -11,7 +11,7 @@ class_name RtsMain
 ##   --join=ADDR[:PORT]  client
 ##   --dedicated[=PORT]  authoritative server with no local player (headless)
 ##   --session=N         pin this peer's session identity, so a RESTARTED process reclaims its seat
-##   --observe           watch without playing: no seat, no commander, an interest centre DECLARED by the
+##   --observe           watch without playing: no seat, no commander, an interest center DECLARED by the
 ##                       server and driven by this peer's camera
 ##   --rts-probe         attach the automated gate (tools/instr/rts_probe.gd)
 ##   --bench             attach netbench's harness with this demo's BenchSubject

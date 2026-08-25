@@ -10,8 +10,8 @@ class_name CommanderAvatar
 ##
 ## 2. IT IS THE AOI ANCHOR, AND WITHOUT IT AOI CANNOT FUNCTION AT ALL. The backend computes a peer's interest
 ##    set by finding the rollback entity whose INPUT authority is that peer, taking its first Vec3 state
-##    property as the centre, and culling other rollback entities against it. A peer with no rollback body
-##    has no centre, and the backend correctly falls back to "everything stays in interest". So `cmd_cursor`
+##    property as the center, and culling other rollback entities against it. A peer with no rollback body
+##    has no center, and the backend correctly falls back to "everything stays in interest". So `cmd_cursor`
 ##    being the first registered Vec3 state property is not incidental -- it is what `Net.set_aoi_radius()`
 ##    reads.
 ##
@@ -28,7 +28,7 @@ var cmd_cursor: Vector3 = Vector3.ZERO
 ## that is presentation-only and whose exact tick nobody cares about.
 var cmd_sel_count: int = 0
 
-## COSMETIC: the live drag box on the ground, as (centre x, centre z, half-extent). Zero half-extent means no
+## COSMETIC: the live drag box on the ground, as (center x, center z, half-extent). Zero half-extent means no
 ## drag in progress. A square rather than a rectangle so it fits one Vector3 and quantizes as one @half --
 ## the box is a hint that a player is selecting, not a UI element anyone measures.
 var cmd_drag: Vector3 = Vector3.ZERO
@@ -79,7 +79,7 @@ func bind_net() -> void:
 ## The "simulation" is deliberately one line of validation: the authoritative cursor is the client's requested
 ## cursor, CLAMPED to the field. That is small but it is not trivial -- it is the moment a client-authored
 ## value becomes server-owned state, and it is where a bounds check belongs. A client that writes a cursor a
-## kilometre off the map gets a cursor at the map edge, on every peer, including its own after reconciliation.
+## kilometer off the map gets a cursor at the map edge, on every peer, including its own after reconciliation.
 func _rollback_tick(_delta: float, _tick: int, _is_fresh: bool) -> void:
 	cmd_cursor = UnitSteering.clamp_to_field(input.nin_cursor, 0.0)
 	# Keep the transform on the cursor as well. Nothing replicates it (the transform is not a registered
@@ -113,9 +113,9 @@ func set_local_cursor(point: Vector3) -> void:
 	input.nin_cursor = point
 
 ## Publish the presentation-only selection state onto the cosmetic channel.
-func set_selection_hint(count: int, drag_centre: Vector3, drag_half_extent: float) -> void:
+func set_selection_hint(count: int, drag_center: Vector3, drag_half_extent: float) -> void:
 	cmd_sel_count = count
-	cmd_drag = Vector3(drag_centre.x, drag_centre.z, drag_half_extent)
+	cmd_drag = Vector3(drag_center.x, drag_center.z, drag_half_extent)
 
 ## Whether this avatar's owner is currently mis-predicting. Diagnostics for the HUD -- with a one-line sim
 ## this should essentially never be true, and if it is, something is wrong upstream of the demo.

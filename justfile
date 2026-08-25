@@ -232,8 +232,8 @@ arena-host PORT="47800":
 arena-join ADDR="127.0.0.1" SEATS="1":
     "{{godot}}" --path demos/arena -- --join={{ADDR}} --seats={{SEATS}}
 
-# A spectator: no seat, no fighter, and an interest centre AND ARENA declared for it by the server. Before
-# `Net.set_peer_anchor()` this peer had no centre, and a peer with no centre is filtered in nowhere.
+# A spectator: no seat, no fighter, and an interest center AND ARENA declared for it by the server. Before
+# `Net.set_peer_anchor()` this peer had no center, and a peer with no center is filtered in nowhere.
 arena-observe ADDR="127.0.0.1":
     "{{godot}}" --path demos/arena -- --join={{ADDR}} --observe
 
@@ -315,8 +315,8 @@ assetlib-zip VERSION="dev":
     out="build/orbitnet-{{VERSION}}.zip"
     mkdir -p build
     rm -f "$out"
-    # Include the licences: an addon installed from a zip carries no repository around with it, and a user
-    # who cannot find the licence terms inside the thing they installed will assume the worst.
+    # Include the licenses: an addon installed from a zip carries no repository around with it, and a user
+    # who cannot find the license terms inside the thing they installed will assume the worst.
     cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
     zip -qr "$out" addons/orbitnet addons/orbitnet_native
     rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md

@@ -96,7 +96,7 @@ func test_this_peer_holds_no_resume_token_until_a_server_mints_one() -> void:
 func test_restoring_a_resume_token_either_round_trips_or_degrades_to_zero() -> void:
 	# The persistence path: a game restores the token beside the stored session id, in either order, before it
 	# joins. Against a binary that predates the call the write is a no-op and the read answers 0 -- the
-	# degraded answer every backwards-compatible accessor on this facade gives -- and the game still runs.
+	# degraded answer every backward-compatible accessor on this facade gives -- and the game still runs.
 	var stored: int = 0x0123456789abcdef
 	Net.set_resume_token(stored)
 	var read_back: int = Net.resume_token()

@@ -5,12 +5,12 @@ class_name ObserverDesk
 ##
 ## PURE. No tree, no `Net` calls, no signals -- this decides, and the session layer declares. That split is
 ## what makes the throttle testable at all, and the throttle is not optional: an observer pans continuously,
-## and one reliable message per frame to restate a centre that slid 20 cm is how a spectator costs more than a
+## and one reliable message per frame to restate a center that slid 20 cm is how a spectator costs more than a
 ## player.
 ##
 ## THE ARENA IS HALF THE DECLARATION, AND IT IS THE HALF THAT CANNOT BE INFERRED. A player's world is read off
 ## the body its input drives; an observer drives none, so without a declared world it is in world 0 -- which
-## the facade reads as EVERY world. An observer that declared only a centre would be watching one point in all
+## the facade reads as EVERY world. An observer that declared only a center would be watching one point in all
 ## three arenas at once, which is the fail-open answer rather than a viewpoint.
 ##
 ## TWO MODES, BECAUSE THE FACADE OFFERS TWO CALLS.
@@ -21,7 +21,7 @@ class_name ObserverDesk
 ##
 ## A TRACKED ENTITY THAT DESPAWNS LEAVES THE PEER WHERE IT LAST WAS, and the desk keeps reporting TRACKED
 ## until the game says otherwise. That is the facade's rule rather than a choice made here: a membership is a
-## declaration and did not fail, while a centre is a measurement and did.
+## declaration and did not fail, while a center is a measurement and did.
 
 enum Mode {
 	## Watching a ground point.
@@ -30,7 +30,7 @@ enum Mode {
 	TRACKED,
 }
 
-## Metres the fixed point must move before a fresh declaration earns a reliable message.
+## Meters the fixed point must move before a fresh declaration earns a reliable message.
 const RESEND_DISTANCE_M: float = 3.0
 ## The longest a declaration may go unrefreshed regardless of movement, so an observer that panned once and
 ## stopped is still corrected if the message that carried it was lost.
@@ -52,7 +52,7 @@ var _sent_at_s: float = NEVER_SENT_S
 
 # --- what is being watched -----------------------------------------------------------------------
 ## Watch a ground point in `arena_id`. The point is ARENA-LOCAL, because that is the frame every anchor in
-## this session is expressed in -- an observer declaring a world position would be declaring a centre 1200 m
+## this session is expressed in -- an observer declaring a world position would be declaring a center 1200 m
 ## from every entity in the arena it named.
 func watch_point(point: Vector3, arena_id: int) -> void:
 	_mode = Mode.FIXED
@@ -60,7 +60,7 @@ func watch_point(point: Vector3, arena_id: int) -> void:
 	_arena = arena_id
 
 ## Watch an entity. `0` is the facade's retraction value and is refused here rather than passed on: a desk in
-## TRACKED mode with no entity would declare a centre and immediately retract it, once per resend interval,
+## TRACKED mode with no entity would declare a center and immediately retract it, once per resend interval,
 ## forever.
 func watch_entity(entity_id: int, arena_id: int) -> bool:
 	if entity_id == 0:
@@ -86,8 +86,8 @@ func arena() -> int:
 ## Whether the current declaration differs from the one last sent by enough to be worth resending.
 ##
 ## A MODE CHANGE OR AN ARENA CHANGE IS ALWAYS DUE, whatever the distance or the clock says. The two modes are
-## different facade calls, and the arena is a different world -- an observer that walked its centre from arena
-## 1 to the same local point in arena 2 moved zero metres and changed everything it can see.
+## different facade calls, and the arena is a different world -- an observer that walked its center from arena
+## 1 to the same local point in arena 2 moved zero meters and changed everything it can see.
 func due(now_s: float) -> bool:
 	if not _sent:
 		return true

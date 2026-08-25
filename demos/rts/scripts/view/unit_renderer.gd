@@ -40,10 +40,10 @@ func build(world: WorldDirector, controller: CommanderController) -> void:
 	for seat: int in RtsConfig.SEATS:
 		for kind: int in _KIND_COUNT:
 			var slot: int = seat * _KIND_COUNT + kind
-			var colour: Color = RtsConfig.seat_color(seat)
-			_bodies[slot] = _add_layer("Body_s%d_k%d" % [seat, kind], _body_mesh(kind), colour)
+			var color: Color = RtsConfig.seat_color(seat)
+			_bodies[slot] = _add_layer("Body_s%d_k%d" % [seat, kind], _body_mesh(kind), color)
 			_barrels[slot] = _add_layer("Barrel_s%d_k%d" % [seat, kind], _barrel_mesh(kind),
-				colour.lightened(0.35))
+				color.lightened(0.35))
 	_rings = _add_layer("SelectionRings", _ring_mesh(), Color(0.95, 0.95, 0.55), true)
 	_bars = _add_layer("HealthBars", _bar_mesh(), Color.WHITE, true)
 
@@ -125,12 +125,12 @@ func _draw_selection() -> void:
 	_rings.visible_instance_count = count
 
 # --- buffer + mesh construction --------------------------------------------------------------------
-func _add_layer(layer_name: String, mesh: Mesh, tint: Color, per_instance_colour: bool = false) -> MultiMesh:
+func _add_layer(layer_name: String, mesh: Mesh, tint: Color, per_instance_color: bool = false) -> MultiMesh:
 	var multi: MultiMesh = MultiMesh.new()
 	multi.transform_format = MultiMesh.TRANSFORM_3D
 	# use_colors MUST be set before instance_count: the buffer stride is decided when the count is assigned,
-	# and enabling colours afterwards silently reallocates without them.
-	multi.use_colors = per_instance_colour
+	# and enabling colors afterward silently reallocates without them.
+	multi.use_colors = per_instance_color
 	multi.mesh = mesh
 	multi.instance_count = RtsConfig.UNIT_COUNT
 	multi.visible_instance_count = 0
@@ -138,7 +138,7 @@ func _add_layer(layer_name: String, mesh: Mesh, tint: Color, per_instance_colour
 	var material: StandardMaterial3D = StandardMaterial3D.new()
 	material.albedo_color = tint
 	material.roughness = 0.75
-	if per_instance_colour:
+	if per_instance_color:
 		material.vertex_color_use_as_albedo = true
 		# Rings and bars are UI drawn in 3D: they must read the same in shadow as in sunlight, so they are
 		# unshaded. A health bar that dims when a unit walks behind a box is a bar you cannot trust.

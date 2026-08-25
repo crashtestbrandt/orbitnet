@@ -67,7 +67,7 @@ var _near_gaps: Array[int] = []
 var _far_gaps: Array[int] = []
 var _absences: int = 0
 
-## Observe one body's replicated pose at `tick`, `dist` metres from the local player. Call once per net tick per
+## Observe one body's replicated pose at `tick`, `dist` meters from the local player. Call once per net tick per
 ## watched body.
 ##
 ## The FIRST observation of a body seeds a baseline only: we do not know how long it had been sitting there

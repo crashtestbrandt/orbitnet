@@ -28,7 +28,7 @@ signal world_built()
 ## ticks later has already let the cloak reach the peer it exists to hide it from. On the rollback lane that
 ## row carries the cloak FLAG, so the peer does not merely see a stale pose: it learns the fighter cloaked.
 const VETO_REFRESH_TICKS: int = 12
-## How close a fighter must be to the cloak spot to take it, metres.
+## How close a fighter must be to the cloak spot to take it, meters.
 const CLOAK_PICKUP_M: float = 1.6
 
 var fighters: Array[FighterBody] = []
@@ -502,7 +502,7 @@ func _apply_shot(sender_id: int, payload: Dictionary) -> int:
 		return ShotValidator.Verdict.OK as int
 	# QUEUED, NOT WRITTEN. This handler runs OUTSIDE the tick, and the health it would write lives on the
 	# ROLLBACK lane -- the next restore would put it back and the fighter would never die. Whether the hit is
-	# fatal is therefore decided inside the tick, and `_credit_kills()` reads the answer afterwards.
+	# fatal is therefore decided inside the tick, and `_credit_kills()` reads the answer afterward.
 	struck.queue_damage(ArenaConfig.SHOT_DAMAGE, fighter.seat)
 	return ShotValidator.Verdict.OK as int
 

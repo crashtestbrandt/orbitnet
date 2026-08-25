@@ -189,7 +189,7 @@ Godot on each. `GAUNTLET_DRYRUN=1` prints the plan without touching anything.
 
 ## What it deliberately does not do
 
-- **It is not a PR gate.** The numbers depend on the machine. CI gates correctness; this measures behaviour.
+- **It is not a PR gate.** The numbers depend on the machine. CI gates correctness; this measures behavior.
 - **It does not assert cross-client determinism.** The server is authoritative; bots need only be
   reproducible.
 - **It does not simulate bandwidth caps or NAT.** Latency, jitter, loss, duplication and reordering only.

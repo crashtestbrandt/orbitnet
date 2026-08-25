@@ -182,4 +182,4 @@ func test_clear_forgets_everyone() -> void:
 	roster.hold(10, SESSION_A)
 	roster.clear()
 	assert_eq(roster.occupied(), 0, "session teardown empties the table")
-	assert_eq(roster.reserved(), 0, "and leaves no reclaims for the next session to honour")
+	assert_eq(roster.reserved(), 0, "and leaves no reclaims for the next session to honor")

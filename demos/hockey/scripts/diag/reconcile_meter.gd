@@ -1,6 +1,6 @@
 extends RefCounted
 class_name ReconcileMeter
-## The demo's signature number: how far the predicted puck was from the authoritative one, in millimetres.
+## The demo's signature number: how far the predicted puck was from the authoritative one, in millimeters.
 ##
 ## HOW IT IS MEASURED. The puck records its simulated position the FIRST time a tick is simulated, and compares
 ## on every later pass over that same tick. A later pass only happens because an authoritative row arrived and
@@ -27,7 +27,7 @@ const RING: int = 128
 ## p99 worth printing, short enough that flipping a lever moves it while you are still looking at it.
 const WINDOW: int = 240
 
-## Recorded correction magnitudes, in metres, oldest first.
+## Recorded correction magnitudes, in meters, oldest first.
 var _errors: PackedFloat32Array = PackedFloat32Array()
 var _ticks: PackedInt64Array = PackedInt64Array()
 var _positions: PackedVector3Array = PackedVector3Array()
@@ -69,7 +69,7 @@ func percentile_mm(fraction: float) -> float:
 	var index: int = roundi(clampf(fraction, 0.0, 1.0) * float(sorted.size() - 1))
 	return sorted[index] * 1000.0
 
-## The most recent recorded correction, in millimetres. 0.0 before the first one.
+## The most recent recorded correction, in millimeters. 0.0 before the first one.
 ##
 ## Separate from the percentiles because it is the only one of these figures with a TIME to it. A percentile
 ## over a rolling window barely moves frame to frame, so plotting one produces a staircase pinned at whatever
@@ -80,7 +80,7 @@ func last_error_mm() -> float:
 		return 0.0
 	return _errors[_errors.size() - 1] * 1000.0
 
-## The largest correction in the window, in millimetres.
+## The largest correction in the window, in millimeters.
 func peak_mm() -> float:
 	var peak: float = 0.0
 	for error: float in _errors:

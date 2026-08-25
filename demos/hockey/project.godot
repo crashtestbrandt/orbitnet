@@ -12,7 +12,7 @@ config_version=5
 [application]
 
 config/name="OrbitNet Air Hockey Demo"
-config/description="Air hockey demonstrating OrbitNet's rollback lane on a SHARED object: every peer predicts the puck through the real simulation and reconciles it against the server, and the correction is reported in millimetres."
+config/description="Air hockey demonstrating OrbitNet's rollback lane on a SHARED object: every peer predicts the puck through the real simulation and reconciles it against the server, and the correction is reported in millimeters."
 run/main_scene="res://scenes/hockey_main.tscn"
 ; Declared as 4.4 to match the extension's compatibility_minimum. A newer editor opens it fine (and offers to
 ; bump this line); the point is that a 4.4 user is not locked out.

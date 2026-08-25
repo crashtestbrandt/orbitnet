@@ -29,7 +29,7 @@ func test_moves_toward_goal() -> void:
 	var goal: Vector3 = Vector3(20.0, 0.0, 0.0)
 	var out: UnitSteering.State = UnitSteering.step(state, goal, _no_obstacles(), _scout(), 0.05)
 	assert_true(out.position.x > 0.0, "a unit steps toward its goal")
-	assert_almost_eq(out.position.z, 0.0, _EPS, "and does not drift off the axis it is travelling along")
+	assert_almost_eq(out.position.z, 0.0, _EPS, "and does not drift off the axis it is traveling along")
 	assert_almost_eq(out.position.y, 0.0, _EPS, "movement stays on the ground plane")
 
 func test_arrives_and_settles() -> void:
@@ -90,7 +90,7 @@ func test_facing_chases_velocity() -> void:
 	var goal: Vector3 = Vector3(0.0, 0.0, 30.0)   # +Z is yaw 0 under the convention
 	for _i: int in 60:
 		state = UnitSteering.step(state, goal, _no_obstacles(), _scout(), 0.05)
-	assert_almost_eq(state.facing, 0.0, 0.05, "travelling +Z settles at yaw 0")
+	assert_almost_eq(state.facing, 0.0, 0.05, "traveling +Z settles at yaw 0")
 	var forward: Vector3 = UnitSteering.forward_of(state.facing)
 	assert_vec_almost_eq(forward, Vector3(0.0, 0.0, 1.0), 0.05, "and forward_of agrees with it")
 
@@ -129,7 +129,7 @@ func test_zero_and_negative_dt_are_no_ops() -> void:
 	var zero: UnitSteering.State = UnitSteering.step(state, Vector3(20.0, 0.0, 0.0), _no_obstacles(), _scout(), 0.0)
 	assert_vec_almost_eq(zero.position, state.position, _EPS, "dt = 0 moves nothing")
 	var negative: UnitSteering.State = UnitSteering.step(state, Vector3(20.0, 0.0, 0.0), _no_obstacles(), _scout(), -0.05)
-	assert_vec_almost_eq(negative.position, state.position, _EPS, "a negative dt never runs the sim backwards")
+	assert_vec_almost_eq(negative.position, state.position, _EPS, "a negative dt never runs the sim backward")
 
 func test_is_finite_vec() -> void:
 	assert_true(UnitSteering.is_finite_vec(Vector3(1.0, 2.0, 3.0)), "an ordinary vector is finite")

@@ -4,7 +4,7 @@
 
 It makes an argument the RTS demo cannot: **the rollback lane is not only for the body you author**. The puck
 is authored by nobody, and every peer predicts it through the real simulation and reconciles it against the
-server. How far wrong that prediction was, in millimetres, is the number on screen.
+server. How far wrong that prediction was, in millimeters, is the number on screen.
 
 ```sh
 just hockey        # single player, no networking at all
@@ -140,15 +140,15 @@ excluded:
 
 | Excluded | Why |
 |---|---|
-| **The join sync** | A client builds its own puck and predicts it forward before any authoritative row has arrived, so the first row rewinds it onto a puck that was somewhere else. A third of a metre is typical. It happens once per session, but the percentile window holds it for the rest of the run — measured on an otherwise untouched puck it was the *only* sample ever taken, so p50, p99 and peak all reported that one join. |
-| **A face-off** | The puck is teleported to the centre spot, so a peer that placed the goal one tick differently differs by half a table. Real, and a different quantity from drift. |
+| **The join sync** | A client builds its own puck and predicts it forward before any authoritative row has arrived, so the first row rewinds it onto a puck that was somewhere else. A third of a meter is typical. It happens once per session, but the percentile window holds it for the rest of the run — measured on an otherwise untouched puck it was the *only* sample ever taken, so p50, p99 and peak all reported that one join. |
+| **A face-off** | The puck is teleported to the center spot, so a peer that placed the goal one tick differently differs by half a table. Real, and a different quantity from drift. |
 
 So a sample is recorded only for a tick the puck was **live on both passes**, and only after the first
 authoritative row has landed. The number then means one thing.
 
 `net_pos` rides as three IEEE-754 binary16s, whose spacing near a table coordinate of 1 m is about a
-millimetre, and the backend writes the quantized value back after every record so every peer replays from the
-same canonical basis. A correction cannot be measured below that. The table is sized in metres partly for this
+millimeter, and the backend writes the quantized value back after every record so every peer replays from the
+same canonical basis. A correction cannot be measured below that. The table is sized in meters partly for this
 reason: ten times the table and the floor would be the number.
 
 ### The view absorbs the correction, and knows when not to
@@ -172,7 +172,7 @@ is nothing to hide.
 
 A correction below `CORRECTION_DEADBAND_M` is not counted at all. The extrapolation the detector compares
 against is a straight line while the simulation damps and substeps, so every tick disagrees by a fraction of a
-millimetre whether or not anything was corrected — without the deadband the blended count climbed once per
+millimeter whether or not anything was corrected — without the deadband the blended count climbed once per
 tick forever, including offline, where nothing is corrected.
 
 ## Teams and seating
@@ -225,7 +225,7 @@ The puck reads every mallet's pose; nothing writes the puck's. Whether a given m
 the puck's tick runs depends on the backend's replay order, which is **ascending entity id** — its planner
 keeps bodies in a `BTreeMap` precisely so replay order cannot vary. An entity id is FNV-1a of the node path, so
 the order is identical on every peer and is already covered by the world signature. At 60 Hz the difference
-between reading a mallet at the start or the end of a tick is under a centimetre.
+between reading a mallet at the start or the end of a tick is under a centimeter.
 
 ## The levers
 
@@ -293,7 +293,7 @@ transport signal is what makes a rejoiner come back onto the other team.
 
 **This demo takes the conservative rule, where the RTS demo takes the permissive one.** A session identity is
 client-asserted and unauthenticated, so a peer presenting an identity it watched someone else use takes that
-player's seat while the original keeps its connection with no error. So a reclaim is honoured only for an
+player's seat while the original keeps its connection with no error. So a reclaim is honored only for an
 identity this layer already saw `Net.peer_dropped` report with `held = true`. The price is the one the facade
 names: a player whose old socket the transport has not yet noticed is gone comes back as a newcomer. On a
 32-seat table that costs them their end of the rink, which is cheap; on the RTS's two-seat table it would cost

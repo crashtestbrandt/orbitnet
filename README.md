@@ -72,7 +72,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 | [getting-started.md](docs/getting-started.md) | Your first replicated body. **Start here.** |
 | [api.md](docs/api.md) | The full surface, wire quantization, and the f64/i64 scalar reality. |
 | [rts-demo.md](docs/rts-demo.md) | A worked example that is not a character shooter, with the byte budget spelled out. |
-| [hockey-demo.md](docs/hockey-demo.md) | The rollback lane on an object nobody authors, and the correction measured in millimetres. |
+| [hockey-demo.md](docs/hockey-demo.md) | The rollback lane on an object nobody authors, and the correction measured in millimeters. |
 | [arena-demo.md](docs/arena-demo.md) | Three interest axes, several seats on one connection, and a rewind sized per shooter and per target. |
 | [architecture.md](docs/architecture.md) | Crate layout, batching, history, prop roles, threading. |
 | [protocol.md](docs/protocol.md) | Wire format, clock, `is_fresh`, entity lifecycle. |
@@ -116,7 +116,7 @@ author**:
 - **State: the scoreboard**, because a goal found inside the tick would be erased by the next rollback restore.
 - **Command: `serve`**, one channel, refused while the puck is live.
 
-Its signature number is the **puck correction in millimetres** — the distance between what this peer predicted
+Its signature number is the **puck correction in millimeters** — the distance between what this peer predicted
 for a tick and what the server said about it, reported beside the wire quantization floor that bounds it.
 
 ## The arena demo
@@ -126,14 +126,14 @@ shooter wants and what neither other demo has. It exists to show that **who rece
 game**:
 
 - **Three arenas in one session**, each rebased to its own origin. What replicates is arena-local, so two
-  fighters standing on the same spot in different arenas are zero metres apart — no radius can separate them,
+  fighters standing on the same spot in different arenas are zero meters apart — no radius can separate them,
   and `set_membership()` is the only thing in the facade that can.
 - **A cloak is a per-peer veto.** `Net.set_entity_hidden()` withholds one fighter from the connections not on
   its team, which is a fact about a *pair* and therefore the one thing neither distance nor membership can
   say. A withheld client is told: `Net.entity_left_interest` fires, and the probe asserts on it.
 - **Split-screen is seats.** `--seats=2` drives two locally-predicted fighters on one connection, each with
   its own interest anchor, in two different arenas by default; the connection receives the union.
-- **An observer declares where it watches from.** No seat, no body, and therefore no inferred centre or world
+- **An observer declares where it watches from.** No seat, no body, and therefore no inferred center or world
   — `Net.set_peer_anchor()` supplies both, and a peer arriving at a full table is admitted rather than
   refused.
 - **The scorecard is membership only.** It replicates two integers and no position, so there is no distance to
@@ -165,7 +165,7 @@ any of them would be wrong for somebody.
   the authority they were given until the game changes them, which is what the reconnect grace window is for.
   `Net.set_seat_release_policy()` says otherwise in one call, and `Net.release_peer_seats(peer)` does it
   directly under any policy. Freeing the node is still yours.
-- **A peer that declares nothing still has its centre and world inferred.** Without `Net.set_peer_anchor()` or
+- **A peer that declares nothing still has its center and world inferred.** Without `Net.set_peer_anchor()` or
   `set_peer_anchor_entity()` both are read off the lowest-id rollback entity each of that peer's **seats**
   drives — so a seat driving more than one body is placed by whichever that is, and a peer driving none has
   neither and sees everything, uncapped, because an entity with no distance is kept uncullable and an
@@ -179,7 +179,7 @@ any of them would be wrong for somebody.
 - **A session identity is client-asserted; the token narrows what asserting one buys.** The server mints a
   **resume token** per identity, sends it in the welcome, and a rejoiner must quote it back — so a peer that
   merely *observed* somebody's session id, off a roster broadcast or a log line, can no longer take that
-  player's body. **An on-path observer still can**, because it reads the welcome the token travelled in. Under
+  player's body. **An on-path observer still can**, because it reads the welcome the token traveled in. Under
   the default policy a valid claim still beats a live connection, which is what makes a relaunched client's
   reconnect immediate rather than waiting out a keepalive; `Net.set_resume_policy(ONLY_IF_DROPPED)` refuses
   that, at the cost of every genuinely fast reconnect. **Persist the token beside the session id**, or a
@@ -200,12 +200,12 @@ any of them would be wrong for somebody.
   hundred lines of hand-written constant-time field arithmetic in a zero-dependency crate with no timing
   harness to prove it stayed constant-time.
 - **A peer's reported round trip is checked, and what the server believes is bounded.** The server mints a
-  token per snapshot frame from a secret it never transmits and refuses any acknowledgement that does not quote
+  token per snapshot frame from a secret it never transmits and refuses any acknowledgment that does not quote
   it back, so a peer cannot acknowledge a frame that never reached it. It can still acknowledge a frame
   **older** than the newest it holds, which reads as a slow link and is believed — indistinguishable from a
   peer behind a traffic shaper, and no wire field closes it, because `current - ack` is the whole round trip
   whatever tick lead a client runs at. The containment is `Net.rtt_believed_max_ms`, 250 ms by default: the
-  sample is clamped **at the read**, so every acknowledgement still buys everything else it bought and only
+  sample is clamped **at the read**, so every acknowledgment still buys everything else it bought and only
   the clock measurement is bounded. `Net.peer_rtt_raw_ms()` keeps a scoreboard ping honest, and
   `bandwidth_metrics()["rtt_at_ceiling_peers"]` says how many connections are asking for the deepest window.
 
@@ -223,7 +223,7 @@ any of them would be wrong for somebody.
   inside `_rollback_tick`, on the server. The full split is in
   [docs/protocol.md](docs/protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
 
-## Licence
+## License
 
 **MIT OR Apache-2.0**, at your option. See [LICENSE](LICENSE).
 

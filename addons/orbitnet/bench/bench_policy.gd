@@ -1,6 +1,6 @@
 extends RefCounted
 class_name BenchPolicy
-## Pure bot-behaviour policies for netbench. A policy is a PURE function of (elapsed time, seed) -> one
+## Pure bot-behavior policies for netbench. A policy is a PURE function of (elapsed time, seed) -> one
 ## per-tick input frame in the [BenchSubject] neutral vocabulary: no scene, no physics, no RNG state carried
 ## between calls, so it is deterministic and unit-testable in isolation. [BenchBot] is the thin driver that
 ## calls this each net tick and pushes the frame through [method BenchSubject.apply_input] -- the same seam a
@@ -8,7 +8,7 @@ class_name BenchPolicy
 ## bench-only shortcut.
 ##
 ## This is the "session-scale bot fleet" layer of the bench: real headless clients driven through the real
-## input path. The behaviours are deliberately simple, cyclic and motion-rich (strafing, turning, firing) so
+## input path. The behaviors are deliberately simple, cyclic and motion-rich (strafing, turning, firing) so
 ## a client generates continuous input, state churn and events for the netcode to replicate under
 ## impairment -- NOT to play the game well. The per-seed phase offset lets a fleet move out of lockstep (so N
 ## clients are not a single correlated waveform) while each stays reproducible.
@@ -17,7 +17,7 @@ class_name BenchPolicy
 ## A game maps the vocabulary onto its own input object; keys it has no use for are ignored, so the same
 ## five policies drive an EVA shooter and an RTS without either knowing about the other.
 
-## The behaviour catalog. Keep in sync with [method policy_from_name] / [method names].
+## The behavior catalog. Keep in sync with [method policy_from_name] / [method names].
 enum Policy {
 	IDLE,          # no input -- a still, connected body (baseline replication of a stationary remote)
 	STRAFE,        # oscillating strafe + gentle turn (steady actuation + rotation churn)

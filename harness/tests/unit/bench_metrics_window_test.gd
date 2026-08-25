@@ -80,7 +80,7 @@ func test_a_window_over_a_session_that_started_at_zero_reports_the_whole_total()
 	assert_eq(m.hits_confirmed(), 12, "and every confirm it earned")
 	m.free()
 
-func test_a_counter_that_goes_backwards_reports_zero_rather_than_a_negative() -> void:
+func test_a_counter_that_goes_backward_reports_zero_rather_than_a_negative() -> void:
 	# A respawn or a reconnect can re-seed a total the recorder had already read. A negative count is worse
 	# than no count: the hit-registration gate reads "fired a lot, confirmed nothing" as a broken mechanism.
 	var m: BenchMetrics = BenchMetrics.new()
@@ -158,7 +158,7 @@ func test_a_tilt_that_never_bleeds_away_holds_the_floor_up() -> void:
 
 func test_a_partial_window_earns_no_floor() -> void:
 	# Fewer samples than the trailing window is not evidence of a standing residual. Reporting one would fail
-	# an arm on the run's LENGTH rather than on its behaviour.
+	# an arm on the run's LENGTH rather than on its behavior.
 	var m: BenchMetrics = BenchMetrics.new()
 	for _i: int in range(0, STANDING_WINDOW - 1):
 		m._sample_orientation(_orientation(0, 0, 0.4, true), 0.0)
@@ -191,7 +191,7 @@ func test_the_floor_is_the_worst_window_and_a_later_recovery_does_not_erase_it()
 	assert_almost_eq(m.standing_orient_residual(), 0.3, 1e-6, "the standing period is measured")
 	for _i: int in range(0, STANDING_WINDOW * 2):
 		m._sample_orientation(_orientation(0, 0, 0.0, true), 0.0)
-	assert_almost_eq(m.standing_orient_residual(), 0.3, 1e-6, "and recovering afterwards does not erase it")
+	assert_almost_eq(m.standing_orient_residual(), 0.3, 1e-6, "and recovering afterward does not erase it")
 	m.free()
 
 func test_the_floor_rises_to_the_worst_standing_level_rather_than_the_first() -> void:

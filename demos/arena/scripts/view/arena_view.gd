@@ -67,8 +67,8 @@ func _build_props(root: Node3D, prop_count: int) -> void:
 	mesh.material_override = _flat(Color(0.42, 0.38, 0.30))
 	root.add_child(mesh)
 
-static func _flat(colour: Color) -> StandardMaterial3D:
+static func _flat(color: Color) -> StandardMaterial3D:
 	var material: StandardMaterial3D = StandardMaterial3D.new()
-	material.albedo_color = colour
+	material.albedo_color = color
 	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	return material

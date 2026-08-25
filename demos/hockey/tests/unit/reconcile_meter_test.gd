@@ -21,9 +21,9 @@ func test_a_replay_that_moves_the_puck_is_measured() -> void:
 	var meter: ReconcileMeter = ReconcileMeter.new()
 	meter.note(10, Vector3.ZERO)
 	var error: float = meter.note(10, Vector3(0.05, 0.0, 0.0))
-	assert_almost_eq(error, 0.05, 0.000001, "the correction is the distance between the two answers, in metres")
+	assert_almost_eq(error, 0.05, 0.000001, "the correction is the distance between the two answers, in meters")
 	assert_eq(meter.corrections(), 1, "and it counts")
-	assert_almost_eq(meter.percentile_mm(0.5), 50.0, 0.01, "reported to a human in millimetres")
+	assert_almost_eq(meter.percentile_mm(0.5), 50.0, 0.01, "reported to a human in millimeters")
 
 func test_the_latest_answer_becomes_the_new_record() -> void:
 	# A tick can be replayed more than once. Each pass is measured against the previous one, so a series of
@@ -90,7 +90,7 @@ func test_the_latest_correction_is_readable_on_its_own() -> void:
 	assert_almost_eq(meter.last_error_mm(), 0.0, 0.0001, "nothing recorded yet")
 	meter.note(1, Vector3.ZERO)
 	meter.note(1, Vector3(0.02, 0.0, 0.0))
-	assert_almost_eq(meter.last_error_mm(), 20.0, 0.01, "the most recent correction, in millimetres")
+	assert_almost_eq(meter.last_error_mm(), 20.0, 0.01, "the most recent correction, in millimeters")
 	meter.note(2, Vector3.ZERO)
 	meter.note(2, Vector3(0.005, 0.0, 0.0))
 	assert_almost_eq(meter.last_error_mm(), 5.0, 0.01, "and it follows the newest one, not the largest")

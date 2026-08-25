@@ -4,7 +4,7 @@ class_name BenchBot
 ## [BenchPolicy] for an input frame and pushes it through [method BenchSubject.apply_input] -- the same seam
 ## a recorded tape replays through and the same one the game's own scripted-input probes drive, so a bot
 ## exercises the real prediction + replication path (its input is recorded and replicated exactly like a
-## human's). All behaviour math is in BenchPolicy (pure, unit-tested); this class owns only the wiring.
+## human's). All behavior math is in BenchPolicy (pure, unit-tested); this class owns only the wiring.
 ##
 ## Attached by [BenchProbe] from the `--bench-bot=<policy>` CLI flag; never present in shipped play.
 ##

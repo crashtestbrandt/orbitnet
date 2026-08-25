@@ -159,7 +159,7 @@ impl ClockEstimator {
     /// **Prefer [`Self::needs_hard_resync_with_lead`].** This form compares the RAW offset, which is only
     /// the control error for a peer that wants zero offset. A client does not: it must run AHEAD of the
     /// server so its input arrives before the tick that consumes it, so its offset settles at minus the
-    /// lead it has dialled in, and testing the raw value fires the panic path on a perfectly healthy client.
+    /// lead it has dialed in, and testing the raw value fires the panic path on a perfectly healthy client.
     #[must_use]
     pub fn needs_hard_resync(&self, panic_threshold: f64) -> bool {
         self.needs_hard_resync_with_lead(panic_threshold, 0.0)

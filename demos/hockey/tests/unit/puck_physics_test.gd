@@ -95,7 +95,7 @@ func test_a_mallet_moving_away_does_not_suck_the_puck_in() -> void:
 	var result: PuckPhysics.State = PuckPhysics.resolve_mallets(
 		_state(mallet + Vector3(0.0, 0.0, contact * 0.9), Vector3.ZERO), positions, retreating)
 	assert_true(result.velocity.z >= -0.0001,
-		"a mallet pulling away leaves the puck alone rather than dragging it backwards through itself")
+		"a mallet pulling away leaves the puck alone rather than dragging it backward through itself")
 
 func test_concentric_contact_has_a_deterministic_answer() -> void:
 	# Exactly concentric has no contact normal. The answer is arbitrary; what matters is that it is the SAME

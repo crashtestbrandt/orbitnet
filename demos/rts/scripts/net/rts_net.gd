@@ -38,20 +38,20 @@ class_name RtsNet
 ## roster broadcast re-points the commander at the new peer id. When the window closes instead,
 ## Net.peer_session_expired frees the seat and the commander goes back to the server.
 ##
-## OBSERVERS: A PEER THAT DECLARES A CENTRE INSTEAD OF DRIVING ONE. What a peer OBSERVES is not what its input
-## CONTROLS, and until `Net.set_peer_anchor()` existed this demo could not say so: an interest centre was read
-## off the peer's own rollback body, so a peer with no body had no centre, and a peer with no centre was
+## OBSERVERS: A PEER THAT DECLARES A CENTER INSTEAD OF DRIVING ONE. What a peer OBSERVES is not what its input
+## CONTROLS, and until `Net.set_peer_anchor()` existed this demo could not say so: an interest center was read
+## off the peer's own rollback body, so a peer with no body had no center, and a peer with no center was
 ## filtered in nowhere -- the backend falls open and sends it everything. That is why a seatless spectator used
 ## to be refused at the door rather than admitted.
 ##
-## It is now a supported state. An observer holds no seat, drives no commander, and has its centre and world
+## It is now a supported state. An observer holds no seat, drives no commander, and has its center and world
 ## DECLARED for it by the server, either at a ground point (`Net.set_peer_anchor`) or on an entity it follows
 ## (`Net.set_peer_anchor_entity`). Two consequences worth stating:
 ##
 ##   - A PEER ARRIVING AT A FULL TABLE IS ADMITTED AS AN OBSERVER, not disconnected. The old refusal was the
 ##     honest answer to "there is nothing I can do with you"; there is now something.
-##   - THE DECLARATION IS THROTTLED, and ObserverDesk decides when. A panning observer moves its centre every
-##     frame, and one reliable message per frame to restate a centre that slid 20 cm is how a spectator costs
+##   - THE DECLARATION IS THROTTLED, and ObserverDesk decides when. A panning observer moves its center every
+##     frame, and one reliable message per frame to restate a center that slid 20 cm is how a spectator costs
 ##     more than a player.
 ##
 ## Deliberately omitted, and listed as known gaps rather than hidden: a build/protocol version handshake (two
@@ -246,7 +246,7 @@ func _connect_peer_signals() -> void:
 ## to report the old socket as gone, and until it does, a returning player would otherwise be refused as
 ## "every seat is taken". The price is that a forged identity takes a live player's seat rather than merely
 ## losing a future resume: the original keeps its connection and its commander simply stops answering it. That
-## is stated as a limit in `README.md`. A game that wants the conservative rule honours `resumed_from` only for
+## is stated as a limit in `README.md`. A game that wants the conservative rule honors `resumed_from` only for
 ## a session it already saw `Net.peer_dropped` report with `held = true`.
 func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	if not Net.is_server():
@@ -254,8 +254,8 @@ func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	var seat: int = roster.assign(peer, session_id)
 	if seat < 0:
 		# Every seat taken -- so this peer OBSERVES. Refusing used to be the honest answer, because a seatless
-		# peer had no rollback body, therefore no interest centre, therefore no filter: it would have received
-		# the whole world and had every order rejected with no explanation. Declaring its centre is what
+		# peer had no rollback body, therefore no interest center, therefore no filter: it would have received
+		# the whole world and had every order rejected with no explanation. Declaring its center is what
 		# changed, and the middle of the map is where a spectator with no preference is put.
 		print("RTS: peer %d admitted as an observer -- every seat is taken" % peer)
 		_apply_observe(peer, true, 0, Vector3.ZERO)
@@ -331,7 +331,7 @@ func observer_count() -> int:
 ## Ask the server to hand this peer's seat back and watch instead, or to seat it again.
 ##
 ## A REQUEST, NOT A SETTING. The server owns seating and owns every anchor declaration -- a client that could
-## set its own interest centre could set it anywhere, which is the whole reason the call is server-side in the
+## set its own interest center could set it anywhere, which is the whole reason the call is server-side in the
 ## facade. `_observing` is updated when the request is sent rather than when it is answered, because the only
 ## thing it drives locally is which viewpoint this peer offers next, and offering the wrong one costs a
 ## message rather than correctness.
@@ -384,9 +384,9 @@ func _observe_request(on: bool, entity_id: int, point: Vector3) -> void:
 ## SERVER-SIDE. The only place in this demo that declares an anchor.
 ##
 ## THE ORDER MATTERS ON THE WAY IN AND ON THE WAY OUT. Starting to observe releases the seat FIRST and then
-## declares, so the roster broadcast that hands the commander back to the server does not race a centre that
+## declares, so the roster broadcast that hands the commander back to the server does not race a center that
 ## is about to be replaced anyway. Stopping retracts FIRST and then seats, so the peer is inferring from its
-## own commander by the time it has one -- `clear_peer_anchor` hands both the centre and the world back to
+## own commander by the time it has one -- `clear_peer_anchor` hands both the center and the world back to
 ## inference, and inference needs the body to exist.
 func _apply_observe(peer: int, on: bool, entity_id: int, point: Vector3) -> void:
 	if not on:

@@ -316,7 +316,7 @@ func test_a_nonzero_int_verdict_refuses_with_that_code() -> void:
 
 func test_a_handler_returning_nothing_refuses_rather_than_applying() -> void:
 	# A validator declared `-> void`, or one that fell off the end of a branch. `null` is not acceptance: the
-	# fail direction for an unrecognised verdict is refusal, because applying on a value nobody chose is how
+	# fail direction for an unrecognized verdict is refusal, because applying on a value nobody chose is how
 	# an unvalidated request reaches authoritative state.
 	var lane: NetCommand = _fresh()
 	lane.register(VERB_MOVE, _verdictless)

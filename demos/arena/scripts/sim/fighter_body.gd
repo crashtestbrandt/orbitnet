@@ -14,7 +14,7 @@ class_name FighterBody
 ## `set_membership("arena_id")` is the only thing that can.
 ##
 ## THE ANCHOR IS `net_pos` BY POSITION, NOT BY NAME. A rollback body's interest anchor is its FIRST Vector3
-## state property, so the registration order below is load-bearing: putting velocity first would centre this
+## state property, so the registration order below is load-bearing: putting velocity first would center this
 ## peer's interest on a velocity.
 ##
 ## THE HITBOX IS NOT REPLICATED AND IS STILL PART OF THE CONTRACT. A lag-compensated shot reconstructs it from
@@ -83,7 +83,7 @@ var _pending_damage_from: int = -1
 var _pending_cloak: bool = false
 var _pending_shots: int = 0
 var _pending_shot_tick: int = -1
-## Set INSIDE the tick when a queued hit killed this fighter, and drained by the director afterwards. The
+## Set INSIDE the tick when a queued hit killed this fighter, and drained by the director afterward. The
 ## scorecard it credits is on the STATE lane, so writing that outside the tick is safe -- which is the whole
 ## reason the score lives there.
 var _kill_by_seat: int = -1
@@ -146,7 +146,7 @@ func bind_net() -> void:
 ##
 ## THE TWO ARE DIFFERENT AXES AND BOTH ARE NEEDED. The connection says WHICH PEER authors this body's input;
 ## the seat label says which of that connection's owned bodies this one is, for interest. A connection driving
-## two fighters that both sat at seat 0 would have one interest centre for both, and the second player's
+## two fighters that both sat at seat 0 would have one interest center for both, and the second player's
 ## surroundings culled around where the first was standing.
 ##
 ## AND PREDICTION IS THE THIRD THING, which nothing else re-resolves. The world is built before the roster
@@ -363,7 +363,7 @@ func _apply_pose() -> void:
 
 # --- server-side outcomes ------------------------------------------------------------------------------
 ## Queue damage from `by_seat`. SERVER-SIDE, from the shot resolution, which runs OUTSIDE the tick -- see
-## `_drain_pending()` for why that means queueing rather than writing.
+## `_drain_pending()` for why that means queuing rather than writing.
 func queue_damage(amount: float, by_seat: int) -> void:
 	if not is_alive():
 		return

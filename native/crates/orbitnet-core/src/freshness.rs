@@ -219,7 +219,7 @@ mod tests {
         let mut ledger = FreshnessLedger::with_capacity(8);
         assert_eq!(ledger.confidence(5), Confidence::Predicted);
         assert!(!ledger.begin_sim(5));
-        // A failed begin_sim must not have materialised a slot.
+        // A failed begin_sim must not have materialized a slot.
         assert_eq!(ledger.confidence(5), Confidence::Predicted);
     }
 
@@ -355,7 +355,7 @@ mod tests {
         assert!(memo.set(10, 1, 100));
         assert!(memo.set(10, 1, 999));
         assert_eq!(memo.get(10, 1), Some(999));
-        // The neighbouring key is untouched.
+        // The neighboring key is untouched.
         assert!(memo.set(10, 2, 200));
         assert!(memo.set(10, 1, 111));
         assert_eq!(memo.get(10, 1), Some(111));

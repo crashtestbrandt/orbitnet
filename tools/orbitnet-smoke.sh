@@ -161,7 +161,7 @@ func _initialize() -> void:
 
 	# The per-peer observer declaration binds and round-trips. It is a `#[func]` quartet plus the entity-id
 	# token it consumes, and nothing else in the tree would notice one of them failing to register: a peer
-	# declared into a world would silently fall back to inferring both its centre and its world from the body
+	# declared into a world would silently fall back to inferring both its center and its world from the body
 	# it drives, which is the inference this declaration exists to replace.
 	if not sync.has_method("get_entity_id"):
 		printerr("ORBIT-SMOKE FAIL: the entity id the anchor declaration names is not published")
@@ -307,7 +307,7 @@ func _process(_delta: float) -> bool:
 		5:
 			# The loop must keep ticking WITH the frees behind it. A freed-handle panic unwinds out of
 			# process/physics_process, so it eats the whole frame -- a stalled counter here is that
-			# showing up as behaviour rather than as a log line, and the frame watchdog above turns a
+			# showing up as behavior rather than as a log line, and the frame watchdog above turns a
 			# permanent stall into a failure instead of a hang. Baselined on stage entry (above), so the
 			# comparison spans calls rather than reading the same value on both sides.
 			if _ticks < _ticks_after_frees + 5:

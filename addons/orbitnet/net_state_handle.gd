@@ -96,7 +96,7 @@ func set_anchor(entry: String) -> void:
 ##
 ## The problem it solves: several independent worlds inside one session, each rebased near its own coordinate
 ## origin, overlap in coordinates. Interest is a distance test, and two entities at the same coordinates in
-## different worlds are zero metres apart, so a radius cannot separate them. A peer only ever replicates
+## different worlds are zero meters apart, so a radius cannot separate them. A peer only ever replicates
 ## channels whose world matches its own, whatever the radius says. A peer's own world is read off the rollback
 ## body that anchors its interest radius -- see [method NetRollbackHandle.set_membership].
 ##

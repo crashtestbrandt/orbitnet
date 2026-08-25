@@ -43,7 +43,7 @@ magic | protocol version (u32) | tickrate (u16) | session id (u64) | session non
 | resume token | 8 | the server-minted value a claim on the identity quotes |
 | confirm | 8 | proof the sender holds the shared secret; `0` proves none |
 
-The session id is what makes a reconnecting player recognisable: a peer id names the connection and is
+The session id is what makes a reconnecting player recognizable: a peer id names the connection and is
 reassigned every time, this names the player and is resent verbatim on every join. It is **asserted by the
 client and verified by nobody** — adequate for giving a player their own entity back, inadequate for anything
 that must not be forged. `0` means "no identity"; see [api.md](api.md#session-identity-and-reconnection).
@@ -651,7 +651,7 @@ latched: under a flood the log is the second thing to fall over.
 
 **The check is not in the shared row decoder.** That decoder serves the state lane and masked deltas
 too, where the sender *is* the authority, so checking there would cost bytes-per-row on a lane that
-does not need it and would change that lane's behaviour.
+does not need it and would change that lane's behavior.
 
 **The pattern to copy for everything else.** Clamp axes, bound rates and reject impossible states in
 `_rollback_tick`, on the server, where the values mean something.
@@ -664,7 +664,7 @@ Correction is a bounded time stretch, not a jump.
 
 **Catch-up must not spiral.** When a frame runs long, running the whole backlog makes the next frame longer
 still. `TickAccumulator` caps ticks per frame and **discards** the backlog it refuses to run, reporting that it
-did. Re-aligning afterwards is the clock's job.
+did. Re-aligning afterward is the clock's job.
 
 **Stretch is pinned to exactly 1.0 in coupled mode.** Any stretch ≠ 1.0 slides tick boundaries across physics
 frames, producing 0-tick and 2-tick frames that render as judder. Coupled mode runs exactly one net tick per

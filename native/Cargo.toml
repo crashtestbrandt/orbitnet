@@ -13,7 +13,7 @@ description = "OrbitNet — rollback netcode for Godot 4, in Rust"
 [workspace.dependencies]
 orbitnet-core = { path = "crates/orbitnet-core" }
 
-# Release binaries ship inside the game export, so favour size + speed over build time.
+# Release binaries ship inside the game export, so favor size + speed over build time.
 # `panic = "abort"` is deliberately NOT set: gdext maps Rust panics onto Godot errors, and a
 # GDExtension that aborts takes the whole editor with it.
 [profile.release]

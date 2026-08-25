@@ -3,7 +3,7 @@ class_name WorldDirector
 ## Builds the world, owns the unit pool, runs the authoritative step, and adjudicates every order.
 ##
 ## A STATIC UNIT POOL, NOT SPAWN/DESPAWN. Every peer creates all RtsConfig.UNIT_COUNT unit nodes at world
-## build, with identical names, and the node set NEVER changes afterwards. Death sets a replicated liveness
+## build, with identical names, and the node set NEVER changes afterward. Death sets a replicated liveness
 ## bit; the respawn drip clears it. That is a deliberate departure from "the server queue_free()s a dead
 ## unit", and the reason is entity identity:
 ##
@@ -205,7 +205,7 @@ static func build_obstacles() -> Array[AABB]:
 	out.push_back(AABB(Vector3(40.0, 0.0, -32.0), Vector3(6.0, 3.0, 14.0)))
 	return out
 
-## Where unit `id` starts and respawns. A deterministic scatter around its seat's spawn centre -- deterministic
+## Where unit `id` starts and respawns. A deterministic scatter around its seat's spawn center -- deterministic
 ## because both peers build the world, and a random scatter would make the initial positions differ until the
 ## first state packet arrived (a visible pop on every join).
 static func spawn_position(id: int) -> Vector3:
@@ -215,8 +215,8 @@ static func spawn_position(id: int) -> Vector3:
 	var golden_angle: float = 2.39996323
 	var angle: float = float(index) * golden_angle
 	var radius: float = RtsConfig.SPAWN_SPREAD * sqrt(float(index) / float(maxi(1, RtsConfig.UNITS_PER_SEAT)))
-	var centre: Vector3 = RtsConfig.spawn_center(seat)
-	var at: Vector3 = centre + Vector3(cos(angle) * radius, 0.0, sin(angle) * radius)
+	var center: Vector3 = RtsConfig.spawn_center(seat)
+	var at: Vector3 = center + Vector3(cos(angle) * radius, 0.0, sin(angle) * radius)
 	return UnitSteering.clamp_to_field(at, 1.0)
 
 ## Which way a unit faces at spawn: toward the middle of the map, i.e. toward the other seat.

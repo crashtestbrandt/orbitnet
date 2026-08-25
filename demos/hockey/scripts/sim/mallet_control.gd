@@ -64,7 +64,7 @@ static func _cap(vector: Vector3, limit: float) -> Vector3:
 	return vector * (limit / length)
 
 # The velocity a mallet ACTUALLY has, derived from the displacement the clamp allowed rather than from the
-# velocity that was asked for. Without this, a mallet held against the centre line keeps the full speed it was
+# velocity that was asked for. Without this, a mallet held against the center line keeps the full speed it was
 # driven at while standing still -- and hands all of it to the next puck that touches it.
 static func _velocity_of(from: Vector3, to: Vector3, dt: float) -> Vector3:
 	return (to - from) / dt

@@ -129,7 +129,7 @@ func _seats_text() -> String:
 ## The wire, per second.
 ##
 ## `unproven acks` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret
-## it never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot claim to
+## it never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot claim to
 ## have received a frame that never reached it -- and therefore cannot deepen its own rewind by lying about
 ## its link. A clean session sits at 0.
 func _wire_line() -> String:
@@ -146,7 +146,7 @@ func _blocks_line() -> String:
 
 ## What the token proof does NOT settle, and the bound that stands in for it.
 ##
-## An acknowledgement that quotes the right token proves the peer received the frame it names. It does not
+## An acknowledgment that quotes the right token proves the peer received the frame it names. It does not
 ## prove the peer received nothing NEWER -- a client advancing its ack at full rate while holding a constant
 ## lag quotes a real token every time and is measured at that lag, indistinguishable from a peer behind a
 ## traffic shaper. No wire field closes that, so the containment is a CEILING on what the server will believe,
@@ -232,17 +232,17 @@ func _veto_line() -> String:
 	if not Net.is_server():
 		return "CLOAK   decided by the server -- a client is not told what it is not being sent"
 	if not net.world.veto_enabled():
-		return "CLOAK   veto off -- a cloaked fighter is sent to everybody, and is only a colour"
+		return "CLOAK   veto off -- a cloaked fighter is sent to everybody, and is only a color"
 	return "CLOAK   veto on -- %d fighter-peer pairs withheld right now (one entity, one peer, one answer)" % [
 		net.world.hidden_total()]
 
-## Where this peer's interest centre comes from. A player's is INFERRED off the body its input drives; an
-## observer's is DECLARED, and a declaration replaces inference on the centre AND the world at once.
+## Where this peer's interest center comes from. A player's is INFERRED off the body its input drives; an
+## observer's is DECLARED, and a declaration replaces inference on the center AND the world at once.
 func _anchor_line() -> String:
 	var watching: String = "%d observing" % net.observer_count() if Net.is_server() else ""
 	if not net.is_observing():
-		return "CENTRE  inferred, one per seat, off the fighters this connection drives   %s" % watching
-	return "CENTRE  DECLARED %s -- this peer drives nothing   %s" % [net.observer.describe(), watching]
+		return "CENTER  inferred, one per seat, off the fighters this connection drives   %s" % watching
+	return "CENTER  DECLARED %s -- this peer drives nothing   %s" % [net.observer.describe(), watching]
 
 ## The signature number of this demo: three rewind depths from one shot.
 func _rewind_line() -> String:
@@ -341,7 +341,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		KEY_F5:
 			_cycle_watch_target()
 
-## Cycle what an observer watches: each arena's centre in turn, then one fighter in the current arena.
+## Cycle what an observer watches: each arena's center in turn, then one fighter in the current arena.
 ##
 ## FOLLOWING A FIGHTER IS `set_peer_anchor_entity()`, and the difference is not cosmetic -- a tracked entity
 ## carries its own position, so the declaration costs one message and then nothing however far it runs, while

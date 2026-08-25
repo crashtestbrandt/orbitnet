@@ -8,7 +8,7 @@ extends UnitTest
 ##
 ## - `seat()` reads the value back as a PROPERTY and type-checks it, because a backend that predates the export
 ##   answers `null` -- which is "too old to carry one", not a value to convert. Getting that wrong is a crash on
-##   a mismatched binary rather than the 0 every other backwards-compatibility path in the facade returns.
+##   a mismatched binary rather than the 0 every other backward-compatibility path in the facade returns.
 ## - `assign_seat()` and `release_seat()` write the owning connection and the label as ONE statement. The roster
 ##   is derived from the pair, so two separate writes are announced as a seat opening and closing again.
 ## - The fallback for a backend without the verbs writes the LABEL FIRST, which is the order that cannot leave
@@ -154,7 +154,7 @@ func test_a_policy_outside_the_enum_clamps_to_hold() -> void:
 		assert_eq(Net.seat_release_policy(), Net.SeatRelease.HOLD, "policy %d is not a policy" % junk)
 
 func test_releasing_a_peers_seats_answers_zero_rather_than_erroring() -> void:
-	# The backwards-compatibility path, and it is the one this suite actually runs: the committed cdylib is
+	# The backward-compatibility path, and it is the one this suite actually runs: the committed cdylib is
 	# refreshed only at a release tag, so a binary that predates these calls is the ordinary checkout. A
 	# teardown call has no business erroring there -- it answers "nothing changed" and the game runs. The same
 	# answer covers a session that is OFFLINE, and a connection that drives nothing.

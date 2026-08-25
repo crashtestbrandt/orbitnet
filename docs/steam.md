@@ -18,7 +18,7 @@ Your game never learns which is in play. That is the factory's whole job.
 and the project lints and runs on a machine with no Steam integration installed at all.
 
 **Does not contain:** any Steamworks code, headers or binaries. Using this path means you install
-[GodotSteam](https://godotsteam.com/) yourself and accept the Steamworks SDK licence directly with Valve.
+[GodotSteam](https://godotsteam.com/) yourself and accept the Steamworks SDK license directly with Valve.
 
 `steam_transport.gd` is the **only** file permitted to name Steamworks, enforced by `tools/net-check.sh`.
 

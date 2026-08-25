@@ -8,7 +8,7 @@ class_name HockeyHud
 ## moves is on screen next to it.
 ##
 ## THE CORRECTION IS REPORTED WITH ITS FLOOR. `net_pos` rides the wire as three IEEE-754 binary16s, whose
-## spacing near a table coordinate of 1 m is about a millimetre, and the backend writes the quantized value
+## spacing near a table coordinate of 1 m is about a millimeter, and the backend writes the quantized value
 ## back after every record so that every peer replays from the same canonical basis. A correction cannot be
 ## measured below that spacing, so the floor is printed beside the number rather than left for a reader to
 ## mistake for noise.
@@ -162,7 +162,7 @@ func _compose() -> String:
 ## The wire, per second.
 ##
 ## `unproven acks` COUNTS REFUSED ACKNOWLEDGEMENTS. The server mints a token per snapshot frame from a secret
-## it never transmits and refuses any acknowledgement that does not quote it back, so a peer cannot claim a
+## it never transmits and refuses any acknowledgment that does not quote it back, so a peer cannot claim a
 ## frame that never reached it. A clean session sits at 0.
 func _wire_line() -> String:
 	var wire: Dictionary[String, float] = Net.bandwidth_metrics()
@@ -258,7 +258,7 @@ func _on_serve_rejected(_verb: StringName, code: int, _tag: int) -> void:
 func _on_goal(team: int, sequence: int) -> void:
 	_last_goal = "   goal #%d to team %d" % [sequence, team]
 
-## The spacing between adjacent IEEE-754 binary16 values near `value`, in millimetres -- the floor under any
+## The spacing between adjacent IEEE-754 binary16 values near `value`, in millimeters -- the floor under any
 ## correction this demo can measure. Static and pure so the arithmetic is unit-testable.
 ##
 ## binary16 carries a 10-bit significand, so the spacing at a magnitude in [2^e, 2^(e+1)) is 2^(e-10).
@@ -327,12 +327,12 @@ func _spark_top() -> float:
 
 # A polyline in _draw rather than a Line2D node: identical output, and it keeps the whole HUD one Control
 # instead of a CanvasLayer with Node2D children whose coordinates would need keeping in step with it.
-func _draw_spark(history: PackedFloat32Array, rect: Rect2, colour: Color, caption: String) -> void:
+func _draw_spark(history: PackedFloat32Array, rect: Rect2, color: Color, caption: String) -> void:
 	draw_rect(rect, Color(0.0, 0.0, 0.0, 0.35), true)
 	var font: Font = get_theme_default_font()
 	if font != null:
 		draw_string(font, rect.position + Vector2(4.0, -3.0), caption,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, colour)
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, color)
 	if history.size() < 2:
 		return
 	var peak: float = 1.0
@@ -344,7 +344,7 @@ func _draw_spark(history: PackedFloat32Array, rect: Rect2, colour: Color, captio
 		var x: float = rect.position.x + step * float(index)
 		var y: float = rect.position.y + rect.size.y * (1.0 - clampf(history[index] / peak, 0.0, 1.0))
 		points.push_back(Vector2(x, y))
-	draw_polyline(points, colour, 1.5)
+	draw_polyline(points, color, 1.5)
 	if font != null:
 		draw_string(font, rect.position + Vector2(rect.size.x - 62.0, 12.0), "peak %.1f" % peak,
-			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, colour.darkened(0.15))
+			HORIZONTAL_ALIGNMENT_LEFT, -1, 11, color.darkened(0.15))

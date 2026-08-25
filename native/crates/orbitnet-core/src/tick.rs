@@ -4,7 +4,7 @@
 //! owns the conversion between ticks and seconds, and the accumulator that decides how many ticks a
 //! given frame should run.
 //!
-//! The important behaviour here is **catch-up bounding**. When a frame runs long, the accumulator
+//! The important behavior here is **catch-up bounding**. When a frame runs long, the accumulator
 //! holds more than one tick's worth of time. Running all of it in one frame is what turns a single
 //! hitch into a spiral: the frame runs longer because it ran more ticks, which leaves more backlog,
 //! which runs more ticks. [`TickAccumulator::advance`] therefore caps the ticks per frame — and it
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(acc.advance(-1.0).ticks, 0);
         assert_eq!(acc.tick(), 0);
         assert!(acc.tick_factor().is_finite());
-        // Still healthy afterwards.
+        // Still healthy afterward.
         assert_eq!(acc.advance(rate.dt()).ticks, 1);
     }
 

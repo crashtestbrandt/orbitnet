@@ -153,7 +153,7 @@ def verdict(column: str, before: float, after: float, tolerance: float,
     if math.isnan(before) or math.isnan(after):
         return ""
     # An absolute floor under the relative test: a column that sits at zero either side is unchanged, and one
-    # whose absolute move is a rounding artefact is noise whatever the ratio says.
+    # whose absolute move is a rounding artifact is noise whatever the ratio says.
     if abs(after - before) <= max(1e-9, abs(before) * tolerance):
         return "same"
     worse = after > before if better_low else after < before

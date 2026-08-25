@@ -4,7 +4,7 @@ extends UnitTest
 # --- the claim --------------------------------------------------------------------------------------
 func test_the_same_local_point_is_the_same_point_in_every_arena() -> void:
 	# THE DEMO'S CENTRAL FACT. What replicates is arena-local, so two fighters standing on the same spot in
-	# different arenas are ZERO metres apart -- no radius can separate them, and a declared membership is the
+	# different arenas are ZERO meters apart -- no radius can separate them, and a declared membership is the
 	# only thing in the facade that can.
 	var spot: Vector3 = Vector3(3.0, 0.0, -4.0)
 	for offset: int in ArenaConfig.ARENAS:
@@ -71,11 +71,11 @@ func test_cover_stands_on_the_floor_and_has_volume() -> void:
 
 func test_cover_blocks_a_line_through_it() -> void:
 	var box: AABB = ArenaGeometry.cover_local(0)
-	var centre: Vector3 = box.get_center()
+	var center: Vector3 = box.get_center()
 	var eye: float = ArenaConfig.FIGHTER_HEIGHT * 0.5
-	var from_point: Vector3 = Vector3(centre.x - 8.0, 0.0, centre.z)
-	var to_point: Vector3 = Vector3(centre.x + 8.0, 0.0, centre.z)
-	# The box is centred at eye height only if it is tall enough; assert against the geometry rather than
+	var from_point: Vector3 = Vector3(center.x - 8.0, 0.0, center.z)
+	var to_point: Vector3 = Vector3(center.x + 8.0, 0.0, center.z)
+	# The box is centered at eye height only if it is tall enough; assert against the geometry rather than
 	# assuming it.
 	if box.position.y <= eye and box.position.y + box.size.y >= eye:
 		assert_true(ArenaGeometry.cover_blocks(from_point, to_point), "a line straight through cover is blocked")

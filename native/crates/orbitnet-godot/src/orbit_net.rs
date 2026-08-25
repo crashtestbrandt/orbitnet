@@ -95,7 +95,7 @@ const UNANCHORED_CLOSED: i64 = 1;
 /// Clamped on set rather than on read, for the reason [`clamp_seat_release_policy`] is: the getter
 /// then reports the policy **in force**, and a caller that writes a number this build does not know
 /// learns it by reading back. OPEN is the direction that is safe to be wrong in — it is today's
-/// behaviour and it withholds nothing from anybody.
+/// behavior and it withholds nothing from anybody.
 #[must_use]
 fn clamp_unanchored_policy(policy: i64) -> i64 {
     if policy == UNANCHORED_CLOSED {
@@ -141,7 +141,7 @@ const RESIM_INPUT_HORIZON_TICKS: u64 = 16;
 
 /// How far into the future a client's input stamps may run and still be accepted.
 ///
-/// The legitimate maximum is `net.input_delay`'s clamp (32) plus the dialled-in lead
+/// The legitimate maximum is `net.input_delay`'s clamp (32) plus the dialed-in lead
 /// (`INITIAL_LEAD_TICKS` + the 8-tick lead-bias clamp) plus jitter — about 44 ticks. Sixty-four
 /// leaves headroom without accepting the near-full-history stamps a joiner with an unsettled
 /// clock (or a hostile peer walking the ring frontier away) can produce.
@@ -218,12 +218,12 @@ impl EntityRow {
 /// a full-world burst for the whole connection, because the connection's set is the union of its
 /// seats'.
 ///
-/// **The centre is per seat, and that half stays per seat.** It used to be per connection: one
-/// anchored seat supplied the centre for the whole connection, so a second seat had its surroundings
+/// **The center is per seat, and that half stays per seat.** It used to be per connection: one
+/// anchored seat supplied the center for the whole connection, so a second seat had its surroundings
 /// culled around a position it was nowhere near.
 #[derive(Clone, Copy)]
 struct PeerObserver {
-    /// The centre this seat's interest radius is measured from.
+    /// The center this seat's interest radius is measured from.
     center: [f32; 3],
     /// The world this seat is in.
     membership: MembershipId,
@@ -293,7 +293,7 @@ struct ResolvedSeats {
     labels: Vec<Option<SeatIndex>>,
     /// One of the `ANCHOR_SOURCE_*` values: what produced the observers above.
     source: i64,
-    /// At least one seat drove several anchored bodies, so its centre is one arbitrary pick among
+    /// At least one seat drove several anchored bodies, so its center is one arbitrary pick among
     /// them. See [`PeerObserver::ambiguous`].
     ambiguous: bool,
 }
@@ -335,7 +335,7 @@ impl AnchorReport {
     }
 }
 
-/// Whether a centre is a measurement rather than [`UNLOCATABLE_CENTRE`].
+/// Whether a center is a measurement rather than [`UNLOCATABLE_CENTER`].
 ///
 /// The same three-component finite test [`orbitnet_core::interest::PeerInterest`] runs, stated here
 /// so the diagnostic reports the sentinel by the rule the filter reads it by rather than by
@@ -350,25 +350,25 @@ fn is_located(center: [f32; 3]) -> bool {
 /// The whole precedence rule, in one testable place. A declaration ([`PeerAnchor`]) wins on both
 /// axes; only [`PeerAnchor::Inferred`] consults the pair read off the body the peer drives:
 ///
-/// | Declaration | Centre | World |
+/// | Declaration | Center | World |
 /// | --- | --- | --- |
 /// | [`PeerAnchor::Fixed`] | the declared position, always | the declared one |
 /// | [`PeerAnchor::Entity`] | where that entity is this tick, else where it last was | the declared one |
 /// | [`PeerAnchor::Inferred`] | the inferred body's, if it has one | the inferred body's, else [`MEMBERSHIP_GLOBAL`] |
 ///
 /// **THE TWO AXES FAIL SEPARATELY, AND ONLY FOR A DECLARED PEER.** A tracked entity that has never
-/// resolved gives no centre — so nothing is distance-culled, the same open direction an entity with
+/// resolved gives no center — so nothing is distance-culled, the same open direction an entity with
 /// no anchor already takes — but the peer stays in the world it was DECLARED into. A membership is a
-/// declaration and did not fail; a centre is a measurement and did. Collapsing them would drop a
+/// declaration and did not fail; a center is a measurement and did. Collapsing them would drop a
 /// peer whose avatar has not spawned into every world at once, which is the failure the declaration
 /// exists to remove.
 ///
 /// **A DECLARATION IS PER CONNECTION, AND IT COLLAPSES THAT CONNECTION TO ONE SEAT.** Only
 /// [`PeerAnchor::Inferred`] is resolved per seat, because only the inferred pair is read off a body
-/// and only bodies carry seats. A game that declares a centre for a split-screen connection has
+/// and only bodies carry seats. A game that declares a center for a split-screen connection has
 /// stated where that connection observes from, and the backend does not then re-split it — the same
-/// precedence that stops a declared centre from falling back to an avatar's. A game that wants a
-/// centre per seat declares nothing and lets each seat's body anchor it.
+/// precedence that stops a declared center from falling back to an avatar's. A game that wants a
+/// center per seat declares nothing and lets each seat's body anchor it.
 #[must_use]
 fn resolve_observer(
     anchor: PeerAnchor,
@@ -459,7 +459,7 @@ struct BandwidthMetrics {
     /// threshold. **The verdict, reported — there is no setting behind it.**
     ///
     /// Read it beside `interest_ms` and nowhere else. The two paths compute identical members,
-    /// distances and leaves, so this column can never explain a behaviour difference; the only
+    /// distances and leaves, so this column can never explain a behavior difference; the only
     /// question it answers is which cost `interest_ms` is the cost of. A session that sits at a
     /// fraction strictly between `0.0` and `1.0` for a whole window is one whose occupancy is
     /// hovering in the selector's hysteresis band, which is a description of the arena rather than
@@ -560,7 +560,7 @@ pub(crate) fn unregister_entity(id: u64, who: InstanceId) {
 /// Where a peer observes from, as the GAME declared it — the alternative to inferring it.
 ///
 /// **A declaration replaces inference outright**, on both axes at once. The inferred pair
-/// ([`PeerObserver`]) reads a peer's centre and its world off the lowest-id body that peer's input
+/// ([`PeerObserver`]) reads a peer's center and its world off the lowest-id body that peer's input
 /// drives, which answers "what does this peer control" when the question interest management asks is
 /// "what does this peer observe". Those are the same answer in a game with one world and one avatar
 /// per player, and different answers in every other one: a spectator drives nothing, a commander
@@ -568,7 +568,7 @@ pub(crate) fn unregister_entity(id: u64, who: InstanceId) {
 /// exactly one of them.
 ///
 /// Once a game answers the real question for a peer, the inferred pair is never consulted again for
-/// that peer. Mixing them would re-centre a peer on its avatar the moment the declared centre was
+/// that peer. Mixing them would re-center a peer on its avatar the moment the declared center was
 /// momentarily unavailable — and, worse, would put it back in its avatar's world.
 #[derive(Default, Clone, Copy, PartialEq)]
 enum PeerAnchor {
@@ -589,7 +589,7 @@ struct PeerState {
     ///
     /// Kept beside the transport peer id rather than replacing it, because the two answer different
     /// questions: the peer id says where to send bytes and is reassigned on every reconnect, this says who
-    /// is on the other end and survives one. Only the second can recognise a rejoiner.
+    /// is on the other end and survives one. Only the second can recognize a rejoiner.
     ///
     /// Per CONNECTION, not per seat: a session identity says which player is on the far end of one socket,
     /// and every seat behind that socket belongs to the same player.
@@ -620,9 +620,9 @@ struct PeerState {
     /// The last position [`PeerAnchor::Entity`] resolved to, and the answer once it no longer can.
     ///
     /// **A tracked entity that despawns leaves the peer where it was.** The alternative — dropping
-    /// to "no centre", which means "no distance filter" — hands a peer every body in its world at
-    /// the exact moment its avatar died. A stale centre is wrong by however far the peer would have
-    /// travelled; the open one is wrong by the size of the world.
+    /// to "no center", which means "no distance filter" — hands a peer every body in its world at
+    /// the exact moment its avatar died. A stale center is wrong by however far the peer would have
+    /// traveled; the open one is wrong by the size of the world.
     ///
     /// It is also what carries a declaration made BEFORE the named entity has a state row: the
     /// declaration survives on this struct and starts resolving the tick that entity does.
@@ -631,7 +631,7 @@ struct PeerState {
     /// undeclared peer still takes its world from the body it drives.
     ///
     /// It rides the anchor declaration rather than standing alone because the two are one statement
-    /// — "this peer is at this point, in this world" — and a centre without the world it is measured
+    /// — "this peer is at this point, in this world" — and a center without the world it is measured
     /// in is precisely the pairing the inferred path takes from one row to keep consistent.
     anchor_membership: MembershipId,
     /// What THIS connection receives when it resolves no anchor, or `None` to follow the session
@@ -747,7 +747,7 @@ struct PeerState {
     /// [`OrbitNet::entities_in_interest`]. So a filtering server sends the section once even when it
     /// is empty — two bytes, once per connection — and the flag retires with the first ack of it.
     interest_seeded: bool,
-    /// Recent snapshot sends awaiting acknowledgement: (frame tick, entity ticks it carried).
+    /// Recent snapshot sends awaiting acknowledgment: (frame tick, entity ticks it carried).
     sent_log: std::collections::VecDeque<(u64, Vec<(u64, u64)>)>,
     /// Per-entity newest tick this peer CONFIRMED receiving (via ack_tick/ack_bits) — the only
     /// tick a masked delta may reference: the peer provably holds that base row.
@@ -953,7 +953,7 @@ const RTT_SAMPLE_MAX_MS: f32 = 10_000.0;
 /// 250 ms for.
 const RTT_BELIEVED_MAX_MS_DEFAULT: f64 = 250.0;
 
-/// What an arriving acknowledgement bought its sender. See [`PeerState::consume_ack`].
+/// What an arriving acknowledgment bought its sender. See [`PeerState::consume_ack`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AckOutcome {
     /// Nothing was claimed — `ack_tick` is still `0`, which is every peer that has yet to receive a
@@ -1217,7 +1217,7 @@ impl PeerState {
         self.acked_base.clear();
     }
 
-    /// Consume one arriving acknowledgement whole: check its proof, raise `newest_ack`, take a
+    /// Consume one arriving acknowledgment whole: check its proof, raise `newest_ack`, take a
     /// round-trip sample, and promote to `acked_base` every entity tick the frames it confirms carried.
     ///
     /// **The proof gate is first, and it gates everything after it.** `ack_tick`, `ack_bits` and the
@@ -1270,7 +1270,7 @@ impl PeerState {
         AckOutcome::Consumed
     }
 
-    /// Consume an arriving acknowledgement: raise `newest_ack`, and take a round-trip sample IF the
+    /// Consume an arriving acknowledgment: raise `newest_ack`, and take a round-trip sample IF the
     /// ack advanced. Returns whether it did.
     ///
     /// **Only an ADVANCING ack is measured, and that is what makes withholding useless.** The gap
@@ -1339,7 +1339,7 @@ impl PeerState {
     /// [`PeerState::rtt_ms`] capped at `ceiling_ms`. `None` for a peer with no sample, exactly as
     /// the raw estimate answers.
     ///
-    /// **It bounds the BELIEF, not the acknowledgement.** Every ack that proves its frame token is
+    /// **It bounds the BELIEF, not the acknowledgment.** Every ack that proves its frame token is
     /// still consumed whole — `newest_ack` still rises, `acked_base` is still promoted, the sample
     /// still enters the window. Only the figure handed to a consumer is capped. Refusing the ack
     /// instead would break the peer's own delta chain over a measurement policy, which is a
@@ -1428,7 +1428,7 @@ pub struct OrbitNet {
     #[export]
     send_budget: i32,
 
-    /// Interest radius in metres (0 = no **distance** filter).
+    /// Interest radius in meters (0 = no **distance** filter).
     ///
     /// The 100-player lever: with a radius set, each peer receives only the entities within it of
     /// that peer's own body, with a 1.25x exit hysteresis so boundary entities don't flicker.
@@ -1449,7 +1449,7 @@ pub struct OrbitNet {
     aoi_radius: f64,
 
     /// The scale the PRIORITY BANDS are derived from (edges at `scale/3` and `2*scale/3`), in
-    /// metres. Independent of [`Self::aoi_radius`] on purpose, and 0 falls back to treating every
+    /// meters. Independent of [`Self::aoi_radius`] on purpose, and 0 falls back to treating every
     /// entity as near.
     ///
     /// These are two different questions with answers two orders of magnitude apart. The cull radius
@@ -1537,7 +1537,7 @@ pub struct OrbitNet {
     /// - **It is what the pinned released binary already does.** The cdylib a project has on disk is
     ///   refreshed only at a release tag, so new GDScript routinely runs against an older one. A
     ///   default that released seats would mean the same project despawns players' viewpoints or does
-    ///   not, depending on which binary happened to be installed — a behaviour difference no source
+    ///   not, depending on which binary happened to be installed — a behavior difference no source
     ///   change explains.
     /// - **It is the documented contract in three places**: [`Self::peer_session_expired`],
     ///   [`Self::seat_closed`], and the sizing note on [`Self::reconnect_grace`] all state that a
@@ -1565,11 +1565,11 @@ pub struct OrbitNet {
     /// The largest round trip this server will BELIEVE about a peer, in milliseconds. Clamped into
     /// `0.0..=RTT_SAMPLE_MAX_MS` on set; defaults to [`RTT_BELIEVED_MAX_MS_DEFAULT`].
     ///
-    /// SERVER-SIDE. It caps [`Self::peer_rtt_ms`] and nothing else: no acknowledgement is refused, no
+    /// SERVER-SIDE. It caps [`Self::peer_rtt_ms`] and nothing else: no acknowledgment is refused, no
     /// stored sample is altered, and [`Self::peer_rtt_raw_ms`] still reports the unclamped window
     /// minimum for a scoreboard ping or an admin tool. See [`PeerState::rtt_believed_ms`].
     ///
-    /// **What it is for.** A round-trip estimate is derived from acknowledgements the client chooses
+    /// **What it is for.** A round-trip estimate is derived from acknowledgments the client chooses
     /// when to send, and the one thing the three ack rules do not close is a client that advances at
     /// full rate behind a constant lag: it quotes a real frame token every time and is believed at
     /// that lag. Without this the only bound on that figure was [`RTT_SAMPLE_MAX_MS`] at ten seconds,
@@ -1914,7 +1914,7 @@ pub struct OrbitNet {
     /// **The other half of `stale`**, and the half a per-peer flag cannot carry: the pass is skipped
     /// wholesale when nothing can be culled (no radius, no declared membership), and every
     /// connection's cached [`AnchorReport`] then describes a tick the session has moved on from.
-    /// Without this a getter would answer "centred at the origin in world 0" for every peer in a
+    /// Without this a getter would answer "centered at the origin in world 0" for every peer in a
     /// session that is replicating everything to everybody.
     interest_ran: bool,
     /// Seats already warned about by [`Self::warn_anchor_conflicts`], so one misconfiguration is one
@@ -1994,7 +1994,7 @@ impl INode for OrbitNet {
             aoi_radius: 0.0,
             // The shipped value is seeded from `[orbitnet]` in `project.godot` by `net.gd`, like
             // every other session default. This is the unconfigured fallback, and it matches the
-            // pre-decoupling behaviour (everything Near) rather than inventing a policy here.
+            // pre-decoupling behavior (everything Near) rather than inventing a policy here.
             aoi_band_radius: 0.0,
             aoi_max_entities: 0,
             rate_tiering: false,
@@ -2097,7 +2097,7 @@ impl INode for OrbitNet {
             delta_entered_scratch: Vec::new(),
             interest_mirror: std::collections::HashSet::new(),
             interest_mirror_seeded: false,
-            // OPEN. Today's behaviour, and the only default that cannot take a world away from a
+            // OPEN. Today's behavior, and the only default that cannot take a world away from a
             // consumer whose binary is refreshed without their source changing.
             unanchored_policy: UNANCHORED_OPEN,
             interest_ran: false,
@@ -2568,7 +2568,7 @@ impl OrbitNet {
     /// input to the per-shooter lag-compensation rewind — `NetLagComp` owns the policy that
     /// turns it into a rewind depth, and the millisecond ceiling that bounds THAT.
     ///
-    /// **Capped at [`Self::rtt_believed_max_ms`].** The estimate is derived from acknowledgements the
+    /// **Capped at [`Self::rtt_believed_max_ms`].** The estimate is derived from acknowledgments the
     /// client chooses when to send, and the residual the ack rules cannot close is a client advancing
     /// at full rate behind a constant lag. This is the figure every rewind input reads, so bounding it
     /// here bounds that residual for every consumer at once. [`Self::peer_rtt_raw_ms`] is the
@@ -2610,7 +2610,7 @@ impl OrbitNet {
     /// Set this peer's session identity — the token its handshake carries.
     ///
     /// CLIENT-SIDE, and the whole of what a client contributes to being resumable. Set it before the join
-    /// handshake goes out; a change afterwards reaches the server only on the next join, which is the right
+    /// handshake goes out; a change afterward reaches the server only on the next join, which is the right
     /// moment for it anyway.
     ///
     /// The token is opaque and it is never interpreted here: the server compares it for equality against the
@@ -2753,10 +2753,10 @@ impl OrbitNet {
     /// Declare where one peer observes from, and which world it observes in.
     ///
     /// SERVER-SIDE ONLY, and the answer to a question the backend cannot infer. Undeclared, a peer
-    /// is centred on — and put in the world of — the lowest-id entity its input drives, which
+    /// is centered on — and put in the world of — the lowest-id entity its input drives, which
     /// answers what that peer CONTROLS when interest management asks what it OBSERVES. Use this for
     /// a spectator, a strategic camera, an observation post, or any peer whose view is not bolted to
-    /// a body it drives. [`Self::set_peer_anchor_entity`] is the same declaration for a centre that
+    /// a body it drives. [`Self::set_peer_anchor_entity`] is the same declaration for a center that
     /// moves with an entity.
     ///
     /// `membership` is the same id `membership_property` names on an entity, with the same rule:
@@ -2785,7 +2785,7 @@ impl OrbitNet {
     /// centring a peer on "no entity" is not a state worth having.
     ///
     /// The same statement as [`Self::set_peer_anchor`], differing in what it costs the caller: a
-    /// tracked centre follows the entity with no per-tick call. The entity NEED NOT be one the peer
+    /// tracked center follows the entity with no per-tick call. The entity NEED NOT be one the peer
     /// drives, and that is the point.
     ///
     /// **When the tracked entity stops resolving — it despawns, or it has no state row yet — the
@@ -2806,7 +2806,7 @@ impl OrbitNet {
 
     /// Retract a peer's anchor declaration AND its world, together.
     ///
-    /// The peer returns to the inferred pair: centred on the lowest-id body its input drives, in
+    /// The peer returns to the inferred pair: centered on the lowest-id body its input drives, in
     /// that body's world. Retracting one axis without the other would leave a peer declared into a
     /// world with no declared position in it, or positioned in a world it is no longer in — and the
     /// inferred path exists precisely to keep those two answers about one entity.
@@ -2852,19 +2852,19 @@ impl OrbitNet {
     /// | `source` | `int` | one of the `ANCHOR_SOURCE_*` values: 0 none, 1 inferred, 2 fixed position, 3 tracked entity |
     /// | `viewpoints` | `int` | how many observers the filter ran — one per resolved seat, `1` for a declared or failed-open connection, `0` for a CLOSED one |
     /// | `membership` | `int` | the world in effect, NOT the declared one |
-    /// | `located` | `bool` | false when the centre is [`UNLOCATABLE_CENTRE`], so nothing is culled by distance |
-    /// | `centre` | `Vector3` | the centre, or `ZERO` when `located` is false |
+    /// | `located` | `bool` | false when the center is [`UNLOCATABLE_CENTER`], so nothing is culled by distance |
+    /// | `center` | `Vector3` | the center, or `ZERO` when `located` is false |
     /// | `open` | `bool` | this connection culls nothing by distance — some viewpoint of it is unlocatable |
-    /// | `ambiguous` | `bool` | some seat drove several anchored bodies, so its centre is one arbitrary pick among them |
+    /// | `ambiguous` | `bool` | some seat drove several anchored bodies, so its center is one arbitrary pick among them |
     /// | `stale` | `bool` | **the interest pass has not run**; read nothing else |
     ///
     /// **`stale` IS THE GATE AND IT IS NOT AN EDGE CASE.** The pass is skipped entirely whenever
     /// nothing can be culled — no `aoi_radius` and no entity declaring a membership, which is a
     /// session replicating everything to everybody — and it never runs on a client at all. Without
-    /// `stale` this call would answer "centred at the origin, in world 0, located" for every peer in
+    /// `stale` this call would answer "centered at the origin, in world 0, located" for every peer in
     /// those sessions, which is a description of a filter that is not running.
     ///
-    /// **`centre`, `located` and `membership` describe the FIRST viewpoint**, which is the whole
+    /// **`center`, `located` and `membership` describe the FIRST viewpoint**, which is the whole
     /// connection whenever `viewpoints` is 1. A split-screen connection has one per seat and they
     /// differ; ask [`Self::seat_anchor_info`] per seat there. `open` and `ambiguous` are already
     /// facts about the whole connection.
@@ -2880,7 +2880,7 @@ impl OrbitNet {
         };
         let first = report.observers.first();
         let located = first.is_some_and(|o| is_located(o.center));
-        let centre = match first {
+        let center = match first {
             Some(o) if located => Vector3::new(o.center[0], o.center[1], o.center[2]),
             _ => Vector3::ZERO,
         };
@@ -2889,7 +2889,7 @@ impl OrbitNet {
             "viewpoints" => report.observers.len() as i64,
             "membership" => first.map_or(0i64, |o| o.membership as i64),
             "located" => located,
-            "centre" => centre,
+            "center" => center,
             // A connection culls nothing by distance as soon as ANY of its viewpoints is
             // unlocatable: its interest is the union of its seats', and an unlocatable seat admits
             // everything its world allows. A connection with no viewpoint at all is the opposite
@@ -2902,12 +2902,12 @@ impl OrbitNet {
 
     /// The same answer for ONE seat on a connection, for the split-screen case.
     ///
-    /// Keys: `centre` (`Vector3`, `ZERO` when unlocated), `located` (`bool`), `membership` (`int`).
+    /// Keys: `center` (`Vector3`, `ZERO` when unlocated), `located` (`bool`), `membership` (`int`).
     ///
     /// A **declared** connection answers its one collapsed viewpoint for every seat label, including
     /// labels no body currently declares — a declaration states where the CONNECTION observes from,
     /// and the backend does not re-split it. An inferred connection answers only for the seats that
-    /// resolved a centre; a seat whose body has not spawned has no viewpoint of its own and reads
+    /// resolved a center; a seat whose body has not spawned has no viewpoint of its own and reads
     /// zeroed, which is exactly what the filter does with it.
     #[func]
     fn seat_anchor_info(&self, peer: i32, seat: i32) -> VarDictionary {
@@ -2927,13 +2927,13 @@ impl OrbitNet {
             return Self::no_seat_anchor_info();
         };
         let located = is_located(observer.center);
-        let centre = if located {
+        let center = if located {
             Vector3::new(observer.center[0], observer.center[1], observer.center[2])
         } else {
             Vector3::ZERO
         };
         vdict! {
-            "centre" => centre,
+            "center" => center,
             "located" => located,
             "membership" => observer.membership as i64,
         }
@@ -2952,7 +2952,7 @@ impl OrbitNet {
             "viewpoints" => 0i64,
             "membership" => 0i64,
             "located" => false,
-            "centre" => Vector3::ZERO,
+            "center" => Vector3::ZERO,
             "open" => false,
             "ambiguous" => false,
             "stale" => true,
@@ -2963,7 +2963,7 @@ impl OrbitNet {
     #[must_use]
     fn no_seat_anchor_info() -> VarDictionary {
         vdict! {
-            "centre" => Vector3::ZERO,
+            "center" => Vector3::ZERO,
             "located" => false,
             "membership" => 0i64,
         }
@@ -2972,7 +2972,7 @@ impl OrbitNet {
     /// What a connection that resolved NO interest anchor receives. Session-wide default; `0` is
     /// OPEN and stays the default.
     ///
-    /// **OPEN (0)** — today's behaviour. Such a connection is handed [`UNLOCATABLE_CENTRE`] and one
+    /// **OPEN (0)** — today's behavior. Such a connection is handed [`UNLOCATABLE_CENTER`] and one
     /// observer in [`MEMBERSHIP_GLOBAL`], which makes every candidate uncullable, and an uncullable
     /// candidate is kept by `apply_cap` regardless of `aoi_max_entities`. So the connection receives
     /// every non-vetoed entity in every world, with the nearest-N cap not bounding it and the
@@ -2983,7 +2983,7 @@ impl OrbitNet {
     ///
     /// **THE CARVE-OUT IS THE WHOLE DESIGN.** CLOSED applies ONLY to a connection that declared
     /// nothing AND drives no rollback row at all. A connection whose seats exist but have not
-    /// RESOLVED a centre yet — a player whose avatar is still spawning — keeps the connection-wide
+    /// RESOLVED a center yet — a player whose avatar is still spawning — keeps the connection-wide
     /// fail-open, and that is deliberate: closing it would deny a player its own avatar for as many
     /// ticks as the body takes to spawn, which is the failure fail-open exists to prevent.
     /// [`seat_observers_into`] states the conjunction as a table.
@@ -3891,7 +3891,7 @@ impl OrbitNet {
         // TEST THE ERROR THE CONTROLLER IS ACTUALLY DRIVING TO ZERO, NOT THE RAW OFFSET.
         //
         // Steady state is `offset/dt + lead_bias_ticks == 0` (see `step_coupled`), so a healthy client's
-        // `clock.offset()` settles at MINUS the dialled-in lead -- by design, because a client must run ahead
+        // `clock.offset()` settles at MINUS the dialed-in lead -- by design, because a client must run ahead
         // of the server for its input to arrive before the tick that consumes it. `lead_bias_ticks` clamps at
         // 8, which at 60 Hz is 133 ms of intended offset before a single millisecond of jitter.
         //
@@ -4623,7 +4623,7 @@ impl OrbitNet {
         self.m_rb_nodes = rb_nodes as f64;
         self.m_rollback_ms = started.elapsed().as_secs_f64() * 1000.0;
         // The three phases sum to slightly less than `rollback_ms`: the difference is the range setup and the
-        // display-offset restore, which belong to neither. Published as they are rather than normalised, so the
+        // display-offset restore, which belong to neither. Published as they are rather than normalized, so the
         // gap stays visible instead of being quietly attributed to one of them.
         self.m_restore_ms = restore_ns as f64 / 1_000_000.0;
         self.m_sim_ms = sim_ns as f64 / 1_000_000.0;
@@ -4691,7 +4691,7 @@ impl OrbitNet {
     ///
     /// **Under `RELEASE_ON_EXPIRY` the seats are released BEFORE the signal that motivated it.** A game
     /// that seats a replacement player from its `peer_session_expired` handler is doing the right thing
-    /// with the event, and releasing afterwards would undo that work — the walk would find bodies the
+    /// with the event, and releasing afterward would undo that work — the walk would find bodies the
     /// handler had just re-pointed and hand them straight back to the server. Releasing first means the
     /// handler runs against a roster the release has already finished with.
     ///
@@ -5209,7 +5209,7 @@ impl OrbitNet {
         }
         // What every anchor read-back is gated on. A pass that did not run left each connection's
         // `AnchorReport` describing an earlier tick, and reporting that as current would state a
-        // centre and a world for a session that is culling nothing and filtering nobody.
+        // center and a world for a session that is culling nothing and filtering nobody.
         self.interest_ran = filtering;
         self.acc_interest_us += interest_started.elapsed().as_micros() as u64;
         self.acc_interest_ticks += 1;
@@ -5289,13 +5289,13 @@ impl OrbitNet {
                     // AN ENTITY WITH NO ANCHOR HAS NO DISTANCE, AND MUST NOT COLLECT A DISTANCE BOOST.
                     //
                     // `PeerInterest` stores always-relevant members at `0.0` (they are pushed at
-                    // `NEG_INFINITY` so the nearest-N cap can never evict them, then normalised), and
+                    // `NEG_INFINITY` so the nearest-N cap can never evict them, then normalized), and
                     // `band_of` reads `0.0` as `Near`. Typically only a handful of channels declare an
                     // anchor — the ones that carry a position — while every other state channel a body owns
                     // (its health, its equipment, its sensors, its lights, the doors around it) does not. Those
                     // would all be scored as though they were in the viewer's face. At four-plus such channels
                     // per body against the ONE anchored row that says where that body is, a distant player's
-                    // torch and hit points outbid their position 4:1 under budget pressure. That is remote-body
+                    // flashlight and hit points outbid their position 4:1 under budget pressure. That is remote-body
                     // stutter by construction.
                     //
                     // `Far` rather than a middle band: "always relevant" is a statement about never being
@@ -5513,7 +5513,7 @@ impl OrbitNet {
 
             // Folded in before the empty-frame `continue` below. A tick that offered this peer
             // candidates and admitted none of them is part of that peer's cadence, and dropping it
-            // would bias the figure towards the peers that got served.
+            // would bias the figure toward the peers that got served.
             let acc = self.acc_peer_band.entry(peer_id).or_insert((0, 0));
             acc.0 += peer_sends;
             acc.1 += peer_members;
@@ -5666,7 +5666,7 @@ impl OrbitNet {
     /// drives.
     ///
     /// **KEYED BY SEAT, NOT BY CONNECTION**, which is the change local split-screen needs. Keyed by
-    /// peer, a connection driving two bodies got one centre — whichever body sorted lowest — and the
+    /// peer, a connection driving two bodies got one center — whichever body sorted lowest — and the
     /// other player's surroundings were culled around a position that player was nowhere near.
     ///
     /// **THE FALLBACK, consulted only for a peer that declared nothing.** `OrbitNet::set_peer_anchor`
@@ -5677,14 +5677,14 @@ impl OrbitNet {
     /// **Called on rows already sorted by id, and it keeps the LOWEST id per seat.** `rows` is
     /// gathered by walking a `HashMap`, so a last-writer-wins insert would pick a different entity
     /// on different runs — and a seat driving more than one rollback entity would have its interest
-    /// centred somewhere iteration order chose. Where each seat drives exactly one rollback body the
+    /// centered somewhere iteration order chose. Where each seat drives exactly one rollback body the
     /// rule is unobservable; it is written down because the failure it prevents is a whole
     /// viewpoint's world quietly centring on the wrong thing. The sort below is `sort_by_key`, which
     /// is STABLE, so the ascending-id order the scan collected in survives it.
     ///
     /// **One row supplies both facts.** A row with no resolved anchor is skipped entirely rather
-    /// than contributing its membership, so a seat's centre and its world always describe the same
-    /// body. Splitting the picks would let a seat be centred on one entity and filtered against
+    /// than contributing its membership, so a seat's center and its world always describe the same
+    /// body. Splitting the picks would let a seat be centered on one entity and filtered against
     /// another's world, which is the same class of failure the lowest-id rule exists to prevent. A
     /// seat that contributes no row at all still exists — [`owned_rows_into`]'s output is what
     /// enumerates a connection's seats — and [`seat_observers_into`] decides what that seat is worth:
@@ -5693,7 +5693,7 @@ impl OrbitNet {
     ///
     /// **THE LIMIT THIS INHERITS, AND WHAT IT COSTS FOR MEMBERSHIP.** "Lowest id" is lowest FNV hash
     /// of a node path, so among a seat's several bodies it is arbitrary — deterministic across peers
-    /// and runs, which is what matters for the centre, but not chosen. For the centre a change of
+    /// and runs, which is what matters for the center, but not chosen. For the center a change of
     /// pick moves a radius. For the membership it changes the seat's *world*, and everything only
     /// that seat held leaves the connection's union on that one tick: `update_interest` clears
     /// `last_sent`, `last_full` and `acked_base` for each, which is a full-state burst rather than
@@ -5765,8 +5765,8 @@ impl OrbitNet {
     /// The quiet tier is quiet because a game that swaps one body for another on a seat holds both
     /// for the frame the swap takes. Warning there fires on every swap, for a configuration that is
     /// correct — and a warning a game learns to ignore reports nothing. Inside one world the pick
-    /// costs a radius that is centred on one of two bodies the same seat drives, which is a
-    /// difference of metres; across worlds it costs the seat's whole membership.
+    /// costs a radius that is centered on one of two bodies the same seat drives, which is a
+    /// difference of meters; across worlds it costs the seat's whole membership.
     ///
     /// **Once per seat per EPISODE, not per process.** The set is inserted into on the warning and
     /// pruned of every seat that is no longer colliding, so the same mistake reintroduced after a map
@@ -5813,7 +5813,7 @@ impl OrbitNet {
 
     /// Recompute every peer's interest set, and clear the delta bookkeeping of what left.
     ///
-    /// Each peer is centred and placed in a world by [`resolve_observer`] — its own declaration when
+    /// Each peer is centered and placed in a world by [`resolve_observer`] — its own declaration when
     /// it made one, the body it drives when it did not — and then filtered on membership first and
     /// distance second, which is [`candidate_for_row`] plus whichever update path
     /// [`select_interest_path`] answered for the tick.
@@ -5851,8 +5851,8 @@ impl OrbitNet {
     ///   ([`candidate_for_own_row`], [`owned_rows_of`]) rather than rebuilding everything around
     ///   them. A peer may drive more than one body and every one of them is patched.
     /// * **A peer with no radius or no resolved anchor culls on distance at all.** That used to
-    ///   reshape every row in the list; it is now [`UNLOCATABLE_CENTRE`], which reaches the same
-    ///   fail-open through the filter's own non-finite-centre rule.
+    ///   reshape every row in the list; it is now [`UNLOCATABLE_CENTER`], which reaches the same
+    ///   fail-open through the filter's own non-finite-center rule.
     ///
     /// The sets this produces are identical — `shared_candidates_match_a_per_peer_rebuild` asserts
     /// it row by row against a reference that rebuilds per peer, over every combination of owned,
@@ -5860,7 +5860,7 @@ impl OrbitNet {
     ///
     /// **ONE FILTER PASS PER SEAT, ONE SET PER CONNECTION.** A connection may drive several
     /// predicted bodies — local split-screen behind one socket — and each is a viewpoint with its
-    /// own centre and its own world. [`ConnectionInterest`] runs the filter once per seat and unions
+    /// own center and its own world. [`ConnectionInterest`] runs the filter once per seat and unions
     /// the results, because relevancy is a property of a viewpoint while the delta base, the ack
     /// window and the byte budget are properties of the datagram. Three consequences, all of them
     /// the reason the union is not simply the widest seat:
@@ -5868,10 +5868,10 @@ impl OrbitNet {
     /// * **A leave is a leave from the UNION.** Clearing `last_sent` when one seat lets go would
     ///   break the delta chain of a body the other seat is still watching.
     /// * **Culling is decided per seat, and an unresolved seat decides nothing.** A seat is filtered
-    ///   around its own body rather than inheriting the centre of a seat it is nowhere near; a seat
+    ///   around its own body rather than inheriting the center of a seat it is nowhere near; a seat
     ///   whose body has no state row yet is skipped instead, so a seat ARRIVING does not open the
     ///   whole connection to every world for as long as its body takes to spawn. Only a connection
-    ///   with no resolved seat at all falls back to [`UNLOCATABLE_CENTRE`].
+    ///   with no resolved seat at all falls back to [`UNLOCATABLE_CENTER`].
     /// * **A declaration is per connection and collapses it to one seat.** See
     ///   [`resolve_observer`]: a game that stated where a connection observes from is not then
     ///   re-split by seat.
@@ -5893,7 +5893,7 @@ impl OrbitNet {
     /// * **The grid's iteration is a `HashMap` walk**, and nothing downstream sees it. Every set
     ///   lands in a `BTreeMap` through `commit`'s id sort, the cap breaks distance ties by
     ///   ascending id, and the send rota's own sort ties by ascending id — so the wire order is
-    ///   fixed by three separate normalisations and cannot vary run to run with the path.
+    ///   fixed by three separate normalizations and cannot vary run to run with the path.
     /// * **The verdict is published, never declared.** `bandwidth_metrics()`'s `interest_grid`
     ///   reports the fraction of the window's ticks that took the index. There is no setter,
     ///   because a wrong verdict costs time and nothing else.
@@ -6778,7 +6778,7 @@ impl OrbitNet {
         }
     }
 
-    /// CLIENT: fold one interest-delta section into the mirrored set, queueing what changed.
+    /// CLIENT: fold one interest-delta section into the mirrored set, queuing what changed.
     ///
     /// **Idempotent, which is what makes a re-send free.** The section rides an unreliable datagram
     /// and is re-sent until this peer acks the frame it first rode on, so the same content arrives
@@ -6853,7 +6853,7 @@ impl OrbitNet {
 ///   * a row WITH an anchor — band it by its distance.
 ///   * a row with NO anchor — [`priority::Band::Far`], NOT its stored `0.0` distance. `PeerInterest` keeps
 ///     always-relevant members at `0.0` and [`priority::band_of`] reads `0.0` as `Near`, so every unanchored
-///     channel (health, holster, inventory, the env sensor, the torch, every hatch) scored as though it were
+///     channel (health, holster, inventory, the env sensor, the flashlight, every hatch) scored as though it were
 ///     in the viewer's face — four-plus channels per body outbidding the one row that says where that body is.
 ///     "Always relevant" is a statement about never being culled and says nothing about priority.
 ///
@@ -6876,18 +6876,18 @@ fn band_for_row(culling: bool, has_anchor: bool, dist_sq: f32, band_scale: f32) 
     }
 }
 
-/// The centre handed to the filter for a peer whose position cannot be established: one whose
+/// The center handed to the filter for a peer whose position cannot be established: one whose
 /// avatar has not spawned, and every peer when no cull radius is configured.
 ///
-/// [`PeerInterest::update_linear_into`] fails open on a non-finite centre — nothing is culled by
+/// [`PeerInterest::update_linear_into`] fails open on a non-finite center — nothing is culled by
 /// distance, while the membership test still runs — which is exactly what both cases mean.
 /// Blanking a peer's world because its avatar has not spawned yet is not a defensible failure mode,
 /// and a radius of zero asks for no distance culling rather than for all of it.
 ///
-/// **Saying it in the centre is what lets one candidate list serve every peer.** The alternative is
+/// **Saying it in the center is what lets one candidate list serve every peer.** The alternative is
 /// a second list shaped for those peers, rebuilt per peer, which is the O(peers × entities) pass
 /// this constant exists to delete.
-const UNLOCATABLE_CENTRE: [f32; 3] = [f32::NAN; 3];
+const UNLOCATABLE_CENTER: [f32; 3] = [f32::NAN; 3];
 
 /// How one gathered row is offered to the interest filter of every peer that does **not** drive it.
 /// A free function so the rule the send loop runs is the rule a test can call.
@@ -6906,7 +6906,7 @@ const UNLOCATABLE_CENTRE: [f32; 3] = [f32::NAN; 3];
 /// every peer in every world.
 ///
 /// **This says nothing about a peer that has no radius to cull by.** That used to be a third case
-/// here, which is what forced the list to be rebuilt per peer; it is now [`UNLOCATABLE_CENTRE`].
+/// here, which is what forced the list to be rebuilt per peer; it is now [`UNLOCATABLE_CENTER`].
 #[must_use]
 fn candidate_for_row(row: &EntityRow) -> InterestCandidate {
     match row.anchor {
@@ -7047,7 +7047,7 @@ fn filter_connection(
 /// unspent.
 ///
 /// **The reserve is taken BEFORE the admit loop runs, not after it.** The loop admits entity blocks
-/// until the body reaches the budget, so a section appended afterwards would push the datagram past
+/// until the body reaches the budget, so a section appended afterward would push the datagram past
 /// [`MAX_FRAME_PAYLOAD`] — an unreliable datagram past the path MTU fragments, and a lost fragment
 /// costs the whole frame.
 ///
@@ -7184,7 +7184,7 @@ fn build_interest_section(
     !left.is_empty() || !entered.is_empty() || !peer.interest_seeded
 }
 
-/// Fold one interest-delta section into a client's mirrored set, queueing what changed.
+/// Fold one interest-delta section into a client's mirrored set, queuing what changed.
 ///
 /// A free function so the rule the receive path runs is the rule a test can call. Two properties,
 /// and both are what let an unreliable datagram carry an event at all:
@@ -7219,7 +7219,7 @@ fn apply_interest_section(
     }
 }
 
-/// Drop every mirrored entity the slot table no longer names, queueing a leave for each.
+/// Drop every mirrored entity the slot table no longer names, queuing a leave for each.
 ///
 /// Run against the slot table an entity manifest has just been applied to, and an id it no longer
 /// names has unregistered. That is what makes one signal cover both "you stopped being sent it" and
@@ -7317,10 +7317,10 @@ fn resim_input_from(novel_tick: u64, current: u64) -> Option<u64> {
     (from < current).then_some(from)
 }
 
-/// One seat's observer as the filter takes it: the resolved centre, or [`UNLOCATABLE_CENTRE`] when
+/// One seat's observer as the filter takes it: the resolved center, or [`UNLOCATABLE_CENTER`] when
 /// there is none to measure from.
 ///
-/// **The centre and the world fail separately, and only the centre fails here.** No radius
+/// **The center and the world fail separately, and only the center fails here.** No radius
 /// configured, or no position resolved, means this seat culls nothing *by distance*; its declared
 /// world is passed through untouched, because a membership is a declaration and did not fail.
 /// Blanking a viewpoint's world because its body has not spawned yet is not a defensible failure
@@ -7334,7 +7334,7 @@ fn seat_observer(
 ) -> SeatObserver {
     let center = match resolved {
         Some(center) if cfg.enter_radius > 0.0 => center,
-        _ => UNLOCATABLE_CENTRE,
+        _ => UNLOCATABLE_CENTER,
     };
     SeatObserver { center, membership }
 }
@@ -7351,13 +7351,13 @@ fn seat_observer(
 /// | Case | Observers |
 /// | --- | --- |
 /// | The connection declared an anchor ([`PeerAnchor::Fixed`] / [`PeerAnchor::Entity`]) | exactly one, the declared pair — a declaration collapses a connection to one viewpoint |
-/// | Undeclared, some seats resolved a centre | one per RESOLVED seat; unresolved seats contribute nothing |
-/// | Undeclared, no seat resolved a centre, but the connection DRIVES something | exactly one, unlocatable — the connection fails open |
+/// | Undeclared, some seats resolved a center | one per RESOLVED seat; unresolved seats contribute nothing |
+/// | Undeclared, no seat resolved a center, but the connection DRIVES something | exactly one, unlocatable — the connection fails open |
 /// | Undeclared, drives nothing, policy OPEN (the default) | exactly one, unlocatable — the connection fails open |
 /// | Undeclared, drives nothing, policy CLOSED | **none** — the connection has no viewpoint, so nothing is relevant to it |
 ///
 /// **An unresolved seat is skipped, not passed through unlocatable.** That is the row that matters for
-/// a seat arriving. The connection's interest is the UNION of its seats', and an unlocatable centre
+/// a seat arriving. The connection's interest is the UNION of its seats', and an unlocatable center
 /// fails open, so a seat whose body has not produced a state row yet would blank the culling of every
 /// other seat on the connection for as many ticks as that body took to spawn — a full-world burst
 /// down one datagram, caused by a body that is not in the world yet. It costs the arriving seat
@@ -7369,9 +7369,9 @@ fn seat_observer(
 /// a conjunction because each half is load-bearing:
 ///
 /// * **The connection declared nothing** — a declaration is an answer, and a declared anchor that has
-///   not resolved a centre is a measurement that failed, not an absent viewpoint.
+///   not resolved a center is a measurement that failed, not an absent viewpoint.
 /// * **AND it drives no rollback row at all** — `mine` is empty. A connection whose seats exist but
-///   have not RESOLVED a centre yet keeps the fail-open above. That is **the joining-player
+///   have not RESOLVED a center yet keeps the fail-open above. That is **the joining-player
 ///   protection**: a player's body takes ticks to spawn, and closing that window would deny the
 ///   player their own avatar for every one of them, which is the failure fail-open exists to prevent.
 ///
@@ -7504,7 +7504,7 @@ fn anchor_conflicts_owed(
 /// The direction this role SENDS in, and the direction it EXPECTS TO RECEIVE.
 ///
 /// A free function so the one rule that must not be inverted is the rule a test can call. Getting it
-/// backwards would authenticate every datagram in the direction it did not travel, and the whole
+/// backward would authenticate every datagram in the direction it did not travel, and the whole
 /// session would refuse itself — which is loud, but it is also exactly what the direction byte exists
 /// to make impossible for an attacker, so it is stated once and checked once.
 ///
@@ -7805,7 +7805,7 @@ fn clamp_seat_release_policy(policy: i64) -> i64 {
 }
 
 /// The core policy the stored `seat_release_policy` selects. Unknown values select `Hold`, the same
-/// way [`clamp_seat_release_policy`] does, so the property and the behaviour cannot disagree.
+/// way [`clamp_seat_release_policy`] does, so the property and the behavior cannot disagree.
 #[must_use]
 fn seat_release_policy_of(policy: i64) -> SeatReleasePolicy {
     match policy {
@@ -7846,7 +7846,7 @@ mod tests {
         MAX_FRAME_PAYLOAD, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS,
         RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS,
         RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY,
-        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTRE,
+        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -8064,14 +8064,14 @@ mod tests {
         assert_eq!(candidate.membership, 9);
     }
 
-    /// A peer that cannot be located culls nothing by distance, and the centre is where that is
+    /// A peer that cannot be located culls nothing by distance, and the center is where that is
     /// said — not in the candidate list, which is why the list can be shared.
     ///
     /// The membership half does NOT fail open with it: an unlocatable peer reads as
     /// `MEMBERSHIP_GLOBAL`, which matches every world, but a peer that is merely out of radius keeps
     /// the world it declared.
     #[test]
-    fn an_unlocatable_centre_admits_every_row_it_is_offered() {
+    fn an_unlocatable_center_admits_every_row_it_is_offered() {
         let cfg = AoiConfig {
             cell_size: 8.0,
             enter_radius: 4.0,
@@ -8089,7 +8089,7 @@ mod tests {
         let mut interest = PeerInterest::new();
         interest.update_linear_into(
             &cfg,
-            UNLOCATABLE_CENTRE,
+            UNLOCATABLE_CENTER,
             MEMBERSHIP_GLOBAL,
             &candidates,
             &mut scratch,
@@ -8101,7 +8101,7 @@ mod tests {
             "9 km away and a cap of one, and nothing is culled: the peer measured nothing"
         );
 
-        // The same rows from a centre that IS locatable, to prove the list itself culls normally.
+        // The same rows from a center that IS locatable, to prove the list itself culls normally.
         let mut located = PeerInterest::new();
         located.update_linear_into(
             &cfg,
@@ -8114,10 +8114,10 @@ mod tests {
         assert_eq!(located.iter().collect::<Vec<_>>(), vec![2, 3]);
     }
 
-    /// The centre fails open per SEAT and the world does not fail at all — the pair
+    /// The center fails open per SEAT and the world does not fail at all — the pair
     /// `update_interest` hands the filter for one viewpoint.
     #[test]
-    fn a_seat_without_a_centre_culls_nothing_by_distance_and_keeps_its_world() {
+    fn a_seat_without_a_center_culls_nothing_by_distance_and_keeps_its_world() {
         let cfg = AoiConfig {
             cell_size: 8.0,
             enter_radius: 100.0,
@@ -8125,11 +8125,11 @@ mod tests {
             max_entities: 0,
         };
         let unlocated = seat_observer(&cfg, None, 5);
-        assert!(unlocated.center[0].is_nan(), "no centre, no distance test");
+        assert!(unlocated.center[0].is_nan(), "no center, no distance test");
         assert_eq!(unlocated.membership, 5, "a declared world did not fail");
 
         // A radius of zero asks for no distance culling rather than for all of it, and it says so
-        // in the centre — which is what lets every seat share one candidate list.
+        // in the center — which is what lets every seat share one candidate list.
         let no_radius = AoiConfig {
             enter_radius: 0.0,
             ..cfg
@@ -8192,14 +8192,14 @@ mod tests {
         }
     }
 
-    /// **The failure the per-seat centre removes**, composed the way `update_interest` composes it:
+    /// **The failure the per-seat center removes**, composed the way `update_interest` composes it:
     /// two seats on one connection, each with its own anchored body.
     ///
-    /// Culling used to be decided per connection, so whichever body sorted lowest supplied the centre
+    /// Culling used to be decided per connection, so whichever body sorted lowest supplied the center
     /// for both and the other player had its surroundings culled around a position it was nowhere
     /// near. Per seat, each measures from its own body.
     #[test]
-    fn each_seat_is_centred_on_its_own_body() {
+    fn each_seat_is_centered_on_its_own_body() {
         let cfg = radius_cfg(50.0);
         let rows = [
             row_seat(1, 42, 0, Some([0.0; 3]), MEMBERSHIP_GLOBAL),
@@ -8225,7 +8225,7 @@ mod tests {
     /// **THE RULE A SEAT ARRIVING NEEDS.** A seat whose body has no state row yet contributes no
     /// viewpoint while another seat on the connection has one.
     ///
-    /// The union is what makes this matter: an unlocatable centre refuses nothing, so passing the
+    /// The union is what makes this matter: an unlocatable center refuses nothing, so passing the
     /// arriving seat through as unlocatable would blank the CONNECTION's culling — every far row in
     /// every world admitted down one datagram — for as many ticks as the new body took to spawn.
     /// That is a full-state burst caused by a body that is not in the world yet, and it arrives
@@ -8314,7 +8314,7 @@ mod tests {
     }
 
     /// A DECLARATION collapses a split-screen connection to one viewpoint, whatever its seats are
-    /// doing — including while a seat is arriving. The precedence that stops a declared centre from
+    /// doing — including while a seat is arriving. The precedence that stops a declared center from
     /// falling back to an avatar's applies to the seat split as well.
     #[test]
     fn a_declared_anchor_is_one_viewpoint_however_many_seats_the_connection_has() {
@@ -8336,7 +8336,7 @@ mod tests {
     /// THE CASE THE POLICY EXISTS FOR. A connection that declared no anchor and drives no rollback
     /// row gets no viewpoint at all, and an empty viewpoint set makes nothing relevant.
     ///
-    /// Under OPEN — today's behaviour and still the default — the same connection is handed one
+    /// Under OPEN — today's behavior and still the default — the same connection is handed one
     /// unlocatable observer in every world, which makes every candidate uncullable, and `apply_cap`
     /// keeps every uncullable entry regardless of `aoi_max_entities`. So it receives the whole
     /// session with the nearest-N cap not bounding it.
@@ -8393,7 +8393,7 @@ mod tests {
     }
 
     /// **THE CARVE-OUT, AND IT IS THE JOINING-PLAYER PROTECTION.** A connection whose seat exists but
-    /// has not RESOLVED a centre yet keeps the connection-wide fail-open under CLOSED as well.
+    /// has not RESOLVED a center yet keeps the connection-wide fail-open under CLOSED as well.
     ///
     /// A player's body takes ticks to spawn and to produce its first state row. Closing that window
     /// would deny the player their own avatar for every one of those ticks — the exact failure
@@ -8431,7 +8431,7 @@ mod tests {
     }
 
     /// A DECLARATION IS AN ANSWER, so the policy never reaches a connection that made one — including
-    /// one whose declared centre has not resolved. That half is a measurement that failed, and the
+    /// one whose declared center has not resolved. That half is a measurement that failed, and the
     /// policy is about connections nothing in the session has anything to say about.
     #[test]
     fn a_declared_anchor_ignores_the_closed_policy() {
@@ -8444,7 +8444,7 @@ mod tests {
         assert_eq!(fixed.observers[0].membership, 4);
         assert_eq!(fixed.source, ANCHOR_SOURCE_FIXED);
 
-        // A tracked entity that has never resolved: no centre, so no distance culling — but the peer
+        // A tracked entity that has never resolved: no center, so no distance culling — but the peer
         // stays in the world it was declared into, and it keeps its viewpoint.
         let tracked = resolve_for(&cfg, &rows, 7, PeerAnchor::Entity(9), 4, true);
         assert_eq!(
@@ -8520,7 +8520,7 @@ mod tests {
     /// The LOUD tier, flagged separately: the dropped rows disagreed about the WORLD.
     ///
     /// That is the misconfiguration worth a log line. Inside one world the pick costs a radius
-    /// centred on one of two bodies the same seat drives; across worlds it costs the seat its whole
+    /// centered on one of two bodies the same seat drives; across worlds it costs the seat its whole
     /// membership, and everything only that seat held leaves the connection's interest on any tick
     /// the pick changes.
     #[test]
@@ -8555,7 +8555,7 @@ mod tests {
 
     /// **A seat whose second body has no resolved anchor is NOT ambiguity.** An unanchored row is
     /// skipped before the dedup ever sees it, so nothing was dropped — the seat has exactly one
-    /// candidate for its centre, and the pick was not a pick.
+    /// candidate for its center, and the pick was not a pick.
     ///
     /// Warning there would fire on every body a game spawns beside an existing one, in the window
     /// before that body has a state row.
@@ -8637,11 +8637,11 @@ mod tests {
     }
 
     /// `is_located` reads the sentinel by the rule the filter reads it by. A NaN is never equal to
-    /// itself, so a diagnostic that compared against `UNLOCATABLE_CENTRE` would report every peer as
+    /// itself, so a diagnostic that compared against `UNLOCATABLE_CENTER` would report every peer as
     /// located.
     #[test]
-    fn an_unlocatable_centre_is_recognised_by_finiteness_not_by_equality() {
-        assert!(!is_located(UNLOCATABLE_CENTRE));
+    fn an_unlocatable_center_is_recognized_by_finiteness_not_by_equality() {
+        assert!(!is_located(UNLOCATABLE_CENTER));
         assert!(
             is_located([0.0; 3]),
             "the origin is a position like any other"
@@ -8941,7 +8941,7 @@ mod tests {
     /// neither seat is in.
     fn mixed_rows() -> Vec<EntityRow> {
         vec![
-            row_seat(1, 42, 0, Some([0.0; 3]), 5), // seat 0's body: its centre and its world
+            row_seat(1, 42, 0, Some([0.0; 3]), 5), // seat 0's body: its center and its world
             row_seat(2, 42, 1, Some([200.0, 0.0, 0.0]), 6), // seat 1's, 200 m away in world 6
             row_seat(3, 42, 1, None, 9),           // driven, no anchor, a world of its own
             row(4, 0, Some([10.0, 0.0, 0.0]), 5),  // near seat 0, in seat 0's world
@@ -8981,7 +8981,7 @@ mod tests {
     }
 
     /// **THE EQUIVALENCE THE AUTOMATIC PATH RESTS ON, at the wiring.** The core suite asserts the
-    /// two paths agree over a randomised walk; this asserts the send loop hands them the same tick,
+    /// two paths agree over a randomized walk; this asserts the send loop hands them the same tick,
     /// which is the half a core test cannot see — the override list and the patched shared list have
     /// to carry the same facts about the same connection.
     ///
@@ -9090,7 +9090,7 @@ mod tests {
     }
 
     /// **The cap and the wire order survive the grid's iteration.** `InterestGrid::query_within`
-    /// walks a `HashMap`, so the order its hits arrive in is unspecified. Two normalisations make
+    /// walks a `HashMap`, so the order its hits arrive in is unspecified. Two normalizations make
     /// that unobservable and both have to hold at the wiring: the cap breaks a distance tie by
     /// ascending id, and `commit` sorts by id before it stores, so the union is a `BTreeMap` either
     /// way. Five bodies at one distance and a cap of two is the case that can only be answered by
@@ -9200,11 +9200,11 @@ mod tests {
         }
     }
 
-    /// The seat's own world comes from the same row its interest centre does: the LOWEST-id owned row
+    /// The seat's own world comes from the same row its interest center does: the LOWEST-id owned row
     /// on that seat that resolved an anchor. Rows arrive sorted by id, and a seat driving more than
     /// one body must not have either answer decided by `HashMap` iteration order.
     #[test]
-    fn a_seats_centre_and_world_both_come_from_its_lowest_id_anchored_body() {
+    fn a_seats_center_and_world_both_come_from_its_lowest_id_anchored_body() {
         let rows = [
             // Owned but unanchored, and the lowest id: skipped, so it supplies NEITHER fact.
             row(1, 42, None, 77),
@@ -9221,7 +9221,7 @@ mod tests {
         assert_eq!(peer.center, [10.0, 0.0, 0.0]);
         assert_eq!(
             peer.membership, 5,
-            "the world comes from the row that supplied the centre, not from a lower unanchored one"
+            "the world comes from the row that supplied the center, not from a lower unanchored one"
         );
         assert_eq!(OrbitNet::observers_of(&observers, 43)[0].1.membership, 8);
         assert!(
@@ -9236,7 +9236,7 @@ mod tests {
     }
 
     /// **The change local split-screen needs.** One connection driving two bodies on two seats gets
-    /// two centres and two worlds. Keyed by connection, the lower entity id won and the other
+    /// two centers and two worlds. Keyed by connection, the lower entity id won and the other
     /// player's surroundings were culled around a position that player was nowhere near.
     #[test]
     fn each_seat_on_one_connection_anchors_itself() {
@@ -9262,7 +9262,7 @@ mod tests {
     /// A seat with no anchored body gets no entry, so it is neither distance-culled nor
     /// membership-filtered: `update_interest` reads the absence as MEMBERSHIP_GLOBAL and it sees
     /// every world. Both halves fail open together, and now they fail open FOR THAT SEAT — the
-    /// other seat on the same connection keeps its centre.
+    /// other seat on the same connection keeps its center.
     #[test]
     fn a_seat_with_no_anchored_body_has_no_observer_at_all() {
         let rows = [row(1, 42, None, 77), row(2, 0, Some([1.0, 0.0, 0.0]), 5)];
@@ -9649,7 +9649,7 @@ mod tests {
     }
 
     /// **THE SEND-PATH OVERRUN THIS RESERVE EXISTS TO STOP.** The admit loop fills the body to its
-    /// budget, and the section is appended afterwards; without taking the reserve off the budget
+    /// budget, and the section is appended afterward; without taking the reserve off the budget
     /// FIRST, a full frame plus a maximal section is a datagram past the path MTU, which fragments,
     /// and a lost fragment costs the whole frame.
     #[test]
@@ -9821,7 +9821,7 @@ mod tests {
             (Some(HERE), 8),
             "the declared field is not read at all without a declaration"
         );
-        // Driving nothing: no centre, and every world. Both halves fail open together.
+        // Driving nothing: no center, and every world. Both halves fail open together.
         assert_eq!(
             resolve_observer(PeerAnchor::Inferred, 5, None, None, None),
             (None, MEMBERSHIP_GLOBAL)
@@ -9829,7 +9829,7 @@ mod tests {
     }
 
     /// THE POINT OF THE DECLARATION. A peer observing one world while driving a body in another must
-    /// be centred where it is LOOKING and filtered in the world it is WATCHING -- the body it drives
+    /// be centered where it is LOOKING and filtered in the world it is WATCHING -- the body it drives
     /// must pull it back on neither axis.
     #[test]
     fn a_declaration_overrides_the_driven_body_on_both_axes() {
@@ -9866,10 +9866,10 @@ mod tests {
     }
 
     /// A tracked entity that despawns leaves the peer where it last was. Falling back to the driven
-    /// body would move the peer into whichever world that body is in, and falling back to "no centre"
+    /// body would move the peer into whichever world that body is in, and falling back to "no center"
     /// would open its radius to the whole world at the moment its avatar died.
     #[test]
-    fn a_tracked_centre_survives_the_entity_it_tracks() {
+    fn a_tracked_center_survives_the_entity_it_tracks() {
         assert_eq!(
             resolve_observer(
                 PeerAnchor::Entity(7),
@@ -9883,10 +9883,10 @@ mod tests {
     }
 
     /// THE TWO AXES FAIL SEPARATELY. A tracked entity that has never resolved -- declared before it
-    /// spawned -- gives no centre, so nothing is distance-culled. The peer nonetheless stays in the
+    /// spawned -- gives no center, so nothing is distance-culled. The peer nonetheless stays in the
     /// world it was DECLARED into: a membership is a declaration and did not fail.
     #[test]
-    fn a_tracked_centre_that_never_resolved_keeps_its_declared_world() {
+    fn a_tracked_center_that_never_resolved_keeps_its_declared_world() {
         assert_eq!(
             resolve_observer(PeerAnchor::Entity(7), 5, None, None, body_in(THERE, 8)),
             (None, 5)
@@ -9899,7 +9899,7 @@ mod tests {
 
     /// THE FIX THAT LET INTEREST MANAGEMENT SHIP ON. An unanchored channel has no distance, and the
     /// `0.0` `PeerInterest` stores for it reads as `Near`. It must be banded `Far` on the absence of
-    /// an anchor rather than on that stored zero -- otherwise a distant player's torch and hit points
+    /// an anchor rather than on that stored zero -- otherwise a distant player's flashlight and hit points
     /// outbid that player's POSITION row four to one under budget pressure.
     #[test]
     fn a_row_with_no_anchor_is_far_whatever_distance_is_stored_for_it() {
@@ -10212,7 +10212,7 @@ mod tests {
 
     #[test]
     fn the_estimate_is_the_minimum_of_the_window_not_the_newest() {
-        // The security property: a peer inflates samples by withholding acknowledgements and can
+        // The security property: a peer inflates samples by withholding acknowledgments and can
         // never deflate one, so one honest round trip inside the window discards every inflated
         // sample. The newest reading here is the worst one and must not be what is believed.
         let peer = peer_with(&[3, 60, 90, 120]);
@@ -10865,7 +10865,7 @@ mod tests {
     }
 
     /// **UNDER `ONLY_IF_DROPPED` THE SUPERSEDE STEP MUST NOT RUN.** The incumbent keeps its identity, so
-    /// its own disconnect still opens a real window; running it backwards would leave the ghost holding
+    /// its own disconnect still opens a real window; running it backward would leave the ghost holding
     /// identity `0`, `hold_on_drop` would refuse to hold anything for it, and the player would lose the
     /// session to a peer that was just told it could not have it.
     #[test]
@@ -11142,7 +11142,7 @@ mod tests {
     #[test]
     fn an_unknown_policy_number_reads_back_as_hold() {
         // The property is an i64 and a project file can hold anything. Falling onto HOLD is what
-        // stops an unrecognised number selecting whichever policy sits at that index in some other
+        // stops an unrecognized number selecting whichever policy sits at that index in some other
         // build — the failure that takes a live player's body away.
         assert_eq!(clamp_seat_release_policy(3), SEAT_RELEASE_HOLD);
         assert_eq!(clamp_seat_release_policy(-1), SEAT_RELEASE_HOLD);

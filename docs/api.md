@@ -86,7 +86,7 @@ evasion. Those need an authenticated layer above it, and `set_session_id()` is w
 **The token is what makes an identity worth asserting.** The server mints one per identity and sends it in the
 welcome; a rejoiner must quote it back. Without it, anyone who *saw* a session id — off a roster broadcast, a
 kill feed, a log line, a screenshot — could present it and take that player's body. **It does not stop an
-on-path observer**, who reads the welcome the token travelled in; that boundary is the same one the session key
+on-path observer**, who reads the welcome the token traveled in; that boundary is the same one the session key
 has, and `set_session_secret()` is what moves it.
 | `peer_session_id(peer: int) -> int` | Server-side: the identity `peer` presented. **Key your roster on this.** 0 for an unknown peer and one that claimed none. |
 | `is_session_held(session_id: int) -> bool` | Server-side: whether a dropped session is still reclaimable. |
@@ -209,7 +209,7 @@ All per-client and live; peers need not agree.
 | `display_offset()` / `set_display_offset(ticks)` | Present a slightly older, more-confirmed tick so late corrections land before they are rendered, 0..32. Purely presentation-side; resim depth is unchanged. |
 | `remote_resim()` / `set_remote_resim(on)` | Whether a client's rollback loop carries **remote** bodies. Default false: remotes are display-only and apply the latest authoritative state. True predicts them forward with held input. Meaningless on a server. |
 | `resim_force()` / `set_resim_force(ticks)` | Test hook: force the loop at least this deep every tick, 0..64. A measurement lever, not a gameplay one. |
-| `aoi_radius()` / `set_aoi_radius(m)` | Interest radius in metres, 0 = off. **Rollback lane only** — see the warning below. Server-side; ignored on clients. |
+| `aoi_radius()` / `set_aoi_radius(m)` | Interest radius in meters, 0 = off. **Rollback lane only** — see the warning below. Server-side; ignored on clients. |
 
 ### Metrics
 
@@ -245,7 +245,7 @@ Net.set_rtt_believed_max_ms(ms: float) -> void
 Net.bandwidth_metrics()["rtt_at_ceiling_peers"]   # how many peers are above it
 ```
 
-The estimate comes from acknowledgements the client chooses when to send. Every one of them is **proven** — the
+The estimate comes from acknowledgments the client chooses when to send. Every one of them is **proven** — the
 server mints a token per snapshot frame from a secret it never transmits and discards any ack that does not
 quote it back, so a peer cannot acknowledge a frame that never reached it. What a token does not settle is
 whether the peer received anything *newer*: a client advancing its ack at full rate behind a constant lag
@@ -253,7 +253,7 @@ quotes a real token every time and is measured at that lag, indistinguishable fr
 shaper. **No wire field closes that** — `current - ack` is the whole round trip whatever tick lead the client
 runs at.
 
-So the containment is a ceiling on what the server will **believe**, not a refusal of any acknowledgement.
+So the containment is a ceiling on what the server will **believe**, not a refusal of any acknowledgment.
 Refusing would break burst-loss recovery for the honest lossy peer; clamping the sample at the read breaks
 nothing, and an honest peer above the ceiling is under-rewound by exactly the amount `NetLagComp.max_delay_ms`
 already under-rewinds it by.
@@ -268,14 +268,14 @@ A peer replicates an entity when **every** filter admits it. They are independen
 
 | axis | rollback lane | state lane |
 |---|---|---|
-| **Distance** — within `aoi_radius` of the peer's centre | always on; the anchor is the body's first `Vector3` **State** property, so register position first | opt in with `NetStateHandle.set_anchor(entry)`, naming a `Vector3` explicitly |
+| **Distance** — within `aoi_radius` of the peer's center | always on; the anchor is the body's first `Vector3` **State** property, so register position first | opt in with `NetStateHandle.set_anchor(entry)`, naming a `Vector3` explicitly |
 | **Membership** — in the same world as the peer | opt in with `NetRollbackHandle.set_membership(entry)`, naming an `int` | opt in with `NetStateHandle.set_membership(entry)`, naming an `int` |
 | **Veto** — not withheld from this peer | `Net.set_entity_hidden(peer, entity_id, true)`, server-side | same call, same ids |
 
 The first two are properties of the **entity** — one position, one world, read the same way by every peer. The
 veto is the only per-(peer, entity) fact in the filter, and the only one that can name an exception.
 
-**The seat's own centre and world both come from one body**: the lowest-id rollback entity whose *input*
+**The seat's own center and world both come from one body**: the lowest-id rollback entity whose *input*
 authority is that peer, which declares that seat, and which resolved an anchor — unless the peer declares them,
 below. A **seat** is one owned, predicted body behind a connection; every body is on seat `0` until
 `NetRollbackHandle.assign_seat()` or `set_seat()` says otherwise, which is one seat per connection.
@@ -300,7 +300,7 @@ Three consequences people find the hard way:
    while leaving them uncullable inside it.
 
 Membership matters when one session hosts **several independent worlds**, each rebased near its own coordinate
-origin. Two entities at the same coordinates in different worlds are zero metres apart, so no radius can
+origin. Two entities at the same coordinates in different worlds are zero meters apart, so no radius can
 separate them. `0` is the default id on both sides and matches every world.
 
 ### Seats: several owned bodies on one connection
@@ -313,7 +313,7 @@ single transport peer. Each is a **seat**, and the second player's surroundings 
 | Seating a body | `NetRollbackHandle.assign_seat(peer, index)`, **on the server**. Writes the owning connection and the label in one call. |
 | Emptying a seat | `NetRollbackHandle.release_seat()`. Input goes back to the server, the label back to `0`; the body stays registered and stays replicated. |
 | Declaring the label alone | `NetRollbackHandle.set_seat(index)`. Only when the owning connection is not changing. Every body starts at `0`. |
-| What a seat gets | Its own interest anchor, its own centre, its own world, its own hysteresis band and its own nearest-N cap. |
+| What a seat gets | Its own interest anchor, its own center, its own world, its own hysteresis band and its own nearest-N cap. |
 | What the connection gets | The **union** of its seats' sets, with the **nearest** seat's distance kept per entity — which is the band the send rota scores it in. |
 | What stays per connection | The delta base, the ack window, `want_full`, the byte budget and the **veto**. Those are properties of a datagram, and a datagram is per connection. |
 
@@ -324,14 +324,14 @@ single transport peer. Each is a **seat**, and the second player's surroundings 
   answers which seats a connection holds and `Net.seat_entities(peer, seat)` which bodies one seat drives.
   A client learns both from the entity manifest, which is reliable and republished on every seat change.
 - **A seat that has not spawned yet contributes no viewpoint.** Culling is decided per seat, so a seat is never
-  centred on a position it is nowhere near — and a seat whose body has no state row yet is **skipped** rather
+  centered on a position it is nowhere near — and a seat whose body has no state row yet is **skipped** rather
   than treated as seeing everything, because the connection's set is a union and one unresolved seat would
   otherwise open the whole connection to every world. Fail-open is per **connection**: a peer with no resolved
   seat at all still sees everything, which is what stops a joining player arriving in an empty world.
 - **A leave is a leave from the union.** An entity one seat lets go of keeps its delta chain while another seat
   still holds it.
 - **`Net.set_peer_anchor()` collapses the connection to one viewpoint.** A declaration states where a
-  *connection* observes from; a game that wants a centre per seat declares nothing and lets each seat's body
+  *connection* observes from; a game that wants a center per seat declares nothing and lets each seat's body
   anchor it.
 - **The input frame is bounded to one datagram.** Each owned body carries four ticks of input per frame, so
   several seats can overrun the payload; what does not fit is offered first on the next tick. A body skipped
@@ -375,11 +375,11 @@ worlds observes exactly one of them.
 |---|---|
 | `set_peer_anchor(peer, position, membership = 0)` | Observe from a fixed world position, in this world. |
 | `set_peer_anchor_entity(peer, entity_id, membership = 0)` | Observe from an entity, wherever it is, in this world. `entity_id` comes from `entity_id()` on a rollback or state handle; `0` retracts. |
-| `clear_peer_anchor(peer)` | Retract the centre **and** the world, back to the inferred body — one per seat. |
+| `clear_peer_anchor(peer)` | Retract the center **and** the world, back to the inferred body — one per seat. |
 | `peer_membership(peer)` | The **declared** world, 0 when nothing was declared. Not what an undeclared peer is filtered in — that is `peer_anchor()`. |
-| `peer_anchor(peer) -> Dictionary` | **What is actually in effect**, which nothing else reported: `source` (`Net.AnchorSource`), `viewpoints`, `membership` (the world in effect, not the declaration), `located`, `centre`, `open`, `ambiguous`, `stale`. Every key present and zeroed OFFLINE. |
-| `seat_anchor(peer, seat) -> Dictionary` | The same for one seat: `centre`, `located`, `membership`. |
-| `unanchored_policy()` / `set_unanchored_policy(p)` / `set_peer_unanchored_policy(peer, p)` | `Net.UnanchoredPolicy.OPEN` (the default, and today's behaviour) or `CLOSED`. |
+| `peer_anchor(peer) -> Dictionary` | **What is actually in effect**, which nothing else reported: `source` (`Net.AnchorSource`), `viewpoints`, `membership` (the world in effect, not the declaration), `located`, `center`, `open`, `ambiguous`, `stale`. Every key present and zeroed OFFLINE. |
+| `seat_anchor(peer, seat) -> Dictionary` | The same for one seat: `center`, `located`, `membership`. |
+| `unanchored_policy()` / `set_unanchored_policy(p)` / `set_peer_unanchored_policy(peer, p)` | `Net.UnanchoredPolicy.OPEN` (the default, and today's behavior) or `CLOSED`. |
 | `seats_of(peer)` | Which seats a connection currently holds, ascending. **Both sides**; empty OFFLINE. Answered from the announced roster, so it agrees with `seat_opened` / `seat_closed`. |
 | `seat_entities(peer, seat)` | Which bodies one seat drives, as entity ids — opaque tokens, never compared or ordered. **Both sides**; empty OFFLINE. What a camera or a split-screen viewport needs when `seat_opened` fires. |
 
@@ -389,12 +389,12 @@ worlds observes exactly one of them.
   bodies sorts lowest by hash, so a peer driving two bodies in different worlds has no defined world without
   this call.
 - **A tracked entity that despawns leaves the peer where it last was, in the world it was declared into.** A
-  membership is a declaration and did not fail; a centre is a measurement and did.
+  membership is a declaration and did not fail; a center is a measurement and did.
 - **A declaration may precede the peer's handshake**, and a tracked entity with no state row yet starts
   resolving on the tick it gets one.
 
 ```gdscript
-# A spectator with no body of its own, watching world 2 from above its centre.
+# A spectator with no body of its own, watching world 2 from above its center.
 Net.set_peer_anchor(peer_id, Vector3(0.0, 120.0, 0.0), 2)
 
 # ...or following one unit around, wherever it goes.

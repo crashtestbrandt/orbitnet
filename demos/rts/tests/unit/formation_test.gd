@@ -7,16 +7,16 @@ func test_a_single_unit_goes_exactly_where_you_clicked() -> void:
 
 func test_an_odd_square_puts_its_middle_unit_exactly_on_the_click() -> void:
 	# 25 units is a 5x5 block, so slot 12 IS the target. This is the strongest form of "something lands where
-	# you pointed" that actually holds: a block with an EVEN column count has no centre slot, which is why the
+	# you pointed" that actually holds: a block with an EVEN column count has no center slot, which is why the
 	# guarantee is stated over the centroid rather than over any individual unit.
 	assert_vec_almost_eq(Formation.slot_offset(12, 25), Vector3.ZERO, 0.0001,
 		"the middle slot of a 5x5 block is the click")
 
 func test_index_zero_is_a_real_slot_not_a_special_case() -> void:
-	# Special-casing index 0 onto the target would hand it the same destination as the centre slot -- two
+	# Special-casing index 0 onto the target would hand it the same destination as the center slot -- two
 	# units ordered to one point, which is exactly what formations exist to prevent.
 	assert_true(Formation.slot_offset(0, 25) != Formation.slot_offset(12, 25),
-		"index 0 and the centre slot are different places")
+		"index 0 and the center slot are different places")
 
 func test_slots_are_distinct() -> void:
 	# The whole point: 24 units ordered to one place must not be 24 units ordered to the SAME place, or they
@@ -29,7 +29,7 @@ func test_slots_are_distinct() -> void:
 		assert_false(seen.has(key), "slot %d of %d is unique" % [index, count])
 		seen[key] = true
 
-func test_the_block_is_roughly_square_and_centred() -> void:
+func test_the_block_is_roughly_square_and_centered() -> void:
 	var count: int = 25
 	var min_x: float = 1e9
 	var max_x: float = -1e9
@@ -39,7 +39,7 @@ func test_the_block_is_roughly_square_and_centred() -> void:
 		min_x = minf(min_x, offset.x)
 		max_x = maxf(max_x, offset.x)
 		sum += offset
-	assert_almost_eq(sum.x / float(count), 0.0, 0.001, "the block is centred on the target in x")
+	assert_almost_eq(sum.x / float(count), 0.0, 0.001, "the block is centered on the target in x")
 	assert_almost_eq(sum.z / float(count), 0.0, 0.001, "and in z")
 	assert_almost_eq(max_x - min_x, Formation.SLOT_SPACING * 4.0, 0.001,
 		"25 units make a 5-wide block")

@@ -8,7 +8,7 @@ func _board(team: int = 0) -> Transform3D:
 	return Transform3D(
 		TableFraming.viewpoint_basis(team, deg_to_rad(HockeyConfig.TABLE_TILT_DEGREES)), Vector3.ZERO)
 
-func test_a_ray_at_the_centre_lands_on_the_centre_spot() -> void:
+func test_a_ray_at_the_center_lands_on_the_center_spot() -> void:
 	var board: Transform3D = _board()
 	var above: Vector3 = board.basis.y * 2.0
 	var hit: Vector3 = TableProjection.table_point(above, -board.basis.y, board)

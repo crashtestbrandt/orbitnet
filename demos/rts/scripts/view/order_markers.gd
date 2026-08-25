@@ -49,7 +49,7 @@ func _process(delta: float) -> void:
 			continue
 		_fade(index, remaining / LIFETIME_S)
 
-## Drop a marker. `verb` only picks the colour -- a move and an attack-move want to be told apart at a glance.
+## Drop a marker. `verb` only picks the color -- a move and an attack-move want to be told apart at a glance.
 func spawn(verb: StringName, point: Vector3) -> void:
 	if _pool.is_empty():
 		return
@@ -59,20 +59,20 @@ func spawn(verb: StringName, point: Vector3) -> void:
 	marker.position = point + Vector3(0.0, 0.05, 0.0)
 	marker.visible = true
 	_expiry[index] = _clock + LIFETIME_S
-	var colour: Color = Color(1.0, 0.35, 0.30) if verb == OrderValidator.VERB_ATTACK_MOVE \
+	var color: Color = Color(1.0, 0.35, 0.30) if verb == OrderValidator.VERB_ATTACK_MOVE \
 		else Color(0.55, 0.95, 0.60)
 	var material: StandardMaterial3D = _material_of(index)
 	if material != null:
-		material.albedo_color = colour
+		material.albedo_color = color
 	_fade(index, 1.0)
 
 func _fade(index: int, amount: float) -> void:
 	var material: StandardMaterial3D = _material_of(index)
 	if material == null:
 		return
-	var colour: Color = material.albedo_color
-	colour.a = clampf(amount, 0.0, 1.0)
-	material.albedo_color = colour
+	var color: Color = material.albedo_color
+	color.a = clampf(amount, 0.0, 1.0)
+	material.albedo_color = color
 	# Expand slightly as it fades, so a marker landing on top of an older one still reads as two events.
 	var scale: float = 1.0 + (1.0 - clampf(amount, 0.0, 1.0)) * 0.45
 	_pool[index].scale = Vector3(scale, 1.0, scale)
