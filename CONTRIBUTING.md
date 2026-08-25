@@ -7,8 +7,8 @@ just native-install  # required once after cloning: builds the extension and syn
 just check           # everything a PR must pass
 ```
 
-`check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → cargo gates → lint →
-unit suites → the server-shape probe → the two-peer RTS probe.
+`check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → `descriptor-parity` →
+cargo gates → lint → unit suites → the server-shape probe → the two-peer RTS probe → the arena probe.
 
 ## Layout, and where to edit
 
@@ -35,7 +35,8 @@ path unless `core.symlinks` *and* Developer Mode are both on — a fatal, crypti
 
 ## The two boundaries
 
-Both grep-enforced by `tools/net-check.sh`:
+The first is grep-enforced by `tools/net-check.sh`. The second is a rule the pattern does not yet carry, so
+it holds by review rather than by the gate:
 
 - **`net.gd` is the only file that may name a backend class** (`OrbitNet`, `OrbitRollbackSynchronizer`,
   `OrbitStateSynchronizer`, `OrbitInterpolator`).

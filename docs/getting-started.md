@@ -148,7 +148,7 @@ func _on_pre_tick(_tick: int) -> void:
    full round trip late. Call `NetRollbackHandle.set_predicted()` whenever ownership changes:
 
    ```gdscript
-   func set_owner_peer(peer: int) -> void:
+   func set_owner_peer(peer: int, seat: int) -> void:
        handle.assign_seat(peer, seat)
        handle.set_predicted(Net.is_server() or peer == multiplayer.get_unique_id())
    ```

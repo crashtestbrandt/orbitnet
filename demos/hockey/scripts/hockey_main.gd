@@ -31,7 +31,7 @@ var mallets: MalletRenderer = null
 var puck_view: PuckView = null
 var hud: HockeyHud = null
 
-## Whether the resume token this session issued has been printed. Once per process. See _log_resume_token().
+## Whether the resume token the server issued this process has been printed. Once per process. See _process().
 var _token_logged: bool = false
 
 func _ready() -> void:

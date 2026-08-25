@@ -35,7 +35,7 @@ var renderer: UnitRenderer = null
 var markers: OrderMarkers = null
 var battlefield: BattlefieldView = null
 
-## Whether the resume token this session issued has been printed. Once per process. See _log_resume_token().
+## Whether the resume token the server issued this process has been printed. Once per process. See _log_resume_token().
 var _token_logged: bool = false
 
 func _ready() -> void:
