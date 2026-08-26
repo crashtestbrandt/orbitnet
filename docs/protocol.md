@@ -332,7 +332,9 @@ Seeding a receiver's mirror is what changes `entities_in_interest()` from "every
 absent from the first one may be out of interest or may simply be waiting for the next frame, and the
 receiver cannot tell which — it can neither announce those departures nor stay silent about them honestly.
 A whole set is complete by construction. It also seeds a large set in one frame where sections take one per
-32.
+32. **The seed completes only on a set the receiver could read in full**: a table short by an unbindable slot
+leaves the read-back answering "everything is in interest" and the first-seed sweep unspent, so the flip to
+the mirror and the departures it implies arrive together on the resolved set that follows.
 
 Five things owe a connection a set, and the server knows four of them without being told:
 
@@ -367,6 +369,7 @@ with the server and its gate never opens. Two consequences follow, and an implem
 | | |
 | --- | --- |
 | **A receiver admits a table only if its generation is STRICTLY NEWER than the one held.** | Two copies of one generation can be in flight. The second is not a repeat: the receiver adopted the first and applied the sections after it, so adopting again rewinds the mirror to the mint and silently undoes every one of them. |
+| **A receiver resolves a table only through a manifest it holds.** | A refused manifest delta keeps the stale bindings for decoding and zeroes the held generation, so a slot in an arriving table can resolve to the entity it used to name — fully resolved as far as anything can tell, ask cleared, echo settling the sender's demand, while the manifest repair that follows only removes. A table arriving while the manifest generation is zero is therefore not adopted at all; un-echoed, it stays owed, and the copy re-sent after the manifest lands is the one adopted. |
 | **A sender re-states afresh once a slot in the held set has been reissued.** | A slot is quarantined and then reissued to another entity, and the quarantine is longer than the retry window — so a late retry can name a slot that now means something else. The receiver resolves it through its current manifest, reports the set fully resolved, and holds an entity the sender never put in its interest. Nothing detects that, because nothing failed. |
 
 **The re-send is rate limited to one per retry window**, and the stamp that limits it outlives the settle: the
@@ -379,12 +382,13 @@ cleared on the settle lets that drive a whole reliable table every round trip fo
   asks for is the only repair for what was lost. This is the opposite convention to the adjacent
   `WANT_MANIFEST` bit, which may clear on send because the client zeroes its own generation at the same
   moment and the next delta re-raises it.
-- **The server sends a bare header while the gate is shut.** One snapshot frame per tick carrying no blocks
-  and no section, for a peer whose echoed generation does not match. Without it the lane can wedge: the echo
-  rides an input frame, a peer driving no body sends one only when a snapshot has arrived, and a peer whose
-  frames are all skipped for want of content is never prompted to echo again. The client cannot detect this —
-  nothing tells it whether its echo landed — so the server, which holds both generations, is what breaks the
-  silence. It lasts about a round trip.
+- **A shut gate suppresses only the SECTION, and never silences the frame.** Entity blocks flow as normal —
+  the resync must not starve a peer of state for the round trip it takes to settle — and on a tick with no
+  block and no section to carry, the server sends a bare header anyway rather than skipping the frame.
+  Without that the lane can wedge: the echo rides an input frame, a peer driving no body sends one only when
+  a snapshot has arrived, and a peer whose frames are all skipped for want of content is never prompted to
+  echo again. The client cannot detect this — nothing tells it whether its echo landed — so the server, which
+  holds both generations, is what breaks the silence. It lasts about a round trip.
 - **A section is only built for a peer that holds its baseline.** The client echoes the generation it holds
   on the input frame it is already sending, and the server declines to build a section until the two agree.
   That is what stops a section overtaking the whole set it was computed after: there is nothing to overtake,
@@ -416,7 +420,7 @@ cleared on the settle lets that drive a whole reliable table every round trip fo
 
 The generation is reserved at a `u64` varint's worst case rather than measured. It reaches two bytes only
 after 127 resyncs on one connection and ten is unreachable, but the reserve is what keeps an unreliable
-datagram inside the path MTU, and a bound that holds only for small values is not a bound.
+datagram inside the path MTU, so it is sized for the varint's worst case rather than its typical one.
 
 The reserve is taken off the byte budget **before** the admit loop runs, not after it. A section appended to a
 frame already filled to the payload ceiling is a datagram past the path MTU, which fragments, and a lost

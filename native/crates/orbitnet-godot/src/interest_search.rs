@@ -4,7 +4,7 @@
 //! whose failures are schedules, not lines. Six review rounds read the same code and missed a defect
 //! that left both ends quiescent, neither asking, and permanently disagreeing; a search like this one
 //! reported it on its first run. Two later rounds each found that the round before had introduced a
-//! new one while fixing the last. Reading does not converge on this code. A search does.
+//! new one while fixing the last. The search is what finds this class; more reading did not.
 //!
 //! **IT DRIVES THE REAL RULES.** Every decision below is the shipping function, not a restatement:
 //!
@@ -76,6 +76,11 @@
 //! - **It covers rules, not their call sites.** A defect in code no free function names is out of
 //!   reach by construction — the model calls `section_is_news`, so mutating the guard where
 //!   `handle_snapshot` uses it changes nothing here.
+//! - **The manifest lane is not modeled.** The client's slot table here is static, so the two rules
+//!   that guard adoption against it — a table refused while the manifest is stale
+//!   (`table_is_resolvable`) and the first-seed sweep an unresolved table must not spend
+//!   (`unseeded_departures`) — are exercised by unit tests rather than by these sweeps. Two shipped
+//!   defects lived exactly there.
 //! - **The scripted tests in this file are not the search.** `a_delayed_duplicate_table_...` and
 //!   `the_search_catches_the_defects_it_was_built_from` are hand-built interleavings and direct
 //!   assertions.
@@ -112,7 +117,7 @@ enum Wire {
     /// A whole interest set at a generation.
     Table(u64, Vec<u16>),
     /// A client input frame: the generation it echoes, and the snapshot tick it acknowledges.
-    Input(u64, u64),
+    Input(u64, u64, bool),
 }
 
 /// The client half. The server half is a real [`PeerState`].
@@ -140,6 +145,8 @@ struct Session {
     client_slots: SlotTable,
     /// Bindings the client's manifest has not delivered, repaired when it asks for the table.
     missing: Vec<u64>,
+    /// When the manifest answering the client's ask lands, a round trip after the ask.
+    manifest_due: Option<u64>,
     peer: PeerState,
     mirror: Mirror,
     in_flight: Vec<(u64, Wire)>,
@@ -190,6 +197,7 @@ impl Session {
             server_slots,
             client_slots,
             missing: unnameable.to_vec(),
+            manifest_due: None,
             peer,
             mirror: Mirror::default(),
             in_flight: Vec::new(),
@@ -315,7 +323,13 @@ impl Session {
         self.mirror.unacked = false;
         self.mirror.echoed = self.mirror.generation;
         let ack = self.mirror.newest_snapshot_tick;
-        self.post(up, Wire::Input(self.mirror.generation, ack));
+        // The ask rides the frame AS SENT. Reading `mirror.want_interest` at delivery time instead
+        // erased the send/receive ordering the echo race lives in: a frame posted before a table
+        // landed reported the mirror's state from after it.
+        self.post(
+            up,
+            Wire::Input(self.mirror.generation, ack, self.mirror.want_interest),
+        );
     }
 
     fn post(&mut self, fate: Fate, frame: Wire) {
@@ -329,6 +343,10 @@ impl Session {
     /// Deliver everything due this tick, in the order it was posted.
     fn deliver(&mut self) {
         let tick = self.tick;
+        if self.manifest_due.is_some_and(|at| at <= tick) {
+            self.manifest_due = None;
+            self.deliver_manifest();
+        }
         let mut due: Vec<Wire> = Vec::new();
         self.in_flight.retain(|(at, frame)| {
             if *at <= tick {
@@ -349,7 +367,6 @@ impl Session {
                 // The admit rule from `handle_frame`: strictly newer, because a retry re-sends the
                 // set in flight verbatim.
                 if table_is_news(generation, self.mirror.generation) {
-                    let seeding = !self.mirror.seeded;
                     let resolved = adopt_whole_set(
                         &self.client_slots,
                         &mut self.mirror.held,
@@ -358,9 +375,13 @@ impl Session {
                         &stated,
                     );
                     self.mirror.generation = generation;
-                    self.mirror.seeded = true;
+                    // As in `adopt_interest_table`: only a set read in full spends the seed. The
+                    // first-seed SWEEP itself is a call-site rule this model does not drive — see
+                    // the module comment's limits.
+                    if resolved {
+                        self.mirror.seeded = true;
+                    }
                     self.mirror.want_interest = !resolved;
-                    let _ = seeding;
                 }
             }
             Wire::Section(section, frame_tick) => {
@@ -378,7 +399,6 @@ impl Session {
                     self.reached.refused_section += 1;
                     return;
                 }
-                self.mirror.seeded = true;
                 let resolved = apply_interest_section(
                     &self.client_slots,
                     &mut self.mirror.held,
@@ -390,7 +410,7 @@ impl Session {
                     self.mirror.want_interest = true;
                 }
             }
-            Wire::Input(echoed, ack) => {
+            Wire::Input(echoed, ack, want_interest) => {
                 self.peer.note_interest_echo(echoed);
                 if ack > 0 {
                     self.peer.note_ack(ack, self.tick, 16.0);
@@ -399,7 +419,7 @@ impl Session {
                 // path, which is what puts the give-up -- and the whole set it owes -- in the phase
                 // BEFORE an input frame can arrive and settle a demand it never covered. Calling it
                 // here as well moved the raise after the echo and hid that ordering entirely.
-                if self.mirror.want_interest {
+                if want_interest {
                     self.peer.interest_full_due = true;
                 }
             }
@@ -429,9 +449,11 @@ impl Session {
                 }
             }
         }
-        if self.mirror.want_manifest {
-            // The server answers the next tick; the ask is latched until it does.
-            self.deliver_manifest();
+        if self.mirror.want_manifest && self.manifest_due.is_none() {
+            // The answer takes a round trip: the ask has to reach the server and the table has to
+            // come back. Delivering it inside the asking tick modelled a zero-latency manifest, so
+            // no schedule could hold a binding missing across the window the defects need.
+            self.manifest_due = Some(self.tick + DELIVER_TICKS * 2);
         }
     }
 
@@ -440,8 +462,13 @@ impl Session {
     /// more entities to overflow -- and without it the generation never leaves 0, which makes the
     /// echo's monotonicity and the table admit rule unreachable.
     fn rekey(&mut self) {
-        self.peer.interest_seeded = false;
-        self.peer.owe_whole_interest_set();
+        // The REAL transition, not a restatement: `forget_interest` is what zeroes the acked
+        // generation, and that reset is the figure the gate reads — a model that omitted it left
+        // the gate-open-against-a-dead-mirror class unreachable in every schedule while the sweeps
+        // stayed green. The client side deliberately keeps its state: an un-restarted client whose
+        // stale echo is still in flight is the harder case the monotone echo and the stays-ahead
+        // generation exist for.
+        self.peer.forget_interest();
     }
 
     fn step(&mut self, down: Fate, up: Fate) {
@@ -726,6 +753,11 @@ fn long_lossy_schedules_converge_once_the_link_is_clean() {
     assert!(
         covered.gate_shut > 0,
         "no schedule found the gate shut: {covered:?}"
+    );
+    assert!(
+        covered.refused_section > 0,
+        "no schedule refused a section against the wrong baseline, so the exact-match defence was \
+         never searched: {covered:?}"
     );
 }
 

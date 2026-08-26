@@ -1217,19 +1217,21 @@ impl PeerState {
     /// [`FrameHeader::FLAG_WANT_INTEREST`] does not, because the set already in flight IS the answer
     /// it is asking for.
     fn owe_whole_interest_set(&mut self) {
+        // **THE STAMP IS CLEARED ONLY FOR A DEMAND ARISING WHERE NONE STOOD.** That is what serves a
+        // brand-new cause on the next flush instead of a window later. A cause recurring while the
+        // demand it raised is still unsettled — a pending half overflowing every tick under
+        // sustained churn — keeps the stamp, or each recurrence would mint a fresh whole set at a
+        // fresh generation, one reliable table per tick per peer, each moving the target past the
+        // echo in flight so the gate never settled and sections stayed suppressed for as long as
+        // the churn lasted. Kept, the recurrence collapses into the standing demand and is served
+        // once per [`INTEREST_DELTA_RETRY_TICKS`] window.
+        if !self.interest_full_due {
+            self.interest_table_tick = None;
+        }
         self.interest_full_due = true;
+        // **THE IN-FLIGHT COPY IS ALWAYS DISCARDED.** It was computed before whatever raised this,
+        // so its echo settling the new demand would retire transitions the set never stated.
         self.interest_table_inflight = None;
-        // **AND THE RETRY STAMP, BECAUSE THIS IS NOT A RETRY.** The stamp and the in-flight copy are
-        // two halves of one fact — a table for THIS demand is on the wire. Left standing, it made
-        // `interest_table_due` throttle the first send of a brand-new demand behind a window
-        // belonging to a different, already-settled one.
-        //
-        // A client's [`FrameHeader::FLAG_WANT_INTEREST`] does NOT come through here, so it keeps the
-        // stamp and stays rate limited: its answer is a whole set, which restates everything however
-        // much was lost, so delaying it by a window costs nothing — where answering it every round
-        // trip, for the life of a connection that can never resolve a slot, costs a reliable frame
-        // each time.
-        self.interest_table_tick = None;
     }
 
     /// Forget everything this connection was believed to hold of its interest set.
@@ -2213,7 +2215,7 @@ pub struct OrbitNet {
     /// asks for the whole table, which is the repair that already exists.
     unbound: UnboundSlots,
     dbg_rx_skipped: u64,
-    dbg_rx_kinds: [u64; 8],
+    dbg_rx_kinds: [u64; 10],
     /// Datagrams refused by [`OrbitNet::open_datagram`]: forged, replayed, or from a peer with no
     /// handshake. Counted always; printed under `ORBITNET_DEBUG`.
     dbg_rx_unauth: u64,
@@ -2377,7 +2379,7 @@ impl INode for OrbitNet {
             dbg_rx_applied: 0,
             dbg_rx_rejected: 0,
             dbg_rx_skipped: 0,
-            dbg_rx_kinds: [0; 8],
+            dbg_rx_kinds: [0; 10],
             dbg_rx_unauth: 0,
             auth_warned: false,
             dbg_input_novel: 0,
@@ -2612,6 +2614,24 @@ impl OrbitNet {
         // the next one would ask a server that has published nothing for a table it does not have.
         self.want_manifest = false;
         self.manifest_break_warned = false;
+        // **EVERY TABLE NAMING THE LAST SESSION IS DROPPED HERE TOO.** `stop()` clears all of this,
+        // but `start()` is reachable without it — `start_tick_loop()`, or a networked mode set over
+        // another — and each carried figure is a wrong answer in the new session: a held manifest
+        // generation lets the first table resolve through dead slot bindings (the stale-manifest
+        // refusal reads it as trustworthy), a held mirror generation makes every new table below it
+        // silently not-news while the echo clamp settles them as delivered, and stale slots resolve
+        // to strangers.
+        self.manifest_generation = 0;
+        self.manifest_published.clear();
+        self.slots.clear();
+        self.slots_dirty = true;
+        self.interest_mirror.clear();
+        self.interest_mirror_seeded = false;
+        self.interest_mirror_generation = 0;
+        self.interest_generation_echoed = 0;
+        self.unbound.cleared();
+        self.want_interest = false;
+        self.interest_events.clear();
         self.ping_timer = 0.0;
 
         self.auth_warned = false;
@@ -3386,7 +3406,7 @@ impl OrbitNet {
     ///
     /// **IT NEEDS NO OTHER AXIS CONFIGURED.** A standing veto turns the interest pass on by itself,
     /// so a session with no radius and no declared membership — the one where a per-(peer, entity)
-    /// refusal is the only lever a game has — gets the behaviour this method describes. It used to
+    /// refusal is the only lever a game has — gets the behavior this method describes. It used to
     /// be inert there: the veto is enforced inside the filter, the filter ran only when a radius or
     /// a membership had already asked for it, and the two read-backs then disagreed, with
     /// `is_entity_hidden` answering `true` while `is_entity_in_interest` also answered `true`.
@@ -3399,6 +3419,14 @@ impl OrbitNet {
     #[func]
     fn set_entity_hidden(&mut self, peer: i32, entity_id: i64, hidden: bool) {
         if entity_id == 0 {
+            return;
+        }
+        // **THE AUTHORITY'S CALL, IGNORED ANYWHERE ELSE.** The docs say server-side only, and until
+        // the veto learned to announce its own leave that was self-enforcing — a client's call
+        // changed nothing it could observe. Now it would: the read-back consults the client's
+        // mirror, so a veto here pushed a `entity_left_interest` for an entity the server keeps
+        // sending, and minted a peers-map entry for a connection this end does not hold.
+        if self.mode != MODE_SERVER && self.mode != MODE_HOST {
             return;
         }
         // **BEFORE THE FIRST PASS, THE READ-BACKS ANSWER FROM "EVERY REGISTERED ENTITY".** See
@@ -3438,8 +3466,11 @@ impl OrbitNet {
     /// or the pass having run before. See [`session_is_filtering`].
     ///
     /// A CLIENT answers from the mirrored set the interest-delta sections built, and ignores `peer`:
-    /// a client holds exactly one interest set, its own. Until it has received a section it answers
-    /// `true` for everything it holds, because a server that culls nothing sends none.
+    /// a client holds exactly one interest set, its own. Until a whole set it could read in full has
+    /// landed it answers `true` for everything it holds — a server that culls nothing sends none,
+    /// and a set short by an unbindable slot states nothing about who is absent. The flip to the
+    /// mirror therefore happens on the same adoption whose sweep announces the departures it
+    /// implies, so the read-back and the events cannot disagree.
     #[func]
     fn is_entity_in_interest(&self, peer: i32, entity_id: i64) -> bool {
         let id = entity_id as u64;
@@ -3508,7 +3539,13 @@ impl OrbitNet {
     /// to the end. A section states at most [`INTEREST_DELTA_PER_FRAME`] enters, so an id absent from
     /// one may simply be waiting for the next frame; a set with an unbindable slot is short by an id
     /// nothing can name. Sweeping on either announces departures for entities that are in the set.
-    fn announce_unseeded_departures(&mut self, seeding: bool, resolved: bool, named: &[u64]) {
+    fn announce_unseeded_departures(
+        &mut self,
+        seeding: bool,
+        resolved: bool,
+        named: &[u64],
+        mirrored: &[u64],
+    ) {
         let registered: Vec<u64> = self
             .rollback_entities
             .keys()
@@ -3516,7 +3553,7 @@ impl OrbitNet {
             .copied()
             .collect();
         let peer = self.local_peer_id();
-        for id in unseeded_departures(seeding, resolved, &registered, named) {
+        for id in unseeded_departures(seeding, resolved, &registered, named, mirrored) {
             self.interest_events.push((peer, id, false));
         }
     }
@@ -3747,7 +3784,9 @@ impl OrbitNet {
         self.acc_rx_bytes += bytes.len() as u64;
         self.acc_rx_datagrams += 1;
         if self.debug_wire {
-            let slot = bytes.first().map(|&b| (b as usize).min(7)).unwrap_or(7);
+            // One bucket per frame kind through `InterestTable` (0x09); anything newer clamps into
+            // the last rather than growing the array every major.
+            let slot = bytes.first().map(|&b| (b as usize).min(9)).unwrap_or(9);
             self.dbg_rx_kinds[slot] += 1;
         }
         self.handle_packet(id as i32, &bytes);
@@ -5095,7 +5134,7 @@ impl OrbitNet {
                 self.dbg_resim_spans = 0;
                 self.dbg_resim_ticks_total = 0;
                 self.dbg_fresh = 0;
-                self.dbg_rx_kinds = [0; 8];
+                self.dbg_rx_kinds = [0; 10];
                 self.dbg_sent = 0;
                 self.dbg_sent_bytes = 0;
                 self.dbg_rx_applied = 0;
@@ -6588,7 +6627,19 @@ impl OrbitNet {
                         Ok((generation, slots))
                             if table_is_news(generation, self.interest_mirror_generation) =>
                         {
-                            self.adopt_interest_table(generation, &slots);
+                            // **A TABLE IS NOT RESOLVED THROUGH A SLOT TABLE THIS PEER KNOWS IS
+                            // WRONG.** `refuse_manifest` keeps the stale bindings and zeroes the
+                            // generation, so a slot here can resolve to the entity it USED to name
+                            // — the set then reads fully resolved, the ask clears, the echo settles
+                            // the server's demand, and the manifest repair that follows only
+                            // removes, so the mis-resolved entity is never announced again. The set
+                            // is not adopted at all instead: un-echoed it stays owed, and the copy
+                            // re-sent after the manifest lands resolves truthfully.
+                            if table_is_resolvable(self.manifest_generation) {
+                                self.adopt_interest_table(generation, &slots);
+                            } else {
+                                self.want_interest = true;
+                            }
                         }
                         Ok(_) => {}
                         // A table that did not decode leaves the mirror as it was and asks again.
@@ -7403,13 +7454,16 @@ impl OrbitNet {
             self.want_interest = true;
             return;
         }
-        // **A SECTION DOES NOT STATE THE WHOLE SET, SO IT CANNOT DRIVE THE FIRST-SEED SWEEP.**
-        // At most [`INTEREST_DELTA_PER_FRAME`] enters ride one frame, so an id absent from this
-        // section may be out of interest or may simply be waiting for the next one — and the two are
+        // **A SECTION DOES NOT STATE THE WHOLE SET, SO IT NEITHER SWEEPS NOR SEEDS.** At most
+        // [`INTEREST_DELTA_PER_FRAME`] enters ride one frame, so an id absent from this section may
+        // be out of interest or may simply be waiting for the next one — and the two are
         // indistinguishable from here. Sweeping on it announced a departure for every entity a
-        // joining client was about to be sent. Only [`Self::adopt_interest_table`] sweeps.
+        // joining client was about to be sent. Marking the mirror seeded here was the same mistake
+        // one step removed: a section landing between an unresolved table and the resolved one that
+        // repairs it would consume the one-shot sweep that only [`Self::adopt_interest_table`] may
+        // spend. The section still applies — the mirror accumulates either way — and per-entity
+        // pairing holds, because a leave only fires for an id whose enter the mirror recorded.
         let peer = self.local_peer_id();
-        self.interest_mirror_seeded = true;
         let resolved = apply_interest_section(
             &self.slots,
             &mut self.interest_mirror,
@@ -7451,8 +7505,11 @@ impl OrbitNet {
             .iter()
             .filter_map(|&slot| self.slots.id_of(slot))
             .collect();
-        // Whether this is the first news, captured before `adopt_whole_set` records that it is not.
+        // Whether the first-seed sweep is still owed, captured before adoption records the seed.
         let seeding = !self.interest_mirror_seeded;
+        // What the mirror held BEFORE this set replaced it: an id already mirrored has a baseline,
+        // so its transitions ride the diff below and the sweep must not announce it a second time.
+        let mirrored: Vec<u64> = self.interest_mirror.iter().copied().collect();
         let peer = self.local_peer_id();
         let resolved = adopt_whole_set(
             &self.slots,
@@ -7462,12 +7519,21 @@ impl OrbitNet {
             slots,
         );
         self.interest_mirror_generation = generation;
-        self.interest_mirror_seeded = true;
+        // **SEEDED MEANS A WHOLE SET THIS PEER COULD READ IN FULL HAS LANDED.** An unresolved
+        // adoption must not consume it: `seeding` is one-shot, so a first table short by an
+        // unbindable slot would otherwise spend the sweep on a set it could not state — and the
+        // resolved table that follows would sweep nothing, leaving every registered out-of-set
+        // entity to flip the read-back with no `entity_left_interest` ever announced. Until a
+        // resolved set lands, the read-back keeps answering "everything is in interest", so the flip
+        // and the leaves it owes arrive together.
+        if resolved {
+            self.interest_mirror_seeded = true;
+        }
         // **SWEPT ONLY ON A SET THIS PEER COULD READ IN FULL.** A set with a slot the manifest has
         // not bound is short by an unknown id, and every registered entity would then look absent
         // from it — so the sweep would announce departures for entities that are in the set and
         // merely unnameable. `want_interest` stays up below and another table follows.
-        self.announce_unseeded_departures(seeding, resolved, &named);
+        self.announce_unseeded_departures(seeding, resolved, &named, &mirrored);
         // A set this peer could not read in full leaves the ask up: the manifest that binds the
         // missing slot re-announces nothing, so calling it answered is how the hole becomes permanent.
         self.want_interest = !resolved;
@@ -7861,9 +7927,9 @@ fn build_interest_section(
     // true to false with nothing announced, and a handler mirroring the two signals holds it for
     // ever. A whole set is complete by construction, so the diff it emits is the whole truth.
     //
-    // Raised only while nothing is owed, or clearing the retry stamp here would re-send the table
-    // every tick until it lands. `state_whole_interest_set` marks the connection seeded, so this
-    // fires once.
+    // Raised only while nothing is owed: the demand is already standing, and re-raising it would
+    // discard the in-flight copy a retry should re-send verbatim. `state_whole_interest_set` marks
+    // the connection seeded, so this fires once.
     if !peer.interest_seeded {
         if !peer.interest_full_due {
             peer.owe_whole_interest_set();
@@ -7919,8 +7985,7 @@ fn build_interest_section(
     }
     peer.interest_delta_left_sent = left.len();
     peer.interest_delta_entered_sent = entered.len();
-    // An empty section still rides once per connection, to say that the session is filtering at all.
-    !left.is_empty() || !entered.is_empty() || !peer.interest_seeded
+    !left.is_empty() || !entered.is_empty()
 }
 
 /// Fold one interest-delta section into a client's mirrored set, queuing what changed.
@@ -8075,6 +8140,14 @@ fn admit_input_blocks(
 /// removes. So adopting a set with a hole in it and calling the ask answered is how that hole becomes
 /// permanent, whichever way the manifest goes. It is the same rule a section follows, for the same
 /// reason.
+///
+/// **AND A SHORT SET REMOVES NOTHING.** An unbindable slot may be a held member under a reissued
+/// binding this peer has not received, so a held id absent from the resolvable part may be gone or
+/// may be the very id the hole names — indistinguishable from here. Removing it fired a false
+/// `entity_left_interest` for a live entity, standing at least a retry window until the manifest
+/// repair and a later adoption re-entered it: a visible hide/show flap. A short set therefore only
+/// enters what it can name; absence is stated by the first set read in full, which is the same
+/// standard the first-seed sweep already holds.
 #[must_use]
 fn adopt_whole_set(
     slots: &SlotTable,
@@ -8093,17 +8166,25 @@ fn adopt_whole_set(
             None => resolved = false,
         }
     }
-    for &id in mirror.iter() {
-        if !next.contains(&id) {
+    // Ascending by id, as the server's own answers are: a `HashSet` walk is not an order, and two
+    // runs of one adoption must announce the same events in the same sequence.
+    if resolved {
+        let mut leaves: Vec<u64> = mirror.difference(&next).copied().collect();
+        leaves.sort_unstable();
+        for id in leaves {
             events.push((peer, id, false));
         }
     }
-    for &id in next.iter() {
-        if !mirror.contains(&id) {
-            events.push((peer, id, true));
-        }
+    let mut enters: Vec<u64> = next.difference(mirror).copied().collect();
+    enters.sort_unstable();
+    for id in enters {
+        events.push((peer, id, true));
     }
-    *mirror = next;
+    if resolved {
+        *mirror = next;
+    } else {
+        mirror.extend(next);
+    }
     resolved
 }
 
@@ -8150,18 +8231,38 @@ fn unseeded_departures(
     resolved: bool,
     registered: &[u64],
     named: &[u64],
+    mirrored: &[u64],
 ) -> Vec<u64> {
     if !seeding || !resolved {
         return Vec::new();
     }
+    // An id the mirror already held has a baseline: its enter was announced when a section put it
+    // there, and if this set drops it the adoption diff announces the leave — the sweep announcing
+    // it too would fire the same departure twice.
     let mut leaving: Vec<u64> = registered
         .iter()
         .copied()
-        .filter(|id| !named.contains(id))
+        .filter(|id| !named.contains(id) && !mirrored.contains(id))
         .collect();
     leaving.sort_unstable();
     leaving.dedup();
     leaving
+}
+
+/// Whether this peer holds a manifest an arriving whole interest set may be resolved through.
+///
+/// **A ZERO MANIFEST GENERATION MEANS THE SLOT TABLE IS MISSING OR KNOWN STALE** — a fresh
+/// connection before its first manifest, or one whose refused delta zeroed the generation while the
+/// stale bindings were deliberately kept for decoding. Resolving a whole set through either can bind
+/// a slot to the entity it used to name: the set reads fully resolved, nothing detects the swap, and
+/// the ask this peer would otherwise keep raising is cleared. A set refused here stays owed — the
+/// server re-sends it each retry window until the echo confirms it — so the copy arriving after the
+/// manifest repair is the one adopted.
+///
+/// A free function so the rule the receive path runs is the rule a test can call.
+#[must_use]
+fn table_is_resolvable(manifest_generation: u64) -> bool {
+    manifest_generation != 0
 }
 
 /// Whether an arriving whole interest set is news, or a copy of one already held.
@@ -8212,7 +8313,7 @@ const UNBOUND_SLOTS_MAX: usize = 64;
 /// | --- | --- |
 /// | a frame names a slot | that slot's entry is dropped: the manifest covers it |
 /// | a frame carries a slot it cannot name | that slot's entry starts, or is tested against the retry window |
-/// | a slot stops arriving | its entry is left alone and never fires, because only a slot IN THIS FRAME is tested |
+/// | a slot stops arriving | its entry is left alone and never fires, because only a slot IN THIS FRAME is tested; at the cap it is the entry evicted for a newcomer |
 /// | a manifest is adopted | every entry is dropped |
 #[derive(Default, Debug, Clone)]
 struct UnboundSlots {
@@ -8233,7 +8334,19 @@ impl UnboundSlots {
     /// ordinary spawn-in-flight lag.
     fn unnamed(&mut self, slot: u16, frame_tick: u64) -> bool {
         if self.since.len() >= UNBOUND_SLOTS_MAX && !self.since.contains_key(&slot) {
-            return false;
+            // **THE OLDEST ENTRY GOES, NOT THE NEW SLOT.** A stale entry is a slot that stopped
+            // arriving — only a slot in the current frame is ever tested, so it can neither fire
+            // nor leave on its own. Refusing the newcomer instead let a map full of those disarm
+            // the whole-manifest ask for every slot that goes unnameable after saturation, for the
+            // life of the session.
+            let oldest = self
+                .since
+                .iter()
+                .min_by_key(|&(_, &at)| at)
+                .map(|(&s, _)| s);
+            if let Some(s) = oldest {
+                self.since.remove(&s);
+            }
         }
         let since = *self.since.entry(slot).or_insert(frame_tick);
         if frame_tick >= since.saturating_add(INTEREST_DELTA_RETRY_TICKS) {
@@ -8987,17 +9100,18 @@ mod tests {
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
         session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
-        state_whole_interest_set, unseeded_departures, veto_announces_leave, AckOutcome, EntityRow,
-        FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
-        PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
-        SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots,
-        Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
-        INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX,
-        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
-        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
-        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
-        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
-        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        state_whole_interest_set, table_is_resolvable, unseeded_departures, veto_announces_leave,
+        AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor,
+        PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable,
+        RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED,
+        AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
+        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
+        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
+        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
+        UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -10766,11 +10880,23 @@ mod tests {
             "the diff, and nothing for the member that never moved"
         );
 
-        // A slot this peer cannot name leaves the set short, and the ask stays up.
-        let resolved = adopt_whole_set(&slots, &mut mirror.held, &mut mirror.events, 4, &[0, 1, 7]);
+        // A slot this peer cannot name leaves the set short, and the ask stays up. And a short set
+        // removes nothing: the hole may BE a held member under a binding this peer has not received,
+        // so dropping any held id here fired a false leave for a live entity.
+        mirror.held.insert(99);
+        mirror.take();
+        let resolved = adopt_whole_set(&slots, &mut mirror.held, &mut mirror.events, 4, &[0, 7]);
         assert!(
             !resolved,
             "an unnameable slot is a set this peer cannot hold in full"
+        );
+        assert!(
+            mirror.held.contains(&99) && mirror.held.contains(&12),
+            "a short set keeps every held member"
+        );
+        assert!(
+            mirror.take().iter().all(|&(_, _, entered)| entered),
+            "and announces no departures"
         );
     }
 
@@ -11026,22 +11152,56 @@ mod tests {
         let registered = [7u64, 8, 9];
 
         assert_eq!(
-            unseeded_departures(true, true, &registered, &[7, 8]),
+            unseeded_departures(true, true, &registered, &[7, 8], &[]),
             vec![9],
             "what the first complete set does not name has left"
         );
         assert!(
-            unseeded_departures(true, true, &registered, &[7, 8, 9]).is_empty(),
+            unseeded_departures(true, true, &registered, &[7, 8, 9], &[]).is_empty(),
             "and a set naming everything says nobody left"
         );
         assert!(
-            unseeded_departures(false, true, &registered, &[7]).is_empty(),
+            unseeded_departures(false, true, &registered, &[7], &[]).is_empty(),
             "after the first news the mirror's own diff carries every transition"
         );
         assert!(
-            unseeded_departures(true, false, &registered, &[7]).is_empty(),
+            unseeded_departures(true, false, &registered, &[7], &[]).is_empty(),
             "a set this peer could not read in full is short by an unknown id, so it states nothing \
              about who is absent"
+        );
+        // An id sections already mirrored has a baseline: dropping it here rides the adoption diff,
+        // and the sweep repeating it would fire the same departure twice.
+        assert_eq!(
+            unseeded_departures(true, true, &registered, &[7], &[9]),
+            vec![8],
+            "an already-mirrored id leaves through the diff, not the sweep"
+        );
+    }
+
+    /// **AN UNRESOLVED FIRST TABLE MUST NOT SPEND THE SEED, AND A STALE MANIFEST MUST NOT RESOLVE
+    /// ONE AT ALL.** `seeding` is one-shot: consumed by a set short of an unbindable slot, the
+    /// resolved set that follows would sweep nothing, and every registered out-of-set entity flips
+    /// the read-back with no `entity_left_interest` ever announced. And a table resolved through the
+    /// stale bindings a refused manifest deliberately keeps can bind a slot to the entity it USED to
+    /// name — fully resolved as far as anything can tell, ask cleared, echo settling the server's
+    /// demand, and the manifest repair that follows only removes.
+    #[test]
+    fn a_table_needs_a_manifest_it_can_trust_and_an_unresolved_one_keeps_the_seed() {
+        // `refuse_manifest` zeroes the generation while keeping the stale bindings for decoding;
+        // resolution through them is refused until a manifest lands.
+        assert!(!table_is_resolvable(0), "no manifest, or a known-stale one");
+        assert!(table_is_resolvable(3), "a held manifest resolves");
+
+        // The seed is spent only by a set read in full: the sweep of an unresolved one is empty
+        // (asserted above), and the caller keeps `interest_mirror_seeded` false so the NEXT table
+        // still finds `seeding == true` and sweeps. What is pinned here is the rule's shape: the
+        // sweep of the later resolved set must announce what the unresolved one could not.
+        let registered = [7u64, 8, 9];
+        assert!(unseeded_departures(true, false, &registered, &[7], &[]).is_empty());
+        assert_eq!(
+            unseeded_departures(true, true, &registered, &[7], &[]),
+            vec![8, 9],
+            "the resolved set that follows still owes the sweep"
         );
     }
 
@@ -11275,11 +11435,13 @@ mod tests {
         );
     }
 
-    /// **A BRAND-NEW DEMAND IS NOT A RETRY, AND THE STAMP MUST NOT THROTTLE IT.**
+    /// **A BRAND-NEW DEMAND IS NOT A RETRY, AND A RECURRING ONE IS NOT BRAND-NEW.**
     ///
-    /// The stamp and the in-flight copy are two halves of one fact — a table for THIS demand is on
-    /// the wire. Left standing across a settle, it made `interest_table_due` refuse the first send of
-    /// an unrelated new demand for up to a whole retry window.
+    /// Left standing across a settle, the stamp made `interest_table_due` refuse the first send of
+    /// an unrelated new demand for up to a whole retry window — so a demand arising where none stood
+    /// clears it. A cause recurring while its demand is still unsettled keeps it: cleared again, a
+    /// sustained overflow minted a fresh whole set at a fresh generation every tick, each moving the
+    /// target past the echo in flight.
     ///
     /// A client's `WANT_INTEREST` does not come through `owe_whole_interest_set`, so it keeps the
     /// stamp and stays rate limited: its answer is a whole set, which restates everything however
@@ -11299,6 +11461,20 @@ mod tests {
         assert!(
             interest_table_due(&peer, 101),
             "a new cause is not throttled by a settled demand's stamp"
+        );
+        // The same cause recurring while that demand still stands collapses into it: the stamp of
+        // the mint it prompted keeps holding, or an overflow sustained across a churn would mint a
+        // fresh reliable table at a fresh generation every tick.
+        let (_, _) = interest_table_to_send(&slots, &mut peer);
+        peer.interest_table_tick = Some(101);
+        peer.owe_whole_interest_set();
+        assert!(
+            !interest_table_due(&peer, 102),
+            "a recurring cause is rate limited by the standing demand's stamp"
+        );
+        assert!(
+            interest_table_due(&peer, 101 + INTEREST_DELTA_RETRY_TICKS),
+            "and is served once the window is up"
         );
 
         // A client's repeated ask keeps the stamp, so it waits.

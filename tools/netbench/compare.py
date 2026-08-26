@@ -86,8 +86,8 @@ HIGHER_IS_BETTER = {
 #
 # The per-frame CPU timers sit near 0.02-0.03 ms, where a 5% relative test is 0.001 ms -- below the spread
 # two runs of the SAME BINARY on the same seed produce. Measured, rather than assumed: back-to-back runs of
-# one commit moved `rollback_ms` +11.5% and `net_ms` +10.0%, and both printed REGRESSED. A gate that fails
-# on a re-run is a gate people learn to ignore.
+# one commit moved `rollback_ms` +11.5% and `net_ms` +10.0%, and both printed REGRESSED — so every verdict
+# on these columns was untrustworthy without a floor.
 #
 # The floor is the smaller of "what the machine can resolve" and "what a player could feel": 0.05 ms is
 # 0.15% of a 33 ms tick, so a move under it is not a regression whatever the ratio says. Columns absent
@@ -103,8 +103,8 @@ NOISE_FLOOR_ABS = {
 # The `new (was 0)` rule below exists because a zero baseline gives a percentage no denominator. That
 # is right for a capability column -- `rollback_ms` reading 0.000 across a release boundary means the
 # baseline never resimulated a tick, not that it was infinitely fast. It is exactly wrong for these:
-# a healthy run reads zero, and leaving zero is the regression. Judged on the absolute move instead,
-# so a fault counter that rises off the floor fails the gate.
+# a healthy run reads zero, and leaving zero is the regression. Judged on the MEDIAN leaving zero, so
+# sustained faulting fails the gate while a single stray sample -- a spawn-in-flight skip -- does not.
 FAULT_COUNTERS = frozenset({
     "want_full_nacks_s",
     "reconcile_snap",
@@ -193,7 +193,16 @@ def load_server(directory: str, warmup_s: float) -> dict[str, list[float]]:
         return pooled
     with open(path, newline="") as handle:
         rows = list(csv.DictReader(handle))
-    first_live = next((i for i, row in enumerate(rows) if float(row.get("peers") or 0.0) > 0.0), len(rows))
+    def live(row: dict[str, str]) -> bool:
+        # The one float() outside the guarded pooling loop below: server.csv is folded out of a live
+        # log, so a repeated header or truncated row is ordinary, and it must skip a row rather than
+        # abort the whole comparison.
+        try:
+            return float(row.get("peers") or 0.0) > 0.0
+        except ValueError:
+            return False
+
+    first_live = next((i for i, row in enumerate(rows) if live(row)), len(rows))
     for row in rows[first_live + int(warmup_s):]:
         for column, text in row.items():
             if text in (None, ""):
@@ -239,13 +248,19 @@ def classify(column: str, before_any: bool, after_any: bool, b50: float, a50: fl
     # Printing those as `same` is how a run that measured nothing reads as a run that found nothing.
     if not before_any and not after_any:
         return "not measured"
+    if column in FAULT_COUNTERS and b50 == 0.0:
+        # A FAULT COUNTER LEAVING ZERO IS THE REGRESSION, not an unmeasured baseline -- and the
+        # figure that leaves zero is the MEDIAN, not any single sample. One spawn-in-flight skip in
+        # an otherwise clean run is the documented everyday case, and a baseline with one stray
+        # nonzero sample still measured a healthy run: judging either on `any()` failed the gate on
+        # one-sample noise, printing REGRESSED beside a delta of n/a. Sustained faulting is a p50
+        # off zero.
+        if a50 > 0.0:
+            return "REGRESSED"
+        return "same" if after_any or before_any else "not measured"
     if not before_any:
         if column in UNJUDGED:
             return ""
-        # A FAULT COUNTER LEAVING ZERO IS THE REGRESSION, not an unmeasured baseline. See
-        # `FAULT_COUNTERS`.
-        if column in FAULT_COUNTERS:
-            return "REGRESSED"
         # THE BASELINE MEASURED NOTHING, so there is no ratio to test a tolerance against. Judged as
         # a percentage it is REGRESSED for any non-zero reading at all, however small -- which is what
         # `rollback_ms` did across a release boundary whose baseline never resimulated a single tick.
@@ -258,6 +273,11 @@ def report(title: str, before: dict[str, list[float]], after: dict[str, list[flo
            lower: dict[str, str], higher: dict[str, str]) -> int:
     columns = [c for c in before if c in after]
     columns.sort(key=lambda c: (order.index(c) if c in order else len(order), c))
+    # A judged column present in only one run is schema drift across the pair, and dropping it from
+    # the table read as "compared and fine" -- the highest-signal counters are exactly the ones a
+    # rename would silently retire.
+    lost = sorted(c for c in (set(before) ^ set(after))
+                  if (c in lower or c in higher) and c not in UNJUDGED)
     print(title)
     header = (f"{'column':<24} {'p50 before':>12} {'p50 after':>12} {'delta':>10} "
               f"{'p95 before':>12} {'p95 after':>12}  verdict")
@@ -278,6 +298,10 @@ def report(title: str, before: dict[str, list[float]], after: dict[str, list[flo
         delta = "n/a" if b50 == 0.0 else f"{(a50 - b50) / abs(b50) * 100.0:+.1f}%"
         print(f"{column:<24} {b50:>12.3f} {a50:>12.3f} {delta:>10} "
               f"{b95:>12.3f} {a95:>12.3f}  {call}")
+    for column in lost:
+        side = "after" if column in after else "before"
+        print(f"{column:<24} judged column only in the {side} run: not comparable  REGRESSED")
+        regressions += 1
     print()
     return regressions
 
@@ -312,6 +336,18 @@ ZERO_BASELINE_CASES = [
     ("reconcile_snap", False, True, "REGRESSED", "the same, on prediction"),
     ("rx_rejected_s", False, True, "REGRESSED", "and on the server's refusals"),
     ("resim_ticks", False, True, "", "an unjudged column stays unjudged"),
+]
+
+# The fault-counter median rule: (column, b50, a50, before populated, after populated, expected).
+FAULT_MEDIAN_CASES = [
+    ("rx_skipped_s", 0.0, 0.0, False, True, "same",
+     "one stray after-sample is one-sample noise, not sustained faulting"),
+    ("rx_skipped_s", 0.0, 0.0, True, True, "same",
+     "a stray sample either side of a clean pair is still a clean pair"),
+    ("rx_skipped_s", 0.0, 1.0, True, True, "REGRESSED",
+     "a sporadic baseline does not excuse a median that left zero"),
+    ("want_full_nacks_s", 0.0, 2.0, False, True, "REGRESSED",
+     "sustained faulting off a clean baseline fails whatever any() says"),
 ]
 
 
@@ -355,6 +391,18 @@ def self_test() -> int:
                   f"expected {expected!r}, got {got!r}")
             failures += 1
 
+    for column, b50, a50, before_any, after_any, expected, _ in FAULT_MEDIAN_CASES:
+        tables = tables_for(column)
+        if tables is None:
+            print(f"FAIL {column}: no direction table claims this column")
+            failures += 1
+            continue
+        got = classify(column, before_any, after_any, b50, a50, 0.05, *tables)
+        checked += 1
+        if got != expected:
+            print(f"FAIL {column} b50={b50} a50={a50}: expected {expected!r}, got {got!r}")
+            failures += 1
+
     print(f"compare.py self-test: {checked} cases, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -394,8 +442,16 @@ def main() -> int:
             server_before, server_after,
             list(SERVER_LOWER_IS_BETTER), args.tolerance,
             SERVER_LOWER_IS_BETTER, {})
+    elif server_before or server_after:
+        # One run has live server rows and the other has none -- a missing server.csv, or a server
+        # that never saw a peer. Skipping quietly read as "compared and fine" on the table
+        # docs/netbench.md calls the point of a send-path change.
+        empty = "after" if server_before else "before"
+        print(f"== SERVER == the {empty} run has no live server rows; the send path was NOT compared.  REGRESSED")
+        print()
+        regressions += 1
     else:
-        print("== SERVER == no server.csv in one or both runs; the send path was not compared.")
+        print("== SERVER == no live server rows in either run; the send path was not compared.")
         print()
 
     if regressions == 0:

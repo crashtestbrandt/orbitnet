@@ -758,7 +758,7 @@ mod tests {
     /// **FOUR HAND-PICKED QUATERNIONS DID NOT REACH IT.** The orbit that breaks byte-exactness is
     /// 10.6% of the diagonal family and 0.0035% of uniformly random orientations, and none of the
     /// four cases above lands in it — so the invariant read as held while a sender and a receiver
-    /// sat one quantum apart for any pose on that orbit. A wire invariant needs a sweep.
+    /// sat one quantum apart for any pose on that orbit. This sweep covers the whole family.
     #[test]
     fn every_canonicalized_quat_survives_its_own_wire_trip() {
         let prop = PropSchema {

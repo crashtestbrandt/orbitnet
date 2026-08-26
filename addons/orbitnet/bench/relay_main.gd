@@ -182,12 +182,17 @@ func _parse_target(spec: String) -> void:
 	var body: String = spec
 	var close: int = spec.rfind("]")
 	if close >= 0:
+		# A bracketed target commits host and port together or not at all. Writing the port before
+		# the bracket check let a malformed target -- `x]:47900` -- move the port while the host kept
+		# its previous value, so the relay forwarded to a host:port pair nobody named.
+		var port: int = _target_port
 		var after: int = spec.find(":", close)
 		if after > 0 and after < spec.length() - 1 and spec.substr(after + 1).is_valid_int():
-			_target_port = clampi(spec.substr(after + 1).to_int(), 1, 65535)
+			port = clampi(spec.substr(after + 1).to_int(), 1, 65535)
 			body = spec.substr(0, after)
 		if body.begins_with("[") and body.ends_with("]") and body.length() > 2:
 			_target_host = body.substr(1, body.length() - 2)
+			_target_port = port
 		return
 	if spec.count(":") == 1:
 		var parts: PackedStringArray = spec.rsplit(":", false, 1)

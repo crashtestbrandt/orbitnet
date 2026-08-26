@@ -8,7 +8,8 @@ just check           # everything a PR must pass
 ```
 
 `check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → `descriptor-parity` →
-cargo gates → lint → unit suites → the server-shape probe → the two-peer RTS probe → the arena probe.
+`bench-check` → cargo gates → lint → unit suites → the server-shape probe → the two-peer RTS probe → the
+arena probe.
 
 ## Layout, and where to edit
 
