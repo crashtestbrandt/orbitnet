@@ -33,6 +33,12 @@ last N ticks for redundancy, so a single lost packet costs nothing.
 delta, and the interest table. All but the handshake carry the same 12-byte trailer. Ordering is what a manifest delta needs
 and a snapshot does not; every frame goes out `TRANSFER_MODE_RELIABLE` on one channel.
 
+**Reliable means retransmitted, not delivered.** Every datagram of a session — reliable and unreliable alike —
+draws from one sequence counter and is checked against one `REPLAY_WINDOW`-wide replay window, so a
+retransmission that lands more than that many datagrams behind the newest is refused as a replay and dropped.
+Anything that depends on a control frame arriving has to notice that it did, rather than assume it: the
+interest table is owed until the client's echo says it holds it, and is re-sent meanwhile.
+
 **Handshake** — magic, protocol version, tick rate, a **session id**, the **session nonce**, the
 **resume token**, then the **confirm tag**:
 

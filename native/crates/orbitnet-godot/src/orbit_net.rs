@@ -7816,10 +7816,12 @@ fn admit_input_blocks(
 /// every entity the peer never lost, and a game acting on those signals would rebuild nodes that were
 /// never gone.
 ///
-/// **A SLOT THIS PEER CANNOT NAME LEAVES THE SET SHORT.** The manifest that binds it is reliable and
-/// will arrive, but its arrival re-announces nothing — [`retire_unnamed_interest`] only removes — so
-/// adopting a set with a hole in it and calling the ask answered is how that hole becomes permanent.
-/// It is the same rule a section follows, for the same reason.
+/// **A SLOT THIS PEER CANNOT NAME LEAVES THE SET SHORT.** The manifest that binds it is reliable —
+/// which means retransmitted, not that it arrives; a copy refused by the replay window is neither —
+/// and even when it does land it re-announces nothing, because [`retire_unnamed_interest`] only
+/// removes. So adopting a set with a hole in it and calling the ask answered is how that hole becomes
+/// permanent, whichever way the manifest goes. It is the same rule a section follows, for the same
+/// reason.
 #[must_use]
 fn adopt_whole_set(
     slots: &SlotTable,
