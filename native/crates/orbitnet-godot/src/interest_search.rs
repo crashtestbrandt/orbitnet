@@ -105,7 +105,7 @@ struct Mirror {
     want_interest: bool,
     newest_snapshot_tick: u64,
     unacked: bool,
-    unbound_since: Option<u64>,
+    unbound: UnboundSlots,
     want_manifest: bool,
 }
 
@@ -169,7 +169,7 @@ impl Session {
                 self.client_slots.bind(slot, id);
             }
         }
-        self.mirror.unbound_since = None;
+        self.mirror.unbound.cleared();
         self.mirror.want_manifest = false;
     }
 
@@ -357,13 +357,19 @@ impl Session {
         if carried.is_empty() {
             return;
         }
-        let unbound = carried
-            .iter()
-            .any(|&id| self.client_slots.slot_of(id).is_none());
-        let (ask, since) =
-            manifest_ask_for_frame(self.mirror.unbound_since, self.tick, true, unbound);
-        self.mirror.unbound_since = since;
-        self.mirror.want_manifest |= ask;
+        // Per slot, through the shipping [`UnboundSlots`]. The server addresses a block by the slot
+        // ITS table names; a client that cannot resolve that slot is the case the ask exists for.
+        for id in carried {
+            match self.server_slots.slot_of(id) {
+                None => continue,
+                Some(slot) if self.client_slots.id_of(slot).is_some() => {
+                    self.mirror.unbound.named(slot);
+                }
+                Some(slot) => {
+                    self.mirror.want_manifest |= self.mirror.unbound.unnamed(slot, self.tick);
+                }
+            }
+        }
         if self.mirror.want_manifest {
             // The server answers the next tick; the ask is latched until it does.
             self.deliver_manifest();
@@ -627,12 +633,14 @@ fn the_search_catches_the_defects_it_was_built_from() {
         "a retry quotes the generation already in flight"
     );
 
-    // Round thirteen: the manifest ask cannot fire if a named slot in the same frame clears it.
-    let (ask, _) = manifest_ask_for_frame(Some(0), INTEREST_DELTA_RETRY_TICKS, true, true);
+    // Round fourteen: a slot's clock is not reset by what OTHER slots did in frames between its
+    // own sightings, which is what made every earlier version starvable.
+    let mut unbound = UnboundSlots::default();
+    assert!(!unbound.unnamed(9, 0), "the first sighting is ordinary lag");
+    unbound.named(3);
+    unbound.named(4);
     assert!(
-        ask,
-        "a frame that could not name a slot still runs the clock"
+        unbound.unnamed(9, INTEREST_DELTA_RETRY_TICKS),
+        "and naming other slots in between says nothing about this one"
     );
-    let (_, cleared) = manifest_ask_for_frame(Some(0), 10, true, false);
-    assert_eq!(cleared, None, "and one that named everything clears it");
 }

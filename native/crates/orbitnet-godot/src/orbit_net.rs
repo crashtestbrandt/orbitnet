@@ -1219,6 +1219,35 @@ impl PeerState {
     fn owe_whole_interest_set(&mut self) {
         self.interest_full_due = true;
         self.interest_table_inflight = None;
+        // **AND THE RETRY STAMP, BECAUSE THIS IS NOT A RETRY.** The stamp and the in-flight copy are
+        // two halves of one fact — a table for THIS demand is on the wire. Left standing, it made
+        // `interest_table_due` throttle the first send of a brand-new demand behind a window
+        // belonging to a different, already-settled one.
+        //
+        // A client's [`FrameHeader::FLAG_WANT_INTEREST`] does NOT come through here, so it keeps the
+        // stamp and stays rate limited: its answer is a whole set, which restates everything however
+        // much was lost, so delaying it by a window costs nothing — where answering it every round
+        // trip, for the life of a connection that can never resolve a slot, costs a reliable frame
+        // each time.
+        self.interest_table_tick = None;
+    }
+
+    /// Forget everything this connection was believed to hold of its interest set.
+    ///
+    /// **A REKEY MEANS THE CLIENT'S MIRROR IS GONE**, and the figure that has to move for the server
+    /// to notice is the ACKED one. The client's `stop()` zeroes its own generation, so it echoes `0`
+    /// — and [`Self::note_interest_echo`] takes a `max`, so the server's belief never falls and
+    /// `gate_shut` keeps reading false. Sections built at the old generation are then refused by the
+    /// client and retired by the server on the same frame's ack: transitions retired as delivered
+    /// without ever being applied, which is the outcome the gate exists to make unreachable.
+    ///
+    /// [`Self::interest_generation`] itself does NOT reset. It has to stay ahead of what the client
+    /// holds, or the replacement set would be stated at a generation the client could still believe
+    /// it has.
+    fn forget_interest(&mut self) {
+        self.interest_seeded = false;
+        self.interest_generation_acked = 0;
+        self.owe_whole_interest_set();
     }
 
     /// Remove `id` from one half, keeping `sent` pointing at the same entries it did.
@@ -2182,7 +2211,7 @@ pub struct OrbitNet {
     /// manifest this peer never received, and since the server advances its per-peer generation when
     /// the frame is handed to the transport, nothing on either end would otherwise notice. The client
     /// asks for the whole table, which is the repair that already exists.
-    unbound_since: Option<u64>,
+    unbound: UnboundSlots,
     dbg_rx_skipped: u64,
     dbg_rx_kinds: [u64; 8],
     /// Datagrams refused by [`OrbitNet::open_datagram`]: forged, replayed, or from a peer with no
@@ -2206,6 +2235,7 @@ impl INode for OrbitNet {
     fn init(base: Base<Node>) -> Self {
         Self {
             base,
+            unbound: UnboundSlots::default(),
             tickrate: 60,
             sync_to_physics: true,
             history_limit: 128,
@@ -2346,7 +2376,6 @@ impl INode for OrbitNet {
             dbg_sent_bytes: 0,
             dbg_rx_applied: 0,
             dbg_rx_rejected: 0,
-            unbound_since: None,
             dbg_rx_skipped: 0,
             dbg_rx_kinds: [0; 8],
             dbg_rx_unauth: 0,
@@ -2665,7 +2694,7 @@ impl OrbitNet {
         self.interest_mirror_seeded = false;
         self.interest_mirror_generation = 0;
         self.interest_generation_echoed = 0;
-        self.unbound_since = None;
+        self.unbound.cleared();
         self.want_interest = false;
         self.interest_events.clear();
         // The path verdict describes THIS session's occupancy, and the next session's arena is not
@@ -6606,7 +6635,7 @@ impl OrbitNet {
     /// see [`Self::announce_seats`].
     fn adopt_manifest_full(&mut self, generation: u64, entries: Vec<ManifestEntry>) {
         // A table landed, so whatever this peer could not place, it may be able to now.
-        self.unbound_since = None;
+        self.unbound.cleared();
         self.slots.clear();
         for entry in &entries {
             self.slots.bind(entry.slot, entry.id);
@@ -6636,7 +6665,7 @@ impl OrbitNet {
     /// alike, and applying one twice lands in the same place.
     fn adopt_manifest_delta(&mut self, delta: &ManifestDelta) {
         // A table landed, so whatever this peer could not place, it may be able to now.
-        self.unbound_since = None;
+        self.unbound.cleared();
         let rows = apply_manifest_delta(&self.manifest_published, delta);
         self.manifest_published = rows;
         self.manifest_generation = delta.generation;
@@ -6858,12 +6887,10 @@ impl OrbitNet {
             // for an interest pass that had never run — an empty set, which a client then holds as
             // the whole truth.
             if rekeyed {
-                peer.interest_seeded = false;
-                // Through the helper, because a set computed before the rekey is stale: the client's
-                // `stop()` cleared the mirror it was stated against, so re-sending it would seat a
-                // baseline neither end holds, and an echo of its generation would settle a demand it
-                // never covered.
-                peer.owe_whole_interest_set();
+                // Everything this connection held of its interest set went with the session that
+                // held it. See [`PeerState::forget_interest`]: the ACKED generation is the figure
+                // that has to move, or the gate reads open against a mirror that no longer exists.
+                peer.forget_interest();
             }
         }
         // The secret this connection's frame tokens are minted from. `get_or_insert_with`, not an
@@ -7236,9 +7263,6 @@ impl OrbitNet {
         // in the same loop, so one nameable block zeroed the clock an unbound block had just set and
         // the ask could never fire for a client that could still name anything — which is exactly the
         // client the ask exists for.
-        let mut frame_had_blocks = false;
-        let mut frame_had_unbound = false;
-
         for _ in 0..header.entity_count {
             let Ok(meta) = decode_state_block_meta(reader, frame_tick) else {
                 self.note_snapshot_break(header.flags);
@@ -7248,8 +7272,18 @@ impl OrbitNet {
             // rides the reliable channel and an unreliable snapshot can overtake it — so it falls
             // through to the skip below, exactly as an unknown entity id used to.
             let named = self.slots.id_of(meta.slot);
-            frame_had_blocks = true;
-            frame_had_unbound |= named.is_none();
+            // **THE CLOCK IS PER SLOT.** See [`UnboundSlots`]: a rule that reads "this frame named
+            // everything it carried" as "the manifest is fine" resets a clock those frames said
+            // nothing about, because a given entity's block rides only a subset of them.
+            //
+            // A NAMED SLOT WHOSE ENTITY IS NOT REGISTERED is not a manifest problem: `named` is the
+            // slot table's answer, not the registry's. That is a node the game has yet to spawn, and
+            // asking for the whole table returns the row this client already holds.
+            if named.is_some() {
+                self.unbound.named(meta.slot);
+            } else {
+                self.want_manifest |= self.unbound.unnamed(meta.slot, frame_tick);
+            }
             let entity = named.unwrap_or(0);
             if let Some(mut sync) = self.rollback_entities.get(&entity).and_then(live_handle) {
                 if !meta.state_lane {
@@ -7306,26 +7340,6 @@ impl OrbitNet {
                 return;
             }
         }
-
-        // THE MANIFEST-ASK CLOCK, decided once for the whole frame.
-        //
-        // | This frame | What it says | The clock |
-        // | --- | --- | --- |
-        // | carried no blocks | nothing about whether slots can be named — a bare header, or a tick with no news | left alone |
-        // | named every slot it carried | the manifest this client holds covers what it is being sent | cleared |
-        // | carried a slot it could not name | either ordinary spawn-in-flight lag or a manifest that never arrived | runs |
-        //
-        // A NAMED SLOT WHOSE ENTITY IS NOT REGISTERED does not reach the third row: `named` is the
-        // slot table's answer, not the registry's. That is a node the game has yet to spawn, and
-        // asking for the whole table returns the same row the client already holds.
-        let (ask, since) = manifest_ask_for_frame(
-            self.unbound_since,
-            frame_tick,
-            frame_had_blocks,
-            frame_had_unbound,
-        );
-        self.unbound_since = since;
-        self.want_manifest |= ask;
 
         // THE TRAILING SECTION, AFTER THE BLOCKS AND BEHIND ITS FLAG. Everything above reads exactly
         // `entity_count` blocks and stops, which is what lets these bytes exist at all: a build that
@@ -8087,31 +8101,6 @@ fn snapshot_frame_is_skipped(has_blocks: bool, carries_delta: bool, gate_shut: b
     !has_blocks && !carries_delta && !gate_shut
 }
 
-/// Whether an unplaceable state block should ask for the whole entity manifest, and what the clock
-/// reads afterwards.
-///
-/// **ONE UNBOUND SLOT IS ORDINARY; A SUSTAINED RUN OF THEM IS NOT.** The manifest rides a reliable
-/// channel and the snapshot an unreliable one, so a block naming a slot the manifest has not bound
-/// is the everyday spawn-in-flight case. What is not ordinary is still being unable to name anything
-/// a retry window later: that is a manifest this connection never received, and since the server
-/// advances its per-peer generation when the frame is handed to the transport, nothing on either end
-/// would otherwise notice.
-///
-/// The caller runs this only while the SLOT ITSELF has no binding — a named slot whose entity is not
-/// registered is a node the game has yet to spawn, which no table can repair.
-///
-/// A free function so the rule the receive path runs is the rule a test can call.
-#[must_use]
-fn manifest_ask_from_unbound(since: Option<u64>, frame_tick: u64) -> (bool, Option<u64>) {
-    match since {
-        None => (false, Some(frame_tick)),
-        Some(at) if frame_tick >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS) => {
-            (true, Some(frame_tick))
-        }
-        keep => (false, keep),
-    }
-}
-
 /// The departures the first interest news implies for this peer, ascending.
 ///
 /// **SEEDING THE MIRROR CHANGES WHAT THE READ-BACK ANSWERS, FOR EVERY REGISTERED ENTITY.** An
@@ -8182,33 +8171,60 @@ fn section_is_news(frame_tick: u64, newest_seen: u64) -> bool {
     frame_tick >= newest_seen
 }
 
-/// Fold one snapshot frame's block outcomes into the manifest-ask clock.
+/// How many distinct unnameable slots are worth watching at once.
 ///
-/// **THE CLOCK IS A FACT ABOUT A FRAME, NOT ABOUT A BLOCK.** Deciding it per block put the clear and
-/// the stamp in one loop, so a single nameable block zeroed the clock an unbound block had just set,
-/// and the ask could fire only for a client that could name NOTHING — never for one missing a single
-/// binding, which is the case it exists for.
+/// A client missing one binding needs one entry. A client missing many is already going to ask on the
+/// first of them, so the rest carry no new information — the cap is a bound on the map, not a policy.
+const UNBOUND_SLOTS_MAX: usize = 64;
+
+/// The per-slot clock behind the whole-manifest ask.
 ///
-/// | This frame | What it says | The clock |
-/// | --- | --- | --- |
-/// | carried no blocks | nothing — a bare header, or a tick with no news | left alone |
-/// | named every slot it carried | the manifest covers what this client is being sent | cleared |
-/// | carried a slot it could not name | spawn-in-flight lag, or a manifest that never arrived | runs |
+/// **A SLOT'S CLOCK IS NOT AFFECTED BY WHAT OTHER SLOTS DID.** Every earlier version of this was a
+/// single figure, and every one was starvable, because block admission is selective: the byte budget
+/// defers blocks, the priority bands ride every one, two or four ticks, and a quarantined slot rides
+/// not at all. So the frames between two appearances of one unnameable slot are frames that named
+/// everything they carried — and any rule that reads "this frame named everything" as "the manifest
+/// is fine" resets a clock that was measuring something those frames said nothing about.
 ///
-/// A free function so the rule the receive path runs is the rule a test can call.
-#[must_use]
-fn manifest_ask_for_frame(
-    since: Option<u64>,
-    frame_tick: u64,
-    had_blocks: bool,
-    had_unbound: bool,
-) -> (bool, Option<u64>) {
-    if !had_blocks {
-        (false, since)
-    } else if had_unbound {
-        manifest_ask_from_unbound(since, frame_tick)
-    } else {
-        (false, None)
+/// | Event | Effect |
+/// | --- | --- |
+/// | a frame names a slot | that slot's entry is dropped: the manifest covers it |
+/// | a frame carries a slot it cannot name | that slot's entry starts, or is tested against the retry window |
+/// | a slot stops arriving | its entry is left alone and never fires, because only a slot IN THIS FRAME is tested |
+/// | a manifest is adopted | every entry is dropped |
+#[derive(Default, Debug, Clone)]
+struct UnboundSlots {
+    /// Slot to the tick it was first seen unnameable. `BTreeMap` for a deterministic walk.
+    since: std::collections::BTreeMap<u16, u64>,
+}
+
+impl UnboundSlots {
+    /// This frame named `slot`, so the manifest this client holds covers it.
+    fn named(&mut self, slot: u16) {
+        if !self.since.is_empty() {
+            self.since.remove(&slot);
+        }
+    }
+
+    /// This frame carried `slot` and could not name it. Answers whether that has now been true for a
+    /// whole [`INTEREST_DELTA_RETRY_TICKS`], which is a manifest that never arrived rather than the
+    /// ordinary spawn-in-flight lag.
+    fn unnamed(&mut self, slot: u16, frame_tick: u64) -> bool {
+        if self.since.len() >= UNBOUND_SLOTS_MAX && !self.since.contains_key(&slot) {
+            return false;
+        }
+        let since = *self.since.entry(slot).or_insert(frame_tick);
+        if frame_tick >= since.saturating_add(INTEREST_DELTA_RETRY_TICKS) {
+            // Re-stamped so the ask repeats once per window rather than once per frame.
+            self.since.insert(slot, frame_tick);
+            return true;
+        }
+        false
+    }
+
+    /// A manifest landed, so whatever this was watching may be nameable now.
+    fn cleared(&mut self) {
+        self.since.clear();
     }
 }
 
@@ -8266,13 +8282,19 @@ fn interest_table_to_send(slots: &SlotTable, peer: &mut PeerState) -> (u64, Vec<
     // mint would state a different entity than the one this set was computed for, and the client
     // would resolve it through its current manifest and report the set fully resolved. See
     // [`PeerState::interest_table_inflight`].
+    // **A REISSUED SLOT FORCES A FRESH SET; AN UNBOUND ONE DOES NOT.** The hazard is a slot that now
+    // means a DIFFERENT entity, because the receiver resolves it through its current manifest and
+    // reports the set fully resolved. A slot merely unbound names an entity that has left, which the
+    // next set states correctly once this one settles — and re-minting on every unbind would move the
+    // generation on every retry of a churning session, which is the defect the retry rule exists to
+    // prevent.
     let reusable = peer
         .interest_table_inflight
         .as_ref()
         .is_some_and(|(_, pairs)| {
             pairs
                 .iter()
-                .all(|&(slot, id)| slots.id_of(slot) == Some(id))
+                .all(|&(slot, id)| slots.id_of(slot).is_none_or(|current| current == id))
         });
     let (generation, pairs) = if reusable {
         peer.interest_table_inflight
@@ -8924,23 +8946,22 @@ mod tests {
         clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
         delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
         input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
-        is_located, manifest_ask_for_frame, manifest_ask_from_unbound, manifest_owed,
-        note_input_tick, owned_rows_into, owned_rows_of, queue_seat_release, resim_input_from,
-        resolve_observer, resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello,
-        seat_observer, seat_observers_into, seat_release_policy_of, section_is_news,
-        select_interest_path, session_directions, session_is_filtering, session_key_from,
-        snapshot_frame_is_skipped, state_whole_interest_set, unseeded_departures,
-        veto_announces_leave, AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed,
-        OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
-        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
-        StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
-        FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX,
-        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
-        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
-        MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
-        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
-        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
-        UNLOCATABLE_CENTER,
+        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
+        queue_seat_release, resim_input_from, resolve_observer, resume_grant,
+        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
+        session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
+        state_whole_interest_set, unseeded_departures, veto_announces_leave, AckOutcome, EntityRow,
+        FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
+        PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
+        SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots,
+        Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
+        INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX,
+        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
+        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
+        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
+        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
+        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -11038,8 +11059,18 @@ mod tests {
             "a plain retry is verbatim"
         );
 
-        // The entity leaves, its slot is quarantined and later reissued to another.
+        // The entity leaves and its slot is quarantined. That is NOT a reissue: the slot still means
+        // what it meant or means nothing, and re-minting here would move the generation on every
+        // retry of a churning session — the defect the retry rule exists to prevent.
         slots.unbind(0);
+        let (unbound, _) = interest_table_to_send(&slots, &mut peer);
+        assert_eq!(
+            unbound, minted,
+            "an unbound slot is not a reissue, so the retry is still verbatim"
+        );
+
+        // Reissued to another entity, which is the hazard: the receiver would resolve it through its
+        // current manifest and report the set fully resolved.
         slots.bind(0, 9);
         let (after, _) = interest_table_to_send(&slots, &mut peer);
         assert!(
@@ -11048,47 +11079,213 @@ mod tests {
         );
     }
 
-    /// **A CLIENT MISSING ONE BINDING IS THE CASE THE ASK EXISTS FOR, AND IS THE ONE IT MISSED.**
+    /// **THE STATED SET IS SORTED AS PAIRS, NOT AS TWO LISTS.**
     ///
-    /// The previous version cleared the clock for every named slot inside the same per-block loop
-    /// that stamped it for an unbound one, so a frame carrying one nameable block zeroed the clock
-    /// the unbound block had just set. `manifest_ask_from_unbound` was then always asked
-    /// `frame_tick >= frame_tick + RETRY`, which is never true. Only a client that could name nothing
-    /// at all ever asked.
+    /// `state_whole_interest_set` used to sort the slots and the ids independently, so index `i` of
+    /// one sat beside a different entity's entry in the other for any set whose slot order and id
+    /// order disagree — which is every set containing a reissued slot. Nothing read them paired until
+    /// the retry guard did, and every other test builds a set whose two orders happen to agree.
     ///
-    /// Ten seconds at 64 Hz, every frame carrying one bound block and one permanently unbound one --
-    /// the shape of a client that missed a single manifest publish.
+    /// Here they are deliberately opposed: the higher id holds the lower slot.
     #[test]
-    fn a_client_that_can_name_all_but_one_slot_still_asks_for_the_table() {
-        let mut since: Option<u64> = None;
+    fn a_set_whose_slot_order_opposes_its_id_order_stays_paired() {
+        let mut slots = SlotTable::default();
+        slots.bind(0, 42);
+        slots.bind(1, 7);
+
+        let mut peer = PeerState {
+            synced: true,
+            ..Default::default()
+        };
+        let (mut scratch, mut delta) = (SeatScratch::default(), InterestDelta::default());
+        peer.interest.update_linear_into(
+            &AoiConfig::default(),
+            &[SeatObserver {
+                center: [0.0; 3],
+                membership: MEMBERSHIP_GLOBAL,
+            }],
+            &[
+                InterestCandidate::anchored(7, [1.0, 0.0, 0.0]),
+                InterestCandidate::anchored(42, [1.0, 0.0, 0.0]),
+            ],
+            &mut scratch,
+            &mut delta,
+        );
+
+        let (_, pairs) = state_whole_interest_set(&slots, &mut peer);
+        for &(slot, id) in &pairs {
+            assert_eq!(
+                slots.id_of(slot),
+                Some(id),
+                "every pair names the entity its slot actually resolves to"
+            );
+        }
+        assert_eq!(
+            pairs,
+            vec![(0u16, 42u64), (1, 7)],
+            "ascending by slot, each carrying its own entity"
+        );
+    }
+
+    /// **A REKEY LEAVES THE CLIENT HOLDING NOTHING, AND THE ACKED FIGURE HAS TO SAY SO.**
+    ///
+    /// The client's `stop()` zeroes its own generation, so it echoes `0` — and `note_interest_echo`
+    /// takes a `max`, so the server's belief never falls on its own. With the gate reading open
+    /// against a mirror that no longer exists, every section built in the meantime is refused by the
+    /// client and retired by the server on the same frame's ack.
+    #[test]
+    fn a_rekey_shuts_the_gate_it_would_otherwise_leave_open() {
+        let slots = table_naming(&[7]);
+        let mut peer = peer_holding(7);
+        peer.synced = true;
+
+        // The connection is settled at a generation both ends agree on.
+        peer.owe_whole_interest_set();
+        let (generation, _) = interest_table_to_send(&slots, &mut peer);
+        peer.interest_table_tick = Some(10);
+        assert!(peer.note_interest_echo(generation), "the client holds it");
+        assert_eq!(
+            peer.interest_generation_acked, peer.interest_generation,
+            "so the gate is open"
+        );
+
+        // It rekeys. Everything it held went with the session.
+        peer.forget_interest();
+        assert_ne!(
+            peer.interest_generation_acked, peer.interest_generation,
+            "the gate is shut against a mirror that no longer exists"
+        );
+        assert!(peer.interest_full_due, "and a whole set is owed");
+        assert!(!peer.interest_seeded, "with nothing seeded");
+
+        // The client's echo of 0 must not reopen it.
+        assert!(
+            !peer.note_interest_echo(0),
+            "an echo of nothing settles nothing"
+        );
+        assert_ne!(
+            peer.interest_generation_acked, peer.interest_generation,
+            "the gate stays shut until the replacement set is echoed"
+        );
+
+        // The replacement is stated at a NEW generation -- restating the old one would land on a
+        // number the client could still believe it held.
+        let (replacement, _) = interest_table_to_send(&slots, &mut peer);
+        assert!(replacement > generation, "and it is stated afresh");
+        assert!(
+            peer.note_interest_echo(replacement),
+            "which the client can settle"
+        );
+    }
+
+    /// **A BRAND-NEW DEMAND IS NOT A RETRY, AND THE STAMP MUST NOT THROTTLE IT.**
+    ///
+    /// The stamp and the in-flight copy are two halves of one fact — a table for THIS demand is on
+    /// the wire. Left standing across a settle, it made `interest_table_due` refuse the first send of
+    /// an unrelated new demand for up to a whole retry window.
+    ///
+    /// A client's `WANT_INTEREST` does not come through `owe_whole_interest_set`, so it keeps the
+    /// stamp and stays rate limited: its answer is a whole set, which restates everything however
+    /// much was lost.
+    #[test]
+    fn a_new_cause_is_served_at_once_and_a_repeated_ask_is_not() {
+        let slots = table_naming(&[7]);
+        let mut peer = peer_holding(7);
+        peer.synced = true;
+        peer.owe_whole_interest_set();
+        let (generation, _) = interest_table_to_send(&slots, &mut peer);
+        peer.interest_table_tick = Some(100);
+        assert!(peer.note_interest_echo(generation), "settled");
+
+        // A server-detected cause: served on the next flush, not a window later.
+        peer.owe_whole_interest_set();
+        assert!(
+            interest_table_due(&peer, 101),
+            "a new cause is not throttled by a settled demand's stamp"
+        );
+
+        // A client's repeated ask keeps the stamp, so it waits.
+        let mut asking = peer_holding(7);
+        asking.synced = true;
+        asking.owe_whole_interest_set();
+        let (asked_generation, _) = interest_table_to_send(&slots, &mut asking);
+        asking.interest_table_tick = Some(100);
+        assert!(asking.note_interest_echo(asked_generation), "settled");
+        asking.interest_full_due = true; // the raw raise a WANT_INTEREST frame makes
+        assert!(
+            !interest_table_due(&asking, 101),
+            "a repeated ask does not buy a table every round trip"
+        );
+        assert!(
+            interest_table_due(&asking, 100 + INTEREST_DELTA_RETRY_TICKS),
+            "and is answered once the window is up"
+        );
+    }
+
+    /// **A CLIENT MISSING ONE BINDING IS THE CASE THE ASK EXISTS FOR, AND EVERY EARLIER RULE MISSED
+    /// IT.** Round eleven kept one global stamp; round twelve cleared it per block, which meant one
+    /// nameable block zeroed the clock an unbound one had just set; round thirteen moved the decision
+    /// to the frame, which is still starvable, because block admission is selective — the byte budget
+    /// defers blocks, the priority bands ride every one, two or four ticks, and a quarantined slot
+    /// rides not at all. The frames between two appearances of one unnameable slot named everything
+    /// THEY carried, and each of them reset a clock measuring something they said nothing about.
+    ///
+    /// A slot's clock is its own. Here entity 9's block rides every fourth frame, which is the worst
+    /// band, and every frame in between names everything it carries.
+    #[test]
+    fn a_slot_seen_only_every_fourth_frame_still_reaches_the_retry_window() {
+        let mut unbound = UnboundSlots::default();
         let mut asked_at: Option<u64> = None;
-        for frame_tick in 0..640u64 {
-            let (ask, next) = manifest_ask_for_frame(since, frame_tick, true, true);
-            since = next;
-            if ask && asked_at.is_none() {
-                asked_at = Some(frame_tick);
+        for frame_tick in 0..(4 * INTEREST_DELTA_RETRY_TICKS + 8) {
+            if frame_tick.is_multiple_of(4) {
+                if unbound.unnamed(9, frame_tick) && asked_at.is_none() {
+                    asked_at = Some(frame_tick);
+                }
+            } else {
+                // Every other frame names everything it carries, which says nothing about slot 9.
+                unbound.named(3);
+                unbound.named(4);
             }
         }
         assert_eq!(
             asked_at,
             Some(INTEREST_DELTA_RETRY_TICKS),
-            "the ask fires a retry window after the first slot it could not name"
+            "the ask fires a retry window after the slot was first unnameable, whatever the frames \
+             in between carried"
         );
 
-        // A frame that named everything says the manifest covers what this client is being sent, so
-        // the clock starts again from the next one that does not.
-        let (ask, since) = manifest_ask_for_frame(Some(10), 700, true, false);
-        assert!(!ask, "naming everything asks for nothing");
-        assert_eq!(since, None, "and clears the clock");
+        // A frame that names the slot says the manifest covers it, and the clock starts over.
+        let mut settled = UnboundSlots::default();
+        assert!(!settled.unnamed(9, 0));
+        settled.named(9);
+        assert!(
+            !settled.unnamed(9, INTEREST_DELTA_RETRY_TICKS),
+            "naming it cleared its clock, so this is the first sighting again"
+        );
 
-        // A frame carrying no blocks says nothing either way, so it must not reset a running clock.
-        // The server sends one of these every tick while an interest gate is shut.
-        let (ask, since) = manifest_ask_for_frame(Some(10), 700, false, false);
-        assert!(!ask);
-        assert_eq!(
-            since,
-            Some(10),
-            "a bare header does not reset a clock that is running"
+        // A manifest landing clears every slot at once.
+        let mut adopted = UnboundSlots::default();
+        assert!(!adopted.unnamed(9, 0));
+        adopted.cleared();
+        assert!(
+            !adopted.unnamed(9, INTEREST_DELTA_RETRY_TICKS),
+            "a manifest that landed may name it, so nothing is owed yet"
+        );
+
+        // The ask repeats once per window rather than once per frame.
+        let mut repeating = UnboundSlots::default();
+        assert!(!repeating.unnamed(9, 0));
+        assert!(
+            repeating.unnamed(9, INTEREST_DELTA_RETRY_TICKS),
+            "asks once"
+        );
+        assert!(
+            !repeating.unnamed(9, INTEREST_DELTA_RETRY_TICKS + 1),
+            "and not again on the next frame"
+        );
+        assert!(
+            repeating.unnamed(9, 2 * INTEREST_DELTA_RETRY_TICKS),
+            "but once the next window is up"
         );
     }
 
@@ -11305,24 +11502,24 @@ mod tests {
     /// manifest arriving to fail its base check.
     #[test]
     fn a_sustained_run_of_unplaceable_blocks_asks_for_the_table() {
-        let ask = manifest_ask_from_unbound;
+        let mut unbound = UnboundSlots::default();
 
-        // The first one starts the clock and asks for nothing.
-        let (asked, since) = ask(None, 100);
-        assert!(!asked, "one unbound slot is ordinary lag");
-        assert_eq!(since, Some(100));
+        // The first sighting starts that slot's clock and asks for nothing.
+        assert!(!unbound.unnamed(5, 100), "one unbound slot is ordinary lag");
 
         // So does one a few ticks later -- still inside a round trip of manifest lag.
-        let (asked, since) = ask(since, 110);
-        assert!(!asked, "and so is a run shorter than the retry window");
-        assert_eq!(since, Some(100), "the clock keeps its start");
+        assert!(
+            !unbound.unnamed(5, 110),
+            "and so is a run shorter than the retry window"
+        );
 
         // Past the window, this peer is not lagging, it is missing a table.
-        let (asked, since) = ask(since, 100 + INTEREST_DELTA_RETRY_TICKS);
-        assert!(asked, "a sustained run asks for the whole table");
-        assert_eq!(
-            since,
-            Some(100 + INTEREST_DELTA_RETRY_TICKS),
+        assert!(
+            unbound.unnamed(5, 100 + INTEREST_DELTA_RETRY_TICKS),
+            "a sustained run asks for the whole table"
+        );
+        assert!(
+            !unbound.unnamed(5, 101 + INTEREST_DELTA_RETRY_TICKS),
             "and the clock restarts, so the ask is one per window rather than one per block"
         );
     }
