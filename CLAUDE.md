@@ -1,6 +1,6 @@
 # OrbitNet — Claude Code context
 
-**CONTRIBUTING.md is the authority on this repository**: layout, the two grep-enforced boundaries, the GDScript
+**CONTRIBUTING.md is the authority on this repository**: layout, the two backend boundaries and which of them the gate enforces, the GDScript
 rules, the addon-sync model, where coverage belongs, and how decisions get recorded. Read it first and follow it.
 This file adds what that document does not cover: how to write for a human, and the rule this repository needs
 that its upstream does not.

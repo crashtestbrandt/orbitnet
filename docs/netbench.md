@@ -90,13 +90,26 @@ tools/netbench/compare.py /tmp/nb-before /tmp/nb-after
 
 `NETBENCH_OUT` names a stable artifact directory instead of a temp one. `compare.py` pools every row, reports
 p50 and p95 per column, and prints `REGRESSED` / `improved` / `same` against a tolerance (5% by default) for
-the columns whose direction is known. It drops the first three seconds of each client's series — the
-handshake, the first full-state burst and the clock's initial convergence — and it exits non-zero on a
-regression.
+the columns whose direction is known, and exits non-zero on a regression.
+
+**Warm-up is dropped from both series.** Each client loses its first three seconds — the handshake, the first
+full-state burst and the clock's initial convergence. The server's per-second wire line loses every row
+before its first live peer, plus the same three seconds after it: a dedicated server logs from boot, so the
+rows before anybody joined describe an empty session and would pull every server p50 toward zero.
 
 **A column that is zero on both sides reads `not measured`, not `same`.** Most send-path columns are
 collected on the server and appear in no client CSV, so in a client-only comparison they are absent rather
 than unchanged. `same` on a dozen of them would read as a send path that was compared and found equal.
+
+**A column zero on the BASELINE only reads `new (was 0)`**, and is not counted as a regression. There is no
+denominator, which is why the delta prints `n/a` — judging it anyway made every capability the baseline never
+exercised look like a regression. It prints under its own verdict rather than as `not measured`, because the
+same shape is a fault counter leaving zero for the first time.
+
+**The per-frame CPU timers carry an absolute floor as well as the relative tolerance.** They sit near
+0.02–0.03 ms, where 5% is below the spread between two runs of one binary — measured, not assumed: back-to-back
+runs of one commit moved `rollback_ms` +11.5% and `net_ms` +10.0%. A move under 0.05 ms, which is 0.15% of a
+33 ms tick, is not judged. `compare.py --self-test` asserts these rules and reads no artifacts.
 
 **Resim depth is printed and not judged**, for the reason the run's own gate does not judge it: it deepens
 legitimately under latency, and prediction that is actually broken shows up as `reconcile_snap`.

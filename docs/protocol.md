@@ -339,6 +339,18 @@ generation it does not hold, and a frame it acknowledged but could not read to t
 before a block is parsed, so a snapshot that breaks partway is counted delivered whatever became of the
 section in it.
 
+- **`WANT_INTEREST` is latched, not self-sustaining.** The client holds the bit raised until a whole set
+  actually arrives, rather than clearing it when the frame carrying it is sent. It rides an unreliable input
+  frame, so clearing on send made it a one-shot NACK that a single lost datagram discarded — and the thing it
+  asks for is the only repair for what was lost. This is the opposite convention to the adjacent
+  `WANT_MANIFEST` bit, which may clear on send because the client zeroes its own generation at the same
+  moment and the next delta re-raises it.
+- **The server sends a bare header while the gate is shut.** One snapshot frame per tick carrying no blocks
+  and no section, for a peer whose echoed generation does not match. Without it the lane can wedge: the echo
+  rides an input frame, a peer driving no body sends one only when a snapshot has arrived, and a peer whose
+  frames are all skipped for want of content is never prompted to echo again. The client cannot detect this —
+  nothing tells it whether its echo landed — so the server, which holds both generations, is what breaks the
+  silence. It lasts about a round trip.
 - **A section is only built for a peer that holds its baseline.** The client echoes the generation it holds
   on the input frame it is already sending, and the server declines to build a section until the two agree.
   That is what stops a section overtaking the whole set it was computed after: there is nothing to overtake,
@@ -363,6 +375,7 @@ section in it.
 |---|---|
 | the section's generation varint | 1 in practice, and 10 reserved |
 | the section's two count varints | 2 |
+| a byte of slack | 1 |
 | per event | 2 |
 | a frame's cap (32 of each half) | 141 reserved off the send budget |
 | at rest — a settled tick with no transitions | **0**, and no flag bit |
@@ -384,8 +397,17 @@ fragment costs the whole frame.
   token are already verified per frame, so this needs no reliable channel of its own — only a tick stamp. The
   stamp does not move on a re-send: what an ack has to reach is the frame whose arrival proves the client
   applied those entries.
-- **The client applies it idempotently** — remove each `left` from a mirrored set, add each `entered` — and
-  announces only a set that actually changed, which is what makes a repeat free.
+- **The client applies it idempotently, and only from the newest snapshot frame it has seen** — remove each
+  `left` from a mirrored set, add each `entered` — announcing only a set that actually changed.
+  - The idempotence covers a re-send of the CURRENT prefix, which is the only copy the stamp rule puts in
+    flight, and that is what makes a repeat free.
+  - It does not cover a copy of a prefix that has since been retired. The generation orders a section against
+    a whole set and gives no order between two sections, because an ordinary run of them all carry the same
+    one — so once a prefix is acknowledged and a different one is built at the same generation, a delayed copy
+    of the older one is an undo rather than a repeat: it re-enters what the newer one removed.
+  - The frame's own tick is what separates them, and the replay window admits about a second of reordering by
+    design. **A receiver must drop a section arriving on a frame older than the newest it has seen.** Dropping
+    it loses nothing: it named state the newer frame has already given the current answer for.
 - **Two bounds, and both are needed.** At most 32 entries of each half ride one frame, so a joining peer's
   burst is spread over frames rather than eating the budget in one. A prefix unacknowledged for 64 ticks is
   dropped unconfirmed: past that an ack can no longer confirm the frame anyway. The events lost with it are
@@ -400,10 +422,18 @@ stopped sending you this" and "this entity unregistered" are the same fact to a 
 longer update. Both paths gate on the mirrored set actually holding the id, so an entity culled and
 unregistered on the same tick fires it exactly once.
 
-**A session that culls nothing announces nothing, and reads as "everything is in interest".** The interest pass
-does not run without a radius or a declared membership, so there is no set to diff; `is_entity_in_interest()`
-answers `true` for every registered entity there rather than `false` for a session replicating all of them to
-everybody.
+**A session that culls nothing announces nothing, and reads as "everything is in interest".** With nothing to
+cull there is no set to diff, so `is_entity_in_interest()` answers `true` for every registered entity there
+rather than `false` for a session replicating all of them to everybody.
+
+**Four things make a session start culling**, and any one of them is enough:
+
+| | |
+| --- | --- |
+| an `aoi_radius` | distance culling |
+| a declared membership | a peer that named the entities it wants |
+| a per-entity veto | `set_entity_hidden()` needs neither of the above, and turns the pass on by itself |
+| the pass having run before | once a session filters it keeps filtering, so a retracted last veto does not freeze every client's mirror |
 
 **The addon does not act on the leave.** The node stays in the scene, holding the last pose it received.
 Hide rather than free — a cap eviction oscillates at the boundary and freeing turns that into spawn churn —

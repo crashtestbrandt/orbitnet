@@ -802,8 +802,10 @@ struct PeerState {
     /// overflowed dropped an event nobody can reconstruct; a prefix given up on unacknowledged left
     /// the two ends disagreeing about what was sent; a rekey on a live connection threw away
     /// everything that connection held. The fourth is the client raising
-    /// [`FrameHeader::FLAG_WANT_INTEREST`], for the two cases only it can see — a section naming a
-    /// slot its manifest has not bound, and one stamped at a generation it does not hold.
+    /// [`FrameHeader::FLAG_WANT_INTEREST`], for the three cases only it can see — a section naming a
+    /// slot its manifest has not bound, one stamped at a generation it does not hold, and a frame it
+    /// acknowledged but could not read to the end. The ack window slides before a block is parsed, so
+    /// a snapshot that breaks partway is counted delivered whatever became of the section in it.
     ///
     /// Before this flag, all three were silent: the mirror stayed wrong for the rest of the session
     /// while the entity's rows kept arriving, and the documented repair
@@ -2108,7 +2110,7 @@ pub struct OrbitNet {
     /// Whether [`Self::update_interest`] ran on the last frame that built snapshots.
     ///
     /// **The other half of `stale`**, and the half a per-peer flag cannot carry: the pass is skipped
-    /// wholesale when nothing can be culled (no radius, no declared membership), and every
+    /// wholesale when the session has nothing to filter by (see [`session_is_filtering`]), and every
     /// connection's cached [`AnchorReport`] then describes a tick the session has moved on from.
     /// Without this a getter would answer "centered at the origin in world 0" for every peer in a
     /// session that is replicating everything to everybody.
@@ -3383,11 +3385,14 @@ impl OrbitNet {
 
     /// Whether `entity_id` is currently in `peer`'s interest.
     ///
-    /// **A session that culls nothing answers `true` for every registered entity.** The interest pass
-    /// does not run at all when there is no radius and no declared membership, so `peer.interest` is
-    /// an empty structure describing a tick that never happened — reading it there would answer
-    /// `false` for a session replicating everything to everybody. [`Self::interest_ran`] is what
-    /// separates the two, and it is the same flag the anchor read-backs are gated on.
+    /// **A session that culls nothing answers `true` for every registered entity.** With nothing to
+    /// filter by, `peer.interest` is an empty structure describing a tick that never happened —
+    /// reading it there would answer `false` for a session replicating everything to everybody.
+    /// [`Self::interest_ran`] is what separates the two, and it is the same flag the anchor
+    /// read-backs are gated on.
+    ///
+    /// Any one of four things makes the pass run: a radius, a declared membership, a per-entity veto,
+    /// or the pass having run before. See [`session_is_filtering`].
     ///
     /// A CLIENT answers from the mirrored set the interest-delta sections built, and ignores `peer`:
     /// a client holds exactly one interest set, its own. Until it has received a section it answers
@@ -7758,8 +7763,8 @@ fn manifest_owed(
 /// Fill `left` and `entered` with the wire slots this peer's next snapshot frame should carry, and
 /// answer whether the frame should raise [`FrameHeader::FLAG_INTEREST_DELTA`] at all.
 ///
-/// **CULLING OFF SENDS NOTHING, and that is the first thing this decides.** With no radius and no
-/// declared membership the interest pass does not run at all, so `peer.interest` is a set describing
+/// **CULLING OFF SENDS NOTHING, and that is the first thing this decides.** With nothing to filter
+/// by, the interest pass does not run at all, so `peer.interest` is a set describing
 /// a tick the session has moved on from. A naive gate would diff against it and announce a leave for
 /// every entity in a session that is replicating all of them to everybody. `filtering` is the same
 /// flag [`OrbitNet::interest_ran`] publishes, so the send path and the read-backs cannot disagree.

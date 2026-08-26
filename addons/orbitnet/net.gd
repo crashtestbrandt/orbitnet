@@ -1225,9 +1225,11 @@ func is_entity_hidden(peer: int, entity_id: int) -> bool:
 ## Whether `entity_id` is currently in `peer`'s interest. False OFFLINE and against a backend that predates the
 ## call.
 ##
-## A SESSION THAT CULLS NOTHING ANSWERS TRUE FOR EVERY REGISTERED ENTITY. With no [member aoi_radius] and no
-## declared membership the interest pass does not run at all, so there is no set to read; "everything is in
-## interest" is the honest answer there, not "nothing is".
+## A SESSION THAT CULLS NOTHING ANSWERS TRUE FOR EVERY REGISTERED ENTITY. With nothing to filter by there is
+## no set to read, and "everything is in interest" is the honest answer there.
+##
+## Any one of four things starts the pass: an [member aoi_radius], a declared membership, a per-entity veto
+## ([method set_entity_hidden], which needs neither of the others), or the pass having run before.
 ##
 ## WORKS ON BOTH SIDES. A server answers from its own interest pass. A client answers from the set the interest
 ## sections built and ignores `peer` -- a client holds exactly one interest set, its own -- and answers true for
