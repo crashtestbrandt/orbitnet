@@ -97,6 +97,15 @@ compiles, still runs, and means something else.
 
 ## The RTS demo
 
+![A client's view of a staged two-seat RTS battle](docs/img/rts-demo.png)
+
+<sub>A **client** at seat 0, with a dedicated server and the other seat's client connected, both armies driven
+by scripted orders. `ORDER RTT p50=68 ms` is the number this demo exists to show — click → validate → state
+broadcast → *observed*, measured against the ordered units' own replicated rows rather than ping. The `LANES`
+row is this section in one line: two commander cursors on rollback, all 96 units on the state lane at ~20 B
+each (~46 units per tick inside the 1200 B budget), and each order on its seat's reliable command channel.
+The red second wave is breaking against the blue line at the center blocks.</sub>
+
 `demos/rts/` is a two-seat skirmish RTS — 96 units, orders, combat — and it exists to show that **which lane
 an entity belongs on is decided by the game**:
 
@@ -133,6 +142,16 @@ Its signature number is the **puck correction in millimeters** — the distance 
 for a tick and what the server said about it, reported beside the wire quantization floor that bounds it.
 
 ## The arena demo
+
+![A client's view of a four-client arena session across two of its three arenas](docs/img/arena-demo.png)
+
+<sub>A **client** driving two seats, spread across two arenas by the server — the default, because a
+connection with a body in two worlds has no world of its own — with a dedicated server and three more botted
+clients connected. The `ARENAS` row is the demo's point: `fighters received per arena — arena 1: 8, arena 2:
+8, arena 3: 0 (membership, not distance)`. All three arenas overlap in coordinates, so no radius could
+separate them; this connection receives the union of its two declared worlds — 210 of the session's 315
+registered entities — and nothing of the third. The capsules are fighters, parked where their seats are
+vacant; the hexagons are per-arena props riding the state lane.</sub>
 
 `demos/arena/` is the third configuration — **decoupled at 30 Hz with a 128-tick history**, which is what a
 shooter wants and what neither other demo has. It exists to show that **who receives what is decided by the
