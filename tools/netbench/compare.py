@@ -242,15 +242,61 @@ def report(title: str, before: dict[str, list[float]], after: dict[str, list[flo
     return regressions
 
 
+# Every case here is one that was decided WRONGLY at some point, so each row is a rule that has already
+# failed once. `--self-test` runs them; there is no test framework under `tools/`, and the alternative to a
+# flag was leaving the judgement of every performance claim unchecked.
+SELF_TEST_CASES = [
+    # (column, before, after, expected verdict, why it is here)
+    ("rollback_ms", 0.023, 0.026, "same",
+     "two runs of ONE binary moved this far; judging it failed a re-run against itself"),
+    ("net_ms", 0.020, 0.022, "same", "the same, on the other per-frame timer"),
+    ("rollback_ms", 0.023, 0.200, "REGRESSED", "a 9x blowup is past the floor and must still be caught"),
+    ("rollback_ms", 2.000, 2.400, "REGRESSED", "the floor must not blind the column once it matters"),
+    ("tx_bytes_s", 3389.0, 3410.0, "same", "a byte counter is exact and carries no floor"),
+    ("tx_bytes_s", 3389.0, 4000.0, "REGRESSED", "and a real byte regression still reads as one"),
+    ("blocks_admitted_s", 900.0, 500.0, "REGRESSED", "higher-is-better reads a DROP as the regression"),
+    ("blocks_admitted_s", 900.0, 1200.0, "improved", "and a rise as the improvement"),
+    ("resim_ticks", 1.0, 8.0, "", "unjudged: depth deepens legitimately under latency"),
+]
+
+
+def self_test() -> int:
+    """Assert the verdict table. Returns a process exit code."""
+    failures = 0
+    for column, before, after, expected in ((c, b, a, e) for c, b, a, e, _ in SELF_TEST_CASES):
+        for table_lower, table_higher in ((LOWER_IS_BETTER, HIGHER_IS_BETTER),
+                                          (SERVER_LOWER_IS_BETTER, {})):
+            if column not in table_lower and column not in table_higher and column not in UNJUDGED:
+                continue
+            got = verdict(column, before, after, 0.05, table_lower, table_higher)
+            if got != expected:
+                print(f"FAIL {column} {before} -> {after}: expected {expected!r}, got {got!r}")
+                failures += 1
+            break
+    # The two all-zero rules live in `report`, not in `verdict`, so they are asserted on their own terms.
+    if verdict("rollback_ms", 0.0, 0.0, 0.05, LOWER_IS_BETTER, HIGHER_IS_BETTER) != "same":
+        print("FAIL rollback_ms 0 -> 0 should be unchanged before `report` relabels it `not measured`")
+        failures += 1
+    print(f"compare.py self-test: {len(SELF_TEST_CASES)} cases, {failures} failure(s)")
+    return 1 if failures else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Diff two netbench runs.")
-    parser.add_argument("before", help="artifact directory of the run before the change")
-    parser.add_argument("after", help="artifact directory of the run after it")
+    parser.add_argument("before", nargs="?", help="artifact directory of the run before the change")
+    parser.add_argument("after", nargs="?", help="artifact directory of the run after it")
+    parser.add_argument("--self-test", action="store_true",
+                        help="assert the verdict rules and exit, reading no artifacts")
     parser.add_argument("--warmup", type=float, default=3.0,
                         help="seconds of each client's series to drop (default 3)")
     parser.add_argument("--tolerance", type=float, default=0.05,
                         help="fractional move below which a column reads as unchanged (default 0.05)")
     args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
+    if not args.before or not args.after:
+        parser.error("before and after are required unless --self-test is given")
 
     print(f"netbench compare: {args.before}  ->  {args.after}")
     print(f"  warm-up dropped: {args.warmup:.1f}s per client    tolerance: {args.tolerance * 100:.0f}%")
