@@ -35,35 +35,50 @@
 //! over a small universe, then a deterministic pseudo-random sweep for the deeper schedules.
 //!
 //! **WHAT THE SWEEPS CATCH, AND WHAT THEY DO NOT.** Seven defects this repository actually shipped
-//! were re-injected one at a time. The two schedule sweeps below fail on **two** of them:
+//! were re-injected one at a time, running ONLY the two schedule sweeps. They fail on three:
 //!
 //! | Defect | Sweeps | Covered elsewhere |
 //! | --- | --- | --- |
 //! | the retry stamp is cleared on the settle, so there is no backoff | **caught** | a unit test |
 //! | the server stays silent while the gate is shut | **caught** | a unit test |
+//! | a stale echo regresses the baseline | **caught** | a unit test |
 //! | the echo settles a demand no table ever answered | blind | a unit test |
 //! | a retry mints a fresh generation | blind | two unit tests |
 //! | a re-sent table is admitted at a generation already held | blind | the scripted test below |
-//! | a stale echo regresses the baseline | blind | a unit test |
 //! | a section applies from a frame that is not the newest | blind | a unit test |
 //!
-//! **THE SWEEPS FIND LIVENESS DEFECTS, NOT SAFETY ONES.** A defect that stops progress or costs a
-//! whole set per round trip shows up in the convergence assertion or the table budget. One that
-//! merely leaves the two ends briefly wrong does not, because this model's client asks more readily
-//! than a real one: it raises `want_interest` whenever a section or set fails to resolve, so a
-//! schedule that would strand a real client instead repairs itself here. Closing that is the single
-//! change that would make these sweeps worth more than the unit tests beside them, and it is not
-//! done.
+//! It was two of seven before the fidelity repairs below, and the third came from making the wire
+//! take a tick and asserting on the event stream. The count is of the SWEEPS alone — the scripted
+//! tests in this file exercise the model but are not a search, and folding them into this score is
+//! the mistake this comment used to make.
 //!
-//! Two further limits, stated because an overstated search is worse than none:
+//! **THE SWEEPS FIND LIVENESS DEFECTS MORE READILY THAN SAFETY ONES.** Something that stops progress
+//! or costs a whole set per round trip trips the convergence assertion or the budget. One that leaves
+//! the two ends briefly wrong is harder, because this model's client asks more readily than a real
+//! one: it raises `want_interest` whenever a section or set fails to resolve, so a schedule that
+//! would strand a real client can repair itself here.
+//!
+//! **FOUR THINGS THAT WERE WRONG WITH THIS FILE, AND ARE THE REASON IT READ STRONGER THAN IT WAS:**
+//!
+//! | | |
+//! | --- | --- |
+//! | the model never stamped `interest_delta_tick` | `retire_interest_delta` returned at its first line on every call, so the give-up cause — and the whole set it owes — was unreachable in every schedule |
+//! | an i.i.d. per-tick adversary | sixty-four consecutive drops at one third each is (1/3)^64, so the give-up stayed unreachable even once the stamp was there. Every third seed now blacks out one direction outright |
+//! | both directions delivered inside the posting tick | the modelled round trip was ZERO, putting every rule triggered by "longer than a round trip" out of reach |
+//! | `quiesce` compared only the two sets | a rule whose only output is a SIGNAL was invisible, and most of this lane's rules are exactly that |
+//!
+//! Each was silent: the sweeps were green throughout, and green read as "searched and found nothing"
+//! when it meant "never looked". [`Reached`] is what makes that a failing test instead — it counts
+//! the states each sweep entered and asserts they are non-zero.
+//!
+//! Two limits remain, stated because an overstated search is worse than none:
 //!
 //! - **It covers rules, not their call sites.** A defect in code no free function names is out of
 //!   reach by construction — the model calls `section_is_news`, so mutating the guard where
 //!   `handle_snapshot` uses it changes nothing here.
 //! - **The scripted tests in this file are not the search.** `a_delayed_duplicate_table_...` and
 //!   `the_search_catches_the_defects_it_was_built_from` are hand-built interleavings and direct
-//!   assertions; they belong here because they exercise the model, but a count that folds them into
-//!   the sweeps' score is the count this comment used to carry, and it was wrong.
+//!   assertions.
 
 use super::*;
 use std::collections::HashSet;
@@ -81,8 +96,13 @@ enum Fate {
 
 const FATES: [Fate; 3] = [Fate::Deliver, Fate::Delay, Fate::Drop];
 
+/// How long a delivered frame sits in flight. **ONE TICK EACH WAY, SO A ROUND TRIP IS TWO.**
+/// Delivering inside the tick that posted made the modelled round trip zero, which put every rule
+/// triggered by "longer than a round trip" out of reach — including the retry window itself.
+const DELIVER_TICKS: u64 = 1;
+
 /// How long a delayed frame sits in flight. Inside the replay window, so it is reordering.
-const DELAY_TICKS: u64 = 3;
+const DELAY_TICKS: u64 = 4;
 
 /// A frame on the wire, with the tick it lands on.
 #[derive(Debug, Clone)]
@@ -128,6 +148,26 @@ struct Session {
     /// Whole sets put on the wire. Each is a reliable frame carrying the peer's entire interest, so
     /// a schedule that needs many of them is a cost failure even when it converges.
     tables_sent: u32,
+    /// Which of the states worth searching this schedule actually reached. See [`Reached`].
+    reached: Reached,
+}
+
+/// The states a schedule has to reach for the sweep over it to mean anything.
+///
+/// **A GREEN SWEEP THAT NEVER ENTERED THE INTERESTING STATE READS EXACTLY LIKE ONE THAT DID.** The
+/// give-up branch was unreachable in every schedule this file ran, for as long as it has existed,
+/// because the model never stamped `interest_delta_tick` — and nothing said so. These counters are
+/// what turn that from a silent hole into a failing test.
+#[derive(Debug, Default, Clone)]
+struct Reached {
+    /// A prefix was given up on unacknowledged, which owes a whole set.
+    give_up: u32,
+    /// A whole set went out.
+    table: u32,
+    /// A section was refused because the receiver held a different baseline.
+    refused_section: u32,
+    /// The gate was shut when the server came to send.
+    gate_shut: u32,
 }
 
 impl Session {
@@ -156,6 +196,7 @@ impl Session {
             events: Vec::new(),
             tick: 1,
             tables_sent: 0,
+            reached: Reached::default(),
         }
     }
 
@@ -207,11 +248,16 @@ impl Session {
             let (generation, stated) = interest_table_to_send(&self.server_slots, &mut self.peer);
             self.peer.interest_table_tick = Some(self.tick);
             self.tables_sent += 1;
+            self.reached.table += 1;
             self.post(down, Wire::Table(generation, stated));
             return;
         }
         let mut left = Vec::new();
         let mut entered = Vec::new();
+        // `build_interest_section` calls `retire_interest_delta`, whose give-up branch is the only
+        // thing inside it that owes a whole set. Watching the flag across the call is how this
+        // schedule knows it reached that state at all.
+        let owed_before = self.peer.interest_full_due;
         let carries = build_interest_section(
             &self.server_slots,
             &mut self.peer,
@@ -220,7 +266,13 @@ impl Session {
             &mut left,
             &mut entered,
         );
+        if !owed_before && self.peer.interest_full_due {
+            self.reached.give_up += 1;
+        }
         let gate_shut = self.peer.interest_generation_acked != self.peer.interest_generation;
+        if gate_shut {
+            self.reached.gate_shut += 1;
+        }
         if snapshot_frame_is_skipped(false, carries, gate_shut) {
             return;
         }
@@ -230,6 +282,12 @@ impl Session {
                 left: left.clone(),
                 entered: entered.clone(),
             };
+            // **THE STAMP, WHICH THE SEND PATH SETS AFTER HANDING THE FRAME TO THE TRANSPORT.**
+            // Without it `retire_interest_delta` returns at its first line, so the give-up branch —
+            // and the whole set it owes — were unreachable in every schedule this file ran.
+            if self.peer.interest_delta_tick.is_none() {
+                self.peer.interest_delta_tick = Some(self.tick);
+            }
             self.post(down, Wire::Section(section, self.tick));
         } else {
             // A bare header still moves the client's newest-snapshot mark, which is what makes it
@@ -263,7 +321,7 @@ impl Session {
     fn post(&mut self, fate: Fate, frame: Wire) {
         match fate {
             Fate::Drop => {}
-            Fate::Deliver => self.in_flight.push((self.tick, frame)),
+            Fate::Deliver => self.in_flight.push((self.tick + DELIVER_TICKS, frame)),
             Fate::Delay => self.in_flight.push((self.tick + DELAY_TICKS, frame)),
         }
     }
@@ -317,6 +375,7 @@ impl Session {
                 }
                 if !section.applies_to(self.mirror.generation) {
                     self.mirror.want_interest = true;
+                    self.reached.refused_section += 1;
                     return;
                 }
                 self.mirror.seeded = true;
@@ -386,11 +445,12 @@ impl Session {
     }
 
     fn step(&mut self, down: Fate, up: Fate) {
+        // Arrivals first: what is due this tick was posted on an earlier one, because nothing crosses
+        // the wire instantly.
+        self.deliver();
         self.server_flush(down);
         self.state_blocks();
-        self.deliver();
         self.client_flush(up);
-        self.deliver();
         self.tick += 1;
     }
 
@@ -400,10 +460,50 @@ impl Session {
             self.step(Fate::Deliver, Fate::Deliver);
         }
         let truth: HashSet<u64> = self.peer.interest.iter().collect();
-        self.mirror.held == truth
+        self.mirror.held == truth && self.events_agree_with_the_mirror()
+    }
+
+    /// **THE SIGNALS A GAME ACTS ON MUST REBUILD THE SET THE READ-BACK ANSWERS FROM.**
+    ///
+    /// Comparing the two sets alone made every rule whose only output is a SIGNAL invisible, and most
+    /// of this lane's rules are exactly that: an enter with no matching leave, a leave for something
+    /// never entered, a departure announced for an entity that is still in the set. A handler
+    /// following the documented pattern — hide on leave, show on enter — holds whatever this
+    /// reconstruction holds, so if it disagrees with the mirror the game is wrong even though the
+    /// read-back is right.
+    fn events_agree_with_the_mirror(&self) -> bool {
+        let mut rebuilt: HashSet<u64> = HashSet::new();
+        for &(_, id, entered) in &self.events {
+            if entered {
+                rebuilt.insert(id);
+            } else {
+                rebuilt.remove(&id);
+            }
+        }
+        rebuilt == self.mirror.held
     }
 
     fn diverged(&self) -> String {
+        if !self.events_agree_with_the_mirror() {
+            let mut rebuilt: Vec<u64> = {
+                let mut set: HashSet<u64> = HashSet::new();
+                for &(_, id, entered) in &self.events {
+                    if entered {
+                        set.insert(id);
+                    } else {
+                        set.remove(&id);
+                    }
+                }
+                set.into_iter().collect()
+            };
+            rebuilt.sort_unstable();
+            let mut held: Vec<u64> = self.mirror.held.iter().copied().collect();
+            held.sort_unstable();
+            return format!(
+                "the events rebuild {rebuilt:?} but the mirror holds {held:?} -- a game following \
+                 the signals disagrees with the read-back"
+            );
+        }
         let truth: Vec<u64> = {
             let mut v: Vec<u64> = self.peer.interest.iter().collect();
             v.sort_unstable();
@@ -440,7 +540,7 @@ fn run_schedule(
     schedule: &[(Fate, Fate)],
     churn: &[u64],
     rekey_at: Option<usize>,
-) -> Result<(), String> {
+) -> Result<Reached, String> {
     let mut session = Session::new(ids, unnameable);
     for (index, &(down, up)) in schedule.iter().enumerate() {
         if rekey_at == Some(index) {
@@ -448,22 +548,33 @@ fn run_schedule(
         }
         // The world moves under the protocol: each tick a different subset is present, so entities
         // enter and leave while frames are in flight.
-        let present: Vec<u64> = churn
-            .iter()
-            .copied()
-            .filter(|id| !(index as u64 + id).is_multiple_of(3))
-            .collect();
+        // The LAST tick puts everything back in the world, so the unnameable entity is in the set
+        // the assertion compares against. Filtered out on the final step, that configuration tested
+        // nothing it claimed to.
+        let present: Vec<u64> = if index + 1 == schedule.len() {
+            churn.to_vec()
+        } else {
+            churn
+                .iter()
+                .copied()
+                .filter(|id| !(index as u64 + id).is_multiple_of(3))
+                .collect()
+        };
         session.set_world(&present);
         session.step(down, up);
     }
     if !session.quiesce(3 * INTEREST_DELTA_RETRY_TICKS + 32) {
         return Err(session.diverged());
     }
-    // **A WHOLE SET PER ROUND TRIP IS A FAILURE THAT CONVERGES.** One reliable frame carrying the
-    // peer's entire interest, once per retry window, for the life of the connection -- which is what
-    // clearing the retry stamp on the settle produced. Convergence cannot see it, so the budget does.
-    // Four causes can owe a set across one schedule, and each may legitimately need a retry or two.
-    let budget = 8;
+    // **A WHOLE SET PER ROUND TRIP IS A FAILURE THAT CONVERGES**, so the budget is what sees it.
+    // Clearing the retry stamp on the settle produced exactly that: one reliable frame carrying the
+    // peer's entire interest, every two ticks, for the life of the connection.
+    //
+    // A GROSS-RATE CHECK, NOT A TIGHT BOUND. A schedule with a sustained outage legitimately owes
+    // several sets — a rekey, then a give-up per retry window it spans — and seed 360 sends five in
+    // 146 ticks honestly. Six leaves that room while still catching a per-round-trip failure by more
+    // than ten times over.
+    let budget = 6;
     if session.tables_sent > budget {
         return Err(format!(
             "{} whole sets sent for a schedule of {} ticks -- the retry rate limit is not holding",
@@ -471,7 +582,15 @@ fn run_schedule(
             schedule.len()
         ));
     }
-    Ok(())
+    Ok(session.reached)
+}
+
+/// Fold one schedule's coverage into a running total.
+fn fold(total: &mut Reached, one: &Reached) {
+    total.give_up += one.give_up;
+    total.table += one.table;
+    total.refused_section += one.refused_section;
+    total.gate_shut += one.gate_shut;
 }
 
 /// **EVERY SCHEDULE OF FOUR TICKS, OVER A UNIVERSE WITH A SLOT THE CLIENT CANNOT NAME.**
@@ -484,6 +603,7 @@ fn every_short_schedule_converges_once_the_link_is_clean() {
     for unnameable in [&[][..], &[12u64][..]] {
         let mut schedule = [(Fate::Deliver, Fate::Deliver); 4];
         let mut checked = 0usize;
+        let mut covered = Reached::default();
         for a in FATES {
             for b in FATES {
                 for c in FATES {
@@ -495,17 +615,18 @@ fn every_short_schedule_converges_once_the_link_is_clean() {
                                 schedule[2] = (e, f);
                                 schedule[3] = (Fate::Deliver, Fate::Deliver);
                                 checked += 1;
-                                if let Err(why) = run_schedule(
+                                match run_schedule(
                                     &ids,
                                     unnameable,
                                     &schedule,
                                     &[10, 11, 12],
                                     Some(1),
                                 ) {
-                                    panic!(
+                                    Ok(reached) => fold(&mut covered, &reached),
+                                    Err(why) => panic!(
                                         "schedule {schedule:?} (unnameable {unnameable:?}) \
                                          left the two ends disagreeing: {why}"
-                                    );
+                                    ),
                                 }
                             }
                         }
@@ -517,6 +638,14 @@ fn every_short_schedule_converges_once_the_link_is_clean() {
             checked, 729,
             "every combination of three tick fates, both directions"
         );
+        // **A GREEN SWEEP THAT NEVER ENTERED THE STATE READS LIKE ONE THAT DID.** Four ticks is too
+        // short for the retry window, so a give-up is out of reach here by construction and belongs
+        // to the long sweep; what these schedules must reach is a whole set and a shut gate.
+        assert!(covered.table > 0, "no schedule here ever sent a whole set");
+        assert!(
+            covered.gate_shut > 0,
+            "no schedule here ever found the gate shut"
+        );
     }
 }
 
@@ -527,23 +656,50 @@ fn every_short_schedule_converges_once_the_link_is_clean() {
 fn long_lossy_schedules_converge_once_the_link_is_clean() {
     let ids = [10u64, 11, 12, 13];
     let mut failures: Vec<String> = Vec::new();
+    let mut covered = Reached::default();
     for seed in 0..400u64 {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-        let length = 8 + (lcg(&mut state) % (2 * INTEREST_DELTA_RETRY_TICKS + 8)) as usize;
+        let length = 8 + (lcg(&mut state) % (3 * INTEREST_DELTA_RETRY_TICKS)) as usize;
+
+        // **A SUSTAINED OUTAGE, WHICH INDEPENDENT PER-TICK LOSS CANNOT PRODUCE.** Giving up on an
+        // unacknowledged prefix needs the ack to be missing for a whole retry window; drawing each
+        // tick independently at one third makes that (1/3)^64, so the branch was unreachable and the
+        // sweep was green because it never looked. Every third seed blacks out one direction for
+        // long enough, which is what a link actually does.
+        let outage = if seed.is_multiple_of(3) && length > INTEREST_DELTA_RETRY_TICKS as usize + 4 {
+            let start = (lcg(&mut state) % 4) as usize + 1;
+            let span = INTEREST_DELTA_RETRY_TICKS as usize + 2;
+            let downstream = lcg(&mut state).is_multiple_of(2);
+            Some((start, start + span.min(length - start), downstream))
+        } else {
+            None
+        };
+
         let schedule: Vec<(Fate, Fate)> = (0..length)
-            .map(|_| {
-                (
+            .map(|tick| {
+                let (mut down, mut up) = (
                     FATES[(lcg(&mut state) % 3) as usize],
                     FATES[(lcg(&mut state) % 3) as usize],
-                )
+                );
+                if let Some((from, to, downstream)) = outage {
+                    if (from..to).contains(&tick) {
+                        if downstream {
+                            down = Fate::Drop;
+                        } else {
+                            up = Fate::Drop;
+                        }
+                    }
+                }
+                (down, up)
             })
             .collect();
         let unnameable: &[u64] = if seed % 3 == 0 { &[13] } else { &[] };
         // A rekey somewhere in the run, so a whole set is actually minted and the generation moves
         // off 0 -- without it the echo's monotonicity and the table admit rule are unreachable.
         let rekey_at = Some((lcg(&mut state) % length as u64) as usize);
-        if let Err(why) = run_schedule(&ids, unnameable, &schedule, &[10, 11, 12, 13], rekey_at) {
-            failures.push(format!("seed {seed}: {why}"));
+        match run_schedule(&ids, unnameable, &schedule, &[10, 11, 12, 13], rekey_at) {
+            Ok(reached) => fold(&mut covered, &reached),
+            Err(why) => failures.push(format!("seed {seed}: {why}")),
         }
     }
     assert!(
@@ -551,6 +707,25 @@ fn long_lossy_schedules_converge_once_the_link_is_clean() {
         "{} of 400 seeds left the two ends disagreeing:\n  {}",
         failures.len(),
         failures.join("\n  ")
+    );
+
+    // **WHAT THESE SCHEDULES ACTUALLY REACHED.** The give-up branch was unreachable in all 400 seeds
+    // for as long as this file existed — the model never stamped `interest_delta_tick`, so
+    // `retire_interest_delta` returned at its first line every time — and the sweep was green
+    // throughout. Green meant "never looked". These are the states the sweep is for; if a change
+    // puts one out of reach again, this says so instead of passing quietly.
+    assert!(
+        covered.give_up > 0,
+        "no schedule gave up on an unacknowledged prefix, so the cause that owes a whole set was \
+         never searched: {covered:?}"
+    );
+    assert!(
+        covered.table > 0,
+        "no schedule sent a whole set: {covered:?}"
+    );
+    assert!(
+        covered.gate_shut > 0,
+        "no schedule found the gate shut: {covered:?}"
     );
 }
 
@@ -568,7 +743,9 @@ fn a_delayed_duplicate_table_does_not_undo_the_sections_after_it() {
     session.set_world(&[10]);
     session.rekey();
 
-    // The first copy of the whole set goes out and lands.
+    // The first copy of the whole set goes out and lands. Two steps, because nothing crosses the
+    // wire inside the tick that posted it.
+    session.step(Fate::Deliver, Fate::Deliver);
     session.step(Fate::Deliver, Fate::Deliver);
     let minted = session.mirror.generation;
     assert!(minted > 0, "a rekey mints a whole set");
