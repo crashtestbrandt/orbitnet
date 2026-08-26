@@ -32,7 +32,7 @@ use godot::prelude::*;
 
 use orbitnet_core::auth::{
     compress_secret, confirm_tag, derive_session_key, siphash24, MAX_INPUT_BLOCKS_PER_TICK,
-    TRAILER_LEN,
+    REPLAY_WINDOW, TRAILER_LEN,
 };
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
@@ -7049,7 +7049,7 @@ impl OrbitNet {
         if let Some(peer) = self.peers.get_mut(&sender) {
             peer.budget = budget;
             let newest = i64::from(header.tick);
-            peer.newest_input_tick = peer.newest_input_tick.max(newest);
+            peer.newest_input_tick = note_input_tick(peer.newest_input_tick, newest);
             // **FROM THE MONOTONE FIGURE, NOT THE ARRIVING FRAME.** This byte reports how early the
             // peer's NEWEST input arrived, and the client steers its clock lead off the MINIMUM of a
             // 32-sample window of it. A merely REORDERED frame carries an older tick and lands
@@ -7568,6 +7568,41 @@ fn interest_delta_reserve(count: usize) -> usize {
         0
     } else {
         13 + 2 * count
+    }
+}
+
+/// How far back an arriving input tick may sit before it is a seek rather than a reorder.
+///
+/// The replay window is what bounds reordering: a datagram more than [`REPLAY_WINDOW`] sequence
+/// numbers behind is refused outright, and a client sends about one input frame per tick. A tick
+/// further back than that therefore arrived on a FRESH datagram, from a client whose clock moved.
+const INPUT_TICK_SEEK_HORIZON: i64 = REPLAY_WINDOW as i64;
+
+/// Fold an arriving input frame's tick into the newest this connection has sent.
+///
+/// **A SEEK MOVES THIS FIGURE BACKWARDS. A REORDERED FRAME LEAVES IT ALONE.** The margin byte is
+/// computed from the result, and the client steers its clock lead off the minimum of a 32-sample
+/// window of that byte, so the two cases need opposite answers:
+///
+/// | Arriving tick | What happened | Answer |
+/// | --- | --- | --- |
+/// | newer | the ordinary case | take it |
+/// | older, within [`INPUT_TICK_SEEK_HORIZON`] | a datagram overtaken in flight | keep the held value |
+/// | older, beyond it | the client hard-resynced and re-stamped its input | take it |
+///
+/// Held monotone through a hard resync, the margin reports the earliness of a tick the client has
+/// abandoned. That is a large positive figure, it pins the window minimum, and it tells the peer it
+/// is running early for as long as the server takes to reach the abandoned tick — so `lead_bias_ticks`
+/// walks DOWN through exactly the window the resync is trying to settle, and the client ends up
+/// under-leading and delivering its input late.
+///
+/// A free function so the rule the receive path runs is the rule a test can call.
+#[must_use]
+fn note_input_tick(held: i64, arriving: i64) -> i64 {
+    if arriving < held.saturating_sub(INPUT_TICK_SEEK_HORIZON) {
+        arriving
+    } else {
+        held.max(arriving)
     }
 }
 
@@ -8511,21 +8546,21 @@ mod tests {
         band_for_row, build_interest_section, candidate_for_own_row, candidate_for_row,
         clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
         delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
-        input_frame_is_owed, interest_delta_reserve, is_located, manifest_owed, owned_rows_into,
-        owned_rows_of, queue_seat_release, resim_input_from, resolve_observer, resume_grant,
-        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        input_frame_is_owed, interest_delta_reserve, is_located, manifest_owed, note_input_tick,
+        owned_rows_into, owned_rows_of, queue_seat_release, resim_input_from, resolve_observer,
+        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
         session_is_filtering, session_key_from, state_whole_interest_set, AckOutcome, EntityRow,
         FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
         PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
         SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, Writer,
         ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
-        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
-        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
-        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
-        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
-        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
-        UNLOCATABLE_CENTER,
+        INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX,
+        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
+        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
+        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
+        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
+        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -10515,22 +10550,77 @@ mod tests {
     /// lead off the minimum of a window of these, so a merely reordered frame — which lands nothing,
     /// because input is sent redundantly and a superseded row is ignored — would otherwise report the
     /// peer as late and buy it lead the link never asked for.
+    ///
+    /// Through [`note_input_tick`] rather than a `max` written out here: the rule has two branches and
+    /// a test that restates one of them cannot fail when the other is wrong.
     #[test]
     fn the_margin_byte_is_measured_from_the_monotone_input_tick() {
-        let mut peer = PeerState::default();
+        let mut held: i64 = -1;
         let current: i64 = 100;
 
         // The newest input so far arrived 3 ticks ahead.
-        peer.newest_input_tick = peer.newest_input_tick.max(103);
-        let margin = peer.newest_input_tick - current;
-        assert_eq!(margin, 3, "three ticks of lead, which is what it has");
+        held = note_input_tick(held, 103);
+        assert_eq!(
+            held - current,
+            3,
+            "three ticks of lead, which is what it has"
+        );
 
         // A reordered frame stamped earlier arrives. It advances nothing and must report nothing.
-        peer.newest_input_tick = peer.newest_input_tick.max(101);
-        let margin = peer.newest_input_tick - current;
+        held = note_input_tick(held, 101);
         assert_eq!(
-            margin, 3,
+            held - current,
+            3,
             "the late copy does not report this peer as later than it is"
+        );
+    }
+
+    /// **A HARD RESYNC RE-STAMPS THIS PEER'S INPUT, AND THE MARGIN HAS TO FOLLOW IT DOWN.**
+    ///
+    /// Held monotone, the byte keeps reporting the earliness of a tick the client has abandoned: a
+    /// large positive figure that pins the 32-sample window minimum and tells the peer it is running
+    /// early. `lead_bias_ticks` then walks DOWN through exactly the window the resync is trying to
+    /// settle, and the client under-leads and starts delivering its input late.
+    ///
+    /// The horizon separates the two cases, and both sides of it are pinned here — a reorder must not
+    /// re-baseline, and a seek must.
+    #[test]
+    fn a_seeking_client_re_baselines_the_margin_a_reordering_one_does_not() {
+        // A frame from just inside the horizon is a datagram overtaken in flight.
+        let held = 1_000;
+        assert_eq!(
+            note_input_tick(held, held - INPUT_TICK_SEEK_HORIZON),
+            held,
+            "the furthest a reorder can reach still leaves the figure alone"
+        );
+
+        // One tick further back is a clock that moved, and nothing else can produce it.
+        let seeked = held - INPUT_TICK_SEEK_HORIZON - 1;
+        assert_eq!(
+            note_input_tick(held, seeked),
+            seeked,
+            "a seek past the horizon re-baselines rather than being ignored"
+        );
+
+        // Which is the whole point: the margin reported after the seek is the truth, not the
+        // pre-seek tick's staleness.
+        let current = seeked - 1;
+        assert_eq!(
+            note_input_tick(held, seeked) - current,
+            1,
+            "one tick of lead, which is what this peer now actually has"
+        );
+        assert_eq!(
+            held - current,
+            INPUT_TICK_SEEK_HORIZON + 2,
+            "against the phantom lead the held figure would have claimed"
+        );
+
+        // A first frame on a fresh connection starts from -1 and must not be read as a seek.
+        assert_eq!(
+            note_input_tick(-1, 0),
+            0,
+            "the first frame of a session advances the figure"
         );
     }
 
