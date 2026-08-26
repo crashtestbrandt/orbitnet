@@ -41,7 +41,11 @@ A column zero on the BASELINE ONLY reads `new (was 0)`, and does not count as a 
 no denominator, which is why the delta column prints `n/a` -- judging it anyway meant one row printed `n/a`
 and `REGRESSED` side by side, and the exit code followed the second. It is still worth a look, so it prints
 under its own verdict rather than as `not measured`: comparing across a release boundary, this is how a
-capability the baseline never exercised appears, and also how a fault counter first rises.
+capability the baseline never exercised appears.
+
+EXCEPT FOR THE FAULT COUNTERS, where zero is the pass condition rather than a missing measurement. A run
+with no `want_full_nacks_s` and no `reconcile_snap` is a healthy run, so leaving zero is the highest-signal
+regression the bench can report and it fails the gate on the absolute move. See `FAULT_COUNTERS`.
 """
 
 from __future__ import annotations
@@ -93,6 +97,24 @@ NOISE_FLOOR_ABS = {
     "net_ms": 0.05,
     "interest_ms": 0.05,
 }
+
+# COLUMNS WHERE ZERO IS THE PASS CONDITION, NOT AN ABSENCE OF MEASUREMENT.
+#
+# The `new (was 0)` rule below exists because a zero baseline gives a percentage no denominator. That
+# is right for a capability column -- `rollback_ms` reading 0.000 across a release boundary means the
+# baseline never resimulated a tick, not that it was infinitely fast. It is exactly wrong for these:
+# a healthy run reads zero, and leaving zero is the regression. Judged on the absolute move instead,
+# so a fault counter that rises off the floor fails the gate.
+FAULT_COUNTERS = frozenset({
+    "want_full_nacks_s",
+    "reconcile_snap",
+    "reconcile_error",
+    "starve_ticks_max",
+    "unsent_backlog_max",
+    "blocks_deferred_s",
+    "rx_rejected_s",
+    "rx_skipped_s",
+})
 
 # Printed, never judged: set by the profile, by the scene, or by the run's own bookkeeping.
 # `blocks_s` is deliberately unjudged: more blocks at the same byte count is a BETTER refresh rate, and more
@@ -204,6 +226,33 @@ def verdict(column: str, before: float, after: float, tolerance: float,
     return "REGRESSED" if worse else "improved"
 
 
+def classify(column: str, before_any: bool, after_any: bool, b50: float, a50: float,
+             tolerance: float, lower: dict[str, str], higher: dict[str, str]) -> str:
+    """The verdict for one column, including the two zero-baseline rules.
+
+    Split out of `report` so `--self-test` can assert it: while these rules lived inline, the
+    self-test claimed to cover them and asserted something else.
+    """
+    # A COLUMN NOTHING POPULATED ON EITHER SIDE IS NOT EVIDENCE OF "UNCHANGED". Every send-path
+    # column reads zero in a client CSV, and `server.csv` carries only the handful the debug wire
+    # line prints -- so a dozen judged columns sit at 0.000 both sides in a client-only comparison.
+    # Printing those as `same` is how a run that measured nothing reads as a run that found nothing.
+    if not before_any and not after_any:
+        return "not measured"
+    if not before_any:
+        if column in UNJUDGED:
+            return ""
+        # A FAULT COUNTER LEAVING ZERO IS THE REGRESSION, not an unmeasured baseline. See
+        # `FAULT_COUNTERS`.
+        if column in FAULT_COUNTERS:
+            return "REGRESSED"
+        # THE BASELINE MEASURED NOTHING, so there is no ratio to test a tolerance against. Judged as
+        # a percentage it is REGRESSED for any non-zero reading at all, however small -- which is what
+        # `rollback_ms` did across a release boundary whose baseline never resimulated a single tick.
+        return "new (was 0)"
+    return verdict(column, b50, a50, tolerance, lower, higher)
+
+
 def report(title: str, before: dict[str, list[float]], after: dict[str, list[float]],
            order: list[str], tolerance: float,
            lower: dict[str, str], higher: dict[str, str]) -> int:
@@ -222,17 +271,8 @@ def report(title: str, before: dict[str, list[float]], after: dict[str, list[flo
         # column reads zero in a client CSV, and `server.csv` carries only the handful the debug wire
         # line prints -- so a dozen judged columns sit at 0.000 both sides in a client-only comparison.
         # Printing those as `same` is how a run that measured nothing reads as a run that found nothing.
-        if not any(before[column]) and not any(after[column]):
-            call = "not measured"
-        elif not any(before[column]):
-            # THE BASELINE MEASURED NOTHING, so there is no ratio to test a tolerance against. Judged
-            # as a percentage it is REGRESSED for any non-zero reading at all, however small -- which
-            # is what `rollback_ms` did across a release boundary whose baseline never resimulated a
-            # single tick. Named rather than hidden, because the same shape is a fault counter
-            # leaving zero for the first time.
-            call = "new (was 0)" if column not in UNJUDGED else ""
-        else:
-            call = verdict(column, b50, a50, tolerance, lower, higher)
+        call = classify(column, any(before[column]), any(after[column]), b50, a50,
+                        tolerance, lower, higher)
         if call == "REGRESSED":
             regressions += 1
         delta = "n/a" if b50 == 0.0 else f"{(a50 - b50) / abs(b50) * 100.0:+.1f}%"
@@ -260,24 +300,62 @@ SELF_TEST_CASES = [
 ]
 
 
+# The zero-baseline rules, which decide whether a column is judged at all.
+# (column, baseline populated, after populated, expected verdict, why it is here)
+ZERO_BASELINE_CASES = [
+    ("rollback_ms", False, False, "not measured",
+     "nothing populated either side is not evidence of unchanged"),
+    ("rollback_ms", False, True, "new (was 0)",
+     "a capability the baseline never exercised has no ratio to judge"),
+    ("want_full_nacks_s", False, True, "REGRESSED",
+     "a fault counter leaving zero IS the regression, not a missing measurement"),
+    ("reconcile_snap", False, True, "REGRESSED", "the same, on prediction"),
+    ("rx_rejected_s", False, True, "REGRESSED", "and on the server's refusals"),
+    ("resim_ticks", False, True, "", "an unjudged column stays unjudged"),
+]
+
+
+def tables_for(column: str):
+    """The direction tables the column is judged against, or None if no table claims it."""
+    for lower, higher in ((LOWER_IS_BETTER, HIGHER_IS_BETTER), (SERVER_LOWER_IS_BETTER, {})):
+        if column in lower or column in higher:
+            return lower, higher
+    return (LOWER_IS_BETTER, HIGHER_IS_BETTER) if column in UNJUDGED else None
+
+
 def self_test() -> int:
-    """Assert the verdict table. Returns a process exit code."""
+    """Assert the verdict rules. Returns a process exit code."""
     failures = 0
+    checked = 0
+
     for column, before, after, expected in ((c, b, a, e) for c, b, a, e, _ in SELF_TEST_CASES):
-        for table_lower, table_higher in ((LOWER_IS_BETTER, HIGHER_IS_BETTER),
-                                          (SERVER_LOWER_IS_BETTER, {})):
-            if column not in table_lower and column not in table_higher and column not in UNJUDGED:
-                continue
-            got = verdict(column, before, after, 0.05, table_lower, table_higher)
-            if got != expected:
-                print(f"FAIL {column} {before} -> {after}: expected {expected!r}, got {got!r}")
-                failures += 1
-            break
-    # The two all-zero rules live in `report`, not in `verdict`, so they are asserted on their own terms.
-    if verdict("rollback_ms", 0.0, 0.0, 0.05, LOWER_IS_BETTER, HIGHER_IS_BETTER) != "same":
-        print("FAIL rollback_ms 0 -> 0 should be unchanged before `report` relabels it `not measured`")
-        failures += 1
-    print(f"compare.py self-test: {len(SELF_TEST_CASES)} cases, {failures} failure(s)")
+        tables = tables_for(column)
+        if tables is None:
+            # A case naming a column no table judges would otherwise be skipped in silence while
+            # still counting toward the total printed below.
+            print(f"FAIL {column}: no direction table claims this column")
+            failures += 1
+            continue
+        got = verdict(column, before, after, 0.05, *tables)
+        checked += 1
+        if got != expected:
+            print(f"FAIL {column} {before} -> {after}: expected {expected!r}, got {got!r}")
+            failures += 1
+
+    for column, before_any, after_any, expected, _ in ZERO_BASELINE_CASES:
+        tables = tables_for(column)
+        if tables is None:
+            print(f"FAIL {column}: no direction table claims this column")
+            failures += 1
+            continue
+        got = classify(column, before_any, after_any, 0.0, 1.0, 0.05, *tables)
+        checked += 1
+        if got != expected:
+            print(f"FAIL {column} baseline={before_any} after={after_any}: "
+                  f"expected {expected!r}, got {got!r}")
+            failures += 1
+
+    print(f"compare.py self-test: {checked} cases, {failures} failure(s)")
     return 1 if failures else 0
 
 
