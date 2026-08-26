@@ -5914,7 +5914,7 @@ impl OrbitNet {
             // nothing tells it whether its echo landed. The server can, because it holds both
             // generations, so the server is what breaks the silence. One header per tick, only while
             // a gate is shut, which is about a round trip.
-            if sent.is_empty() && !carries_delta && !gate_shut {
+            if snapshot_frame_is_skipped(!sent.is_empty(), carries_delta, gate_shut) {
                 continue;
             }
             let header = FrameHeader {
@@ -7270,16 +7270,9 @@ impl OrbitNet {
             // the game has yet to spawn, and asking for the whole table returns the same row it
             // already holds — an ask that repeats once per retry window and repairs nothing.
             if named.is_none() {
-                match self.unbound_since {
-                    None => self.unbound_since = Some(frame_tick),
-                    Some(since)
-                        if frame_tick >= since.saturating_add(INTEREST_DELTA_RETRY_TICKS) =>
-                    {
-                        self.want_manifest = true;
-                        self.unbound_since = Some(frame_tick);
-                    }
-                    Some(_) => {}
-                }
+                let (ask, since) = manifest_ask_from_unbound(self.unbound_since, frame_tick);
+                self.unbound_since = since;
+                self.want_manifest |= ask;
             }
             self.dbg_rx_skipped += 1;
             if self.debug_wire && self.dbg_rx_skipped % 120 == 1 {
@@ -8036,6 +8029,47 @@ fn adopt_whole_set(
     resolved
 }
 
+/// Whether this tick's snapshot frame for a connection can be skipped entirely.
+///
+/// **A SHUT GATE IS A REASON TO SEND, NOT A REASON TO STAY QUIET.** The client's generation echo
+/// rides an input frame; a connection driving no body sends one only when a snapshot has arrived,
+/// and the echo is discharged when that frame is handed to an unreliable transport. So one lost
+/// datagram leaves the client believing it has told the server something the server never heard, and
+/// the client cannot detect it — nothing tells it whether its echo landed. The server can, because
+/// it holds both generations, so the server is what breaks the silence: one bare header per tick
+/// while the gate is shut, which is about a round trip.
+///
+/// A free function so the rule the send path runs is the rule a test can call.
+#[must_use]
+fn snapshot_frame_is_skipped(has_blocks: bool, carries_delta: bool, gate_shut: bool) -> bool {
+    !has_blocks && !carries_delta && !gate_shut
+}
+
+/// Whether an unplaceable state block should ask for the whole entity manifest, and what the clock
+/// reads afterwards.
+///
+/// **ONE UNBOUND SLOT IS ORDINARY; A SUSTAINED RUN OF THEM IS NOT.** The manifest rides a reliable
+/// channel and the snapshot an unreliable one, so a block naming a slot the manifest has not bound
+/// is the everyday spawn-in-flight case. What is not ordinary is still being unable to name anything
+/// a retry window later: that is a manifest this connection never received, and since the server
+/// advances its per-peer generation when the frame is handed to the transport, nothing on either end
+/// would otherwise notice.
+///
+/// The caller runs this only while the SLOT ITSELF has no binding — a named slot whose entity is not
+/// registered is a node the game has yet to spawn, which no table can repair.
+///
+/// A free function so the rule the receive path runs is the rule a test can call.
+#[must_use]
+fn manifest_ask_from_unbound(since: Option<u64>, frame_tick: u64) -> (bool, Option<u64>) {
+    match since {
+        None => (false, Some(frame_tick)),
+        Some(at) if frame_tick >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS) => {
+            (true, Some(frame_tick))
+        }
+        keep => (false, keep),
+    }
+}
+
 /// Whether vetoing an entity for a connection announces a departure.
 ///
 /// **THE SET IS NOT THE ONLY AUTHORITY ON WHAT WAS IN INTEREST.** `is_entity_in_interest` answers
@@ -8717,19 +8751,19 @@ mod tests {
         clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
         delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
         input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
-        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
-        queue_seat_release, resim_input_from, resolve_observer, resume_grant,
+        is_located, manifest_ask_from_unbound, manifest_owed, note_input_tick, owned_rows_into,
+        owned_rows_of, queue_seat_release, resim_input_from, resolve_observer, resume_grant,
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
-        session_is_filtering, session_key_from, state_whole_interest_set, veto_announces_leave,
-        AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor,
-        PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable,
-        RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
-        StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
-        FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX,
-        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
-        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
-        MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        session_is_filtering, session_key_from, snapshot_frame_is_skipped,
+        state_whole_interest_set, veto_announces_leave, AckOutcome, EntityRow, FrameHeader,
+        InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
+        ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent,
+        SeatReleasePolicy, SlotTable, StateIntegration, Writer, ANCHOR_SOURCE_FIXED,
+        ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
+        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
+        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
         RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
         SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
         UNLOCATABLE_CENTER,
@@ -10573,9 +10607,7 @@ mod tests {
     #[test]
     fn a_shut_gate_still_sends_the_frame_that_opens_it() {
         // The send path's own condition, as the rule it applies.
-        let skips = |has_blocks: bool, carries_delta: bool, gate_shut: bool| {
-            !has_blocks && !carries_delta && !gate_shut
-        };
+        let skips = snapshot_frame_is_skipped;
 
         assert!(
             skips(false, false, false),
@@ -10613,16 +10645,17 @@ mod tests {
     /// The same rule `note_ack` applies to a stale ack, and `newest_input_tick` to a stale tick.
     #[test]
     fn a_reordered_echo_cannot_regress_the_baseline_the_server_believes() {
-        let mut peer = PeerState::default();
-
-        // The client catches up to generation 2.
-        peer.interest_generation = 2;
-        peer.interest_generation_acked = peer.interest_generation_acked.max(2);
+        // The client catches up to generation 2. Through `note_interest_echo`, which is the rule
+        // the receive path runs -- writing the `max` out here asserted that `u64::max` works.
+        let mut peer = PeerState {
+            interest_generation: 2,
+            ..Default::default()
+        };
+        peer.note_interest_echo(2);
         assert_eq!(peer.interest_generation_acked, 2, "the gate is open");
 
         // A frame sent before the client adopted that set arrives late, quoting generation 1.
-        let stale: u64 = 1;
-        peer.interest_generation_acked = peer.interest_generation_acked.max(stale);
+        peer.note_interest_echo(1);
         assert_eq!(
             peer.interest_generation_acked, 2,
             "a late frame quoting an older baseline is ignored, not believed"
@@ -10630,10 +10663,19 @@ mod tests {
 
         // And a genuine advance is still taken.
         peer.interest_generation = 3;
-        peer.interest_generation_acked = peer.interest_generation_acked.max(3);
+        peer.note_interest_echo(3);
         assert_eq!(
             peer.interest_generation_acked, 3,
             "the gate reopens on a real echo"
+        );
+
+        // An echo ABOVE anything this server minted is a number the client chose, and taking it
+        // would leave a figure no set can ever match -- the gate shut for the life of the
+        // connection, with the whole-set re-send armed at the server's expense.
+        peer.note_interest_echo(u64::MAX);
+        assert_eq!(
+            peer.interest_generation_acked, 3,
+            "an echo past the minted generation is clamped, not believed"
         );
     }
 
@@ -10905,16 +10947,7 @@ mod tests {
     /// manifest arriving to fail its base check.
     #[test]
     fn a_sustained_run_of_unplaceable_blocks_asks_for_the_table() {
-        // The rule the receive path applies, as the decision it makes.
-        let ask = |since: Option<u64>, frame_tick: u64| -> (bool, Option<u64>) {
-            match since {
-                None => (false, Some(frame_tick)),
-                Some(at) if frame_tick >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS) => {
-                    (true, Some(frame_tick))
-                }
-                keep => (false, keep),
-            }
-        };
+        let ask = manifest_ask_from_unbound;
 
         // The first one starts the clock and asks for nothing.
         let (asked, since) = ask(None, 100);
