@@ -339,6 +339,25 @@ generation it does not hold, and a frame it acknowledged but could not read to t
 before a block is parsed, so a snapshot that breaks partway is counted delivered whatever became of the
 section in it.
 
+**A set stays owed until the client's echo names it.** Reliable here means the transport retransmits, not that
+the datagram arrives: reliable and unreliable share one sequence counter and one 64-wide replay window, so a
+retransmit landing more than that many datagrams late is refused as a replay and dropped. A set marked
+delivered when it was handed to the transport could therefore never arrive, and the gate it was sent to open
+would stay shut for the rest of the session.
+
+**A retry re-sends the set in flight, at the same generation, byte for byte.** Minting a fresh one per attempt
+moves the target the client is echoing, so a connection whose round trip exceeds the retry window never agrees
+with the server and its gate never opens. Two consequences follow, and an implementation needs both:
+
+| | |
+| --- | --- |
+| **A receiver admits a table only if its generation is STRICTLY NEWER than the one held.** | Two copies of one generation can be in flight. The second is not a repeat: the receiver adopted the first and applied the sections after it, so adopting again rewinds the mirror to the mint and silently undoes every one of them. |
+| **A sender re-states afresh once a slot in the held set has been reissued.** | A slot is quarantined and then reissued to another entity, and the quarantine is longer than the retry window — so a late retry can name a slot that now means something else. The receiver resolves it through its current manifest, reports the set fully resolved, and holds an entity the sender never put in its interest. Nothing detects that, because nothing failed. |
+
+**The re-send is rate limited to one per retry window**, and the stamp that limits it outlives the settle: the
+client's ask is latched, so the same input frame that settles one demand can raise the next, and a stamp
+cleared on the settle lets that drive a whole reliable table every round trip for the life of the connection.
+
 - **`WANT_INTEREST` is latched, not self-sustaining.** The client holds the bit raised until a whole set
   actually arrives, rather than clearing it when the frame carrying it is sent. It rides an unreliable input
   frame, so clearing on send made it a one-shot NACK that a single lost datagram discarded — and the thing it
