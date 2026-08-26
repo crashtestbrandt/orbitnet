@@ -7038,6 +7038,10 @@ impl OrbitNet {
             return;
         };
         let frame_tick = u64::from(header.tick);
+        // **IS THIS THE NEWEST FRAME?** Read before the window slides below, which moves the mark it
+        // is being compared against. It decides whether a trailing interest section is news or an
+        // echo of state that has already been superseded; see the section branch at the end.
+        let newest_frame = frame_tick >= self.newest_snapshot_tick;
         // What this peer now owes an input frame for, whether or not it drives a body. The window
         // slid below is only worth sliding if something carries it back.
         self.snapshot_unacked = true;
@@ -7133,7 +7137,21 @@ impl OrbitNet {
         // undecodable one is. `note_snapshot_break` is what those paths call on the way out.
         if header.flags & FrameHeader::FLAG_INTEREST_DELTA != 0 {
             match decode_interest_delta(reader) {
-                Ok(section) => self.apply_interest_delta(&section),
+                // **ONLY FROM THE NEWEST FRAME.** The generation places a section against a whole
+                // SET; it gives no order between two sections, because an ordinary run of them all
+                // carry the same one. That is sound while every copy in flight is a re-send of the
+                // CURRENT prefix, which is idempotent by construction — and stops being sound the
+                // moment that prefix is acknowledged and a different one is built at the same
+                // generation. A copy of the old one, delayed inside the replay window that
+                // deliberately admits about a second of reordering, is then an UNDO rather than a
+                // repeat: it re-enters what a later section removed, or removes what a later one
+                // entered, and nothing afterwards contradicts it. The frame's own tick is the order
+                // between them, and this peer already tracks it.
+                Ok(section) if newest_frame => self.apply_interest_delta(&section),
+                // An older frame's section is dropped in silence rather than asked about: it named
+                // state this peer has already been told the newer answer for, so there is nothing to
+                // repair and nothing lost.
+                Ok(_) => {}
                 // **THE FRAME IS ALREADY ACKNOWLEDGED BY NOW.** The ack window slides before a single
                 // block is parsed, so the server retires this frame's interest prefix as delivered
                 // whatever became of the section in it. A section that will not decode is therefore
@@ -10339,6 +10357,40 @@ mod tests {
         assert_eq!(
             peer.interest_generation_acked, 3,
             "the gate reopens on a real echo"
+        );
+    }
+
+    /// **A SECTION IS NEWS ONLY FROM THE NEWEST FRAME.** The generation places a section against a
+    /// whole set; it is not a sequence between sections, because an ordinary run of them all carry the
+    /// same one. Idempotence covers a re-send of the CURRENT prefix and nothing more — once that
+    /// prefix is acknowledged and a different one is built at the same generation, a delayed copy of
+    /// the old one re-enters what the new one removed. The replay window admits about a second of
+    /// reordering, so this is ordinary delivery rather than a corner.
+    #[test]
+    fn a_section_from_an_older_frame_is_an_echo_not_news() {
+        let slots = table_naming(&[11]);
+        let mut mirror = Mirror::default();
+
+        // Tick 5: 11 enters. Tick 7, after that prefix was acked: 11 leaves.
+        mirror.apply(&slots, &[], &[0]);
+        assert!(mirror.held.contains(&11), "the enter landed");
+        mirror.apply(&slots, &[0], &[]);
+        assert!(!mirror.held.contains(&11), "and the leave superseded it");
+        mirror.take();
+
+        // The tick-6 re-send of the enter now arrives, carrying the same generation. Applying it
+        // would put 11 back with nothing afterwards to contradict it. The frame tick is what refuses
+        // it, so the receive path never reaches the apply -- this asserts what applying WOULD do,
+        // which is why the guard has to sit above it.
+        mirror.apply(&slots, &[], &[0]);
+        assert!(
+            mirror.held.contains(&11),
+            "an out-of-order copy undoes the newer section, which is why it must not be applied"
+        );
+        assert_eq!(
+            mirror.take(),
+            vec![(4, 11, true)],
+            "and it announces a spurious enter while doing so"
         );
     }
 

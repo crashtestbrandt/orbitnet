@@ -1540,6 +1540,14 @@ fn read_manifest_entries(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, 
 /// **The section is applied idempotently**: remove each `left` slot from a mirrored set, add each
 /// `entered` slot to it, and emit only on a set that actually changed. That is what makes a re-send
 /// free, which is what lets an unreliable datagram carry an event at all.
+///
+/// **Idempotent against a re-send of the CURRENT prefix, which is the only thing that guarantee
+/// covers.** Once a prefix is acknowledged and a different one is built, both carry the same
+/// generation — a run of sections all do — so a delayed copy of the older one is an UNDO rather than
+/// a repeat: it re-enters what a later section removed, or removes what a later one entered. The
+/// generation cannot separate them, because it orders a section against a whole
+/// [`FrameKind::InterestTable`] and was never a sequence between sections. What separates them is the
+/// frame's own tick, so a receiver applies a section only from the newest snapshot it has seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InterestDeltaSection {
     /// The generation of the interest set this delta was built against.
