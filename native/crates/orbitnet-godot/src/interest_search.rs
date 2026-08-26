@@ -34,27 +34,36 @@
 //! Kept to a few hundred milliseconds so it can sit in `just check`: exhaustive to a shallow depth
 //! over a small universe, then a deterministic pseudo-random sweep for the deeper schedules.
 //!
-//! **WHAT IT CATCHES, MEASURED RATHER THAN CLAIMED.** Seven defects this repository actually shipped
-//! were re-injected one at a time. It fails on five:
+//! **WHAT THE SWEEPS CATCH, AND WHAT THEY DO NOT.** Seven defects this repository actually shipped
+//! were re-injected one at a time. The two schedule sweeps below fail on **two** of them:
 //!
-//! | Defect | |
-//! | --- | --- |
-//! | the echo settles a demand no table ever answered | caught |
-//! | a retry mints a fresh generation, so a slow link never catches up | caught |
-//! | the retry stamp is cleared on the settle, so there is no backoff | caught |
-//! | a re-sent table is admitted at a generation already held | caught |
-//! | the server stays silent while the gate is shut | caught |
-//! | a section applies from a frame that is not the newest | **missed** |
-//! | a stale echo regresses the baseline the server believes | **missed** |
+//! | Defect | Sweeps | Covered elsewhere |
+//! | --- | --- | --- |
+//! | the retry stamp is cleared on the settle, so there is no backoff | **caught** | a unit test |
+//! | the server stays silent while the gate is shut | **caught** | a unit test |
+//! | the echo settles a demand no table ever answered | blind | a unit test |
+//! | a retry mints a fresh generation | blind | two unit tests |
+//! | a re-sent table is admitted at a generation already held | blind | the scripted test below |
+//! | a stale echo regresses the baseline | blind | a unit test |
+//! | a section applies from a frame that is not the newest | blind | a unit test |
 //!
-//! The two it misses share a shape: both converge once the link is quiet, paying a whole set to get
-//! there, so an assertion about convergence cannot see them and the cost budget below is too loose to
-//! catch them either. Both have their own unit tests. Widening this to catch them means asserting on
-//! the events emitted rather than only on the final sets, which is worth doing and is not done here.
+//! **THE SWEEPS FIND LIVENESS DEFECTS, NOT SAFETY ONES.** A defect that stops progress or costs a
+//! whole set per round trip shows up in the convergence assertion or the table budget. One that
+//! merely leaves the two ends briefly wrong does not, because this model's client asks more readily
+//! than a real one: it raises `want_interest` whenever a section or set fails to resolve, so a
+//! schedule that would strand a real client instead repairs itself here. Closing that is the single
+//! change that would make these sweeps worth more than the unit tests beside them, and it is not
+//! done.
 //!
-//! It is a bug-finder rather than a proof: absence of a counterexample is not a guarantee, and the
-//! model covers the RULES rather than their call sites — a defect in code no free function names is
-//! out of its reach by construction.
+//! Two further limits, stated because an overstated search is worse than none:
+//!
+//! - **It covers rules, not their call sites.** A defect in code no free function names is out of
+//!   reach by construction — the model calls `section_is_news`, so mutating the guard where
+//!   `handle_snapshot` uses it changes nothing here.
+//! - **The scripted tests in this file are not the search.** `a_delayed_duplicate_table_...` and
+//!   `the_search_catches_the_defects_it_was_built_from` are hand-built interleavings and direct
+//!   assertions; they belong here because they exercise the model, but a count that folds them into
+//!   the sweeps' score is the count this comment used to carry, and it was wrong.
 
 use super::*;
 use std::collections::HashSet;
@@ -327,7 +336,10 @@ impl Session {
                 if ack > 0 {
                     self.peer.note_ack(ack, self.tick, 16.0);
                 }
-                self.peer.retire_interest_delta(self.tick);
+                // **NO `retire_interest_delta` HERE.** `build_interest_section` calls it on the SEND
+                // path, which is what puts the give-up -- and the whole set it owes -- in the phase
+                // BEFORE an input frame can arrive and settle a demand it never covered. Calling it
+                // here as well moved the raise after the echo and hid that ordering entirely.
                 if self.mirror.want_interest {
                     self.peer.interest_full_due = true;
                 }

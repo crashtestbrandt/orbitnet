@@ -8927,19 +8927,20 @@ mod tests {
         is_located, manifest_ask_for_frame, manifest_ask_from_unbound, manifest_owed,
         note_input_tick, owned_rows_into, owned_rows_of, queue_seat_release, resim_input_from,
         resolve_observer, resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello,
-        seat_observer, seat_observers_into, seat_release_policy_of, select_interest_path,
-        session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
-        state_whole_interest_set, unseeded_departures, veto_announces_leave, AckOutcome, EntityRow,
-        FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
-        PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
-        SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, Writer,
-        ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
-        INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX,
-        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
-        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
-        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
-        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
-        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        seat_observer, seat_observers_into, seat_release_policy_of, section_is_news,
+        select_interest_path, session_directions, session_is_filtering, session_key_from,
+        snapshot_frame_is_skipped, state_whole_interest_set, unseeded_departures,
+        veto_announces_leave, AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed,
+        OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
+        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
+        FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX,
+        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
+        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
+        MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
+        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
+        UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -10981,6 +10982,34 @@ mod tests {
             unseeded_departures(true, false, &registered, &[7]).is_empty(),
             "a set this peer could not read in full is short by an unknown id, so it states nothing \
              about who is absent"
+        );
+    }
+
+    /// **A SECTION FROM AN OLDER FRAME IS AN ECHO, NOT NEWS** — and until this test, nothing in the
+    /// repository pinned that. `a_section_from_an_older_frame_is_an_echo_not_news` asserts what
+    /// applying an out-of-order section WOULD do to a mirror; it never exercises the guard that stops
+    /// one being applied. Forcing `section_is_news` to `true` left the whole workspace green.
+    ///
+    /// The rule: the generation places a section against a whole SET and gives no order between two
+    /// sections, because an ordinary run of them all carry the same one. Idempotence covers a re-send
+    /// of the CURRENT prefix and nothing more — once that prefix is retired and a different one is
+    /// built at the same generation, a delayed copy of the old one re-enters what the new one
+    /// removed. The frame's own tick is the order between them.
+    #[test]
+    fn a_section_is_news_only_from_the_newest_frame_seen() {
+        assert!(
+            section_is_news(100, 100),
+            "the frame that set the mark is still news -- a re-send of the current prefix is \
+             idempotent, and refusing it would drop the only copy that arrived"
+        );
+        assert!(section_is_news(101, 100), "and so is a newer one");
+        assert!(
+            !section_is_news(99, 100),
+            "a section on a frame older than the newest seen names state already superseded"
+        );
+        assert!(
+            !section_is_news(0, u64::MAX),
+            "however far behind the replay window let it fall"
         );
     }
 
