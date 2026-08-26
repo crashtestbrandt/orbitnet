@@ -6832,7 +6832,18 @@ impl OrbitNet {
             let Some(peer) = self.peers.get_mut(&sender) else {
                 return; // No handshake, no input.
             };
-            peer.interest_generation_acked = echoed_interest;
+            // **MONOTONE, LIKE EVERY OTHER PER-FRAME FIGURE THIS FUNCTION TAKES.** The echo rides an
+            // UNRELIABLE datagram, and the replay window deliberately admits reordering — about a
+            // second of it — so a frame sent before the client adopted a set can arrive after one
+            // sent since. Taking it at face value regresses this figure and shuts the gate, and a
+            // shut gate suppresses the SECTION but not the ack that retires it: the next frame goes
+            // out carrying no section, the client acks it, and `retire_interest_delta` drains a
+            // prefix that was never delivered. The transitions in it are then unrecoverable, because
+            // no later diff re-enters an id the server already believes is in the set.
+            //
+            // `note_ack` refuses a stale ack and `newest_input_tick` takes a `max` for the same
+            // reason; this figure was the one that did not.
+            peer.interest_generation_acked = peer.interest_generation_acked.max(echoed_interest);
             // Consume the ack window: every snapshot frame the client PROVES it received promotes
             // the entity ticks that frame carried to `acked_base` — the only ticks a masked delta
             // may reference, because the client provably holds those rows. An ack that carries the
@@ -10293,6 +10304,41 @@ mod tests {
         assert!(
             input_frame_is_owed(false, true, false, false, false, false),
             "the empty frame lands, the client owes an ack, and the echo rides that frame"
+        );
+    }
+
+    /// **A LATE FRAME MUST NOT REGRESS WHAT THE CLIENT HOLDS.** The echo rides an unreliable datagram
+    /// and the replay window admits about a second of reordering, so a frame sent before the client
+    /// adopted a whole set can arrive after one sent since. Believing it shuts the gate — and a shut
+    /// gate suppresses the SECTION but not the ack that retires it, so the next frame goes out
+    /// carrying nothing, the client acks it, and a prefix that was never delivered is drained as
+    /// though it had been. Those transitions are unrecoverable: no later diff re-enters an id the
+    /// server already believes is in the set.
+    ///
+    /// The same rule `note_ack` applies to a stale ack, and `newest_input_tick` to a stale tick.
+    #[test]
+    fn a_reordered_echo_cannot_regress_the_baseline_the_server_believes() {
+        let mut peer = PeerState::default();
+
+        // The client catches up to generation 2.
+        peer.interest_generation = 2;
+        peer.interest_generation_acked = peer.interest_generation_acked.max(2);
+        assert_eq!(peer.interest_generation_acked, 2, "the gate is open");
+
+        // A frame sent before the client adopted that set arrives late, quoting generation 1.
+        let stale: u64 = 1;
+        peer.interest_generation_acked = peer.interest_generation_acked.max(stale);
+        assert_eq!(
+            peer.interest_generation_acked, 2,
+            "a late frame quoting an older baseline is ignored, not believed"
+        );
+
+        // And a genuine advance is still taken.
+        peer.interest_generation = 3;
+        peer.interest_generation_acked = peer.interest_generation_acked.max(3);
+        assert_eq!(
+            peer.interest_generation_acked, 3,
+            "the gate reopens on a real echo"
         );
     }
 
