@@ -26,6 +26,10 @@ THE VERDICT IS ADVISORY. `--tolerance` (default 5%) decides which deltas print a
 than as noise, and the exit code follows the regressions -- but the right tolerance depends on the machine and
 the fleet size, so read the table when the two disagree.
 
+A RELATIVE TOLERANCE IS NOT ENOUGH ON ITS OWN. The per-frame CPU timers are sub-millisecond, so 5% of them is
+smaller than the spread between two runs of one binary; those columns carry an absolute floor as well. See
+`NOISE_FLOOR_ABS`.
+
 Only columns whose DIRECTION is known are judged. `rtt_ms` is set by the profile rather than by the netcode and
 `interest_entities` is a scene fact; both are printed and neither is judged.
 
@@ -72,6 +76,22 @@ LOWER_IS_BETTER = {
 HIGHER_IS_BETTER = {
     "blocks_admitted_s": "entity blocks actually sent per second",
     "hits_confirmed": "authoritative hits confirmed",
+}
+
+# AN ABSOLUTE FLOOR FOR COLUMNS WHOSE OWN REPEATABILITY IS WORSE THAN THE TOLERANCE.
+#
+# The per-frame CPU timers sit near 0.02-0.03 ms, where a 5% relative test is 0.001 ms -- below the spread
+# two runs of the SAME BINARY on the same seed produce. Measured, rather than assumed: back-to-back runs of
+# one commit moved `rollback_ms` +11.5% and `net_ms` +10.0%, and both printed REGRESSED. A gate that fails
+# on a re-run is a gate people learn to ignore.
+#
+# The floor is the smaller of "what the machine can resolve" and "what a player could feel": 0.05 ms is
+# 0.15% of a 33 ms tick, so a move under it is not a regression whatever the ratio says. Columns absent
+# from this table keep the pure relative test -- byte counters are exact and need no floor.
+NOISE_FLOOR_ABS = {
+    "rollback_ms": 0.05,
+    "net_ms": 0.05,
+    "interest_ms": 0.05,
 }
 
 # Printed, never judged: set by the profile, by the scene, or by the run's own bookkeeping.
@@ -175,8 +195,10 @@ def verdict(column: str, before: float, after: float, tolerance: float,
     if math.isnan(before) or math.isnan(after):
         return ""
     # An absolute floor under the relative test: a column that sits at zero either side is unchanged, and one
-    # whose absolute move is a rounding artifact is noise whatever the ratio says.
-    if abs(after - before) <= max(1e-9, abs(before) * tolerance):
+    # whose absolute move is a rounding artifact is noise whatever the ratio says. See `NOISE_FLOOR_ABS` for
+    # why the per-frame CPU timers carry a floor far above the 1e-9 default.
+    floor = max(NOISE_FLOOR_ABS.get(column, 0.0), 1e-9)
+    if abs(after - before) <= max(floor, abs(before) * tolerance):
         return "same"
     worse = after > before if better_low else after < before
     return "REGRESSED" if worse else "improved"
