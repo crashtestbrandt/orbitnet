@@ -6548,7 +6548,9 @@ impl OrbitNet {
                         // silently undoes every one of them. An older table is ignored for the reason
                         // a stale manifest is — adopting one would make this peer refuse every delta
                         // built on the newer set.
-                        Ok((generation, slots)) if generation > self.interest_mirror_generation => {
+                        Ok((generation, slots))
+                            if table_is_news(generation, self.interest_mirror_generation) =>
+                        {
                             self.adopt_interest_table(generation, &slots);
                         }
                         Ok(_) => {}
@@ -7199,7 +7201,7 @@ impl OrbitNet {
         // **IS THIS THE NEWEST FRAME?** Read before the window slides below, which moves the mark it
         // is being compared against. It decides whether a trailing interest section is news or an
         // echo of state that has already been superseded; see the section branch at the end.
-        let newest_frame = frame_tick >= self.newest_snapshot_tick;
+        let newest_frame = section_is_news(frame_tick, self.newest_snapshot_tick);
         // What this peer now owes an input frame for, whether or not it drives a body. The window
         // slid below is only worth sliding if something carries it back.
         self.snapshot_unacked = true;
@@ -8107,6 +8109,35 @@ fn manifest_ask_from_unbound(since: Option<u64>, frame_tick: u64) -> (bool, Opti
     }
 }
 
+/// Whether an arriving whole interest set is news, or a copy of one already held.
+///
+/// **STRICTLY NEWER, BECAUSE A RETRY RE-SENDS THE SET IN FLIGHT VERBATIM.** Two copies of one
+/// generation can therefore be on the wire at once, and the second is not a repeat: the receiver
+/// adopted the first, applied the sections that followed it, and adopting again rewinds the mirror to
+/// the mint and silently undoes every one of them. An older table is ignored for the reason a stale
+/// manifest is -- adopting one would make this peer refuse every delta built on the newer set.
+///
+/// A free function so the rule the receive path runs is the rule a test can call.
+#[must_use]
+fn table_is_news(generation: u64, held: u64) -> bool {
+    generation > held
+}
+
+/// Whether a trailing interest section on this frame is news, or an echo of superseded state.
+///
+/// **ONLY THE NEWEST FRAME'S SECTION IS NEWS.** The generation places a section against a whole SET
+/// and gives no order between two sections — an ordinary run of them all carry the same one. That is
+/// sound while every copy in flight is a re-send of the CURRENT prefix, which is idempotent by
+/// construction, and stops being sound the moment that prefix is retired and a different one is built
+/// at the same generation: a delayed copy of the old one re-enters what the new one removed. The
+/// frame's own tick is the order between them.
+///
+/// A free function so the rule the receive path runs is the rule a test can call.
+#[must_use]
+fn section_is_news(frame_tick: u64, newest_seen: u64) -> bool {
+    frame_tick >= newest_seen
+}
+
 /// Fold one snapshot frame's block outcomes into the manifest-ask clock.
 ///
 /// **THE CLOCK IS A FACT ABOUT A FRAME, NOT ABOUT A BLOCK.** Deciding it per block put the clear and
@@ -8819,6 +8850,12 @@ fn queue_seat_release(pending: &mut Vec<i32>, peer: i32) {
         pending.push(peer);
     }
 }
+
+// The adversarial state search over the interest lane. A child module so it can reach the rules
+// directly: they are the point, and a search that restated them would find nothing.
+#[cfg(test)]
+#[path = "interest_search.rs"]
+mod interest_search;
 
 #[cfg(test)]
 mod tests {
