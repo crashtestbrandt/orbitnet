@@ -1174,6 +1174,12 @@ impl PeerState {
     /// A method rather than an inline block so the rule the receive path runs is the rule a test can
     /// call — a test that restates it cannot fail when it regresses.
     fn note_interest_echo(&mut self, echoed: u64) -> bool {
+        // **NEVER ABOVE WHAT THIS SERVER MINTED.** The echo is a number the client chose. It rides
+        // inside the MAC, so an off-path attacker cannot forge it, but the client itself can send
+        // anything at all. Taken raw, one figure above `interest_generation` can never be matched by
+        // any set this connection is later sent: the gate stays shut for the life of the connection
+        // and the whole-set re-send stays armed, once per retry window, at the server's expense.
+        let echoed = echoed.min(self.interest_generation);
         self.interest_generation_acked = self.interest_generation_acked.max(echoed);
         let settled = self
             .interest_table_inflight
@@ -3350,11 +3356,21 @@ impl OrbitNet {
         if entity_id == 0 {
             return;
         }
-        let left = self
+        // **BEFORE THE FIRST PASS, THE READ-BACKS ANSWER FROM "EVERY REGISTERED ENTITY".** See
+        // [`Self::is_entity_in_interest`], which returns `is_registered` while `interest_ran` is
+        // false. `peer.interest` is empty until the pass has run once, and a veto is what turns the
+        // pass on in a session with no radius and no membership — so the first veto found nothing to
+        // have left and announced nothing, while the read-back had been answering `true` for that
+        // entity all session. The pass then seeded the set without it, announcing enters for its
+        // siblings and nothing for it: the unpaired leave this signal exists to close.
+        let interest_ran = self.interest_ran;
+        let registered = self.is_registered(entity_id as u64);
+        let held = self
             .peers
             .entry(peer)
             .or_default()
             .set_entity_hidden(entity_id as u64, hidden);
+        let left = veto_announces_leave(held, hidden, interest_ran, registered);
         // THE SIGNAL THE WIRE LEAVE ALREADY CARRIED. A veto drops the id from the set in that same
         // call, so no later `leaves` diff can ever name it — which is exactly why the rule stated
         // above `update_interest` is that each between-updates leave queues its own event. Without
@@ -3424,6 +3440,37 @@ impl OrbitNet {
     /// token that names nothing still reads as `false`.
     fn is_registered(&self, id: u64) -> bool {
         self.rollback_entities.contains_key(&id) || self.state_entities.contains_key(&id)
+    }
+
+    /// Announce the departure of everything the first interest news does not name.
+    ///
+    /// **SEEDING THE MIRROR CHANGES WHAT THE READ-BACK ANSWERS, FOR EVERY REGISTERED ENTITY.** An
+    /// unseeded client answers [`Self::is_entity_in_interest`] from `is_registered`, because a server
+    /// that culls nothing sends no section at all. The first section or whole set replaces that with
+    /// the mirror, so every registered entity the news does not name goes from `true` to `false` in
+    /// one step — and the diff against an EMPTY mirror announces only enters, so a handler mirroring
+    /// the two signals is told about none of them.
+    ///
+    /// That is the unpaired-enter shape the server-side veto signal exists to close, on the other
+    /// end of the same wire. Runs on the FIRST seed only: afterwards the mirror is the baseline and
+    /// its own diff carries every transition.
+    fn announce_unseeded_departures(&mut self, named: &[u64]) {
+        if self.interest_mirror_seeded {
+            return;
+        }
+        let peer = self.local_peer_id();
+        let mut leaving: Vec<u64> = self
+            .rollback_entities
+            .keys()
+            .chain(self.state_entities.keys())
+            .copied()
+            .filter(|id| !named.contains(id))
+            .collect();
+        leaving.sort_unstable();
+        leaving.dedup();
+        for id in leaving {
+            self.interest_events.push((peer, id, false));
+        }
     }
 
     /// Every registered entity id, ascending. What "everything is in interest" resolves to.
@@ -7169,7 +7216,16 @@ impl OrbitNet {
             // A slot with no binding is the ordinary in-flight case — the manifest that binds it
             // rides the reliable channel and an unreliable snapshot can overtake it — so it falls
             // through to the skip below, exactly as an unknown entity id used to.
-            let entity = self.slots.id_of(meta.slot).unwrap_or(0);
+            let named = self.slots.id_of(meta.slot);
+            if named.is_some() {
+                // **THE SLOT TABLE NAMED IT, SO THE MANIFEST IS DOING ITS JOB.** Clearing here and not
+                // only on an adopted manifest is what keeps the clock measuring a CONTIGUOUS run of
+                // being unable to name anything. A stamp left behind by a slot that stopped arriving
+                // before its manifest landed otherwise turned the next ordinary spawn-in-flight block,
+                // however many seconds later, straight into a whole-table request.
+                self.unbound_since = None;
+            }
+            let entity = named.unwrap_or(0);
             if let Some(mut sync) = self.rollback_entities.get(&entity).and_then(live_handle) {
                 if !meta.state_lane {
                     let result = {
@@ -7206,17 +7262,24 @@ impl OrbitNet {
                     continue;
                 }
             }
-            // Unknown entity (spawn in flight) — skip its body cleanly, and start the clock. See
-            // [`Self::unbound_since`]: one of these is lag, a run of them is a manifest that never
-            // arrived.
-            if self.unbound_since.is_none() {
-                self.unbound_since = Some(frame_tick);
-            } else if self
-                .unbound_since
-                .is_some_and(|since| frame_tick >= since.saturating_add(INTEREST_DELTA_RETRY_TICKS))
-            {
-                self.want_manifest = true;
-                self.unbound_since = Some(frame_tick);
+            // Unknown entity (spawn in flight) — skip its body cleanly, and start the clock only if
+            // the SLOT ITSELF has no binding. See [`Self::unbound_since`]: one of those is lag, a run
+            // of them is a manifest that never arrived.
+            //
+            // **A NAMED SLOT WHOSE ENTITY IS NOT REGISTERED IS NOT A MANIFEST PROBLEM.** That is a node
+            // the game has yet to spawn, and asking for the whole table returns the same row it
+            // already holds — an ask that repeats once per retry window and repairs nothing.
+            if named.is_none() {
+                match self.unbound_since {
+                    None => self.unbound_since = Some(frame_tick),
+                    Some(since)
+                        if frame_tick >= since.saturating_add(INTEREST_DELTA_RETRY_TICKS) =>
+                    {
+                        self.want_manifest = true;
+                        self.unbound_since = Some(frame_tick);
+                    }
+                    Some(_) => {}
+                }
             }
             self.dbg_rx_skipped += 1;
             if self.debug_wire && self.dbg_rx_skipped % 120 == 1 {
@@ -7293,6 +7356,12 @@ impl OrbitNet {
             self.want_interest = true;
             return;
         }
+        let named: Vec<u64> = section
+            .entered
+            .iter()
+            .filter_map(|&slot| self.slots.id_of(slot))
+            .collect();
+        self.announce_unseeded_departures(&named);
         let peer = self.local_peer_id();
         self.interest_mirror_seeded = true;
         let resolved = apply_interest_section(
@@ -7332,6 +7401,11 @@ impl OrbitNet {
     /// that announced the whole set would re-announce every entity the peer already had, and a game
     /// acting on those signals would rebuild nodes it never lost.
     fn adopt_interest_table(&mut self, generation: u64, slots: &[u16]) {
+        let named: Vec<u64> = slots
+            .iter()
+            .filter_map(|&slot| self.slots.id_of(slot))
+            .collect();
+        self.announce_unseeded_departures(&named);
         let peer = self.local_peer_id();
         let resolved = adopt_whole_set(
             &self.slots,
@@ -7960,6 +8034,20 @@ fn adopt_whole_set(
     }
     *mirror = next;
     resolved
+}
+
+/// Whether vetoing an entity for a connection announces a departure.
+///
+/// **THE SET IS NOT THE ONLY AUTHORITY ON WHAT WAS IN INTEREST.** `is_entity_in_interest` answers
+/// `is_registered` while the pass has never run, because a session with no radius and no membership
+/// replicates everything to everybody — and a veto is what turns the pass on in exactly that
+/// session. Reading `held` alone found an empty set, announced nothing, and let the next pass seed
+/// the set without the vetoed entity: enters for its siblings, and nothing at all for it.
+///
+/// A free function so the rule the facade runs is the rule a test can call.
+#[must_use]
+fn veto_announces_leave(held: bool, hidden: bool, interest_ran: bool, registered: bool) -> bool {
+    held || (hidden && !interest_ran && registered)
 }
 
 /// Whether this connection should be sent a whole interest set on `current`.
@@ -8633,17 +8721,18 @@ mod tests {
         queue_seat_release, resim_input_from, resolve_observer, resume_grant,
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
-        session_is_filtering, session_key_from, state_whole_interest_set, AckOutcome, EntityRow,
-        FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
-        PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
-        SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, Writer,
-        ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL,
-        INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX,
-        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
-        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
-        RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT,
-        RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP,
-        SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        session_is_filtering, session_key_from, state_whole_interest_set, veto_announces_leave,
+        AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor,
+        PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable,
+        RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        StateIntegration, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
+        FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX,
+        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
+        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
+        MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
+        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
+        UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::InterestDeltaSection;
     use std::collections::HashMap;
@@ -10579,6 +10668,41 @@ mod tests {
             mirror.take(),
             vec![(4, 11, true)],
             "and it announces a spurious enter while doing so"
+        );
+    }
+
+    /// **THE FIRST VETO IN A SESSION THAT FILTERS NOTHING ELSE STILL OWES A LEAVE.**
+    ///
+    /// Through [`veto_announces_leave`], which is the rule the facade runs.
+    #[test]
+    fn a_first_veto_announces_its_leave_before_the_pass_has_ever_run() {
+        // The pass has never run, so `peer.interest` names nothing and `held` is false — while
+        // `is_entity_in_interest` has been answering `true` for every registered entity all session.
+        assert!(
+            veto_announces_leave(false, true, false, true),
+            "a first veto on a registered entity is a departure the read-back reported"
+        );
+
+        // Once the pass has run, the set is the authority.
+        assert!(
+            !veto_announces_leave(false, true, true, true),
+            "a filtering session announces only what its set actually named"
+        );
+        assert!(
+            veto_announces_leave(true, true, true, true),
+            "and it announces that"
+        );
+
+        // A retraction announces nothing either way: the entity re-enters through the next pass.
+        assert!(
+            !veto_announces_leave(false, false, false, true),
+            "retracting a veto is not a departure"
+        );
+
+        // Nor is vetoing something this peer has never registered.
+        assert!(
+            !veto_announces_leave(false, true, false, false),
+            "an unregistered entity was never reported as in interest"
         );
     }
 
