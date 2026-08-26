@@ -779,6 +779,23 @@ struct PeerState {
     /// So the set stays owed until the client's echo says it holds it, and this stamp is what keeps
     /// the re-send to one per [`INTEREST_DELTA_RETRY_TICKS`] rather than one per tick.
     interest_table_tick: Option<u64>,
+    /// The whole set last stated to this connection, and the generation it was stated at.
+    ///
+    /// **A RETRY RE-SENDS THIS, RATHER THAN MINTING A NEW ONE.** Two things go wrong when a retry
+    /// states a fresh set:
+    ///
+    /// | | |
+    /// | --- | --- |
+    /// | the generation moves | a connection whose round trip exceeds [`INTEREST_DELTA_RETRY_TICKS`] echoes `N` while the server has gone to `N+1`, so the two never agree and the gate never opens |
+    /// | the content moves | one generation then names two different sets, and the first copy landing while the second is refused leaves the server believing a set the client does not hold |
+    ///
+    /// It is also what an arriving echo is matched against: an echo settles the demand only when it
+    /// names a set this connection was actually SENT. Testing the two generations alone cleared a
+    /// demand raised a tick earlier, because an ordinary session sits at `0 == 0` for ever.
+    ///
+    /// Discarded by [`Self::owe_whole_interest_set`], so a cause raised AFTER the mint states a
+    /// fresh set rather than re-sending one computed before it happened.
+    interest_table_inflight: Option<(u64, Vec<u16>)>,
     /// Whether this connection is owed a whole interest set rather than another delta.
     ///
     /// **FOUR THINGS SET IT, AND THE SERVER KNOWS THREE OF THEM ITSELF.** A pending half that
@@ -1122,7 +1139,7 @@ impl PeerState {
             &mut self.interest_delta_left_sent,
             id,
         ) {
-            self.interest_full_due = true;
+            self.owe_whole_interest_set();
         }
     }
 
@@ -1139,8 +1156,47 @@ impl PeerState {
             &mut self.interest_delta_entered_sent,
             id,
         ) {
-            self.interest_full_due = true;
+            self.owe_whole_interest_set();
         }
+    }
+
+    /// Take this connection's echoed interest generation, and answer whether it settles the whole
+    /// set the connection was owed.
+    ///
+    /// **MONOTONE, AND SETTLED ONLY BY AN ECHO NAMING A SET THAT WAS SENT.** Two separate rules,
+    /// both of which a review round found broken:
+    ///
+    /// | Rule | What it stops |
+    /// | --- | --- |
+    /// | the figure only rises | a reordered input frame regressing the baseline and shutting the gate, after which a section-less frame's ack retires a prefix that was never delivered |
+    /// | the echo is matched against [`Self::interest_table_inflight`] | an ordinary session, which sits at `0 == 0` for ever, clearing a demand raised a tick earlier and never sending the set |
+    ///
+    /// A method rather than an inline block so the rule the receive path runs is the rule a test can
+    /// call — a test that restates it cannot fail when it regresses.
+    fn note_interest_echo(&mut self, echoed: u64) -> bool {
+        self.interest_generation_acked = self.interest_generation_acked.max(echoed);
+        let settled = self
+            .interest_table_inflight
+            .as_ref()
+            .is_some_and(|(stated, _)| *stated == self.interest_generation_acked);
+        if settled {
+            self.interest_full_due = false;
+            self.interest_table_tick = None;
+            self.interest_table_inflight = None;
+        }
+        settled
+    }
+
+    /// Owe this connection a whole interest set, and discard any set already in flight.
+    ///
+    /// **THE IN-FLIGHT COPY WAS COMPUTED BEFORE WHATEVER RAISED THIS.** Re-sending it would answer
+    /// the new cause with a set that predates it, and the echo confirming it would then settle a
+    /// demand it never covered. The three server-detected causes all route through here; a client's
+    /// [`FrameHeader::FLAG_WANT_INTEREST`] does not, because the set already in flight IS the answer
+    /// it is asking for.
+    fn owe_whole_interest_set(&mut self) {
+        self.interest_full_due = true;
+        self.interest_table_inflight = None;
     }
 
     /// Remove `id` from one half, keeping `sent` pointing at the same entries it did.
@@ -1234,7 +1290,7 @@ impl PeerState {
             // GIVEN UP ON, NOT DELIVERED. The prefix is still dropped — re-queuing it is what would
             // make one unreachable peer accumulate for ever — but the two ends now disagree about
             // what was sent, and a whole set is the only thing that settles that.
-            self.interest_full_due = true;
+            self.owe_whole_interest_set();
         }
         let left = self
             .interest_delta_left_sent
@@ -5352,16 +5408,7 @@ impl OrbitNet {
         let owed: Vec<i32> = self
             .peers
             .iter()
-            .filter(|(_, peer)| {
-                // Owed, and not already answered inside the retry window. The stamp is what stops a
-                // set that is owed until ACKNOWLEDGED from being re-sent every tick while the first
-                // copy is still in flight.
-                peer.synced
-                    && peer.interest_full_due
-                    && peer
-                        .interest_table_tick
-                        .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
-            })
+            .filter(|(_, peer)| interest_table_due(peer, current))
             .map(|(&id, _)| id)
             .collect();
         if owed.is_empty() {
@@ -5372,7 +5419,7 @@ impl OrbitNet {
             let Some(peer) = self.peers.get_mut(&peer_id) else {
                 continue;
             };
-            let (generation, slots) = state_whole_interest_set(&self.slots, peer);
+            let (generation, slots) = interest_table_to_send(&self.slots, peer);
             peer.interest_table_tick = Some(current);
             frames.push((peer_id, encode_interest_table(generation, &slots)));
         }
@@ -6742,7 +6789,11 @@ impl OrbitNet {
             // the whole truth.
             if rekeyed {
                 peer.interest_seeded = false;
-                peer.interest_full_due = true;
+                // Through the helper, because a set computed before the rekey is stale: the client's
+                // `stop()` cleared the mirror it was stated against, so re-sending it would seat a
+                // baseline neither end holds, and an echo of its generation would settle a demand it
+                // never covered.
+                peer.owe_whole_interest_set();
             }
         }
         // The secret this connection's frame tokens are minted from. `get_or_insert_with`, not an
@@ -6880,12 +6931,7 @@ impl OrbitNet {
             //
             // `note_ack` refuses a stale ack and `newest_input_tick` takes a `max` for the same
             // reason; this figure was the one that did not.
-            peer.interest_generation_acked = peer.interest_generation_acked.max(echoed_interest);
-            if peer.interest_generation_acked == peer.interest_generation {
-                // The set this peer was owed is the set it now says it holds, so it is owed no more.
-                peer.interest_full_due = false;
-                peer.interest_table_tick = None;
-            }
+            peer.note_interest_echo(echoed_interest);
             // Consume the ack window: every snapshot frame the client PROVES it received promotes
             // the entity ticks that frame carried to `acked_base` — the only ticks a masked delta
             // may reference, because the client provably holds those rows. An ack that carries the
@@ -7916,6 +7962,42 @@ fn adopt_whole_set(
     resolved
 }
 
+/// Whether this connection should be sent a whole interest set on `current`.
+///
+/// **OWED, AND NOT ALREADY ANSWERED INSIDE THE RETRY WINDOW.** The stamp is what keeps a set that is
+/// owed until ACKNOWLEDGED from being re-sent every tick while the first copy may still be in
+/// flight; the retry exists at all because a reliable frame the replay window refuses is neither
+/// delivered nor retried.
+///
+/// A free function so the rule the send path runs is the rule a test can call.
+#[must_use]
+fn interest_table_due(peer: &PeerState, current: u64) -> bool {
+    peer.synced
+        && peer.interest_full_due
+        && peer
+            .interest_table_tick
+            .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
+}
+
+/// Take the whole set to send this connection: the one already in flight, or a freshly stated one.
+///
+/// **A RETRY RE-SENDS WHAT IS IN FLIGHT, BYTE FOR BYTE.** Stating a fresh set on every attempt moved
+/// the target the client was echoing — a round trip longer than [`INTEREST_DELTA_RETRY_TICKS`] never
+/// caught up, so the gate never opened — and let one generation name two different sets, which is the
+/// silent divergence the whole mechanism exists to close.
+///
+/// A free function so the rule the send path runs is the rule a test can call.
+fn interest_table_to_send(slots: &SlotTable, peer: &mut PeerState) -> (u64, Vec<u16>) {
+    match peer.interest_table_inflight.clone() {
+        Some(held) => held,
+        None => {
+            let minted = state_whole_interest_set(slots, peer);
+            peer.interest_table_inflight = Some(minted.clone());
+            minted
+        }
+    }
+}
+
 /// Take the whole interest set a connection is owed, and retire what stating it supersedes.
 ///
 /// A free function so the rule the send path runs is the rule a test can call — the same shape as
@@ -8546,9 +8628,10 @@ mod tests {
         band_for_row, build_interest_section, candidate_for_own_row, candidate_for_row,
         clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
         delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
-        input_frame_is_owed, interest_delta_reserve, is_located, manifest_owed, note_input_tick,
-        owned_rows_into, owned_rows_of, queue_seat_release, resim_input_from, resolve_observer,
-        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
+        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
+        queue_seat_release, resim_input_from, resolve_observer, resume_grant,
+        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, select_interest_path, session_directions,
         session_is_filtering, session_key_from, state_whole_interest_set, AckOutcome, EntityRow,
         FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration,
@@ -10506,44 +10589,106 @@ mod tests {
     /// and the gate it was sent to open would stay shut for the rest of the session.
     ///
     /// The retry stamp is what keeps "owed until acknowledged" from meaning "re-sent every tick".
+    ///
+    /// Through [`interest_table_due`] and [`PeerState::note_interest_echo`] rather than copies of
+    /// them: the previous version of this test restated both predicates in its own body and passed
+    /// against a build where neither worked.
     #[test]
     fn a_whole_set_stays_owed_until_the_echo_confirms_it() {
         let slots = table_naming(&[7]);
         let mut peer = peer_holding(7);
-        peer.interest_full_due = true;
+        peer.synced = true;
+        peer.owe_whole_interest_set();
 
-        let (generation, _) = state_whole_interest_set(&slots, &mut peer);
+        // **BEFORE ANYTHING IS MINTED**, which is the shape the bug had. An ordinary session sits at
+        // generation 0 on both sides for its whole life, so an echo of 0 arriving here settled a
+        // demand that no table had answered — on the very next input frame, before the send path ran.
+        assert!(
+            !peer.note_interest_echo(0),
+            "a session that has minted nothing must not read an echo of 0 as delivery"
+        );
+        assert!(
+            peer.interest_full_due,
+            "the demand raised a tick ago survives the frame that confirms nothing"
+        );
+
+        let (generation, stated) = state_whole_interest_set(&slots, &mut peer);
         assert_eq!(generation, 1);
         assert!(
             peer.interest_full_due,
             "handing the frame to the transport is not delivery"
         );
 
-        // The send path stamps the attempt, and the stamp is what gates a re-send.
+        // The send path records what it stated and stamps the attempt.
+        peer.interest_table_inflight = Some((generation, stated));
         peer.interest_table_tick = Some(100);
-        let due = |peer: &PeerState, current: u64| {
-            peer.interest_full_due
-                && peer
-                    .interest_table_tick
-                    .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
-        };
         assert!(
-            !due(&peer, 101),
+            !interest_table_due(&peer, 101),
             "not re-sent while the first copy may still land"
         );
         assert!(
-            due(&peer, 100 + INTEREST_DELTA_RETRY_TICKS),
+            interest_table_due(&peer, 100 + INTEREST_DELTA_RETRY_TICKS),
             "and re-sent once the window says it did not"
         );
 
-        // The echo catching up is what actually settles it.
-        peer.interest_generation_acked = peer.interest_generation_acked.max(generation);
-        if peer.interest_generation_acked == peer.interest_generation {
-            peer.interest_full_due = false;
-            peer.interest_table_tick = None;
-        }
+        // An echo naming a generation this connection was never sent settles nothing.
+        assert!(
+            !peer.note_interest_echo(0),
+            "an ordinary session sits at 0 and must not read that as delivery"
+        );
+        assert!(
+            peer.interest_full_due,
+            "the demand survives a frame that confirms nothing"
+        );
+
+        // The echo naming the set that WAS sent is what settles it.
+        assert!(
+            peer.note_interest_echo(generation),
+            "the client names the set it was sent"
+        );
         assert!(!peer.interest_full_due, "the client says it holds the set");
-        assert!(!due(&peer, 10_000), "so nothing is re-sent again");
+        assert!(
+            !interest_table_due(&peer, 10_000),
+            "so nothing is re-sent again"
+        );
+    }
+
+    /// **A RETRY RE-SENDS THE SET IN FLIGHT RATHER THAN MINTING A NEW ONE.** Minting on every retry
+    /// moved the target the client was echoing: a connection whose round trip exceeds
+    /// [`INTEREST_DELTA_RETRY_TICKS`] echoed `N` while the server had already gone to `N+1`, so the
+    /// two could never agree and the gate never opened.
+    #[test]
+    fn a_retry_does_not_move_the_generation_the_client_is_echoing() {
+        let slots = table_naming(&[7]);
+        let mut peer = peer_holding(7);
+        peer.synced = true;
+        peer.owe_whole_interest_set();
+
+        // The first send mints and records it, through the rule the send path runs.
+        let (first, _) = interest_table_to_send(&slots, &mut peer);
+
+        // A retry goes through the same rule the send path does.
+        let (retried, _) = interest_table_to_send(&slots, &mut peer);
+        assert_eq!(
+            retried, first,
+            "the retry quotes the generation the client was given"
+        );
+
+        // So the echo of the FIRST generation still settles it, however many retries went out.
+        assert!(
+            peer.note_interest_echo(first),
+            "a slow round trip catches up rather than chasing a moving target"
+        );
+        assert!(!peer.interest_full_due);
+
+        // A cause raised after the mint discards the held copy, so the next send states afresh.
+        peer.owe_whole_interest_set();
+        assert!(
+            peer.interest_table_inflight.is_none(),
+            "a new cause is not answered by a set computed before it"
+        );
+        let (second, _) = interest_table_to_send(&slots, &mut peer);
+        assert!(second > first, "and that set carries a new generation");
     }
 
     /// **THE MARGIN BYTE REPORTS THE NEWEST INPUT, NOT THE ARRIVING ONE.** The client steers its clock
