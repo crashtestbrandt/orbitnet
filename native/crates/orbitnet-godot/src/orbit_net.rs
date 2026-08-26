@@ -7848,6 +7848,25 @@ fn build_interest_section(
         return false;
     }
     peer.retire_interest_delta(current);
+    // **A CONNECTION'S FIRST INTEREST NEWS IS A WHOLE SET, NOT A SECTION.**
+    //
+    // A section states at most [`INTEREST_DELTA_PER_FRAME`] enters, so an id absent from the first
+    // one may be out of interest or may simply be waiting for the next frame — and the receiver
+    // cannot tell which. That matters because seeding the mirror is what changes
+    // `is_entity_in_interest` from "every registered entity" to "what the mirror holds", for every
+    // registered entity at once: seeded by a section, everything the section did not name goes from
+    // true to false with nothing announced, and a handler mirroring the two signals holds it for
+    // ever. A whole set is complete by construction, so the diff it emits is the whole truth.
+    //
+    // Raised only while nothing is owed, or clearing the retry stamp here would re-send the table
+    // every tick until it lands. `state_whole_interest_set` marks the connection seeded, so this
+    // fires once.
+    if !peer.interest_seeded {
+        if !peer.interest_full_due {
+            peer.owe_whole_interest_set();
+        }
+        return false;
+    }
     // **NO SECTION UNTIL THE CLIENT HOLDS THE BASELINE IT WOULD BE DIFFED AGAINST.** A whole set is
     // reliable and a section is not, so a section built after a table could reach the client first
     // and be applied against a set it was not computed from. Every earlier attempt at this tried to
@@ -10749,9 +10768,12 @@ mod tests {
     fn a_section_waits_for_the_client_to_hold_the_baseline() {
         let slots = table_naming(&[7]);
         let mut peer = peer_holding(7);
+        // Seeded: a connection's FIRST interest news is a whole set, so the section
+        // path this test is about only runs once one has landed.
+        peer.interest_seeded = true;
         peer.note_interest_enter(7);
 
-        // An ordinary session sends no whole set, so both ends sit at zero and nothing waits.
+        // Seeded already, so both ends sit at the seed's generation and nothing waits.
         assert_eq!(peer.interest_generation, 0);
         assert_eq!(peer.interest_generation_acked, 0);
         let (carries, _, entered) = section_for(&slots, &mut peer, 100);
@@ -11124,6 +11146,64 @@ mod tests {
             pairs,
             vec![(0u16, 42u64), (1, 7)],
             "ascending by slot, each carrying its own entity"
+        );
+    }
+
+    /// **A CONNECTION'S FIRST INTEREST NEWS IS A WHOLE SET, NOT A SECTION.**
+    ///
+    /// Seeding the mirror is what changes `is_entity_in_interest` from "every registered entity" to
+    /// "what the mirror holds", for every registered entity at once. A section states at most
+    /// [`INTEREST_DELTA_PER_FRAME`] enters, so an id absent from the first one may be out of interest
+    /// or may simply be waiting for the next frame — and the receiver cannot tell which, so it can
+    /// neither announce the departures nor stay silent about them honestly. A whole set is complete
+    /// by construction, so the diff it emits is the whole truth.
+    ///
+    /// It also replaces the empty section that used to ride once per connection just to say the
+    /// session was filtering, and it seeds a large set in one frame where sections took one per 32.
+    #[test]
+    fn a_connections_first_interest_news_is_a_whole_set() {
+        let ids: Vec<u64> = (1..=(INTEREST_DELTA_PER_FRAME as u64 + 5)).collect();
+        let slots = table_naming(&ids);
+        let mut peer = PeerState {
+            synced: true,
+            ..Default::default()
+        };
+        for &id in &ids {
+            peer.note_interest_enter(id);
+        }
+
+        // Unseeded: no section rides, and a whole set is owed instead.
+        let (carries, _, _) = section_for(&slots, &mut peer, 100);
+        assert!(!carries, "an unseeded connection sends no section");
+        assert!(peer.interest_full_due, "it owes a whole set");
+        assert!(
+            interest_table_due(&peer, 100),
+            "and the set goes out on the next flush, not a window later"
+        );
+
+        // Raised once, not once per tick: clearing the retry stamp every tick would re-send the
+        // table every tick until it landed.
+        peer.interest_table_tick = Some(100);
+        let (carries, _, _) = section_for(&slots, &mut peer, 101);
+        assert!(!carries);
+        assert!(
+            !interest_table_due(&peer, 101),
+            "the demand is not re-raised while one is already owed"
+        );
+
+        // Stating the set is what seeds the connection, after which sections carry the news.
+        let _ = state_whole_interest_set(&slots, &mut peer);
+        assert!(peer.interest_seeded, "the set is what seeds it");
+        peer.interest_generation_acked = peer.interest_generation;
+        let (carries, _, entered) = section_for(&slots, &mut peer, 102);
+        assert!(
+            carries,
+            "and a seeded connection is back on the section path"
+        );
+        assert_eq!(
+            entered.len(),
+            INTEREST_DELTA_PER_FRAME,
+            "where the per-frame cap applies again"
         );
     }
 
@@ -11850,6 +11930,9 @@ mod tests {
     fn a_pending_delta_rides_again_until_the_peer_acks_the_tick_it_first_rode_on() {
         let slots = table_naming(&[7, 8]);
         let mut peer = peer_holding(7);
+        // Seeded: a connection's FIRST interest news is a whole set, so the section
+        // path this test is about only runs once one has landed.
+        peer.interest_seeded = true;
         peer.note_interest_leave(7);
         peer.note_interest_enter(8);
 
@@ -11888,6 +11971,9 @@ mod tests {
     fn an_unacked_prefix_is_given_up_on_at_the_retry_bound() {
         let slots = table_naming(&[7, 8]);
         let mut peer = peer_holding(7);
+        // Seeded: a connection's FIRST interest news is a whole set, so the section
+        // path this test is about only runs once one has landed.
+        peer.interest_seeded = true;
         peer.note_interest_leave(7);
         let (carries, _, _) = section_for(&slots, &mut peer, 100);
         assert!(carries);
@@ -11931,7 +12017,12 @@ mod tests {
     fn a_burst_larger_than_one_frame_is_spread_over_frames() {
         let ids: Vec<u64> = (1..=(INTEREST_DELTA_PER_FRAME as u64 + 5)).collect();
         let slots = table_naming(&ids);
-        let mut peer = PeerState::default();
+        // Seeded: a connection's FIRST interest news is a whole set, so the per-frame cap this test
+        // is about only applies to the sections after it.
+        let mut peer = PeerState {
+            interest_seeded: true,
+            ..Default::default()
+        };
         for &id in &ids {
             peer.note_interest_enter(id);
         }
@@ -11957,7 +12048,11 @@ mod tests {
     #[test]
     fn an_unnameable_leave_is_retired_and_an_unnameable_enter_is_held() {
         let slots = table_naming(&[7]); // 9 is not in the table
-        let mut peer = PeerState::default();
+                                        // Seeded: an unseeded connection owes a whole set rather than a section.
+        let mut peer = PeerState {
+            interest_seeded: true,
+            ..Default::default()
+        };
         peer.note_interest_leave(9);
         peer.note_interest_leave(7);
         let (carries, left, _) = section_for(&slots, &mut peer, 100);

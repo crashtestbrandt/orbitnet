@@ -325,14 +325,29 @@ recipient.
 kind 0x09 | varint generation | varint count | [slot (u16)]*
 ```
 
-Four things owe a connection one, and the server knows three of them without being told:
+**A connection's FIRST interest news is a whole set**, and the four repairs below are the rest.
+
+Seeding a receiver's mirror is what changes `entities_in_interest()` from "every registered entity" to
+"what the mirror holds", for every registered entity at once. A section states at most 32 enters, so an id
+absent from the first one may be out of interest or may simply be waiting for the next frame, and the
+receiver cannot tell which — it can neither announce those departures nor stay silent about them honestly.
+A whole set is complete by construction. It also seeds a large set in one frame where sections take one per
+32.
+
+Five things owe a connection a set, and the server knows four of them without being told:
 
 | Cause | Noticed by |
 | --- | --- |
+| the connection has never been seeded | the server, on the first tick it filters for that peer |
 | a pending half overflowed its cap | the server, queuing a transition |
 | a prefix was given up on unacknowledged | the server, retiring it |
 | a rekey on a live connection | the server, in the handshake |
 | a section it cannot name, cannot place, or never reached | the client, via `WANT_INTEREST` |
+
+**A rekey also resets what the server believes the client holds.** The client's own generation goes to zero
+with the session, so it echoes zero — and the echo is taken monotonically, so the server's belief never
+falls on its own. Left standing, the gate reads open against a mirror that no longer exists and every
+section built meanwhile is refused by the client and retired by the server as delivered.
 
 The client's row is three cases: an `entered` slot its manifest has not bound, a section stamped at a
 generation it does not hold, and a frame it acknowledged but could not read to the end — the ack window slides
