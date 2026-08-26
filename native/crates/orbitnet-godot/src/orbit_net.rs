@@ -768,6 +768,17 @@ struct PeerState {
     /// ordinary session, which sends none, runs with this equal to `interest_generation` throughout
     /// and pays nothing.
     interest_generation_acked: u64,
+    /// The tick a whole interest set was last sent to this connection, or `None`.
+    ///
+    /// **RELIABLE IS NOT THE SAME AS DELIVERED.** ENet retransmits a reliable datagram, but every
+    /// datagram of this session shares one sequence counter and one [`REPLAY_WINDOW`]-wide replay
+    /// window, so a retransmit that lands more than that many datagrams late is refused as a replay
+    /// and dropped. A set sent once and marked done can therefore never arrive — and the gate it was
+    /// meant to open stays shut for the rest of the session, because nothing else re-arms it.
+    ///
+    /// So the set stays owed until the client's echo says it holds it, and this stamp is what keeps
+    /// the re-send to one per [`INTEREST_DELTA_RETRY_TICKS`] rather than one per tick.
+    interest_table_tick: Option<u64>,
     /// Whether this connection is owed a whole interest set rather than another delta.
     ///
     /// **FOUR THINGS SET IT, AND THE SERVER KNOWS THREE OF THEM ITSELF.** A pending half that
@@ -5322,14 +5333,23 @@ impl OrbitNet {
     ///
     /// The pending halves are cleared rather than sent: every entry in them is a transition into or
     /// out of the set this frame states outright.
-    fn send_interest_tables(&mut self) {
+    fn send_interest_tables(&mut self, current: u64) {
         if self.mode == MODE_CLIENT {
             return;
         }
         let owed: Vec<i32> = self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.synced && peer.interest_full_due)
+            .filter(|(_, peer)| {
+                // Owed, and not already answered inside the retry window. The stamp is what stops a
+                // set that is owed until ACKNOWLEDGED from being re-sent every tick while the first
+                // copy is still in flight.
+                peer.synced
+                    && peer.interest_full_due
+                    && peer
+                        .interest_table_tick
+                        .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
+            })
             .map(|(&id, _)| id)
             .collect();
         if owed.is_empty() {
@@ -5341,6 +5361,7 @@ impl OrbitNet {
                 continue;
             };
             let (generation, slots) = state_whole_interest_set(&self.slots, peer);
+            peer.interest_table_tick = Some(current);
             frames.push((peer_id, encode_interest_table(generation, &slots)));
         }
         for (peer_id, bytes) in frames {
@@ -5458,7 +5479,7 @@ impl OrbitNet {
         // with no ordering between them. It also clears the pending halves, so the peer it answers
         // sends no section this tick: the table already says where every entity stands.
         if filtering {
-            self.send_interest_tables();
+            self.send_interest_tables(current);
         }
 
         // The cull radius is applied by `update_interest` above, which is the only thing that
@@ -6844,6 +6865,11 @@ impl OrbitNet {
             // `note_ack` refuses a stale ack and `newest_input_tick` takes a `max` for the same
             // reason; this figure was the one that did not.
             peer.interest_generation_acked = peer.interest_generation_acked.max(echoed_interest);
+            if peer.interest_generation_acked == peer.interest_generation {
+                // The set this peer was owed is the set it now says it holds, so it is owed no more.
+                peer.interest_full_due = false;
+                peer.interest_table_tick = None;
+            }
             // Consume the ack window: every snapshot frame the client PROVES it received promotes
             // the entity ticks that frame carried to `acked_base` — the only ticks a masked delta
             // may reference, because the client provably holds those rows. An ack that carries the
@@ -7008,7 +7034,14 @@ impl OrbitNet {
             peer.budget = budget;
             let newest = i64::from(header.tick);
             peer.newest_input_tick = peer.newest_input_tick.max(newest);
-            let margin = newest - i64::try_from(current).unwrap_or(i64::MAX);
+            // **FROM THE MONOTONE FIGURE, NOT THE ARRIVING FRAME.** This byte reports how early the
+            // peer's NEWEST input arrived, and the client steers its clock lead off the MINIMUM of a
+            // 32-sample window of it. A merely REORDERED frame carries an older tick and lands
+            // nothing — input is sent redundantly, so a superseded row is ignored — but read raw it
+            // reports that peer as late, pins the window minimum, and buys it lead it does not need.
+            // Every tick of that is input latency the link never asked for, on the one loop whose
+            // whole purpose is to minimise it.
+            let margin = peer.newest_input_tick - i64::try_from(current).unwrap_or(i64::MAX);
             peer.margin_last = margin.clamp(-127, 127) as i8;
         }
     }
@@ -7854,7 +7887,10 @@ fn state_whole_interest_set(slots: &SlotTable, peer: &mut PeerState) -> (u64, Ve
     peer.interest_delta_entered_sent = 0;
     peer.interest_delta_tick = None;
     peer.interest_seeded = true;
-    peer.interest_full_due = false;
+    // **STILL OWED UNTIL THE CLIENT SAYS IT HOLDS IT.** Clearing this on the send treated handing a
+    // frame to the transport as delivery, and a reliable frame refused by the replay window is
+    // neither delivered nor retried. `send_interest_tables` clears it when the echo catches up, and
+    // its retry stamp is what keeps the meantime to one re-send per window.
     (peer.interest_generation, stated)
 }
 
@@ -10138,7 +10174,12 @@ mod tests {
             "a leave is superseded whatever it named -- absence is what it was going to say"
         );
         assert!(peer.interest_seeded, "the connection holds a set now");
-        assert!(!peer.interest_full_due, "and is owed nothing further");
+        assert!(
+            peer.interest_full_due,
+            "and is STILL owed it until the client's echo says it holds it -- handing a frame to the \
+             transport is not delivery, and a reliable frame the replay window refuses is neither \
+             delivered nor retried"
+        );
         assert!(peer.interest_delta_tick.is_none(), "nothing is in flight");
     }
 
@@ -10391,6 +10432,76 @@ mod tests {
             mirror.take(),
             vec![(4, 11, true)],
             "and it announces a spurious enter while doing so"
+        );
+    }
+
+    /// **A WHOLE SET IS OWED UNTIL THE CLIENT SAYS IT HOLDS IT.** Reliable means ENet retransmits, not
+    /// that the datagram arrives: every datagram of a session shares one sequence counter and one
+    /// replay window, so a retransmit landing far enough behind is refused as a replay and dropped.
+    /// A set marked done at the moment it was handed to the transport could therefore never arrive,
+    /// and the gate it was sent to open would stay shut for the rest of the session.
+    ///
+    /// The retry stamp is what keeps "owed until acknowledged" from meaning "re-sent every tick".
+    #[test]
+    fn a_whole_set_stays_owed_until_the_echo_confirms_it() {
+        let slots = table_naming(&[7]);
+        let mut peer = peer_holding(7);
+        peer.interest_full_due = true;
+
+        let (generation, _) = state_whole_interest_set(&slots, &mut peer);
+        assert_eq!(generation, 1);
+        assert!(
+            peer.interest_full_due,
+            "handing the frame to the transport is not delivery"
+        );
+
+        // The send path stamps the attempt, and the stamp is what gates a re-send.
+        peer.interest_table_tick = Some(100);
+        let due = |peer: &PeerState, current: u64| {
+            peer.interest_full_due
+                && peer
+                    .interest_table_tick
+                    .is_none_or(|at| current >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS))
+        };
+        assert!(
+            !due(&peer, 101),
+            "not re-sent while the first copy may still land"
+        );
+        assert!(
+            due(&peer, 100 + INTEREST_DELTA_RETRY_TICKS),
+            "and re-sent once the window says it did not"
+        );
+
+        // The echo catching up is what actually settles it.
+        peer.interest_generation_acked = peer.interest_generation_acked.max(generation);
+        if peer.interest_generation_acked == peer.interest_generation {
+            peer.interest_full_due = false;
+            peer.interest_table_tick = None;
+        }
+        assert!(!peer.interest_full_due, "the client says it holds the set");
+        assert!(!due(&peer, 10_000), "so nothing is re-sent again");
+    }
+
+    /// **THE MARGIN BYTE REPORTS THE NEWEST INPUT, NOT THE ARRIVING ONE.** The client steers its clock
+    /// lead off the minimum of a window of these, so a merely reordered frame — which lands nothing,
+    /// because input is sent redundantly and a superseded row is ignored — would otherwise report the
+    /// peer as late and buy it lead the link never asked for.
+    #[test]
+    fn the_margin_byte_is_measured_from_the_monotone_input_tick() {
+        let mut peer = PeerState::default();
+        let current: i64 = 100;
+
+        // The newest input so far arrived 3 ticks ahead.
+        peer.newest_input_tick = peer.newest_input_tick.max(103);
+        let margin = peer.newest_input_tick - current;
+        assert_eq!(margin, 3, "three ticks of lead, which is what it has");
+
+        // A reordered frame stamped earlier arrives. It advances nothing and must report nothing.
+        peer.newest_input_tick = peer.newest_input_tick.max(101);
+        let margin = peer.newest_input_tick - current;
+        assert_eq!(
+            margin, 3,
+            "the late copy does not report this peer as later than it is"
         );
     }
 
