@@ -2095,6 +2095,16 @@ pub struct OrbitNet {
     dbg_sent_bytes: u64,
     dbg_rx_applied: u64,
     dbg_rx_rejected: u64,
+    /// CLIENT: the frame tick this peer first could not place a state block on, or `None`.
+    ///
+    /// **AN UNBOUND SLOT IS ORDINARY; A SUSTAINED ONE IS NOT.** A block naming a slot the manifest has
+    /// not bound is the everyday spawn-in-flight case — the manifest rides a reliable channel and the
+    /// snapshot an unreliable one, so a round trip of lag is expected and skipping the block is right.
+    /// What is not ordinary is still being unable to place anything a retry window later: that is a
+    /// manifest this peer never received, and since the server advances its per-peer generation when
+    /// the frame is handed to the transport, nothing on either end would otherwise notice. The client
+    /// asks for the whole table, which is the repair that already exists.
+    unbound_since: Option<u64>,
     dbg_rx_skipped: u64,
     dbg_rx_kinds: [u64; 8],
     /// Datagrams refused by [`OrbitNet::open_datagram`]: forged, replayed, or from a peer with no
@@ -2258,6 +2268,7 @@ impl INode for OrbitNet {
             dbg_sent_bytes: 0,
             dbg_rx_applied: 0,
             dbg_rx_rejected: 0,
+            unbound_since: None,
             dbg_rx_skipped: 0,
             dbg_rx_kinds: [0; 8],
             dbg_rx_unauth: 0,
@@ -2576,6 +2587,7 @@ impl OrbitNet {
         self.interest_mirror_seeded = false;
         self.interest_mirror_generation = 0;
         self.interest_generation_echoed = 0;
+        self.unbound_since = None;
         self.want_interest = false;
         self.interest_events.clear();
         // The path verdict describes THIS session's occupancy, and the next session's arena is not
@@ -6476,6 +6488,8 @@ impl OrbitNet {
     /// boundary rather than here, so a client emits its seat events where a server emits its own —
     /// see [`Self::announce_seats`].
     fn adopt_manifest_full(&mut self, generation: u64, entries: Vec<ManifestEntry>) {
+        // A table landed, so whatever this peer could not place, it may be able to now.
+        self.unbound_since = None;
         self.slots.clear();
         for entry in &entries {
             self.slots.bind(entry.slot, entry.id);
@@ -6504,6 +6518,8 @@ impl OrbitNet {
     /// directions, so one `added` record covers a new binding, a reissued slot and a changed row
     /// alike, and applying one twice lands in the same place.
     fn adopt_manifest_delta(&mut self, delta: &ManifestDelta) {
+        // A table landed, so whatever this peer could not place, it may be able to now.
+        self.unbound_since = None;
         let rows = apply_manifest_delta(&self.manifest_published, delta);
         self.manifest_published = rows;
         self.manifest_generation = delta.generation;
@@ -7144,7 +7160,18 @@ impl OrbitNet {
                     continue;
                 }
             }
-            // Unknown entity (spawn in flight) — skip its body cleanly.
+            // Unknown entity (spawn in flight) — skip its body cleanly, and start the clock. See
+            // [`Self::unbound_since`]: one of these is lag, a run of them is a manifest that never
+            // arrived.
+            if self.unbound_since.is_none() {
+                self.unbound_since = Some(frame_tick);
+            } else if self
+                .unbound_since
+                .is_some_and(|since| frame_tick >= since.saturating_add(INTEREST_DELTA_RETRY_TICKS))
+            {
+                self.want_manifest = true;
+                self.unbound_since = Some(frame_tick);
+            }
             self.dbg_rx_skipped += 1;
             if self.debug_wire && self.dbg_rx_skipped % 120 == 1 {
                 godot_print!(
@@ -10504,6 +10531,49 @@ mod tests {
         assert_eq!(
             margin, 3,
             "the late copy does not report this peer as later than it is"
+        );
+    }
+
+    /// **ONE UNBOUND SLOT IS LAG; A RUN OF THEM IS A MANIFEST THAT NEVER ARRIVED.** The manifest rides
+    /// a reliable channel and the snapshot an unreliable one, so a block naming a slot the manifest
+    /// has not bound is the everyday spawn-in-flight case and skipping it is right. But the server
+    /// advances its per-peer manifest generation when the frame is handed to the transport, and a
+    /// reliable frame the replay window refuses is neither delivered nor retried — so a client can be
+    /// left unable to place anything, sending no input for want of a slot, in a frozen world nothing
+    /// on either end notices.
+    ///
+    /// The repair already existed; what was missing was anything that raised it without a later
+    /// manifest arriving to fail its base check.
+    #[test]
+    fn a_sustained_run_of_unplaceable_blocks_asks_for_the_table() {
+        // The rule the receive path applies, as the decision it makes.
+        let ask = |since: Option<u64>, frame_tick: u64| -> (bool, Option<u64>) {
+            match since {
+                None => (false, Some(frame_tick)),
+                Some(at) if frame_tick >= at.saturating_add(INTEREST_DELTA_RETRY_TICKS) => {
+                    (true, Some(frame_tick))
+                }
+                keep => (false, keep),
+            }
+        };
+
+        // The first one starts the clock and asks for nothing.
+        let (asked, since) = ask(None, 100);
+        assert!(!asked, "one unbound slot is ordinary lag");
+        assert_eq!(since, Some(100));
+
+        // So does one a few ticks later -- still inside a round trip of manifest lag.
+        let (asked, since) = ask(since, 110);
+        assert!(!asked, "and so is a run shorter than the retry window");
+        assert_eq!(since, Some(100), "the clock keeps its start");
+
+        // Past the window, this peer is not lagging, it is missing a table.
+        let (asked, since) = ask(since, 100 + INTEREST_DELTA_RETRY_TICKS);
+        assert!(asked, "a sustained run asks for the whole table");
+        assert_eq!(
+            since,
+            Some(100 + INTEREST_DELTA_RETRY_TICKS),
+            "and the clock restarts, so the ask is one per window rather than one per block"
         );
     }
 
