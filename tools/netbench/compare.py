@@ -32,6 +32,12 @@ Only columns whose DIRECTION is known are judged. `rtt_ms` is set by the profile
 A column that is ZERO ON BOTH SIDES reads `not measured` rather than `same`. Most send-path columns are
 collected on the server and appear in no client CSV, so in a client-only comparison they are absent rather
 than unchanged -- and `same` on a dozen of them reads as a send path that was compared and found equal.
+
+A column zero on the BASELINE ONLY reads `new (was 0)`, and does not count as a regression. The ratio has
+no denominator, which is why the delta column prints `n/a` -- judging it anyway meant one row printed `n/a`
+and `REGRESSED` side by side, and the exit code followed the second. It is still worth a look, so it prints
+under its own verdict rather than as `not measured`: comparing across a release boundary, this is how a
+capability the baseline never exercised appears, and also how a fault counter first rises.
 """
 
 from __future__ import annotations
@@ -196,6 +202,13 @@ def report(title: str, before: dict[str, list[float]], after: dict[str, list[flo
         # Printing those as `same` is how a run that measured nothing reads as a run that found nothing.
         if not any(before[column]) and not any(after[column]):
             call = "not measured"
+        elif not any(before[column]):
+            # THE BASELINE MEASURED NOTHING, so there is no ratio to test a tolerance against. Judged
+            # as a percentage it is REGRESSED for any non-zero reading at all, however small -- which
+            # is what `rollback_ms` did across a release boundary whose baseline never resimulated a
+            # single tick. Named rather than hidden, because the same shape is a fault counter
+            # leaving zero for the first time.
+            call = "new (was 0)" if column not in UNJUDGED else ""
         else:
             call = verdict(column, b50, a50, tolerance, lower, higher)
         if call == "REGRESSED":
