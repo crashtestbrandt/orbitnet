@@ -4383,7 +4383,7 @@ impl OrbitNet {
         self.emitting_tick = None;
 
         let current = first_tick + u64::from(ticks);
-        self.run_rollback(current, dt);
+        self.run_rollback(first_tick, current, dt);
         self.capture_state_lane(current);
         self.run_net_upkeep(dt * f64::from(ticks));
         self.flush_network(current);
@@ -4758,7 +4758,10 @@ impl OrbitNet {
         *batch = calls;
     }
 
-    fn run_rollback(&mut self, current: u64, dt: f64) {
+    /// `first_tick` is where this frame's fresh batch begins: the loop simulates `from..current`,
+    /// and the ticks at `first_tick..current` are first simulations rather than replays — see
+    /// [`replayed_depth`] for why the resim figures must not count them.
+    fn run_rollback(&mut self, first_tick: u64, current: u64, dt: f64) {
         let started = Instant::now();
         let limit = self.history_limit.max(2) as u64;
 
@@ -4786,8 +4789,8 @@ impl OrbitNet {
         }
 
         let from = plan.iter().map(|p| p.range.from).min().unwrap_or(current);
-        self.dbg_resim_spans += plan.len() as u64;
-        self.dbg_resim_ticks_total += current.saturating_sub(from);
+        self.dbg_resim_spans += plan.iter().filter(|p| p.range.from < first_tick).count() as u64;
+        self.dbg_resim_ticks_total += replayed_depth(from, first_tick);
         let mut ranges: Vec<(u64, u64, u64, Gd<OrbitRollbackSynchronizer>)> = Vec::new();
         // Whether ANY entity in this frame's plan captures through a bulk hook. Answered once here,
         // where the entities are already being walked, so phase 3's staging pass is skipped
@@ -4942,7 +4945,7 @@ impl OrbitNet {
             self.run_hooks(&mut hook_batch);
         }
 
-        self.m_resim_ticks = (current - from) as f64;
+        self.m_resim_ticks = replayed_depth(from, first_tick) as f64;
         self.m_rb_nodes = rb_nodes as f64;
         self.m_rollback_ms = started.elapsed().as_secs_f64() * 1000.0;
         // The three phases sum to slightly less than `rollback_ms`: the difference is the range setup and the
@@ -8439,6 +8442,20 @@ fn resim_input_from(novel_tick: u64, current: u64) -> Option<u64> {
     (from < current).then_some(from)
 }
 
+/// Ticks the rollback loop RE-simulated: the part of the planned window before the frame's own
+/// fresh batch.
+///
+/// The plan is never only replays. `mark_forward_ticks` marks every simulating entity at each new
+/// tick of the batch, so the loop's window `from..current` always ends with `first_tick..current` —
+/// first simulations, not replays. `resim_ticks` counted the whole window, so every peer with a
+/// predicted body read a depth of 1 on every ordinary frame and the column could no longer show a
+/// mispredict against that floor (#63). Only the span the plan reaches back BEFORE the fresh batch
+/// is a resimulation, and that is what the metric reports.
+#[must_use]
+fn replayed_depth(plan_from: u64, batch_first_tick: u64) -> u64 {
+    batch_first_tick.saturating_sub(plan_from)
+}
+
 /// One seat's observer as the filter takes it: the resolved center, or [`UNLOCATABLE_CENTER`] when
 /// there is none to measure from.
 ///
@@ -8966,7 +8983,7 @@ mod tests {
         delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
         input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
         is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
-        queue_seat_release, resim_input_from, resolve_observer, resume_grant,
+        queue_seat_release, replayed_depth, resim_input_from, resolve_observer, resume_grant,
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
         session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
@@ -13895,5 +13912,18 @@ mod tests {
             ),
             InputIntegration::Landed(5),
         );
+    }
+
+    #[test]
+    fn resim_depth_counts_replays_and_not_the_fresh_batch() {
+        // An ordinary predicted frame: the planner holds only `mark_forward_ticks`' marks, so the
+        // plan begins at the batch itself. Depth 0 — the fresh ticks are first simulations, and a
+        // metric that counted them read 1 on every frame with a predicted body (#63), a floor no
+        // real mispredict could be seen against.
+        assert_eq!(replayed_depth(100, 100), 0);
+        // A mispredict marked 3 ticks before the batch is a genuine replay of 3.
+        assert_eq!(replayed_depth(97, 100), 3);
+        // A plan that begins inside the batch (an entity registered mid-frame) replays nothing.
+        assert_eq!(replayed_depth(102, 100), 0);
     }
 }

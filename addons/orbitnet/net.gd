@@ -1278,8 +1278,9 @@ func set_send_budget(bytes: int) -> void:
 	_orbit.send_budget = clampi(bytes, 256, 1200)
 
 ## Diagnostic (net.perf): last-loop rollback counters from the backend. resim_ticks is the effective
-## resim window depth (ticks re-simulated in the latest rollback loop). Live in EVERY build, release
-## included -- the counters are a byproduct of the native loop, not debug monitors.
+## resim window depth: ticks RE-simulated in the latest rollback loop, excluding the frame's own fresh
+## forward ticks, which ride the same loop. Live in EVERY build, release included -- the counters are a
+## byproduct of the native loop, not debug monitors.
 func perf_summary() -> String:
 	if _mode == Mode.OFFLINE:
 		return "offline (no rollback loop)"

@@ -225,8 +225,9 @@ Net.perf_summary()   -> String
 - **`stretch`** — the sim-clock speed multiplier. Pinned to exactly 1.0 in coupled mode (clock error is
   absorbed by rare whole-tick slews instead, because a stretch ≠ 1.0 slides tick boundaries across physics
   frames and renders as judder). Under the decouple it rides within `max_time_stretch`.
-- **`resim_ticks`** — how deep the last rollback loop replayed. This is the resim *cost*; it legitimately
-  deepens under latency and loss, and is bounded by `history_limit`.
+- **`resim_ticks`** — how deep the last rollback loop replayed. Replays only: the frame's own fresh
+  forward ticks ride the same loop and are not counted, so an ordinary predicted frame reads `0`. This
+  is the resim *cost*; it legitimately deepens under latency and loss, and is bounded by `history_limit`.
 - **`rb_nodes`** — how many nodes the loop called `_rollback_tick` on. A quick check that your rollback
   entity count is what you think it is.
 - **`restore_ms` / `sim_ms` / `record_ms`** — the three phases `rollback_ms` wraps: writing a tick's recorded
