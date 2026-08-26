@@ -420,3 +420,22 @@ func test_a_refusal_with_mismatched_lengths_is_ignored() -> void:
 	assert_eq(_rejected_codes.size(), 1, "and matched halves do announce, so the guard is not a blanket refusal")
 	assert_eq(_rejected_tags[0], 7, "carrying the tag the server quoted back")
 	lane.free()
+
+func test_an_over_cap_reply_carries_one_code_per_tag() -> void:
+	# THE BUG THIS PINS: the server replied with a single code beside N tags, and the client's own lockstep
+	# guard in _announce_refusals dropped the whole frame -- so an over-cap batch from a peer that skipped the
+	# client-side courtesy check was refused in total silence.
+	var lane: NetCommand = _fresh()
+	lane.register(VERB_MOVE, _accept)
+	var tags: PackedInt32Array = PackedInt32Array([11, 22, 33])
+	var codes: PackedInt32Array = NetCommand.uniform_codes(NetCommand.CODE_BATCH_TOO_LARGE, tags.size())
+	assert_eq(codes.size(), tags.size(), "the halves are the same length, which is what makes them readable")
+	lane._announce_refusals(VERB_MOVE, codes, tags)
+	assert_eq(_rejected_codes.size(), 3, "every tag was announced")
+	assert_eq(_rejected_tags, [11, 22, 33], "naming the requests the caller is still waiting on")
+	assert_eq(_rejected_codes[2], NetCommand.CODE_BATCH_TOO_LARGE, "under the lane's own reason code")
+	lane.free()
+
+func test_uniform_codes_of_an_empty_batch_is_empty() -> void:
+	assert_eq(NetCommand.uniform_codes(NetCommand.CODE_BATCH_TOO_LARGE, 0).size(), 0,
+		"no tags means no refusals to announce")

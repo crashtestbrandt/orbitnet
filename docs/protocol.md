@@ -12,10 +12,16 @@ Little-endian.
 ```
 frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | 32-bit ack token | input-arrival margin byte
            | header flags byte | entity count (varint)
+CLIENT TO SERVER ONLY, before the blocks: the interest generation this client holds (varint)
 then per entity:  { slot (u16) | frame-tick delta | body length | flags | changed-property bitmask | packed payload }
-then, if the header's flags say so: the interest-delta section
+then, SERVER TO CLIENT, if the header's flags say so: the interest-delta section
 then the trailer: { sequence (u32) | MAC tag (u64) }
 ```
+
+**The client's interest generation rides BEFORE the blocks**, because the server's block loop stops early
+when its receive budget refuses one — so anything after them is not reliably reached. It is what lets the
+server decline to build an interest-delta section at all until the two ends agree on the baseline; see
+[the whole interest set](#the-whole-interest-set).
 
 No property names, no type tags — the schema is positional and agreed in advance. Client input carries the
 last N ticks for redundancy, so a single lost packet costs nothing.
@@ -24,8 +30,14 @@ last N ticks for redundancy, so a single lost packet costs nothing.
 [entity slots](#entity-slots) for what that costs and what it saves.
 
 **Control frames** — reliable and **ordered**: handshake, welcome, entity manifest, entity manifest
-delta. All but the handshake carry the same 12-byte trailer. Ordering is what a manifest delta needs
+delta, and the interest table. All but the handshake carry the same 12-byte trailer. Ordering is what a manifest delta needs
 and a snapshot does not; every frame goes out `TRANSFER_MODE_RELIABLE` on one channel.
+
+**Reliable means retransmitted, not delivered.** Every datagram of a session — reliable and unreliable alike —
+draws from one sequence counter and is checked against one `REPLAY_WINDOW`-wide replay window, so a
+retransmission that lands more than that many datagrams behind the newest is refused as a replay and dropped.
+Anything that depends on a control frame arriving has to notice that it did, rather than assume it: the
+interest table is owed until the client's echo says it holds it, and is re-sent meanwhile.
 
 **Handshake** — magic, protocol version, tick rate, a **session id**, the **session nonce**, the
 **resume token**, then the **confirm tag**:
@@ -84,6 +96,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 5 | Blocks name entities by a **16-bit session slot**; the entity manifest distributes the slot table for both lanes. |
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 | 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
+| 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. A client input frame also carries, before its blocks, the interest generation that client holds, so the server builds a section only for a peer that provably holds the baseline it is diffed against. The leading generation shifts the offsets of the section's own counts and the echo shifts every block's, which is what makes this a major rather than a trailing addition. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -286,18 +299,111 @@ whose packets were lost. The section carries the decision, on the snapshot the p
 
 ```
 header flags bit 1 set, then after the entity blocks:
-varint left_count | [slot (u16)]* | varint entered_count | [slot (u16)]*
+varint generation | varint left_count | [slot (u16)]* | varint entered_count | [slot (u16)]*
 ```
 
 - **Server to client only.** Every flag owns a bit of its own: bit 0 is the client's `WANT_FULL`
-  NACK, bit 1 is this and is never set by a client, bit 2 is the client's `WANT_MANIFEST` NACK and is
-  never set by a server.
+  NACK, bit 1 is this and is never set by a client, bit 2 is the client's `WANT_MANIFEST` NACK and
+  bit 3 its `WANT_INTEREST` NACK, neither of which a server sets.
 - **A trailing section is invisible to a peer that does not know about it.** A receiver reads exactly
   `entity_count` blocks and stops, so an older build never looks at the bytes after them. It is a major bump
   anyway, because a peer that skips the section receives none of the events.
 - **Slots, not ids** — 2 fixed bytes against ~9.5 for a varint id, resolved against the table the entity
-  manifest already distributes. **An unbound slot is dropped in silence**, exactly as a block naming one is;
-  see [entity slots](#entity-slots).
+  manifest already distributes. An unbound slot in the `left` half is dropped in silence, exactly as a block
+  naming one is; see [entity slots](#entity-slots).
+- **An unbound slot in the `entered` half asks for the whole set.** The section rides an unreliable snapshot
+  and the manifest that binds its slots rides a reliable channel, with no ordering between them, so a
+  snapshot can name a slot whose binding is still being retransmitted. That enter cannot be held for later —
+  the server retires it on this frame's ack — so the client raises `WANT_INTEREST` instead.
+
+### The whole interest set
+
+`InterestTable` (kind `0x09`) is the repair path, and the only reliable frame here whose contents differ per
+recipient.
+
+```
+kind 0x09 | varint generation | varint count | [slot (u16)]*
+```
+
+**A connection's FIRST interest news is a whole set**, and the four repairs below are the rest.
+
+Seeding a receiver's mirror is what changes `entities_in_interest()` from "every registered entity" to
+"what the mirror holds", for every registered entity at once. A section states at most 32 enters, so an id
+absent from the first one may be out of interest or may simply be waiting for the next frame, and the
+receiver cannot tell which — it can neither announce those departures nor stay silent about them honestly.
+A whole set is complete by construction. It also seeds a large set in one frame where sections take one per
+32. **The seed completes only on a set the receiver could read in full**: a table short by an unbindable slot
+leaves the read-back answering "everything is in interest" and the first-seed sweep unspent, so the flip to
+the mirror and the departures it implies arrive together on the resolved set that follows.
+
+Five things owe a connection a set, and the server knows four of them without being told:
+
+| Cause | Noticed by |
+| --- | --- |
+| the connection has never been seeded | the server, on the first tick it filters for that peer |
+| a pending half overflowed its cap | the server, queuing a transition |
+| a prefix was given up on unacknowledged | the server, retiring it |
+| a rekey on a live connection | the server, in the handshake |
+| a section it cannot name, cannot place, or never reached | the client, via `WANT_INTEREST` |
+
+**A rekey also resets what the server believes the client holds.** The client's own generation goes to zero
+with the session, so it echoes zero — and the echo is taken monotonically, so the server's belief never
+falls on its own. Left standing, the gate reads open against a mirror that no longer exists and every
+section built meanwhile is refused by the client and retired by the server as delivered.
+
+The client's row is three cases: an `entered` slot its manifest has not bound, a section stamped at a
+generation it does not hold, and a frame it acknowledged but could not read to the end — the ack window slides
+before a block is parsed, so a snapshot that breaks partway is counted delivered whatever became of the
+section in it.
+
+**A set stays owed until the client's echo names it.** Reliable here means the transport retransmits, not that
+the datagram arrives: reliable and unreliable share one sequence counter and one 64-wide replay window, so a
+retransmit landing more than that many datagrams late is refused as a replay and dropped. A set marked
+delivered when it was handed to the transport could therefore never arrive, and the gate it was sent to open
+would stay shut for the rest of the session.
+
+**A retry re-sends the set in flight, at the same generation, byte for byte.** Minting a fresh one per attempt
+moves the target the client is echoing, so a connection whose round trip exceeds the retry window never agrees
+with the server and its gate never opens. Two consequences follow, and an implementation needs both:
+
+| | |
+| --- | --- |
+| **A receiver admits a table only if its generation is STRICTLY NEWER than the one held.** | Two copies of one generation can be in flight. The second is not a repeat: the receiver adopted the first and applied the sections after it, so adopting again rewinds the mirror to the mint and silently undoes every one of them. |
+| **A receiver resolves a table only through a manifest it holds.** | A refused manifest delta keeps the stale bindings for decoding and zeroes the held generation, so a slot in an arriving table can resolve to the entity it used to name — fully resolved as far as anything can tell, ask cleared, echo settling the sender's demand, while the manifest repair that follows only removes. A table arriving while the manifest generation is zero is therefore not adopted at all; un-echoed, it stays owed, and the copy re-sent after the manifest lands is the one adopted. |
+| **A sender re-states afresh once a slot in the held set has been reissued.** | A slot is quarantined and then reissued to another entity, and the quarantine is longer than the retry window — so a late retry can name a slot that now means something else. The receiver resolves it through its current manifest, reports the set fully resolved, and holds an entity the sender never put in its interest. Nothing detects that, because nothing failed. |
+
+**The re-send is rate limited to one per retry window**, and the stamp that limits it outlives the settle: the
+client's ask is latched, so the same input frame that settles one demand can raise the next, and a stamp
+cleared on the settle lets that drive a whole reliable table every round trip for the life of the connection.
+
+- **`WANT_INTEREST` is latched, not self-sustaining.** The client holds the bit raised until a whole set
+  actually arrives, rather than clearing it when the frame carrying it is sent. It rides an unreliable input
+  frame, so clearing on send made it a one-shot NACK that a single lost datagram discarded — and the thing it
+  asks for is the only repair for what was lost. This is the opposite convention to the adjacent
+  `WANT_MANIFEST` bit, which may clear on send because the client zeroes its own generation at the same
+  moment and the next delta re-raises it.
+- **A shut gate suppresses only the SECTION, and never silences the frame.** Entity blocks flow as normal —
+  the resync must not starve a peer of state for the round trip it takes to settle — and on a tick with no
+  block and no section to carry, the server sends a bare header anyway rather than skipping the frame.
+  Without that the lane can wedge: the echo rides an input frame, a peer driving no body sends one only when
+  a snapshot has arrived, and a peer whose frames are all skipped for want of content is never prompted to
+  echo again. The client cannot detect this — nothing tells it whether its echo landed — so the server, which
+  holds both generations, is what breaks the silence. It lasts about a round trip.
+- **A section is only built for a peer that holds its baseline.** The client echoes the generation it holds
+  on the input frame it is already sending, and the server declines to build a section until the two agree.
+  That is what stops a section overtaking the whole set it was computed after: there is nothing to overtake,
+  because none is sent. The pending halves hold meanwhile and ride the first frame after the client catches
+  up.
+- **The generation places a section, and the match is exact.** A section states a change against one
+  baseline, and a receiver holding any other is not holding the set it was diffed from. The table is reliable
+  and a section is not, so a section built either side of a table can arrive on the wrong side of it; a
+  receiver applies one only at the exact generation it holds and asks for the whole set otherwise. A re-send
+  of a prefix carries the generation it was built at, so retransmission still matches.
+- **It is not a chain.** A manifest delta names one exact predecessor and refuses a gap, because its channel
+  is ordered and a gap there is a fault. This generation moves only when a whole set is sent, so an ordinary
+  run of sections all carry the same one and a dropped datagram costs nothing.
+- **The receiver emits the diff, not the set.** A resync that announced every slot would re-announce every
+  entity the peer already had.
 - **The manifest cannot carry this.** It is a session-wide table broadcast identically to every peer, so it
   says "this entity exists" and never "this entity is relevant to you".
 
@@ -305,10 +411,16 @@ varint left_count | [slot (u16)]* | varint entered_count | [slot (u16)]*
 
 | | Bytes |
 |---|---|
+| the section's generation varint | 1 in practice, and 10 reserved |
 | the section's two count varints | 2 |
+| a byte of slack | 1 |
 | per event | 2 |
-| a frame's cap (32 of each half) | 131 reserved off the send budget |
+| a frame's cap (32 of each half) | 141 reserved off the send budget |
 | at rest — a settled tick with no transitions | **0**, and no flag bit |
+
+The generation is reserved at a `u64` varint's worst case rather than measured. It reaches two bytes only
+after 127 resyncs on one connection and ten is unreachable, but the reserve is what keeps an unreliable
+datagram inside the path MTU, so it is sized for the varint's worst case rather than its typical one.
 
 The reserve is taken off the byte budget **before** the admit loop runs, not after it. A section appended to a
 frame already filled to the payload ceiling is a datagram past the path MTU, which fragments, and a lost
@@ -323,12 +435,22 @@ fragment costs the whole frame.
   token are already verified per frame, so this needs no reliable channel of its own — only a tick stamp. The
   stamp does not move on a re-send: what an ack has to reach is the frame whose arrival proves the client
   applied those entries.
-- **The client applies it idempotently** — remove each `left` from a mirrored set, add each `entered` — and
-  announces only a set that actually changed, which is what makes a repeat free.
+- **The client applies it idempotently, and only from the newest snapshot frame it has seen** — remove each
+  `left` from a mirrored set, add each `entered` — announcing only a set that actually changed.
+  - The idempotence covers a re-send of the CURRENT prefix, which is the only copy the stamp rule puts in
+    flight, and that is what makes a repeat free.
+  - It does not cover a copy of a prefix that has since been retired. The generation orders a section against
+    a whole set and gives no order between two sections, because an ordinary run of them all carry the same
+    one — so once a prefix is acknowledged and a different one is built at the same generation, a delayed copy
+    of the older one is an undo rather than a repeat: it re-enters what the newer one removed.
+  - The frame's own tick is what separates them, and the replay window admits about a second of reordering by
+    design. **A receiver must drop a section arriving on a frame older than the newest it has seen.** Dropping
+    it loses nothing: it named state the newer frame has already given the current answer for.
 - **Two bounds, and both are needed.** At most 32 entries of each half ride one frame, so a joining peer's
   burst is spread over frames rather than eating the budget in one. A prefix unacknowledged for 64 ticks is
-  dropped unconfirmed: past that an ack can no longer confirm the frame anyway. What is lost is those events,
-  and the game resyncs from `Net.entities_in_interest()`.
+  dropped unconfirmed: past that an ack can no longer confirm the frame anyway. The events lost with it are
+  not reconstructible, so that drop owes the connection a whole set rather than another delta — see
+  [the whole interest set](#the-whole-interest-set).
 
 ### One signal for two causes
 
@@ -338,10 +460,18 @@ stopped sending you this" and "this entity unregistered" are the same fact to a 
 longer update. Both paths gate on the mirrored set actually holding the id, so an entity culled and
 unregistered on the same tick fires it exactly once.
 
-**A session that culls nothing announces nothing, and reads as "everything is in interest".** The interest pass
-does not run without a radius or a declared membership, so there is no set to diff; `is_entity_in_interest()`
-answers `true` for every registered entity there rather than `false` for a session replicating all of them to
-everybody.
+**A session that culls nothing announces nothing, and reads as "everything is in interest".** With nothing to
+cull there is no set to diff, so `is_entity_in_interest()` answers `true` for every registered entity there
+rather than `false` for a session replicating all of them to everybody.
+
+**Four things make a session start culling**, and any one of them is enough:
+
+| | |
+| --- | --- |
+| an `aoi_radius` | distance culling |
+| a declared membership | a peer that named the entities it wants |
+| a per-entity veto | `set_entity_hidden()` needs neither of the above, and turns the pass on by itself |
+| the pass having run before | once a session filters it keeps filtering, so a retracted last veto does not freeze every client's mirror |
 
 **The addon does not act on the leave.** The node stays in the scene, holding the last pose it received.
 Hide rather than free — a cap eviction oscillates at the boundary and freeing turns that into spawn churn —
@@ -585,8 +715,9 @@ newer. A client that advances its ack at full rate while holding a constant lag 
 time and is measured at that lag — indistinguishable from a peer behind a traffic shaper, and it gains
 nothing that peer does not gain honestly. No wire field closes that: `current - ack` is the whole round trip
 whatever tick lead the client runs at, so there is no second quantity the server could derive an independent
-figure from. The containment is `NetLagComp.max_delay_ms`, 250 ms by default, which bounds every rewind
-whatever the estimate says.
+figure from. The containment is `Net.rtt_believed_max_ms`, 250 ms by default, which clamps the sample at the read;
+`NetLagComp.max_delay_ms` separately bounds the rewind itself. The two are different bounds that happen to
+share a default.
 
 ## What the receive path refuses, and what it does not
 
@@ -606,7 +737,7 @@ The backend checks the wire. It does not check your game.
 | An entity-manifest delta against a generation the client does not hold | Refused whole, never in part. The client zeroes its generation and asks for the table; see [the manifest states a change](#the-manifest-states-a-change-not-the-table). |
 | An entity manifest that does not decode | The same answer, and the same NACK. It used to be dropped in silence, which was safe only while the next frame carried the whole table. |
 | An entity manifest whose generation is older than the one held | Ignored. Adopting it would make the client refuse every delta built on the newer table. |
-| An interest-delta entry naming a slot with no binding | Usually a leave whose cause is an unregister, naming a slot the manifest has released. Dropped in silence; the manifest rebuild emits that leave. |
+| An interest-delta entry naming a slot with no binding | A `left` entry is usually an unregister naming a slot the manifest has released: dropped in silence, and the manifest rebuild emits that leave. An `entered` entry has no second source, so it raises `WANT_INTEREST`. |
 | An input block for an entity the sender does not own | The live `get_multiplayer_authority()` check on the input node. |
 | An input block stamped too far into the future | Past `INPUT_FUTURE_HORIZON_TICKS` ahead of the server. |
 | An input row of the wrong wire stride, or for a tick history has rotated past | |

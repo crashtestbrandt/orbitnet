@@ -36,6 +36,12 @@ result-*
 .vscode/
 .idea/
 
+# --- Python ----------------------------------------------------------------------------------------
+# tools/netbench/compare.py is a script, not a package. Importing it -- which `--self-test` and any
+# ad-hoc check does -- leaves bytecode beside it.
+__pycache__/
+*.pyc
+
 # --- OS --------------------------------------------------------------------------------------------
 .DS_Store
 Thumbs.db

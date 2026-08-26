@@ -48,6 +48,13 @@ net-check:
 descriptor-parity:
     tools/check-descriptor-parity.sh
 
+# The bench comparison decides every performance claim this repository makes, and three of its
+# judgement rules were wrong at some point -- a column zero on both sides, a column zero only on the
+# baseline, and a relative tolerance below the columns' own run-to-run spread. Standard library only,
+# reads no artifacts, runs in milliseconds.
+bench-check:
+    python3 tools/netbench/compare.py --self-test
+
 # Headless project load for each Godot project -- catches every GDScript compile and parse error, with the
 # project's warnings-as-errors promotion applied.
 lint: (lint-project "harness") (lint-project "demos/rts") (lint-project "demos/hockey") (lint-project "demos/arena")
@@ -97,7 +104,7 @@ arena-probe:
 # Everything a PR must pass, in the order that fails fastest first. The shape probe runs before the two demo
 # probes because it is the addon's own project: a failure there is the addon, where a failure in a demo could
 # be either.
-check: addon-tracked addon-drift net-check descriptor-parity native-test lint test server-shape-probe rts-probe arena-probe
+check: addon-tracked addon-drift net-check descriptor-parity bench-check native-test lint test server-shape-probe rts-probe arena-probe
 
 # =====================================================================================================
 # the native backend (Rust)

@@ -140,9 +140,6 @@ static func evaluate_bandwidth(r: Result, rx_bytes: Array[float], want_full: Arr
 		percentile(starve_ticks, 0.95)])
 	return r
 
-## Report how often remote bodies' poses actually reached this client. INFORMATIONAL, and read the NEAR figure:
-## the far band is what interest management is supposed to make sparser, so pooling the two reports a working
-## cull as a regression. See [RemoteCadence] for why the reading is biased LONG and never short.
 ## Rounds a run must fire before "the server confirmed nothing" is evidence rather than luck.
 const MIN_SHOTS_TO_CONCLUDE: int = 120
 
@@ -198,6 +195,9 @@ static func evaluate_orientation_arm(r: Result, armed: bool, smooths: int, misse
 		smooths, samples, rad_to_deg(standing_rad), rad_to_deg(peak_rad), misses, resim_max])
 	return r
 
+## Report how often remote bodies' poses actually reached this client. INFORMATIONAL, and read the NEAR
+## figure: the far band is what interest management is supposed to make sparser, so pooling the two reports a
+## working cull as a regression. See [RemoteCadence] for why the reading is biased LONG and never short.
 static func evaluate_remote_cadence(r: Result, cadence: RemoteCadence) -> Result:
 	var near: Array[int] = cadence.near_gaps()
 	if near.is_empty() and cadence.far_gaps().is_empty():

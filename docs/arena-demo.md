@@ -367,5 +367,7 @@ Recorded rather than hidden.
   plausible-aim test that is not also a test of what the player could see.
 - **An observer is on no team, so every cloak is withheld from it.** That is this demo's rule rather than the
   facade's: a spectator watching cloaked fighters would have better information than either player.
-- **A build/protocol version handshake.** Two incompatible peers connect and misbehave rather than being
-  refused with a reason.
+- **A game build version handshake.** OrbitNet refuses a PROTOCOL major mismatch at the handshake and logs
+  the reason, so two peers on different addon versions do not connect. A game's OWN build version — its
+  content, its rules — is not checked, so two peers on the same protocol and different game builds still
+  connect and misbehave.

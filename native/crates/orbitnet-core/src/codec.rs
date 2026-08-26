@@ -136,6 +136,13 @@ pub enum FrameKind {
     /// ~22.5 bytes per named entity. See [`ManifestDelta`] for the layout and for what a delta gives
     /// up against the complete table it replaces.
     EntityManifestDelta = 0x08,
+    /// The whole of one peer's interest set, server to client. Reliable, and **per peer** — unlike
+    /// every other reliable frame here, its contents differ per recipient.
+    ///
+    /// The repair path for the interest delta, and the answer to
+    /// [`FrameHeader::FLAG_WANT_INTEREST`]. See [`encode_interest_table`] for why a set rather than
+    /// a diff, and [`InterestDeltaSection::generation`] for what stops an older delta undoing it.
+    InterestTable = 0x09,
 }
 
 impl FrameKind {
@@ -149,6 +156,7 @@ impl FrameKind {
             0x06 => Ok(FrameKind::Welcome),
             0x07 => Ok(FrameKind::EntityManifest),
             0x08 => Ok(FrameKind::EntityManifestDelta),
+            0x09 => Ok(FrameKind::InterestTable),
             other => Err(CodecError::UnknownFrameKind(other)),
         }
     }
@@ -507,6 +515,32 @@ impl FrameHeader {
     /// the client zeroed its own generation at the same moment, so the next delta fails its base
     /// check as well and raises the bit again.
     pub const FLAG_WANT_MANIFEST: u8 = 1 << 2;
+
+    /// Client → server: "I could not apply an interest delta; send me the whole set."
+    ///
+    /// **CLIENT-TO-SERVER only**, and the exact shape [`FrameHeader::FLAG_WANT_MANIFEST`]
+    /// established one bit down: a bit on an input frame the client is sending anyway, so the repair
+    /// costs no frame kind on the way up.
+    ///
+    /// A client raises it for the three cases only it can see: an `entered` slot its manifest has not
+    /// bound yet, a section stamped at a generation it does not hold, and a frame it acknowledged but
+    /// could not read to the end — the ack window slides before a block is parsed, so a snapshot that
+    /// breaks partway is counted delivered whatever became of the section in it. The interest delta rides an UNRELIABLE snapshot while the manifest that names its
+    /// slots rides a RELIABLE channel, and the two have no ordering relationship — so a snapshot can
+    /// arrive naming a slot whose binding is still in ENet's retransmit queue. Dropping that enter
+    /// silently is what left a client's mirror permanently short of an entity whose rows kept
+    /// arriving.
+    ///
+    /// The server's own three cases — a pending queue that overflowed, a prefix given up on
+    /// unacknowledged, and a rekey on a live connection — need no bit, because the server is the side
+    /// that knows.
+    ///
+    /// **The raise is LATCHED, not self-sustaining.** The manifest's clears when the frame carrying it
+    /// goes out and re-raises on the next delta it cannot apply; this one stays up until it is
+    /// ANSWERED, by a whole set the client could name in full. Clearing it on send made it a one-shot
+    /// NACK on an unreliable frame, with nothing to raise it again on a session quiet enough to send
+    /// no further sections.
+    pub const FLAG_WANT_INTEREST: u8 = 1 << 3;
 
     /// Append this header to `writer`.
     pub fn encode(&self, writer: &mut Writer) {
@@ -1506,20 +1540,62 @@ fn read_manifest_entries(reader: &mut Reader<'_>) -> Result<Vec<ManifestEntry>, 
 /// **The section is applied idempotently**: remove each `left` slot from a mirrored set, add each
 /// `entered` slot to it, and emit only on a set that actually changed. That is what makes a re-send
 /// free, which is what lets an unreliable datagram carry an event at all.
+///
+/// **Idempotent against a re-send of the CURRENT prefix, which is the only thing that guarantee
+/// covers.** Once a prefix is acknowledged and a different one is built, both carry the same
+/// generation — a run of sections all do — so a delayed copy of the older one is an UNDO rather than
+/// a repeat: it re-enters what a later section removed, or removes what a later one entered. The
+/// generation cannot separate them, because it orders a section against a whole
+/// [`FrameKind::InterestTable`] and was never a sequence between sections. What separates them is the
+/// frame's own tick, so a receiver applies a section only from the newest snapshot it has seen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InterestDeltaSection {
+    /// The generation of the interest set this delta was built against.
+    ///
+    /// **IT PLACES THE SECTION, AND THE MATCH IS EXACT** — see [`Self::applies_to`]. A section
+    /// states a change against one baseline, and a receiver holding any other is not holding the set
+    /// it was diffed from. A whole [`FrameKind::InterestTable`] is reliable and a section is not, so
+    /// a section built either side of a table can arrive on the wrong side of it.
+    ///
+    /// **It is not a chain.** [`ManifestDelta::base_generation`] names one exact predecessor and
+    /// refuses a gap, because its channel is ordered and a gap there is a fault. This moves only when
+    /// a whole set is sent, so an ordinary run of sections all carry the same one and a dropped
+    /// datagram costs nothing.
+    pub generation: u64,
     /// Slots that left this peer's interest, ascending.
     pub left: Vec<u16>,
     /// Slots that entered it, ascending.
     pub entered: Vec<u16>,
 }
 
+impl InterestDeltaSection {
+    /// Whether a receiver holding `generation` may apply this section.
+    ///
+    /// **EXACT, DELIBERATELY.** A section states a change against one baseline, and a receiver
+    /// holding any other is not holding the set it was diffed from. Greater-or-equal would admit
+    /// the case this exists to refuse: a table is reliable and a section is not, so a section built
+    /// AFTER a table can arrive before it, and applying it early would have the table then undo it.
+    ///
+    /// A re-send of a prefix carries the generation it was built at, so retransmission — which the
+    /// whole reliability model rests on — still matches. A receiver that drops a section for this
+    /// reason asks for the whole set, exactly as it does for a slot it cannot name.
+    #[must_use]
+    pub fn applies_to(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+}
+
 /// Append an interest-delta section to `writer`.
 ///
-/// Layout, in order: `varint left_count | [u16 slot]* | varint entered_count | [u16 slot]*`. Both
+/// Layout, in order:
+/// `varint generation | varint left_count | [u16 slot]* | varint entered_count | [u16 slot]*`. The
 /// counts are varints because they are usually one byte and never need more than three at a payload
 /// this size; every slot is a fixed 2 bytes, for the reason [`ManifestEntry::slot`] states.
-pub fn encode_interest_delta(left: &[u16], entered: &[u16], writer: &mut Writer) {
+///
+/// **The leading generation is what made this a major bump.** It shifts the offset of both counts,
+/// so a peer that does not know about it reads a slot run out of the generation's bytes.
+pub fn encode_interest_delta(generation: u64, left: &[u16], entered: &[u16], writer: &mut Writer) {
+    writer.varint(generation);
     writer.varint(left.len() as u64);
     for &slot in left {
         writer.u16(slot);
@@ -1537,11 +1613,50 @@ pub fn encode_interest_delta(left: &[u16], entered: &[u16], writer: &mut Writer)
 /// the same 4096 [`decode_manifest_full`] uses and the reads that follow run out of buffer.
 pub fn decode_interest_delta(reader: &mut Reader<'_>) -> Result<InterestDeltaSection, CodecError> {
     Ok(InterestDeltaSection {
-        // Field order IS wire order: a struct literal evaluates its fields as written, and both of
-        // these advance the same cursor.
+        // Field order IS wire order: a struct literal evaluates its fields as written, and all
+        // three of these advance the same cursor.
+        generation: reader.varint()?,
         left: decode_slot_run(reader)?,
         entered: decode_slot_run(reader)?,
     })
+}
+
+/// Encode one peer's whole interest set, at the generation it stands at.
+///
+/// ```text
+/// kind 0x09 | generation varint | count varint | count x u16 slot
+/// ```
+///
+/// **A SET RATHER THAN A DIFF**, because this frame exists for the cases where no diff can be
+/// trusted: a delta naming a slot the receiver could not resolve, a pending queue that overflowed,
+/// and a prefix given up on unacknowledged. Each leaves the two ends disagreeing about the set
+/// itself, and only a set settles that.
+///
+/// It is **per peer**, which no other reliable frame here is — an interest set is the one piece of
+/// server state that is not the same for everybody. At 2 bytes a slot a thousand-entity set is 2 kB
+/// on a reliable channel, which ENet fragments; the manifest already sends its whole table the same
+/// way.
+///
+/// The receiver adopts the set wholesale, emits its own enters and leaves by diffing against what it
+/// held, and stores `generation` so a delta built before this frame cannot undo it.
+pub fn encode_interest_table(generation: u64, slots: &[u16]) -> Vec<u8> {
+    let mut writer = Writer::with_capacity(12 + slots.len() * 2);
+    writer.u8(FrameKind::InterestTable.tag());
+    writer.varint(generation);
+    writer.varint(slots.len() as u64);
+    for &slot in slots {
+        writer.u16(slot);
+    }
+    writer.into_inner()
+}
+
+/// Decode an interest table, returning its generation and the slots it names.
+///
+/// The kind byte is expected to be consumed already, exactly as [`decode_manifest_full`] expects.
+/// Bounds-checked the same way: a hostile count reserves at most 4096 and then runs out of buffer.
+pub fn decode_interest_table(reader: &mut Reader<'_>) -> Result<(u64, Vec<u16>), CodecError> {
+    let generation = reader.varint()?;
+    Ok((generation, decode_slot_run(reader)?))
 }
 
 /// One `varint count | [u16 slot]*` run.
@@ -3181,15 +3296,89 @@ mod tests {
         assert!(removed.is_empty() && added.is_empty());
     }
 
+    /// The whole set is the repair path, so it has to survive its own wire trip at the sizes a
+    /// repair actually happens at — a joining peer's first set, not a two-slot example.
+    #[test]
+    fn an_interest_table_round_trips_at_every_size() {
+        for count in [0usize, 1, 2, 255, 256, 1000] {
+            let slots: Vec<u16> = (0..count as u16).collect();
+            let bytes = encode_interest_table(42, &slots);
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(
+                reader.u8().unwrap(),
+                FrameKind::InterestTable.tag(),
+                "the kind byte leads, as every other frame's does"
+            );
+            let (generation, decoded) = decode_interest_table(&mut reader).unwrap();
+            assert_eq!(generation, 42);
+            assert_eq!(decoded, slots, "a set of {count} slots");
+        }
+    }
+
+    /// The table rides a reliable channel, so a truncated one is a fault rather than an ordinary
+    /// event — but it still reports rather than panicking or inventing slots, like every decoder here.
+    #[test]
+    fn a_truncated_interest_table_reports_eof_rather_than_panicking() {
+        let bytes = encode_interest_table(7, &[1, 2, 3, 4]);
+        for cut in 1..bytes.len() {
+            let mut reader = Reader::new(&bytes[..cut]);
+            let _ = reader.u8();
+            let outcome = decode_interest_table(&mut reader);
+            if cut < bytes.len() {
+                assert!(
+                    outcome.is_err() || outcome.unwrap().1.len() < 4,
+                    "a section cut at {cut} claimed a whole table"
+                );
+            }
+        }
+    }
+
+    /// **EXACT, AND BOTH DIRECTIONS MATTER.** A whole set is reliable and a section is not, so a
+    /// section built either side of a table can arrive on the wrong side of it. Below the held
+    /// generation it is one the table already superseded; above it, one diffed against a set that
+    /// has not arrived — and applying that early would let the table then undo it. What the match
+    /// must still admit is a re-send, which carries the generation it was built at.
+    #[test]
+    fn a_section_applies_only_at_the_generation_it_was_built_against() {
+        let section = InterestDeltaSection {
+            generation: 4,
+            left: Vec::new(),
+            entered: Vec::new(),
+        };
+        assert!(
+            section.applies_to(4),
+            "the baseline it was diffed from, and every re-send of it"
+        );
+        assert!(
+            !section.applies_to(3),
+            "a section built against a set this peer has not adopted yet"
+        );
+        assert!(
+            !section.applies_to(5),
+            "and one the whole set it now holds has already superseded"
+        );
+    }
+
     #[test]
     fn an_interest_delta_round_trips_both_halves() {
         let left = vec![0u16, 7, 4096, u16::MAX];
         let entered = vec![1u16, 2, 3];
         let mut writer = Writer::new();
-        encode_interest_delta(&left, &entered, &mut writer);
+        encode_interest_delta(9, &left, &entered, &mut writer);
         let bytes = writer.into_inner();
-        // varint(4) + 4x2 + varint(3) + 3x2 = 1 + 8 + 1 + 6.
-        assert_eq!(bytes.len(), 16, "two count varints and 2 bytes per slot");
+        // varint(9) + varint(4) + 4x2 + varint(3) + 3x2 = 1 + 1 + 8 + 1 + 6.
+        assert_eq!(
+            bytes.len(),
+            17,
+            "a generation varint, two count varints, 2 bytes per slot"
+        );
+        assert_eq!(
+            decode_interest_delta(&mut Reader::new(&bytes))
+                .unwrap()
+                .generation,
+            9,
+            "and the generation leads the section"
+        );
 
         let section = decode_interest_delta(&mut Reader::new(&bytes)).unwrap();
         assert_eq!(section.left, left);
@@ -3207,7 +3396,7 @@ mod tests {
             (Vec::new(), Vec::new()),
         ] {
             let mut writer = Writer::new();
-            encode_interest_delta(&left, &entered, &mut writer);
+            encode_interest_delta(0, &left, &entered, &mut writer);
             let bytes = writer.into_inner();
             let section = decode_interest_delta(&mut Reader::new(&bytes)).unwrap();
             assert_eq!(section.left, left);
@@ -3215,8 +3404,12 @@ mod tests {
         }
 
         let mut writer = Writer::new();
-        encode_interest_delta(&[], &[], &mut writer);
-        assert_eq!(writer.len(), 2, "an empty section is one byte per count");
+        encode_interest_delta(0, &[], &[], &mut writer);
+        assert_eq!(
+            writer.len(),
+            3,
+            "an empty section is one byte for the generation and one per count"
+        );
     }
 
     /// The section rides an unreliable datagram, so a truncated one is an ordinary event rather than
@@ -3224,7 +3417,7 @@ mod tests {
     #[test]
     fn a_truncated_interest_delta_reports_eof_rather_than_panicking() {
         let mut writer = Writer::new();
-        encode_interest_delta(&[1, 2, 3], &[4, 5], &mut writer);
+        encode_interest_delta(0, &[1, 2, 3], &[4, 5], &mut writer);
         let full = writer.into_inner();
         for cut in 0..full.len() {
             assert_eq!(
@@ -3266,10 +3459,12 @@ mod tests {
         assert_eq!(FrameHeader::FLAG_WANT_FULL, 1);
         assert_eq!(FrameHeader::FLAG_INTEREST_DELTA, 2);
         assert_eq!(FrameHeader::FLAG_WANT_MANIFEST, 4);
+        assert_eq!(FrameHeader::FLAG_WANT_INTEREST, 8);
         let bits = [
             FrameHeader::FLAG_WANT_FULL,
             FrameHeader::FLAG_INTEREST_DELTA,
             FrameHeader::FLAG_WANT_MANIFEST,
+            FrameHeader::FLAG_WANT_INTEREST,
         ];
         for (index, &flag) in bits.iter().enumerate() {
             assert_eq!(

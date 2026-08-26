@@ -271,10 +271,32 @@ func _poll_pending_order() -> void:
 # measurement honest when a player issues a second order before the first resolves: the reply names the
 # request that failed, so an older refusal cannot cancel a newer pending order.
 func _on_order_rejected(_verb: StringName, code: int, tag: int) -> void:
-	_last_refusal = OrderValidator.describe(code)
+	# TAG 0 IS NOT THIS PLAYER'S REFUSAL, with one exception. A listen host applies every peer's
+	# request locally, and a refusal of one it did not mint arrives on this same lane under tag 0 --
+	# so recording those put another player's forged order in the local HUD, attributed to the local
+	# player. The batch-shape reply is the exception: a batch whose halves disagree has unreadable
+	# tags, so 0 is the only tag the server can answer under, and dropping it left a buggy batch
+	# builder invisible -- every minted tag outstanding and no refusal line ever printed. It reaches
+	# the HUD and cancels nothing, because it names no request.
+	if tag == 0:
+		if code == NetCommand.CODE_BATCH_MALFORMED:
+			_last_refusal = _describe_refusal(code)
+		return
+	_last_refusal = _describe_refusal(code)
 	_refused_tag = tag
-	if tag != 0 and tag == _pending_tag:
+	if tag == _pending_tag:
 		_clear_pending()
+
+# The lane's own refusals are negative and OrderValidator.describe() answers "" for them, which made
+# the HUD line blank exactly when the refusal was not the game's.
+func _describe_refusal(code: int) -> String:
+	match code:
+		NetCommand.CODE_BATCH_TOO_LARGE:
+			return "too many orders in one batch"
+		NetCommand.CODE_BATCH_MALFORMED:
+			return "a submitted batch was malformed"
+		_:
+			return OrderValidator.describe(code)
 
 ## The most recent order refusal in words, for the HUD. Empty until one arrives.
 func last_refusal() -> String:

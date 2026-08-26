@@ -470,7 +470,12 @@ func _apply_roster(owners: PackedInt32Array) -> void:
 # --- join targets ----------------------------------------------------------------------------------
 static func _address_of(target: String) -> String:
 	var separator: int = _port_separator(target)
-	return target if separator < 0 else target.substr(0, separator)
+	var address: String = target if separator < 0 else target.substr(0, separator)
+	# `[::1]` and `[::1]:47800` both name the address `::1`. ENet takes the literal; the brackets are there
+	# to keep the port unambiguous in the string, and stop at the string.
+	if address.length() > 1 and address.begins_with("[") and address.ends_with("]"):
+		return address.substr(1, address.length() - 2)
+	return address
 
 static func _port_of(target: String) -> int:
 	var separator: int = _port_separator(target)
@@ -481,6 +486,22 @@ static func _port_of(target: String) -> int:
 # The index of the ':' that introduces a port, or -1. ONE rule, so the two accessors above can never disagree
 # about where the split is and hand ENet an address and a port that came from different readings of the string.
 static func _port_separator(target: String) -> int:
+	# A BRACKETED IPv6 LITERAL NAMES ITS OWN PORT: `[::1]:47800`. The split goes after the bracket, so no
+	# colon inside the literal can be mistaken for the one that introduces a port.
+	var close: int = target.rfind("]")
+	if close >= 0:
+		var after: int = target.find(":", close)
+		if after < 0 or after >= target.length() - 1:
+			return -1
+		if not target.substr(after + 1).is_valid_int():
+			return -1
+		return after
+	# A BARE IPv6 LITERAL CARRIES SEVERAL COLONS AND NO PORT, and `::1` and `fe80::1` end in digits -- so a
+	# rule that split on the last colon with a numeric suffix handed ENet the address `:` on port 1. Only a
+	# SINGLE colon introduces a port. A target with more is an address in its own right, and naming a port
+	# beside one needs the brackets above, because `a:b:47900` cannot be told apart from a literal otherwise.
+	if target.count(":") != 1:
+		return -1
 	var separator: int = target.rfind(":")
 	if separator <= 0 or separator >= target.length() - 1:
 		return -1

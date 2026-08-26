@@ -56,7 +56,7 @@ local player.
 | `peer_session_expired(session_id, peer)` | **Server-side.** A held session's window closed unclaimed. The release point — the addon does not act on it by default; `Net.set_seat_release_policy()` is how a game says otherwise. |
 | `seat_opened(peer, seat)` | **Both sides.** A seat arrived on a connection — the server as it seats the body, a client one entity manifest later. **Bind presentation here**: a split-screen viewport, a camera, a HUD panel. A joining connection's first seat is announced here too. |
 | `entity_entered_interest(peer, entity_id)` | **Both sides.** An entity started being sent to `peer` — on a client, `peer` is its own id. Call `NetInterpolatorHandle.teleport()` before drawing it: a body that moved while it was away would otherwise fly to its new pose over one tick. |
-| `entity_left_interest(peer, entity_id)` | **Both sides.** An entity stopped being sent — a distance cull, a membership refusal, a per-peer veto or an unregister, and the three are indistinguishable by design. **The addon frees nothing.** Hide rather than free: a nearest-N eviction can oscillate at the boundary. |
+| `entity_left_interest(peer, entity_id)` | **Both sides.** An entity stopped being sent — a distance cull, a membership refusal, a cap eviction, a per-peer veto or an unregister, and the five are indistinguishable by design. **The addon frees nothing.** Hide rather than free: a nearest-N eviction can oscillate at the boundary. |
 | `seat_closed(peer, seat)` | **Both sides.** Nothing drives `(peer, seat)` any more. A dropped connection does **not** close its seats by itself *by default* — its bodies keep the authority they were given until the game changes them, or until `Net.set_seat_release_policy()` says otherwise. |
 
 ### Session identity and reconnection
@@ -82,15 +82,15 @@ evasion. Those need an authenticated layer above it, and `set_session_id()` is w
 | `peer_resume_token(peer: int) -> int` | Server-side, diagnostics. |
 | `resume_policy()` / `set_resume_policy(p)` | `Net.ResumePolicy.ALWAYS` (the default), `ONLY_IF_DROPPED`, or `NEVER`. |
 | `set_session_secret(secret: PackedByteArray)` / `has_session_secret() -> bool` | Derive the per-datagram key from a secret both ends already share. **Before `set_mode()`**, on both ends. An empty array clears it. There is no getter for the bytes. |
+| `peer_session_id(peer: int) -> int` | Server-side: the identity `peer` presented. **Key your roster on this.** 0 for an unknown peer and one that claimed none. |
+| `is_session_held(session_id: int) -> bool` | Server-side: whether a dropped session is still reclaimable. |
+| `reconnect_grace() -> float` / `set_reconnect_grace(s: float) -> void` | Seconds a dropped peer's session is held open. Wall-clock, server-side, 30 s by default. 0 disables resume — a drop is forgotten in the same frame and `peer_dropped` reports `held = false`. |
 
 **The token is what makes an identity worth asserting.** The server mints one per identity and sends it in the
 welcome; a rejoiner must quote it back. Without it, anyone who *saw* a session id — off a roster broadcast, a
 kill feed, a log line, a screenshot — could present it and take that player's body. **It does not stop an
 on-path observer**, who reads the welcome the token traveled in; that boundary is the same one the session key
 has, and `set_session_secret()` is what moves it.
-| `peer_session_id(peer: int) -> int` | Server-side: the identity `peer` presented. **Key your roster on this.** 0 for an unknown peer and one that claimed none. |
-| `is_session_held(session_id: int) -> bool` | Server-side: whether a dropped session is still reclaimable. |
-| `reconnect_grace() -> float` / `set_reconnect_grace(s: float) -> void` | Seconds a dropped peer's session is held open. Wall-clock, server-side, 30 s by default. 0 disables resume — a drop is forgotten in the same frame and `peer_dropped` reports `held = false`. |
 
 #### Releasing a dropped connection's seats
 
@@ -225,8 +225,9 @@ Net.perf_summary()   -> String
 - **`stretch`** — the sim-clock speed multiplier. Pinned to exactly 1.0 in coupled mode (clock error is
   absorbed by rare whole-tick slews instead, because a stretch ≠ 1.0 slides tick boundaries across physics
   frames and renders as judder). Under the decouple it rides within `max_time_stretch`.
-- **`resim_ticks`** — how deep the last rollback loop replayed. This is the resim *cost*; it legitimately
-  deepens under latency and loss, and is bounded by `history_limit`.
+- **`resim_ticks`** — how deep the last rollback loop replayed. Replays only: the frame's own fresh
+  forward ticks ride the same loop and are not counted, so an ordinary predicted frame reads `0`. This
+  is the resim *cost*; it legitimately deepens under latency and loss, and is bounded by `history_limit`.
 - **`rb_nodes`** — how many nodes the loop called `_rollback_tick` on. A quick check that your rollback
   entity count is what you think it is.
 - **`restore_ms` / `sim_ms` / `record_ms`** — the three phases `rollback_ms` wraps: writing a tick's recorded
@@ -405,6 +406,10 @@ Net.set_peer_anchor_entity(peer_id, body.entity_id(), 2)
 
 Server-side only, and no-ops OFFLINE. A membership scopes a whole class of entities by a declared key; the veto
 covers one peer and one entity, which is how an exception inside a world gets said at all.
+
+**A veto needs no radius and no membership declared.** It turns the interest pass on by itself, so it works in
+the configuration it exists for. Setting one is what makes `is_entity_in_interest()` answer per peer at all in
+a session that filters nothing else.
 
 | | |
 |---|---|

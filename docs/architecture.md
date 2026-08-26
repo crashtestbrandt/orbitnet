@@ -35,8 +35,9 @@ Rejected alternatives:
 | `MultiplayerAPIExtension` | Full control, but it means reimplementing RPC routing for every spawner and `@rpc` site in the host project. |
 | One `@rpc` per peer carrying bytes | The viable fallback — still one call per peer per tick, at the cost of the RPC layer's per-call overhead. |
 
-**Channels:** state on one unreliable channel, input on another, handshake and entity binding on a reliable
-one — so netcode traffic never shares a stream with a game's own reliable RPCs.
+**Channels:** every OrbitNet datagram goes out on channel 0, and the lanes are separated by TRANSFER MODE
+rather than by channel — state and input unreliable, handshake and entity binding reliable. Channel 0 is
+also Godot's own RPC default, so netcode traffic does share a stream with a game's reliable RPCs.
 
 The scaling law is `O(peers)` **engine crossings** plus `O(entities × peers)` **bytes in native memory**, not
 `O(entities × peers)` crossings. Acks piggyback on the frame header, so there is no separate ack RPC.

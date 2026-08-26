@@ -50,7 +50,7 @@ var _watch_arena: int = ArenaConfig.FIRST_ARENA_ID
 ## Whether to print the per-second ARENA-WIRE line, and its accumulator. See _log_wire().
 var _wire_log: bool = false
 var _wire_timer: float = 0.0
-## Whether the resume token this server issued has been printed. Once per process. See _log_resume_token().
+## Whether the resume token the server issued this process has been printed. Once per process. See _log_resume_token().
 var _token_logged: bool = false
 
 func _ready() -> void:

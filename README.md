@@ -68,7 +68,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 
 ## Upgrading from 0.2.x
 
-**`PROTOCOL_VERSION` moved major 6 → 7**, so a 0.2.x peer and a current one refuse each other's handshake.
+**`PROTOCOL_VERSION` moved major 6 → 8**, so a 0.2.x peer and a current one refuse each other's handshake.
 Upgrade both ends of a session together. The three `Net` changes below raise nothing — the 0.2.1 call still
 compiles, still runs, and means something else.
 
