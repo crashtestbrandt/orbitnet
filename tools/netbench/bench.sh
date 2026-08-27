@@ -197,30 +197,59 @@ for f in "$OUT"/*.log; do cp "$f" "$f.snap" 2>/dev/null || true; done
 kill_all; trap - EXIT
 
 # --- verdict ---------------------------------------------------------------------------------------
-# Fold the server's per-second wire lines into a CSV beside the clients'. One row per second of the run.
+# Fold the server's per-second wire lines into a CSV beside the clients'. One row per published window.
+#
+# TWO LINES PER WINDOW, AND THE `NETSEND` ONE IS WHY THIS EXISTS. The `tick=` line carries the raw debug
+# counters; `NETSEND` carries the published send-path accounting, including the counters that ONLY a server
+# increments -- `want_full_nacks_s` above all. A client writes a structural 0.00 for those, so before this
+# they reached no artifact a comparison could read, while `compare.py` already listed `want_full_nacks_s`
+# in FAULT_COUNTERS and judged it on a column nothing produced.
+#
+# Where the two lines name the same figure (`tx_bytes_s`, `peers`), the WINDOW wins: it is the same quantity
+# off the same accumulator that `Net.bandwidth_metrics()` publishes, rather than the debug timer's own tally.
 python3 - "$OUT/server.log.snap" "$OUT/server.csv" <<'PYEOF' || true
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
-pattern = re.compile(
-    r"tick=(\d+) mode=(\d+) peers=(\d+) ents=(\d+)r/(\d+)s sent=(\d+) blk (\d+) B "
+# The debug line, minus the two figures NETSEND states better.
+tick_re = re.compile(
+    r"tick=(\d+) mode=(\d+) peers=\d+ ents=(\d+)r/(\d+)s sent=(\d+) blk \d+ B "
     r"rx applied=(\d+) rejected=(\d+) skipped=(\d+)")
-rows = []
+TICK_COLS = ["tick", "mode", "ents_rollback", "ents_state", "blocks_s",
+             "rx_applied_s", "rx_rejected_s", "rx_skipped_s"]
+# `key=value` pairs, so a counter added to BandwidthMetrics::fields needs no change here.
+send_re = re.compile(r"NETSEND\s+(.*)")
+pair_re = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(-?[0-9.]+)")
+
+tick = None
+rows, send_cols = [], []
 try:
     for line in open(src, errors="replace"):
-        m = pattern.search(line)
+        m = tick_re.search(line)
         if m:
-            rows.append(m.groups())
+            tick = list(m.groups())
+            continue
+        m = send_re.search(line)
+        if not m:
+            continue
+        pairs = pair_re.findall(m.group(1))
+        if not pairs:
+            continue
+        if not send_cols:
+            send_cols = [k for k, _ in pairs]
+        by_key = dict(pairs)
+        # A row is emitted per WINDOW. The tick half is whatever the debug timer last said, and empty
+        # until it has said anything -- which compare.py skips per column rather than dropping the row.
+        rows.append((tick or [""] * len(TICK_COLS), [by_key.get(k, "") for k in send_cols]))
 except OSError:
     rows = []
 with open(dst, "w") as out:
     # `blocks_s` is ENTITY BLOCKS admitted across every peer, not datagrams: the backend counts one per
-    # entity row it put in a frame. `tx_bytes_s` is the snapshot frames' payload bytes over the same second.
-    out.write("second,tick,mode,peers,ents_rollback,ents_state,blocks_s,tx_bytes_s,"
-              "rx_applied_s,rx_rejected_s,rx_skipped_s\n")
-    for i, g in enumerate(rows):
-        out.write("%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" % ((i, g[0], g[1], g[2], g[3], g[4],
-                                                            g[5], g[6], g[7], g[8], g[9])))
-print("netbench: server.csv <- %d per-second wire lines" % len(rows))
+    # entity row it put in a frame. The NETSEND columns are documented on `BandwidthMetrics`.
+    out.write(",".join(["second"] + TICK_COLS + send_cols) + "\n")
+    for i, (t, sv) in enumerate(rows):
+        out.write(",".join([str(i)] + t + sv) + "\n")
+print("netbench: server.csv <- %d published window(s), %d send-path column(s)" % (
+    len(rows), len(send_cols)))
 PYEOF
 
 echo "--- relay ---"
@@ -238,6 +267,30 @@ for i in $(seq 1 "$CLIENTS"); do
 	# Echo the gate reasons for a failing client so the artifact is self-diagnosing.
 	echo "$line" | grep -q "BENCH-RESULT PASS" || grep -a "BENCH-GATE FAIL" "$snap" | sed 's/^/      /'
 done
+
+# --- server send path ---
+# REPORTED, NOT GATED. The counters below are the server's own, and until the window line existed no
+# netbench run could print them at all: `bench_gate.gd` evaluates on a CLIENT, where `want_full_nacks_s` is
+# a structural 0.00, so its own "near zero is the interest-management acceptance bar" line reported the bar
+# as met on every run without measuring it once.
+#
+# No threshold here. What a healthy rate is depends on the profile and the arena, and picking one from a
+# single run is how a gate ends up asserting the number it happened to see. Two runs of the same seed are
+# comparable through `compare.py`, which already judges this column as a fault counter -- it just had no
+# column to read. A THRESHOLD IS A SEPARATE CHANGE, and it needs a week of runs behind it.
+#
+# THE FIRST WINDOW IS THE JOIN WINDOW and is excluded. A peer that receives a block for an entity it has not
+# registered yet drops the block and still acks the frame, so every join costs one keyframe interval of
+# NACKs per affected channel. That residual is real, bounded and correct; reading it as the steady-state
+# rate reports bring-up.
+echo "--- server send path ---"
+nacks="$(grep -ao 'want_full_nacks_s=[0-9.]*' "$OUT/server.log.snap" | cut -d= -f2 | tail -n +2 || true)"
+nack_n="$(printf '%s' "$nacks" | grep -c . || true)"
+if [ "${nack_n:-0}" -eq 0 ]; then
+	echo "  want_full nacks: NO STEADY-STATE WINDOW (the server published none past the join window)"
+else
+	echo "  want_full nacks MAX $(printf '%s\n' "$nacks" | sort -g | tail -1)/s over ${nack_n} steady-state window(s) -- reported, not gated"
+fi
 
 echo "(artifacts: $OUT  -- per-client CSVs + logs)"
 if [ "$fail" -ne 0 ]; then echo "=== netbench: FAIL ($DEMO) ==="; exit 1; fi
