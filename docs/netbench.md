@@ -198,6 +198,24 @@ All after `--`:
 Environment: `NETBENCH_OUT=<dir>` writes the artifacts somewhere stable (see *Comparing two runs*), and
 `SERVER_PORT` / `RELAY_PORT` move the two UDP ports.
 
+## The import that runs first
+
+Every run imports the demo project before it launches anything, and says so.
+
+- A project whose `.godot/global_script_class_cache.cfg` is absent or **stale** resolves every `class_name`
+  to `Variant`, which each demo promotes from a warning to an error. The run then dies at parse time and the
+  bringup wait reports `dedicated server never bound` — the symptom three steps from the cause.
+- A stale cache is the case CI hits: a workspace checked out over a previous run keeps its `.godot/`, so
+  testing that the directory exists skips the import on exactly the tree that needs it. The import is
+  therefore unconditional; a warm project rescans in seconds.
+- A cold project is imported twice, the first discarded. A GDExtension perturbs the build order of a cache
+  built from nothing, so an autoload's own type can transiently resolve as its base `Node`.
+- The run stops with the import log if no class cache exists afterwards, rather than launching a server that
+  cannot parse.
+
+A bringup failure prints the errors found anywhere in that process's log before the tail. A GDScript parse
+cascade is longer than a tail, and the first script it names is the one to read.
+
 ## Multi-machine
 
 ```sh

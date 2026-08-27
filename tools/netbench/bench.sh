@@ -51,7 +51,7 @@ mkdir -p "$OUT"
 # shrank would be compared against rows nobody measured. Only the files this script writes are removed.
 rm -f "$OUT"/client*.csv "$OUT"/client*.log "$OUT"/client*.log.snap \
 	"$OUT"/server.csv "$OUT"/server.log "$OUT"/server.log.snap \
-	"$OUT"/relay.log "$OUT"/relay.log.snap
+	"$OUT"/relay.log "$OUT"/relay.log.snap "$OUT"/import.log
 
 PIDS=()
 sweep() { pkill -9 -f -- "--headless --path $PROJECT" 2>/dev/null || true; }
@@ -67,17 +67,35 @@ if [ ! -d "$PROJECT/addons/orbitnet" ]; then
 	exit 1
 fi
 
-# A PROJECT GODOT HAS NEVER IMPORTED HAS NO GLOBAL CLASS CACHE, so every `class_name` in the demo resolves to
-# `Variant` -- which each demo's project.godot promotes from a warning to an ERROR. The run then dies at parse
-# time and the bringup wait below reports it as "dedicated server never bound", which names the symptom three
-# steps from the cause. `just check` imports all four projects on its way past, so only a bench run on a fresh
-# clone reaches a cold one.
-if [ ! -d "$PROJECT/.godot" ]; then
-	echo "netbench: $DEMO has not been imported yet -- importing it once (this takes a moment)..."
+# A PROJECT WHOSE GLOBAL CLASS CACHE IS ABSENT OR STALE RESOLVES `class_name` TO `Variant`, which each demo's
+# project.godot promotes from a warning to an ERROR. The run then dies at parse time and the bringup wait below
+# reports it as "dedicated server never bound", which names the symptom three steps from the cause.
+#
+# THE IMPORT IS UNCONDITIONAL. Testing `.godot/` for existence, which is what this did, only covers the fresh
+# clone -- and the case that actually reaches CI is the OTHER one: a workspace checked out over a previous run
+# (`actions/checkout` with `clean: false`) carries a `.godot/` built from an older tree, so the guard saw a
+# directory, skipped the import, and the run died on exactly the parse cascade the guard exists to prevent. A
+# class added or renamed since that import is missing from the cache and nothing on this path notices.
+# Re-importing an already-imported project rescans and re-imports only what changed, so the cost of doing it
+# every run is seconds and the cost of skipping it is the whole run.
+CLASS_CACHE="$PROJECT/.godot/global_script_class_cache.cfg"
+# ON A COLD PROJECT THE FIRST IMPORT IS PRIMING AND IS DISCARDED. A GDExtension perturbs the build order of a
+# cache being built from nothing, so an autoload's own type can transiently resolve as its base `Node` and
+# warnings-as-errors then rejects correct code -- the same reason tools/lint-gdscript.sh primes before its
+# checked pass. A warm project cannot hit that, so it pays for one import rather than two.
+if [ ! -s "$CLASS_CACHE" ]; then
+	echo "netbench: $DEMO has never been imported -- priming the class cache (this takes a moment)..."
 	"$GODOT" --headless --path "$PROJECT" --import >/dev/null 2>&1 || true
 fi
-if [ ! -d "$PROJECT/.godot" ]; then
-	echo "netbench: could not import $PROJECT. Run \`$GODOT --headless --path $PROJECT --import\` and retry." >&2
+echo "netbench: importing $DEMO (refreshes the global class cache; a warm project is quick)..."
+"$GODOT" --headless --path "$PROJECT" --import >"$OUT/import.log" 2>&1 || true
+# `global_script_class_cache.cfg` IS THE ARTIFACT THAT MATTERS, not the directory holding it: it is the file
+# every `class_name` in the demo is resolved through. A `.godot/` without it is precisely the state that parses
+# to Variant, so that is what is asserted.
+if [ ! -s "$CLASS_CACHE" ]; then
+	echo "netbench: $PROJECT has no global class cache after importing ($CLASS_CACHE)." >&2
+	echo "Every class_name would resolve to Variant and the demo promotes that to a parse error." >&2
+	tail -20 "$OUT/import.log" >&2 2>/dev/null || true
 	exit 1
 fi
 
@@ -88,6 +106,29 @@ wait_marker() { # log timeout-seconds marker
 	# `--` before the pattern: the ready marker starts with a hyphen, and grep would read it as an option.
 	while [ "$i" -lt "$2" ]; do grep -aq -- "$3" "$1" 2>/dev/null && return 0; sleep 1; i=$((i+1)); done
 	return 1
+}
+
+# Report a process that never printed its ready marker, and STOP THE RUN.
+#
+# The errors come before the tail because a fixed tail is the wrong end of a GDScript parse cascade. Godot
+# prints two lines per offending expression and then one `Failed to load script` naming the file, so a
+# twelve-line tail of a cascade shows the last few expressions and drops every earlier one -- including, when
+# several scripts fail, the first file to fail, which is the one to read. Grepping the WHOLE log puts the
+# beginning of the cascade back in the output. The tail stays after it for the failures that print no error at
+# all: a port already bound, a missing binary, a process killed before it wrote anything.
+bringup_failed() { # label log
+	echo "netbench: $1 never bound:"
+	local errors
+	# -A1 carries the `at: GDScript::reload (res://...)` line that names the script; without it every error
+	# reads as a type complaint with no file attached.
+	errors="$(grep -aE -A1 'SCRIPT ERROR|Parse Error|^ERROR:|^USER ERROR:' "$2" 2>/dev/null | head -40 || true)"
+	if [ -n "$errors" ]; then
+		echo "--- errors logged by $1 (first 40 lines; the FIRST script named is the one to read) ---"
+		printf '%s\n' "$errors"
+	fi
+	echo "--- last 12 lines of $2 ---"
+	tail -12 "$2"
+	exit 1
 }
 
 echo "=== netbench: $DEMO -- dedicated server + relay('$PROFILE') + $CLIENTS bot client(s) ('$POLICY'), ${MEASURE_S}s, seed $SEED ==="
@@ -107,7 +148,7 @@ ORBITNET_DEBUG=1 "$GODOT" --headless --path "$PROJECT" -- --dedicated="$SERVER_P
 	--quit-after=$((MEASURE_S + 150)) >"$OUT/server.log" 2>&1 &
 PIDS+=($!)
 if ! wait_marker "$OUT/server.log" 40 "$READY_MARKER"; then
-	echo "netbench: dedicated server never bound:"; tail -12 "$OUT/server.log"; exit 1
+	bringup_failed "dedicated server" "$OUT/server.log"
 fi
 
 # 2) Relay between clients and the server. Clients self-finish MEASURE_S after THEY connect, and staggered/slow
@@ -120,7 +161,7 @@ RELAY_DUR=$((MEASURE_S + 90))
 	--relay-profile="$PROFILE" --relay-seed="$SEED" --relay-duration="$RELAY_DUR" >"$OUT/relay.log" 2>&1 &
 PIDS+=($!)
 if ! wait_marker "$OUT/relay.log" 25 "RELAY: bound"; then
-	echo "netbench: relay never bound:"; tail -12 "$OUT/relay.log"; exit 1
+	bringup_failed "relay" "$OUT/relay.log"
 fi
 
 # 3) Bot clients, joining THROUGH the relay port, staggered so connect-time spikes don't overlap. Each self-quits
