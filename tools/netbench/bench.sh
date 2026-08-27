@@ -119,9 +119,16 @@ wait_marker() { # log timeout-seconds marker
 bringup_failed() { # label log
 	echo "netbench: $1 never bound:"
 	local errors
+	# The first five alternatives are tools/lint-gdscript.sh's ERROR_PATTERN verbatim, because both places
+	# are answering the same question -- did Godot reject a script -- and two patterns for one question drift.
+	# `^ERROR:` and `^USER ERROR:` are this script's addition: a bringup failure need not be a script at all
+	# (a squatted port, a missing binary), and the relay uses this function too.
+	#
 	# -A1 carries the `at: GDScript::reload (res://...)` line that names the script; without it every error
 	# reads as a type complaint with no file attached.
-	errors="$(grep -aE -A1 'SCRIPT ERROR|Parse Error|^ERROR:|^USER ERROR:' "$2" 2>/dev/null | head -40 || true)"
+	errors="$(grep -aE -A1 \
+		'SCRIPT ERROR|Parse Error|Compile Error|Failed to load script|GDScript::reload|^ERROR:|^USER ERROR:' \
+		"$2" 2>/dev/null | head -40 || true)"
 	if [ -n "$errors" ]; then
 		echo "--- errors logged by $1 (first 40 lines; the FIRST script named is the one to read) ---"
 		printf '%s\n' "$errors"
