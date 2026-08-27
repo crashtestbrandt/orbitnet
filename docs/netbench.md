@@ -123,7 +123,9 @@ per window.
 | `server.csv` column | |
 |---|---|
 | `want_full_nacks_s` / `unproven_acks_s` | **server-side only.** A client increments neither, so these reach an artifact through this line and no other. |
+| `stale_blocks_s` | **client-side only** — counted where a received snapshot is integrated, which a server never does, so it is `0.00` in every `server.csv` row. It is the other half of the NACK/stale pair: the diagnosis is a client's `stale_blocks_s` beside a server's `want_full_nacks_s`, and the two never come from one process. |
 | `tx_bytes_s` / `tx_wire_bytes_s` / `tx_datagrams_s` / `tx_peak_peer_bytes_s` | egress payload, the same with per-datagram overhead, the datagram count, and the busiest peer's share |
+| `rx_bytes_s` / `rx_datagrams_s` | ingress payload and its datagram count — on a server, the fleet's input frames |
 | `blocks_admitted_s` / `blocks_deferred_s` / `blocks_culled_s` / `blocks_oversize_s` / `blocks_full_s` | what the admit loop did with each block |
 | `starve_ticks_max` / `unsent_backlog_max` | worst in-interest staleness, and the re-entry backlog it cannot see |
 | `interest_ms` / `interest_grid` / `interest_entities` | the interest pass's cost, which path ran, and the mean set size |
@@ -131,6 +133,7 @@ per window.
 | `blocks_s` | entity blocks admitted per second, from the debug counter. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
 | `rx_applied_s` / `rx_rejected_s` / `rx_skipped_s` | inbound rows applied, refused, and unplaceable |
 | `peers` / `ents_rollback` / `ents_state` | what the session held that window |
+| `rtt_at_ceiling_peers` | connected peers whose raw round trip is above `Net.rtt_believed_max_ms`, so the figure reported for them is the ceiling rather than what was measured. A gauge, not a rate — read it against `peers`. |
 
 `BandwidthMetrics::fields` is the one list both the log line and the Godot dictionary are built from, and
 `server.csv` takes its send-path columns from whatever that line names — so a counter added there appears in
