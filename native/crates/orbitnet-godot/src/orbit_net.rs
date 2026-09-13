@@ -494,6 +494,46 @@ struct BandwidthMetrics {
     rtt_at_ceiling_peers: f64,
 }
 
+impl BandwidthMetrics {
+    /// Every published figure, named, in one ordered list.
+    ///
+    /// ONE LIST, TWO CONSUMERS. `Net.bandwidth_metrics()` hands these to GDScript and
+    /// [`OrbitNet::log_bandwidth_window`] prints them for a headless server whose only output is its
+    /// log. Building both from here is what stops them naming different sets: the log line is the
+    /// only way the SERVER-SIDE counters (`want_full_nacks_s`, `unproven_acks_s`) can be read at
+    /// all in a bench run, and a counter that exists in one consumer and not the other is a
+    /// counter nobody notices is missing.
+    fn fields(&self) -> [(&'static str, f64); 25] {
+        [
+            ("tx_bytes_s", self.tx_bytes_s),
+            ("tx_datagrams_s", self.tx_datagrams_s),
+            ("tx_wire_bytes_s", self.tx_wire_bytes_s),
+            ("tx_peak_peer_bytes_s", self.tx_peak_peer_bytes_s),
+            ("rx_bytes_s", self.rx_bytes_s),
+            ("rx_datagrams_s", self.rx_datagrams_s),
+            ("blocks_admitted_s", self.blocks_admitted_s),
+            ("blocks_deferred_s", self.blocks_deferred_s),
+            ("blocks_culled_s", self.blocks_culled_s),
+            ("blocks_oversize_s", self.blocks_oversize_s),
+            ("blocks_full_s", self.blocks_full_s),
+            ("want_full_nacks_s", self.want_full_nacks_s),
+            ("unproven_acks_s", self.unproven_acks_s),
+            ("stale_blocks_s", self.stale_blocks_s),
+            ("starve_ticks_max", self.starve_ticks_max),
+            ("unsent_backlog_max", self.unsent_backlog_max),
+            ("interest_ms", self.interest_ms),
+            ("interest_grid", self.interest_grid),
+            ("interarrival_near", self.interarrival_near),
+            ("interarrival_mid", self.interarrival_mid),
+            ("interarrival_far", self.interarrival_far),
+            ("interarrival_all", self.interarrival_all),
+            ("peers", self.peers),
+            ("interest_entities", self.interest_entities),
+            ("rtt_at_ceiling_peers", self.rtt_at_ceiling_peers),
+        ]
+    }
+}
+
 enum PendingOp {
     RegisterRollback(u64, Gd<OrbitRollbackSynchronizer>),
     RegisterState(u64, Gd<OrbitStateSynchronizer>),
@@ -3685,34 +3725,14 @@ impl OrbitNet {
     /// `tx_datagrams_s` is published so the sum can be checked rather than trusted.
     #[func]
     fn bandwidth_metrics(&self) -> VarDictionary {
-        let bw = &self.m_bw;
-        vdict! {
-            "tx_bytes_s" => bw.tx_bytes_s,
-            "tx_datagrams_s" => bw.tx_datagrams_s,
-            "tx_wire_bytes_s" => bw.tx_wire_bytes_s,
-            "tx_peak_peer_bytes_s" => bw.tx_peak_peer_bytes_s,
-            "rx_bytes_s" => bw.rx_bytes_s,
-            "rx_datagrams_s" => bw.rx_datagrams_s,
-            "blocks_admitted_s" => bw.blocks_admitted_s,
-            "blocks_deferred_s" => bw.blocks_deferred_s,
-            "blocks_culled_s" => bw.blocks_culled_s,
-            "blocks_oversize_s" => bw.blocks_oversize_s,
-            "blocks_full_s" => bw.blocks_full_s,
-            "want_full_nacks_s" => bw.want_full_nacks_s,
-            "unproven_acks_s" => bw.unproven_acks_s,
-            "stale_blocks_s" => bw.stale_blocks_s,
-            "starve_ticks_max" => bw.starve_ticks_max,
-            "unsent_backlog_max" => bw.unsent_backlog_max,
-            "interest_ms" => bw.interest_ms,
-            "interest_grid" => bw.interest_grid,
-            "interarrival_near" => bw.interarrival_near,
-            "interarrival_mid" => bw.interarrival_mid,
-            "interarrival_far" => bw.interarrival_far,
-            "interarrival_all" => bw.interarrival_all,
-            "peers" => bw.peers,
-            "interest_entities" => bw.interest_entities,
-            "rtt_at_ceiling_peers" => bw.rtt_at_ceiling_peers,
+        // Built from `BandwidthMetrics::fields`, which is also what the debug log line prints, so the
+        // two cannot name different sets. The KEYS and their meanings are unchanged by that sourcing;
+        // `bench_metrics.gd` and the perf probe index this by name and are unaffected by order.
+        let mut out = VarDictionary::new();
+        for (key, value) in self.m_bw.fields() {
+            out.set(key, value);
         }
+        out
     }
 
     /// The wire protocol version this build speaks.
@@ -5199,6 +5219,9 @@ impl OrbitNet {
                 self.rtt_believed_max_ms as f32,
             ) as f64,
         };
+        if self.debug_wire {
+            self.log_bandwidth_window();
+        }
         // Cleared and refilled rather than updated in place: a peer that disconnected during the
         // window has no entry in the accumulator, and must not keep answering with the figure it
         // last earned.
@@ -5207,6 +5230,30 @@ impl OrbitNet {
             self.m_peer_interarrival.insert(peer, band(sends, members));
         }
         self.reset_bandwidth_counters();
+    }
+
+    /// Print the window just published as one `key=value` line, under `ORBITNET_DEBUG=1`.
+    ///
+    /// WHY A LINE AND NOT A DICTIONARY READ. A dedicated server has no console and no GDScript
+    /// reading `Net.bandwidth_metrics()`, so on the one process that OWNS the send path every
+    /// server-side counter was unreadable. `want_full_nacks_s` is the case that cost something: its
+    /// own doc calls it the acceptance bar for interest management being on, `compare.py` already
+    /// lists it in `FAULT_COUNTERS`, and `bench_gate.gd` reports it from a CLIENT, where it is a
+    /// structural 0.00. The bar read as met on every run because nothing was measuring it.
+    ///
+    /// PRINTED WHERE THE WINDOW CLOSES, not on the `tick=` line's own timer. Both fire about once a
+    /// second and they are different timers, so a line assembled from the other one would pair a
+    /// window's figures with a neighbouring window's tick.
+    ///
+    /// `key=value` separated by two spaces, every figure on one line, so a reader can add a counter
+    /// to [`BandwidthMetrics::fields`] without a parser change anywhere. `NETSEND` leads the line
+    /// because a log carries more than this.
+    fn log_bandwidth_window(&self) {
+        let mut line = String::from("[orbitnet] NETSEND");
+        for (key, value) in self.m_bw.fields() {
+            line.push_str(&format!("  {key}={value:.2}"));
+        }
+        godot_print!("{line}");
     }
 
     /// Zero every raw send-path counter. Called at each window boundary, and at session teardown so a new

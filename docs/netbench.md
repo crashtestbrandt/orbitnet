@@ -116,14 +116,34 @@ legitimately under latency, and prediction that is actually broken shows up as `
 
 **Two tables, and the second one is the point for a send-path change.** Every column describing the SEND path
 reads zero in a client CSV, because a client is not the authority and runs none of it. The server is therefore
-run under `ORBITNET_DEBUG=1` and its per-second wire line is folded into `server.csv`:
+run under `ORBITNET_DEBUG=1`, which prints two lines: the `tick=` debug counters, and one `NETSEND` line per
+published window carrying the whole of `Net.bandwidth_metrics()`. Both are folded into `server.csv`, one row
+per window.
 
 | `server.csv` column | |
 |---|---|
-| `tx_bytes_s` | snapshot payload bytes per second, across every peer — **server egress** |
-| `blocks_s` | entity blocks admitted per second. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
+| `want_full_nacks_s` / `unproven_acks_s` | **server-side only.** A client increments neither, so these reach an artifact through this line and no other. |
+| `stale_blocks_s` | **client-side only** — counted where a received snapshot is integrated, which a server never does, so it is `0.00` in every `server.csv` row. It is the other half of the NACK/stale pair: the diagnosis is a client's `stale_blocks_s` beside a server's `want_full_nacks_s`, and the two never come from one process. |
+| `tx_bytes_s` / `tx_wire_bytes_s` / `tx_datagrams_s` / `tx_peak_peer_bytes_s` | egress payload, the same with per-datagram overhead, the datagram count, and the busiest peer's share |
+| `rx_bytes_s` / `rx_datagrams_s` | ingress payload and its datagram count — on a server, the fleet's input frames |
+| `blocks_admitted_s` / `blocks_deferred_s` / `blocks_culled_s` / `blocks_oversize_s` / `blocks_full_s` | what the admit loop did with each block |
+| `starve_ticks_max` / `unsent_backlog_max` | worst in-interest staleness, and the re-entry backlog it cannot see |
+| `interest_ms` / `interest_grid` / `interest_entities` | the interest pass's cost, which path ran, and the mean set size |
+| `interarrival_near` / `_mid` / `_far` / `_all` | mean ticks between admissions, per distance band |
+| `blocks_s` | entity blocks admitted per second, from the debug counter. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
 | `rx_applied_s` / `rx_rejected_s` / `rx_skipped_s` | inbound rows applied, refused, and unplaceable |
-| `peers` / `ents_rollback` / `ents_state` | what the session held that second |
+| `peers` / `ents_rollback` / `ents_state` | what the session held that window |
+| `rtt_at_ceiling_peers` | connected peers whose raw round trip is above `Net.rtt_believed_max_ms`, so the figure reported for them is the ceiling rather than what was measured. A gauge, not a rate — read it against `peers`. |
+
+`BandwidthMetrics::fields` is the one list both the log line and the Godot dictionary are built from, and
+`server.csv` takes its send-path columns from whatever that line names — so a counter added there appears in
+the CSV with no parser change.
+
+**`want_full_nacks_s` is reported at the end of a run and not gated.** Its own doc calls near-zero the
+acceptance bar for interest management being on, and `compare.py` already judges it as a fault counter — but
+`bench_gate.gd` evaluates on a client, where it is a structural `0.00`, so the bar read as met on every run
+without being measured once. The run now prints the server's maximum past the join window. No threshold: what
+a healthy rate is moves with the profile and the arena, and one run is not enough to set one.
 
 ## What a run asserts
 
