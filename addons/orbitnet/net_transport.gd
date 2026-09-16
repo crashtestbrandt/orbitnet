@@ -23,6 +23,13 @@ const DEFAULT_MAX_CLIENTS: int = 8
 # CI, where there is no Steam persona. Empty = "no override", the default. Static: the factory has no instance.
 static var _local_name_override: String = ""
 
+# THE HOST SESSION'S ADVERTISEMENT, recorded on every transport. `_host_open` is a host peer this process created
+# and has not released; `_advertised` is whether that session has been published. Steam publishes a lobby or a
+# game-server listing; ENet publishes nothing, but records the same two flags so a game can assert its own order
+# of events (build, then advertise) in CI, where there is no Steam.
+static var _host_open: bool = false
+static var _advertised: bool = false
+
 ## The transport kind this build prefers, from feature tags: Steam if this is a Steam build (the `Steam` /
 ## `Steam Server` export presets set custom_features="steam", so OS.has_feature("steam") trips), otherwise native
 ## ENet. On any non-Steam build the "steam" feature is false and this returns ENET -- Steamworks is never even looked up (steam_transport
@@ -55,22 +62,43 @@ static func preferred_kind_name() -> String:
 ## game server, a listen host uses the logged-in user's client + advertises a discoverable lobby carrying the cap /
 ## friends-only flag. `friends_only` is a Steam lobby-type concept, so it is ignored on the ENet path (native builds
 ## have no matchmaking) -- max_clients maps to ENet's hard cap there.
+##
+## `advertise = false` opens the peer and publishes nothing: no lobby, no game-server listing. A game whose world
+## has to be built with the peer already set (so what it spawns is networked from birth) passes false, builds, and
+## calls [method advertise_session] once the session is ready to be found. The default publishes at once.
 static func create_server(port: int = DEFAULT_PORT, max_clients: int = DEFAULT_MAX_CLIENTS,
-		friends_only: bool = false) -> MultiplayerPeer:
+		friends_only: bool = false, advertise: bool = true) -> MultiplayerPeer:
+	var peer: MultiplayerPeer = null
 	match preferred_kind():
 		Kind.ENET:
-			var peer: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
-			var err: Error = peer.create_server(port, max_clients)
+			var enet: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
+			var err: Error = enet.create_server(port, max_clients)
 			if err != OK:
 				push_warning("NetTransport: ENet create_server(%d) failed: %s" % [port, error_string(err)])
-				return null
-			return peer
+			else:
+				peer = enet
 		Kind.STEAM:
 			if OS.has_feature("dedicated_server"):
-				return SteamTransport.service().create_dedicated_host(port, max_clients, friends_only)
-			return SteamTransport.service().create_listen_host(port, max_clients, friends_only)
-		_:
-			return null
+				peer = SteamTransport.service().create_dedicated_host(port, max_clients, friends_only, advertise)
+			else:
+				peer = SteamTransport.service().create_listen_host(port, max_clients, friends_only, advertise)
+	_host_open = peer != null
+	_advertised = _host_open and advertise
+	return peer
+
+## Publish the host session opened with `advertise = false`: the Steam lobby for a listen host, the game-server
+## listing for a dedicated one, nothing on ENet. Idempotent, and a no-op when no host session is open (none was
+## created, or [method release_session] has run since).
+static func advertise_session() -> void:
+	if not _host_open or _advertised:
+		return
+	_advertised = true
+	if preferred_kind() == Kind.STEAM:
+		SteamTransport.service().advertise_session()
+
+## Whether the open host session has been published. False with no host session open.
+static func is_session_advertised() -> bool:
+	return _host_open and _advertised
 
 ## Build a client peer connecting to `address`:`port`. Returns null on failure. On a Steam build `address` carries
 ## the host's 64-bit Steam ID (a decimal string) rather than an IP -- the SessionMenu "Host address" field is
@@ -179,7 +207,10 @@ static func open_invite_overlay() -> void:
 		SteamTransport.service().open_invite_overlay()
 
 ## Release any platform-side session advertisement (a discoverable lobby, presence) when a session ends, so a
-## stopped session stops showing up in other players' browsers. A no-op on ENet, where nothing is advertised.
+## stopped session stops showing up in other players' browsers. On ENet, where nothing is published, it clears the
+## recorded host session only.
 static func release_session() -> void:
+	_host_open = false
+	_advertised = false
 	if preferred_kind() == Kind.STEAM:
 		SteamTransport.service().release_session()

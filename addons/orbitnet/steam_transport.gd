@@ -132,6 +132,10 @@ var _peer_steam: Dictionary[int, int] = {}
 var _hosted_lobby_id: int = 0
 var _advertise_max: int = 0             # the "max players" to publish as lobby metadata once the lobby is created
 var _advertise_friends_only: bool = false
+# A host opened with `advertise = false` and not yet published: advertise_session() creates the lobby (listen host)
+# or turns the game-server listing on (dedicated host) from the settings stored at creation.
+var _advertise_pending: bool = false
+var _hosting_dedicated: bool = false
 # The most recent discovery result (Steam-blind [NetSessionInfo] rows), refreshed from lobby_match_list. Read by
 # sessions(); the join browser renders it. Empty until the first requestLobbyList result arrives.
 var _sessions: Array[NetSessionInfo] = []
@@ -218,7 +222,8 @@ func _process(_delta: float) -> void:
 ## any failure (GodotSteam absent, init failed, create_host failed) so the session layer's host path stays OFFLINE /
 ## surfaces the error exactly as it does for an ENet failure. `max_clients` is advisory on Steam (the relay does
 ## not take a hard cap the way ENet does); kept in the signature for parity with the ENet arm.
-func create_listen_host(_port: int, max_clients: int, friends_only: bool = false) -> MultiplayerPeer:
+func create_listen_host(_port: int, max_clients: int, friends_only: bool = false,
+		advertise: bool = true) -> MultiplayerPeer:
 	if not _ensure_client():
 		return null
 	var peer: MultiplayerPeer = _create_host_peer(max_clients)
@@ -226,9 +231,16 @@ func create_listen_host(_port: int, max_clients: int, friends_only: bool = false
 		# Surface this host's Steam ID so a second account can join it (the SessionMenu join field / --join= carries a
 		# Steam ID on a Steam build, not an IP). The relay needs no port-forwarding -- just this 64-bit id.
 		print("SteamTransport: Steam listen host ready -- joiners use this host's Steam ID: %d" % _local_steam_id())
+		_hosting_dedicated = false
+		_advertise_max = max_clients
+		_advertise_friends_only = friends_only
 		# advertise a discoverable lobby carrying the cap + friends-only flag so the join browser can find this
 		# session (best-effort; a lobby-create failure never blocks the host -- the direct-Steam-ID join still works).
-		_advertise_lobby(max_clients, friends_only)
+		# Deferred to advertise_session() when the caller opened the host unadvertised.
+		if advertise:
+			_advertise_lobby(max_clients, friends_only)
+		else:
+			_advertise_pending = true
 	return peer
 
 ## Build a Steam DEDICATED-server host peer -- the headless, no-local-player path (the session layer's dedicated path).
@@ -236,16 +248,42 @@ func create_listen_host(_port: int, max_clients: int, friends_only: bool = false
 ## discover + connect to it over Steam's relay by lobby / server id, mirroring the ENet dedicated server's raw
 ## IP:port reachability but over Steam (dedicated-server deliverable). The factory is the ONLY thing that
 ## knows the server registered itself with Steam -- host_dedicated is unchanged.
-func create_dedicated_host(_port: int, max_clients: int, friends_only: bool = false) -> MultiplayerPeer:
+func create_dedicated_host(_port: int, max_clients: int, friends_only: bool = false,
+		advertise: bool = true) -> MultiplayerPeer:
 	if not _ensure_game_server():
 		return null
 	var peer: MultiplayerPeer = _create_host_peer(max_clients)
 	# a dedicated server has no logged-in Steam user, so it cannot create a client-owned matchmaking lobby the
 	# way a listen host does -- discovery for a dedicated server rides the game-server registration
-	# (setAdvertiseServerActive, wired in _ensure_game_server). The friends-only flag is a client-lobby concept and
-	# is inert here; kept in the signature for parity with the listen path.
+	# (setAdvertiseServerActive). The friends-only flag is a client-lobby concept and is inert here; kept in the
+	# signature for parity with the listen path.
 	_advertise_friends_only = friends_only
+	if peer != null:
+		_hosting_dedicated = true
+		if advertise:
+			_set_server_advertised(true)
+		else:
+			_advertise_pending = true
 	return peer
+
+## Publish a host opened with `advertise = false` (see [method NetTransport.advertise_session]): create the lobby
+## for a listen host, or turn the game-server listing on for a dedicated one. A no-op when nothing is pending.
+func advertise_session() -> void:
+	if not _advertise_pending:
+		return
+	_advertise_pending = false
+	if _hosting_dedicated:
+		_set_server_advertised(true)
+	else:
+		_advertise_lobby(_advertise_max, _advertise_friends_only)
+
+# The dedicated server's listing in Steam's server browser, on or off. Guarded across the GodotSteam-Server function
+# names, like every server call here.
+func _set_server_advertised(on: bool) -> void:
+	if _steam_obj == null or not _server_ready:
+		return
+	_call_first(_steam_obj, [&"setAdvertiseServerActive", &"serverSetAdvertiseServerActive",
+		&"gameServerSetAdvertiseServerActive"], [on])
 
 ## Build a Steam client peer joining `target` -- the Steam analog of the ENET arm's create_client. `target` is
 ## the host's Steam ID (a 64-bit id as a decimal string; the SessionMenu "address" field carries it on a Steam
@@ -351,10 +389,10 @@ func _ensure_game_server() -> bool:
 	if not _init_ok(result):
 		push_warning("SteamTransport: server init (app=%d) failed: %s (verify GodotSteam-Server API)" % [app_id, str(result)])
 		return false
-	# Log the server on anonymously + advertise it so a client can discover/connect over the relay. Best-effort +
-	# guarded across GodotSteam server-function names (VERIFY against the vendored version).
+	# Log the server on anonymously so a client can connect over the relay. Best-effort + guarded across GodotSteam
+	# server-function names (VERIFY against the vendored version). The server-browser LISTING is not turned on here:
+	# create_dedicated_host does that, or advertise_session() does for a host opened unadvertised.
 	_call_first(steam, [&"logOnAnonymous", &"serverLogOnAnonymous", &"gameServerLogOnAnonymous"], [])
-	_call_first(steam, [&"setAdvertiseServerActive", &"serverSetAdvertiseServerActive", &"gameServerSetAdvertiseServerActive"], [true])
 	_steam_obj = steam
 	_connect_auth_response(steam)
 	_server_ready = true
@@ -782,8 +820,12 @@ func _on_connection_failed() -> void:
 ## advertised -- otherwise the lobby lingers in every browser as a ghost row, and re-hosting in the same process
 ## leaks a second lobby. Safe to call on any build, in any state.
 func release_session() -> void:
+	_advertise_pending = false
 	if _steam_obj == null:
 		return
+	if _hosting_dedicated:
+		_set_server_advertised(false)
+		_hosting_dedicated = false
 	if _hosted_lobby_id != 0:
 		_call_first(_steam_obj, [&"leaveLobby"], [_hosted_lobby_id])
 		_hosted_lobby_id = 0
