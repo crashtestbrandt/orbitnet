@@ -57,6 +57,12 @@ per row, and a lobby that is full or mid-teardown is filterable before anyone tr
 Republish the headcount off the same peer-connect boundary the session layer already watches, so the browser
 cannot show a stale count.
 
+**A host can open its session before it is findable.** `create_server(port, max, friends_only, false)` opens
+the peer and publishes nothing: no lobby for a listen host, no server-browser listing for a dedicated one.
+`advertise_session()` publishes it. A game whose world has to be built with the peer already set calls it once
+that world exists, so no browser row points at a host with nothing to join. `is_session_advertised()` records
+the same state on ENet, where nothing is published, so the order is testable without Steam.
+
 ## Auth tickets
 
 A dedicated server has no user account, so it cannot infer trust from a lobby. The transport exchanges
