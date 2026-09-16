@@ -2,9 +2,9 @@
 
 What is open, ranked. One row per issue, so the ranking is actionable rather than descriptive.
 
-- **The tiers are an ordering, not a schedule.** Nothing here carries a date, and a lower tier is not blocked
-  on a higher one unless a row says so.
-- **This file is not a decision record.** `CONTRIBUTING.md`'s rule stands. A decision goes in the README, a
+- **The tiers order the work.** Nothing here carries a date, and a lower tier waits on a higher one only
+  where a row says so.
+- **This file is a backlog.** `CONTRIBUTING.md`'s rule on decisions stands. A decision goes in the README, a
   `docs/` page, or the header comment of the file it governs. A row that resolves into a decision records it
   there.
 - **The README's [Limits](README.md#limits) section is the companion to this one.** Limits states what is known
@@ -18,7 +18,7 @@ Ranked first because every other tier is measured through it, and a gap here hid
 | --- | --- | --- |
 | `bench-check` runs locally and not in CI | [#74](https://github.com/crashtestbrandt/orbitnet/issues/74) | `compare.py --self-test` is in `just check` and absent from `check.yml`, so the rules that judge every performance claim are ungated. |
 | Nothing runs netbench on a schedule | [#75](https://github.com/crashtestbrandt/orbitnet/issues/75) | No workflow carries a `schedule:`. Without run history, no column can be given a threshold. |
-| `want_full_nacks_s` is reported, not gated | [#69](https://github.com/crashtestbrandt/orbitnet/issues/69) | PR #70 landed the server-side window. `bench.sh:272` still reports the counter without asserting it, which is that issue's item 2. Blocked on #75. |
+| `want_full_nacks_s` has no threshold | [#69](https://github.com/crashtestbrandt/orbitnet/issues/69) | PR #70 landed the server-side window. `bench.sh:272` still reports the counter without asserting it, which is that issue's item 2. Blocked on #75. |
 | Every impairment run is loopback | [#76](https://github.com/crashtestbrandt/orbitnet/issues/76) | A relayed link reorders and duplicates on its own schedule. `gauntlet.sh` can measure one and has no recorded run. |
 
 ## Tier 2 — Coverage
@@ -82,7 +82,7 @@ Listed so the roadmap is not read as a list of oversights.
 - **The interest grid stays unused.** It is written and tested and applies the same rules as the flat scan,
   and it is slower at the extents a session runs at. `net.perf`'s `interest_ms` is the number that would
   reopen it (`docs/architecture.md:114`).
-- **Web is out, and not a build-matrix question.** Godot's web export cannot load a GDExtension at all.
+- **Web is out.** Godot's web export cannot load a GDExtension at all, so no build matrix reaches it.
 - **An unauthenticated X25519 exchange is declined.** It is substituted by exactly the on-path attacker it
   would defend against, at the cost of several hundred lines of hand-written field arithmetic
   (`auth.rs:36-41`). #84 is the authenticated form, which is a different trade.

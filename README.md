@@ -73,7 +73,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 |---|---|
 | [getting-started.md](docs/getting-started.md) | Your first replicated body. **Start here.** |
 | [api.md](docs/api.md) | The full surface, wire quantization, and the f64/i64 scalar reality. |
-| [rts-demo.md](docs/rts-demo.md) | A worked example that is not a character shooter, with the byte budget spelled out. |
+| [rts-demo.md](docs/rts-demo.md) | A worked example from a different genre, with the byte budget spelled out. |
 | [hockey-demo.md](docs/hockey-demo.md) | The rollback lane on an object nobody authors, and the correction measured in millimeters. |
 | [arena-demo.md](docs/arena-demo.md) | Three interest axes, several seats on one connection, and a rewind sized per shooter and per target. |
 | [architecture.md](docs/architecture.md) | Crate layout, batching, history, prop roles, threading. |
