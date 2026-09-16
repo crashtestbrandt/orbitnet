@@ -29,6 +29,7 @@ just rts-host                    # then `just rts-join` in another terminal
 > **0.x.** `Net` is the surface intended to be stable, and before 1.0 that covers its shape rather than its
 > behavior. **A minor version may change what an existing `Net` call returns**, alongside the wire format and
 > the Rust internals. Pin a tag, and read [Upgrading from 0.2.x](#upgrading-from-02x) before moving one.
+> [ROADMAP.md](ROADMAP.md) ranks what is open.
 
 ## Three lanes
 
@@ -62,21 +63,9 @@ project. Both directories are required: `Net` without the extension is a facade 
 |---|---|
 | **Godot** | 4.4+ (built against the 4.4 API; loads in anything at or above it) |
 | **Language** | GDScript. No C# bindings. |
-| **Platforms** | Linux x86_64, Windows x86_64, macOS universal |
+| **Platforms** | Linux x86_64, Windows x86_64, macOS universal. Linux arm64, Android and iOS have no published build yet — see [ROADMAP.md](ROADMAP.md) |
 | **Transports** | ENet out of the box; Steam via [GodotSteam](https://godotsteam.com/), selected by export-preset feature tag |
 | **Not supported** | Web — Godot's web export cannot load a GDExtension |
-
-## Upgrading from 0.2.x
-
-**`PROTOCOL_VERSION` moved major 6 → 8**, so a 0.2.x peer and a current one refuse each other's handshake.
-Upgrade both ends of a session together. The three `Net` changes below raise nothing — the 0.2.1 call still
-compiles, still runs, and means something else.
-
-| Change | What breaks | What to do |
-|---|---|---|
-| **`Net.peer_rtt_ms()` is capped** at `Net.rtt_believed_max_ms`, 250 ms by default | a scoreboard ping reads 250 for every player on a worse link | display `Net.peer_rtt_raw_ms()`, and keep `peer_rtt_ms()` for anything that feeds a rewind |
-| **Resuming a seat needs `Net.set_resume_token()`** beside `Net.set_session_id()` | a game that persisted only the session id is seated as a newcomer | persist `Net.resume_token()` too, and restore both before the join |
-| **A `NetCommand` validator returning a non-zero `int` is a refusal** carrying that code | a validator that returned a truthy int to mean "applied" now refuses every request | return `true`, or `NetCommand.CODE_OK` (`0`), to apply |
 
 ## Docs
 
@@ -179,37 +168,36 @@ distance band, beside the flat per-shooter window they refine.
 
 ## Limits
 
-Known and filed, not hidden.
+What is open or deliberately bounded about the shipped behavior. Several entries are decisions rather
+than gaps. [ROADMAP.md](ROADMAP.md) ranks what is planned.
 
-### The addon reports; the game decides
+### What the addon reports and leaves to the game
 
-Three of these are one shape. OrbitNet now publishes a fact it used to keep to itself, and still acts on none
-of them — freeing a body, releasing a seat and refusing a resume are game decisions, and a default that made
-any of them would be wrong for somebody.
+Three facts OrbitNet reports and never acts on. Freeing a body, releasing a seat and refusing a resume
+are game decisions, and any default here would be wrong for somebody.
 
-- **Nothing despawns, and a client is now told which entities stopped.** A culled entity — or one
+- **Nothing despawns, and the client is told which entities stopped.** A culled entity — or one
   `Net.set_entity_hidden()` withholds — freezes at its last received pose rather than leaving the scene. The
   per-peer diff the send path already computed rides the snapshot as a flag-guarded trailing section, two
   bytes per changed entity on the ticks that changed and nothing at rest, and reaches the game as
   `Net.entity_left_interest` / `Net.entity_entered_interest`. `Net.entities_in_interest()` answers the same
-  question for a handler bound mid-session. **The addon still frees nothing.** Hide rather than free: a
+  question for a handler bound mid-session. **The addon frees nothing.** Hide rather than free — a
   nearest-N eviction can oscillate at the boundary, and freeing turns that into spawn churn.
 - **Releasing a seat is the game's call, and a dropped connection keeps its own by default.** Its bodies hold
   the authority they were given until the game changes them, which is what the reconnect grace window is for.
   `Net.set_seat_release_policy()` says otherwise in one call, and `Net.release_peer_seats(peer)` does it
   directly under any policy. Freeing the node is still yours.
-- **A peer that declares nothing still has its center and world inferred.** Without `Net.set_peer_anchor()` or
-  `set_peer_anchor_entity()` both are read off the lowest-id rollback entity each of that peer's **seats**
-  drives — so a seat driving more than one body is placed by whichever that is, and a peer driving none has
-  neither and sees everything, uncapped, because an entity with no distance is kept uncullable and an
-  uncullable entity occupies no slot in `set_aoi_max_entities()`. The inference and its default are unchanged.
-  What is new: `Net.peer_anchor()` reports what is actually in effect, an inference whose dropped bodies
-  disagreed about the **world** warns once, and `Net.set_unanchored_policy(CLOSED)` makes "declare nothing"
-  mean "receive nothing".
+- **A peer that declares nothing still has its center and world inferred.** Without `Net.set_peer_anchor()`
+  or `set_peer_anchor_entity()`, both are read off the lowest-id rollback entity each of that peer's **seats**
+  drives. A seat driving more than one body is placed by whichever that is, and a peer driving none has
+  neither and sees everything, uncapped — an entity with no distance is kept uncullable, and an uncullable
+  entity occupies no slot in `set_aoi_max_entities()`. `Net.peer_anchor()` reports what is in effect, an
+  inference whose dropped bodies disagreed about the **world** warns once, and
+  `Net.set_unanchored_policy(CLOSED)` makes "declare nothing" mean "receive nothing".
 
 ### Security
 
-- **A session identity is client-asserted; the token narrows what asserting one buys.** The server mints a
+- **A session identity is client-asserted, and the token narrows what asserting one buys.** The server mints a
   **resume token** per identity, sends it in the welcome, and a rejoiner must quote it back — so a peer that
   merely *observed* somebody's session id, off a roster broadcast or a log line, can no longer take that
   player's body. **An on-path observer still can**, because it reads the welcome the token traveled in. Under
@@ -218,26 +206,28 @@ any of them would be wrong for somebody.
   that, at the cost of every genuinely fast reconnect. **Persist the token beside the session id**, or a
   restarted process cannot resume.
 - **The session key crosses the wire in the clear unless the game supplies a secret.** Every datagram but the
-  handshake carries a MAC and a replay sequence. With no secret configured the handshake carries the key they
-  are checked with: an attacker who cannot read the session's traffic cannot forge a datagram and one connected
-  peer cannot forge another's, but **an on-path observer who reads the handshake can do everything the client
-  can**. `Net.set_session_secret()` changes that — the handshake's 16 bytes become a **nonce**, the key is
-  derived from it and the secret, and an observer reading the handshake learns nothing. The secret has to come
-  from a channel the game already authenticates: a lobby, a matchmaker ticket. **None of this encrypts
-  anything**, the ceiling is still a 64-bit tag and a 128-bit key, and an on-path observer can still **replay**
-  a join it recorded — the nonce is the client's choice, so presenting it again derives the same key. It
-  authors nothing new and the captured datagrams land nowhere, but closing that too needs a value the acceptor
-  contributes and therefore a second round trip before a client may send anything.
-  An X25519 exchange was considered and declined: unauthenticated ECDH is substituted by exactly the on-path
-  attacker this bullet is about, so it would demote the adversary to passive-only in exchange for several
-  hundred lines of hand-written constant-time field arithmetic in a zero-dependency crate with no timing
-  harness to prove it stayed constant-time.
+  handshake carries a MAC and a replay sequence. With no secret configured, the handshake carries the key
+  those are checked with. An attacker who cannot read the session's traffic cannot forge a datagram, and one
+  connected peer cannot forge another's, but **an on-path observer who reads the handshake can do everything
+  the client can**.
+- **`Net.set_session_secret()` closes that, and the secret has to come from a channel the game already
+  authenticates** — a lobby, a matchmaker ticket. The handshake's 16 bytes become a **nonce**, the key is
+  derived from it and the secret, and an observer reading the handshake learns nothing.
+- **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes. The
+  ceiling is a 64-bit tag and a 128-bit key, and an on-path observer can still **replay** a join it recorded,
+  because the nonce is the client's choice and presenting it again derives the same key. It authors nothing
+  new and the captured datagrams land nowhere. Closing that needs a value the acceptor contributes, and
+  therefore a second round trip before a client may send anything. An X25519 exchange was considered and
+  declined — unauthenticated ECDH is substituted by exactly the on-path attacker these bullets are about, so
+  it would demote the adversary to passive-only in exchange for several hundred lines of hand-written
+  constant-time field arithmetic in a zero-dependency crate with no timing harness to prove it stayed
+  constant-time. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
 - **A peer's reported round trip is checked, and what the server believes is bounded.** The server mints a
   token per snapshot frame from a secret it never transmits and refuses any acknowledgment that does not quote
   it back, so a peer cannot acknowledge a frame that never reached it. It can still acknowledge a frame
   **older** than the newest it holds, which reads as a slow link and is believed — indistinguishable from a
   peer behind a traffic shaper, and no wire field closes it, because `current - ack` is the whole round trip
-  whatever tick lead a client runs at. The containment is `Net.rtt_believed_max_ms`, 250 ms by default: the
+  whatever tick lead a client runs at. The containment is `Net.rtt_believed_max_ms`, 250 ms by default. The
   sample is clamped **at the read**, so every acknowledgment still buys everything else it bought and only
   the clock measurement is bounded. `Net.peer_rtt_raw_ms()` keeps a scoreboard ping honest, and
   `bandwidth_metrics()["rtt_at_ceiling_peers"]` says how many connections are asking for the deepest window.
@@ -255,6 +245,18 @@ any of them would be wrong for somebody.
   make the body uncullable so it replicated to all of them. **Range, rate and plausibility are still yours**,
   inside `_rollback_tick`, on the server. The full split is in
   [docs/protocol.md](docs/protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
+
+## Upgrading from 0.2.x
+
+**`PROTOCOL_VERSION` moved major 6 → 8**, so a 0.2.x peer and a current one refuse each other's handshake.
+Upgrade both ends of a session together. The three `Net` changes below raise nothing — the 0.2.1 call still
+compiles, still runs, and means something else.
+
+| Change | What breaks | What to do |
+|---|---|---|
+| **`Net.peer_rtt_ms()` is capped** at `Net.rtt_believed_max_ms`, 250 ms by default | a scoreboard ping reads 250 for every player on a worse link | display `Net.peer_rtt_raw_ms()`, and keep `peer_rtt_ms()` for anything that feeds a rewind |
+| **Resuming a seat needs `Net.set_resume_token()`** beside `Net.set_session_id()` | a game that persisted only the session id is seated as a newcomer | persist `Net.resume_token()` too, and restore both before the join |
+| **A `NetCommand` validator returning a non-zero `int` is a refusal** carrying that code | a validator that returned a truthy int to mean "applied" now refuses every request | return `true`, or `NetCommand.CODE_OK` (`0`), to apply |
 
 ## License
 
