@@ -94,6 +94,7 @@ compiles, still runs, and means something else.
 | [steam.md](docs/steam.md) | The Steam transport contract. |
 | [crash-capture.md](docs/crash-capture.md) | What a release build records when it dies, and the Windows fail-fast gap. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Layout, the enforced boundaries, the GDScript rules. |
+| [ROADMAP.md](ROADMAP.md) | What is open, ranked, with an issue per row. |
 
 ## The RTS demo
 
