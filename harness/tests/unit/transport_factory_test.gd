@@ -43,21 +43,48 @@ func test_a_session_peer_outlasts_a_stalled_frame_but_a_dead_one_still_goes() ->
 
 func test_holding_a_peer_through_a_hitch_is_a_no_op_without_an_open_enet_peer() -> void:
 	# The call site is a game's `peer_connected` handler, which runs on every transport. Steam, offline and a peer
-	# that failed to open all reach it, and none of them may raise.
-	NetTransport.hold_through_hitches(null)
-	NetTransport.hold_through_hitches(null, 2)
-	NetTransport.hold_through_hitches(OfflineMultiplayerPeer.new())
-	NetTransport.hold_through_hitches(ENetMultiplayerPeer.new())
-	assert_true(true, "offline, unopened and absent peers are all no-ops")
+	# that failed to open all reach it, and none of them may raise. The count is how many connections took the floor.
+	assert_eq(NetTransport.hold_through_hitches(null), 0, "no peer at all")
+	assert_eq(NetTransport.hold_through_hitches(null, 2), 0, "...nor for one id")
+	assert_eq(NetTransport.hold_through_hitches(OfflineMultiplayerPeer.new()), 0, "an offline peer holds nothing")
+	assert_eq(NetTransport.hold_through_hitches(ENetMultiplayerPeer.new()), 0, "...nor one that never opened")
 
-func test_an_open_enet_host_takes_the_floor() -> void:
-	# Port 0: the OS picks a free one, so the suite never collides with a running session.
+func test_an_unknown_peer_id_holds_nothing_rather_than_everything() -> void:
+	# THE FAILURE THAT MATTERS: asking for one connection and getting all of them. The id comes from a
+	# `peer_connected` handler and the peer can be gone by the time it runs, so an id that resolves to nothing
+	# must set nothing -- the count is what says which of the two happened.
 	var peer: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
-	assert_eq(peer.create_server(0, 4), OK, "a host opens")
-	NetTransport.hold_through_hitches(peer)          # no connections yet: nothing to set, and no error
-	NetTransport.hold_through_hitches(peer, 2)       # ...nor for a peer id that has not joined
+	assert_eq(peer.create_server(0, 4), OK, "a host opens")   # port 0: the OS picks a free one
+	assert_eq(NetTransport.hold_through_hitches(peer, 7), 0, "an id that joined nothing holds nothing")
+	assert_eq(NetTransport.hold_through_hitches(peer), 0, "and the host's own connection list is empty")
 	assert_eq(peer.get_connection_status(), MultiplayerPeer.CONNECTION_CONNECTED, "the host is still open")
 	peer.close()
+
+func test_a_live_connection_takes_the_floor_and_a_stranger_id_takes_nothing() -> void:
+	# The distinction only shows once a connection EXISTS: with none open, holding one peer and holding them all
+	# both count zero. So this opens a host and a client on the loopback and polls them into a handshake, with a
+	# bounded budget -- no scene tree, no timers. A machine with no loopback UDP stands the case down rather than
+	# failing; the guarantee it covers is structural either way.
+	var server: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
+	assert_eq(server.create_server(0, 4), OK, "a host opens")   # port 0: the OS picks a free one
+	var client: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
+	assert_eq(client.create_client("127.0.0.1", server.host.get_local_port()), OK, "a client opens")
+	var joined: Array[int] = []
+	server.peer_connected.connect(func(id: int) -> void: joined.push_back(id))
+	for _i: int in 400:
+		server.poll()
+		client.poll()
+		if not joined.is_empty():
+			break
+		OS.delay_msec(2)
+	if not joined.is_empty():
+		var id: int = joined[0]
+		assert_eq(NetTransport.hold_through_hitches(server, id), 1, "the connection that joined takes the floor")
+		assert_eq(NetTransport.hold_through_hitches(server, id + 1), 0,
+			"an id that named no connection takes nothing, rather than every connection")
+		assert_eq(NetTransport.hold_through_hitches(server), 1, "and every open connection is the one")
+	client.close()
+	server.close()
 
 func test_a_host_opened_unadvertised_is_published_only_when_asked() -> void:
 	# A game that builds its world after setting the peer opens the host unadvertised and publishes it once the

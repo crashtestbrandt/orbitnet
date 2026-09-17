@@ -135,19 +135,30 @@ const SESSION_TIMEOUT_MAX_MS: int = 30000
 ## ENet's own retry count before the floor applies, spelled out so the call reads.
 const SESSION_TIMEOUT_LIMIT: int = 32
 
-## Let `peer_id`'s connection ride out a stalled frame, or every open connection when `peer_id` is 0.
+## Let `peer_id`'s connection ride out a stalled frame, or every open connection when `peer_id` is 0. Returns how
+## many connections took the floor.
 ##
 ## Call it as a peer joins, and on a client once it reaches the server: the stall a client has to ride out is the
 ## HOST's. ENet only -- a no-op on Steam, offline, and a peer that was never opened.
-static func hold_through_hitches(peer: MultiplayerPeer, peer_id: int = 0) -> void:
+##
+## A `peer_id` that names no live connection sets NOTHING. Asking for one peer and silently getting all of them is
+## the wrong way for this to fail: the id comes from a `peer_connected` handler, and a peer can be gone again by the
+## time the handler runs.
+static func hold_through_hitches(peer: MultiplayerPeer, peer_id: int = 0) -> int:
 	var enet: ENetMultiplayerPeer = peer as ENetMultiplayerPeer
 	if enet == null or enet.host == null:
-		return
-	var wanted: ENetPacketPeer = enet.get_peer(peer_id) if peer_id != 0 else null
+		return 0
+	if peer_id != 0:
+		var wanted: ENetPacketPeer = enet.get_peer(peer_id)
+		if wanted == null:
+			return 0
+		wanted.set_timeout(SESSION_TIMEOUT_LIMIT, SESSION_TIMEOUT_MIN_MS, SESSION_TIMEOUT_MAX_MS)
+		return 1
+	var held: int = 0
 	for connection: ENetPacketPeer in enet.host.get_peers():
-		if wanted != null and connection != wanted:
-			continue
 		connection.set_timeout(SESSION_TIMEOUT_LIMIT, SESSION_TIMEOUT_MIN_MS, SESSION_TIMEOUT_MAX_MS)
+		held += 1
+	return held
 
 # --- player identity (Steam-blind seam) ------------------------------------------------------------------
 ## Set (or clear, with "") this peer's local display-name override -- the `net.name` console cvar routes here. It
