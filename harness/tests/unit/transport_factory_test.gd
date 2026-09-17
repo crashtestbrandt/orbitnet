@@ -32,6 +32,33 @@ func test_the_default_port_and_client_cap_are_sane() -> void:
 	assert_true(NetTransport.DEFAULT_PORT < 65536, "and is a valid UDP port")
 	assert_true(NetTransport.DEFAULT_MAX_CLIENTS >= 2, "a default session can hold at least two players")
 
+func test_a_session_peer_outlasts_a_stalled_frame_but_a_dead_one_still_goes() -> void:
+	# The floor is what a host's own worst synchronous frame is measured against, so it has to be longer than
+	# ENet's 5 s default by a margin. The ceiling is ENet's own: this keeps a stalled peer, not a dead one.
+	assert_true(NetTransport.SESSION_TIMEOUT_MIN_MS > 5000, "the floor is longer than ENet's own default")
+	assert_true(NetTransport.SESSION_TIMEOUT_MIN_MS >= 15000, "and long enough to cover a world-build hitch")
+	assert_true(NetTransport.SESSION_TIMEOUT_MAX_MS > NetTransport.SESSION_TIMEOUT_MIN_MS,
+		"a peer that is really gone still goes, at the ceiling")
+	assert_true(NetTransport.SESSION_TIMEOUT_LIMIT > 0, "the retry count before the floor applies is ENet's own")
+
+func test_holding_a_peer_through_a_hitch_is_a_no_op_without_an_open_enet_peer() -> void:
+	# The call site is a game's `peer_connected` handler, which runs on every transport. Steam, offline and a peer
+	# that failed to open all reach it, and none of them may raise.
+	NetTransport.hold_through_hitches(null)
+	NetTransport.hold_through_hitches(null, 2)
+	NetTransport.hold_through_hitches(OfflineMultiplayerPeer.new())
+	NetTransport.hold_through_hitches(ENetMultiplayerPeer.new())
+	assert_true(true, "offline, unopened and absent peers are all no-ops")
+
+func test_an_open_enet_host_takes_the_floor() -> void:
+	# Port 0: the OS picks a free one, so the suite never collides with a running session.
+	var peer: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
+	assert_eq(peer.create_server(0, 4), OK, "a host opens")
+	NetTransport.hold_through_hitches(peer)          # no connections yet: nothing to set, and no error
+	NetTransport.hold_through_hitches(peer, 2)       # ...nor for a peer id that has not joined
+	assert_eq(peer.get_connection_status(), MultiplayerPeer.CONNECTION_CONNECTED, "the host is still open")
+	peer.close()
+
 func test_a_host_opened_unadvertised_is_published_only_when_asked() -> void:
 	# A game that builds its world after setting the peer opens the host unadvertised and publishes it once the
 	# world exists. ENet publishes nothing, but records the same flags, which is what lets this run without Steam.
