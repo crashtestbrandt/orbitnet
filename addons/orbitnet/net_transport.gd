@@ -117,6 +117,49 @@ static func create_client(address: String, port: int = DEFAULT_PORT) -> Multipla
 		_:
 			return null
 
+# --- established peers ride out a stalled frame -----------------------------------------------------------
+
+## How long an ENet connection in a session may go unanswered before it is dropped, and the ceiling that still
+## buries one that is really gone.
+##
+## ENet's own floor is 5 s, and a host serves its connection from the game's main loop: a synchronous frame longer
+## than that goes wire-silent and the client's ENet declares the host dead, while the host is alive and about to
+## finish. A world build is that kind of frame -- procedural content built in one call, on a machine slower than the
+## one it was written on. Measured on a LAN behind an 8 s build: 4 of 4 clients dropped.
+##
+## The CEILING is ENet's own, so this buys a live-but-stalled host time rather than keeping a dead one. Steam needs
+## none of it: its keepalives ride the Steam client's service threads instead of the game's loop, which is why the
+## same build never dropped a Steam peer.
+const SESSION_TIMEOUT_MIN_MS: int = 20000
+const SESSION_TIMEOUT_MAX_MS: int = 30000
+## ENet's own retry count before the floor applies, spelled out so the call reads.
+const SESSION_TIMEOUT_LIMIT: int = 32
+
+## Let `peer_id`'s connection ride out a stalled frame, or every open connection when `peer_id` is 0. Returns how
+## many connections took the floor.
+##
+## Call it as a peer joins, and on a client once it reaches the server: the stall a client has to ride out is the
+## HOST's. ENet only -- a no-op on Steam, offline, and a peer that was never opened.
+##
+## A `peer_id` that names no live connection sets NOTHING. Asking for one peer and silently getting all of them is
+## the wrong way for this to fail: the id comes from a `peer_connected` handler, and a peer can be gone again by the
+## time the handler runs.
+static func hold_through_hitches(peer: MultiplayerPeer, peer_id: int = 0) -> int:
+	var enet: ENetMultiplayerPeer = peer as ENetMultiplayerPeer
+	if enet == null or enet.host == null:
+		return 0
+	if peer_id != 0:
+		var wanted: ENetPacketPeer = enet.get_peer(peer_id)
+		if wanted == null:
+			return 0
+		wanted.set_timeout(SESSION_TIMEOUT_LIMIT, SESSION_TIMEOUT_MIN_MS, SESSION_TIMEOUT_MAX_MS)
+		return 1
+	var held: int = 0
+	for connection: ENetPacketPeer in enet.host.get_peers():
+		connection.set_timeout(SESSION_TIMEOUT_LIMIT, SESSION_TIMEOUT_MIN_MS, SESSION_TIMEOUT_MAX_MS)
+		held += 1
+	return held
+
 # --- player identity (Steam-blind seam) ------------------------------------------------------------------
 ## Set (or clear, with "") this peer's local display-name override -- the `net.name` console cvar routes here. It
 ## wins over the transport's own name, so a handle works on ENet too and the name pipeline is testable offline.
