@@ -213,15 +213,22 @@ are game decisions, and any default here would be wrong for somebody.
 - **`Net.set_session_secret()` closes that, and the secret has to come from a channel the game already
   authenticates** — a lobby, a matchmaker ticket. The handshake's 16 bytes become a **nonce**, the key is
   derived from it and the secret, and an observer reading the handshake learns nothing.
-- **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes. The
-  ceiling is a 64-bit tag and a 128-bit key, and an on-path observer can still **replay** a join it recorded,
-  because the nonce is the client's choice and presenting it again derives the same key. It authors nothing
-  new and the captured datagrams land nowhere. Closing that needs a value the acceptor contributes, and
+- **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes, unless the
+  transport underneath encrypts the link — see the next bullet. The ceiling is a 64-bit tag and a 128-bit key,
+  and an on-path observer can still **replay** a join it recorded, because the nonce is the client's choice
+  and presenting it again derives the same key. It authors nothing new and the captured datagrams land
+  nowhere. Closing that needs a value the acceptor contributes, and
   therefore a second round trip before a client may send anything. An X25519 exchange was considered and
   declined — unauthenticated ECDH is substituted by exactly the on-path attacker these bullets are about, so
   it would demote the adversary to passive-only in exchange for several hundred lines of hand-written
   constant-time field arithmetic in a zero-dependency crate with no timing harness to prove it stayed
   constant-time. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+- **Encryption comes from the transport, and OrbitNet supplies none of it.** An ENet session carries every
+  payload in the clear. A Steam session's packets are encrypted and its peer identity authenticated by
+  SteamNetworkingSockets. A game inherits that from the `custom_features="steam"` export-preset tag, not from
+  anything visible at a call site, and loses it when the same code exports without the tag. The per-transport
+  table of what is authenticated, what is encrypted, by whom, and what of it this repository cannot verify is
+  in [docs/steam.md](docs/steam.md#what-each-transport-authenticates-and-encrypts).
 - **A peer's reported round trip is checked, and what the server believes is bounded.** The server mints a
   token per snapshot frame from a secret it never transmits and refuses any acknowledgment that does not quote
   it back, so a peer cannot acknowledge a frame that never reached it. It can still acknowledge a frame
