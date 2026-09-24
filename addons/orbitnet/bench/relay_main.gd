@@ -20,14 +20,14 @@ extends MainLoop
 ##
 ## Args (all after `--`):
 ##   --relay-listen=<port>            UDP port clients connect to (REQUIRED)
-##   --relay-target=<host>:<port>     the real server (default 127.0.0.1:47800)
+##   --relay-target=<host>:<port>     the real server (default 127.0.0.1 on the transport's DEFAULT_PORT)
 ##   --relay-profile=<name>           a NetProfiles catalog name (default clean)
 ##   --relay-seed=<int>               base RNG seed (default 1); each client/direction derives a distinct seed
 ##   --relay-duration=<seconds>       auto-quit after N seconds (default 0 = run until killed)
 ##   --relay-latency/jitter/loss/dup/reorder/reorder_ms=<value>   override individual profile knobs (one-way ms / [0,1])
 
 const _DEFAULT_TARGET_HOST: String = "127.0.0.1"
-const _DEFAULT_TARGET_PORT: int = 47800
+const _DEFAULT_TARGET_PORT: int = NetTransport.DEFAULT_PORT   # the transport's own, so the two cannot drift
 const _MAX_SESSIONS: int = 64          # backstop against unbounded socket growth
 const _POLL_DELAY_USEC: int = 200      # ~5kHz poll: fine for ms-resolution impairment without pinning a core
 const _STAT_INTERVAL_MS: int = 2000    # periodic RELAY: stat line cadence
@@ -172,36 +172,26 @@ func _parse_args() -> void:
 	_profile.reorder = _arg_float(args, "--relay-reorder=", _profile.reorder)
 	_profile.reorder_ms = _arg_float(args, "--relay-reorder_ms=", _profile.reorder_ms)
 
-# `ADDR`, `ADDR:PORT`, or `[LITERAL]:PORT`.
+# The real server's `ADDR`, `ADDR:PORT`, or `[LITERAL]:PORT`, split by the transport's own parser
+# ([method NetTransport.target_address] / [method NetTransport.target_port]) rather than by a rule restated
+# here. That rule -- a bracketed literal names its own port, a single bare colon introduces one, several do
+# not -- had four copies and this was the one that had already diverged.
 #
-# THE LAST COLON DOES NOT DECIDE IT. An IPv6 literal ends in digits, so a rule that split on the last
-# colon with a numeric suffix turned `--relay-target=::1` into host `:` on port 1 -- the same cut the
-# three demos' join targets carried until this release. Only a SINGLE bare colon introduces a port; a
-# target with more is an address in its own right, and naming a port beside one needs brackets.
+# **A malformed target moves NEITHER host nor port**, and that stays this function's own job. The shared
+# accessors always answer: they hand back a default port when the target names none, and hand back the target
+# whole when they cannot read it. Committing those answers unconditionally is what let `x]:47900` write the
+# port while the host kept its previous value, so the relay forwarded to a host:port pair nobody named.
+#
+# A TARGET IS MALFORMED WHEN A BRACKET SURVIVES THE PARSE. A well-formed bracketed literal is unwrapped and a
+# bare one never had brackets, so a `[` or `]` in the address means the target was neither -- `x]:47900`,
+# `[::1`. An empty target names nothing and is the same case, and so is `[]:47900`, whose brackets unwrap to
+# nothing.
 func _parse_target(spec: String) -> void:
-	var body: String = spec
-	var close: int = spec.rfind("]")
-	if close >= 0:
-		# A bracketed target commits host and port together or not at all. Writing the port before
-		# the bracket check let a malformed target -- `x]:47900` -- move the port while the host kept
-		# its previous value, so the relay forwarded to a host:port pair nobody named.
-		var port: int = _target_port
-		var after: int = spec.find(":", close)
-		if after > 0 and after < spec.length() - 1 and spec.substr(after + 1).is_valid_int():
-			port = clampi(spec.substr(after + 1).to_int(), 1, 65535)
-			body = spec.substr(0, after)
-		if body.begins_with("[") and body.ends_with("]") and body.length() > 2:
-			_target_host = body.substr(1, body.length() - 2)
-			_target_port = port
+	var host: String = NetTransport.target_address(spec)
+	if host == "" or host.contains("[") or host.contains("]"):
 		return
-	if spec.count(":") == 1:
-		var parts: PackedStringArray = spec.rsplit(":", false, 1)
-		if parts.size() == 2 and parts[1].is_valid_int():
-			_target_host = parts[0]
-			_target_port = clampi(parts[1].to_int(), 1, 65535)
-			return
-	if spec != "":
-		_target_host = spec
+	_target_host = host
+	_target_port = NetTransport.target_port(spec)
 
 func _arg_str(args: PackedStringArray, prefix: String, fallback: String) -> String:
 	for a: String in args:

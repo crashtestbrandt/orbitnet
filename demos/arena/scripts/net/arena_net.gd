@@ -156,7 +156,11 @@ func join(target: String) -> bool:
 	Net.set_net_tick_decoupled(ArenaConfig.NET_TICK_HZ)   # RULE 2
 	_build_world()                                        # RULE 1, first half. Seats are owned by nobody yet.
 
-	var peer: MultiplayerPeer = NetTransport.create_client(_address_of(target), _port_of(target))
+	# The transport owns the `ADDR[:PORT]` / `[LITERAL]:PORT` rule -- one parser for every caller, and the
+	# demo still never learns which transport it is talking to (a Steam target carries no colon).
+	var host: String = NetTransport.target_address(target)
+	var port: int = NetTransport.target_port(target)
+	var peer: MultiplayerPeer = NetTransport.create_client(host, port)
 	if peer == null:
 		_fail("could not create a client peer for '%s'" % target)
 		return false
@@ -166,8 +170,7 @@ func join(target: String) -> bool:
 	world.bind_net_all()                                  # RULE 1, second half
 	interest_log.attach(multiplayer.get_unique_id())
 	_set_state(State.CONNECTING)
-	print("ARENA: joining %s:%d (%s)" % [
-		_address_of(target), _port_of(target), NetTransport.preferred_kind_name()])
+	print("ARENA: joining %s:%d (%s)" % [host, port, NetTransport.preferred_kind_name()])
 	return true
 
 ## Tear the session down and return the process to a clean OFFLINE state.
@@ -466,48 +469,6 @@ func _apply_roster(owners: PackedInt32Array) -> void:
 	if mine != _local_seats:
 		_local_seats = mine
 		local_seats_changed.emit(_local_seats)
-
-# --- join targets ----------------------------------------------------------------------------------
-static func _address_of(target: String) -> String:
-	var separator: int = _port_separator(target)
-	var address: String = target if separator < 0 else target.substr(0, separator)
-	# `[::1]` and `[::1]:47800` both name the address `::1`. ENet takes the literal; the brackets are there
-	# to keep the port unambiguous in the string, and stop at the string.
-	if address.length() > 1 and address.begins_with("[") and address.ends_with("]"):
-		return address.substr(1, address.length() - 2)
-	return address
-
-static func _port_of(target: String) -> int:
-	var separator: int = _port_separator(target)
-	if separator < 0:
-		return NetTransport.DEFAULT_PORT
-	return clampi(target.substr(separator + 1).to_int(), 1, 65535)
-
-# The index of the ':' that introduces a port, or -1. ONE rule, so the two accessors above can never disagree
-# about where the split is and hand ENet an address and a port that came from different readings of the string.
-static func _port_separator(target: String) -> int:
-	# A BRACKETED IPv6 LITERAL NAMES ITS OWN PORT: `[::1]:47800`. The split goes after the bracket, so no
-	# colon inside the literal can be mistaken for the one that introduces a port.
-	var close: int = target.rfind("]")
-	if close >= 0:
-		var after: int = target.find(":", close)
-		if after < 0 or after >= target.length() - 1:
-			return -1
-		if not target.substr(after + 1).is_valid_int():
-			return -1
-		return after
-	# A BARE IPv6 LITERAL CARRIES SEVERAL COLONS AND NO PORT, and `::1` and `fe80::1` end in digits -- so a
-	# rule that split on the last colon with a numeric suffix handed ENet the address `:` on port 1. Only a
-	# SINGLE colon introduces a port. A target with more is an address in its own right, and naming a port
-	# beside one needs the brackets above, because `a:b:47900` cannot be told apart from a literal otherwise.
-	if target.count(":") != 1:
-		return -1
-	var separator: int = target.rfind(":")
-	if separator <= 0 or separator >= target.length() - 1:
-		return -1
-	if not target.substr(separator + 1).is_valid_int():
-		return -1
-	return separator
 
 # --- internals -------------------------------------------------------------------------------------
 func _build_world() -> void:

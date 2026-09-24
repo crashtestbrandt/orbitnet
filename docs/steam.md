@@ -6,7 +6,8 @@ export-preset feature tag, not by runtime config.
 ```gdscript
 NetTransport.preferred_kind()        # STEAM if OS.has_feature("steam"), else ENET
 NetTransport.create_server(port, max_clients, friends_only)
-NetTransport.create_client(address)  # address is an IP:port on ENet, the host's 64-bit Steam id on Steam
+# `target` is ADDR, ADDR:PORT or [LITERAL]:PORT on ENet, the host's 64-bit Steam id on Steam.
+NetTransport.create_client(NetTransport.target_address(target), NetTransport.target_port(target))
 ```
 
 Your game never learns which is in play. That is the factory's whole job.
