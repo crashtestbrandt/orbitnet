@@ -6,7 +6,7 @@ export-preset feature tag, not by runtime config.
 ```gdscript
 NetTransport.preferred_kind()        # STEAM if OS.has_feature("steam"), else ENET
 NetTransport.create_server(port, max_clients, friends_only)
-NetTransport.create_client(address)  # address is an IP:port on ENet, a lobby handle on Steam
+NetTransport.create_client(address)  # address is an IP:port on ENet, the host's 64-bit Steam id on Steam
 ```
 
 Your game never learns which is in play. That is the factory's whole job.
@@ -97,8 +97,65 @@ already runs. A session that sets none stays on the cleartext key, which is what
 See [protocol.md](protocol.md#datagram-authentication) for the two regimes and for what a misconfiguration
 looks like from each side.
 
+## What each transport authenticates and encrypts
+
+**OrbitNet encrypts nothing on any transport.** Its datagram layer authenticates; confidentiality, where a
+session has any, comes from the link underneath it and differs per transport.
+
+| Transport | What is authenticated | What is encrypted | By whom |
+| --- | --- | --- | --- |
+| **ENet** | every datagram but the handshake, by a 64-bit SipHash tag and a 64-entry replay window. Nothing about the peer behind the connection. | nothing. Every payload is raw UDP in the clear | OrbitNet's datagram layer, with nothing under it |
+| **Steam** | the same datagram tag, and the connection itself — each end presents a certificate signed by Valve's PKI, so a verified Steam identity is attached to the peer before a payload flows | every packet — AES-GCM-256, keyed by a Curve25519 exchange | OrbitNet for the datagram, SteamNetworkingSockets for the connection |
+
+**Every Steam row above rests on Valve's documentation, and none of it is exercised in this repository's
+CI.** Each claim is cited below. See [Testing without Steam](#testing-without-steam) for what confirming it
+takes, and the `VERIFY-ON-A-STEAM-BUILD` marker in `addons/orbitnet/steam_transport.gd` for the same caveat
+on the call signatures quoted here.
+
+What Valve's own documentation supports, read 2026-09-24:
+
+- **The cipher.** "AES-GCM-256 per packet, Curve25519 for key exchange and cert signatures. The details for
+  shared key derivation and per-packet IV are based on the design used by Google's QUIC protocol."
+  ([GameNetworkingSockets](https://github.com/ValveSoftware/GameNetworkingSockets))
+- **Encryption is on by default and both ends have to opt out of it.**
+  `k_ESteamNetworkingConfig_Unencrypted` is "a dev configuration value, since its purpose is to disable
+  encryption ... it requires the peer to also modify their value in order for encryption to be disabled."
+  ([steamnetworkingtypes.h](https://github.com/ValveSoftware/GameNetworkingSockets/blob/master/include/steam/steamnetworkingtypes.h))
+- **It is end to end rather than terminated at a relay.** Certificates are "an end-to-end concept, and can be
+  used in all forms of SteamNetworkingSockets communication, including direct UDP connectivity or P2P", and
+  traffic carried by the relay network is "authenticated, encrypted, and rate-limited".
+  ([Steam Datagram Relay](https://partner.steamgames.com/doc/features/multiplayer/steamdatagramrelay))
+- **Identity authentication depends on how the connection was opened, and encryption does not.** A connection
+  addressed by **Steam identity** carries a certificate at both ends. An **IP-addressed** connection can fail
+  to obtain one, and Valve's default is to refuse it rather than proceed —
+  `k_ESteamNetworkingConfig_IP_AllowWithoutAuth` is documented as "Don't automatically fail IP connections
+  that don't have strong auth". A connection admitted that way is still encrypted, under a key exchange with
+  no verified peer on the other end, which is the same on-path substitution
+  [protocol.md](protocol.md#datagram-authentication) records against an unauthenticated exchange.
+- **The Steam arm here only ever connects by Steam id.** `create_client(steam_id, virtual_port)` takes a
+  64-bit account id and never an address, and `create_host(virtual_port)` takes no address either, so the
+  unauthenticated IP case is not reachable through this transport. A dedicated server logs on anonymously and
+  has no account of its own, which is why it authenticates its clients with the auth tickets above rather than
+  from a lobby.
+
+### What a game inherits and what it configures
+
+- **Confidentiality on Steam is inherited.** The game writes no code for it and OrbitNet contributes nothing
+  to it. The same session exported without Steam puts every payload back in the clear.
+- **The transport is chosen by an export preset.** `NetTransport.preferred_kind()` returns
+  `STEAM` when `OS.has_feature("steam")` trips, which is the `custom_features="steam"` tag on the preset. No
+  line of game code differs between the two builds, so a preset missing that tag ships a build with no link
+  encryption that reads identically everywhere in the source.
+- **What a game configures on every transport is `Net.set_session_secret()`**, and it buys unforgeability
+  rather than confidentiality. See [Where a session secret comes from](#where-a-session-secret-comes-from).
+- **Encrypting OrbitNet's own payloads would buy confidentiality on the ENet path only.** On a Steam link it
+  restates a property the connection already has. The Encryption tier in [ROADMAP.md](../ROADMAP.md) is
+  scoped to the ENet path for that reason, and says why its order does not move.
+
 ## Testing without Steam
 
 Everything above is inert on an ENet build, so the whole netcode surface — including `just netbench` and the
 demos — runs with no Steam installed. What genuinely cannot be tested that way: persona names, lobby
-discovery, invites, and ticket validation. Those need a real Steam build, two accounts and a manual pass.
+discovery, invites, ticket validation, and the link encryption and peer-identity authentication in the table
+above. Those need a real Steam build, two accounts and a manual pass — the encryption and identity rows also
+need a packet capture.
