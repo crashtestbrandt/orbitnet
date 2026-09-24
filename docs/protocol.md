@@ -1,7 +1,8 @@
 # Protocol and the tick model
 
-What is on the wire, how the clock works, and what `is_fresh` guarantees. Read this before changing
-`native/crates/orbitnet-core/`, or when a replication bug does not make sense.
+What is on the wire, how the clock works, what `is_fresh` guarantees, and how versions move across
+releases. Read this before changing `native/crates/orbitnet-core/`, or when a replication bug does not make
+sense.
 
 ## Wire format
 
@@ -1002,3 +1003,110 @@ disagree on size, which is what catches the silent sweep.
 `tools/orbitnet-smoke.sh` gates all of this by freeing a registered body in each window. Note that such a panic
 is *recovered* — the process keeps running with a corrupted frame — so it can only be caught by reading the
 log, never by an exit code.
+
+## Versioning across releases
+
+Two version numbers move here, and each answers a different question.
+
+| Version | Question it answers | Where it is stated |
+| --- | --- | --- |
+| The **addon version** | must game code change | `addons/orbitnet/plugin.cfg`, the release tag, and the generated release notes |
+| The **`PROTOCOL_VERSION` major** | must every peer in a session upgrade together | the majors table in `native/crates/orbitnet-core/src/protocol.rs` |
+
+What separates a major wire bump from a minor one is in that table's comment: a major shifts an existing
+field's offset, a minor is an optional trailing field on a control frame. What follows is the policy across
+releases, which that comment does not cover.
+
+### What 1.0 freezes
+
+**At 1.0 the `Net` surface freezes against change and removal for the whole 1.x line. It stays open to
+addition. The wire does not freeze.**
+
+| Operation on the `Net` surface | Permitted by |
+| --- | --- |
+| **Add** a call, a signal or an optional argument | any 1.x addon minor |
+| **Change** what an existing call does or returns | the next addon major |
+| **Remove** a call | the next addon major, and only after a minor deprecated it |
+
+- The README's 0.x note is the promise that ends at 1.0. Before 1.0 a minor may change what an existing `Net`
+  call returns; from 1.0 that change needs a new addon major.
+- `PROTOCOL_VERSION` keeps moving inside 1.x, major included.
+
+What it commits the project to:
+
+- A change to what an existing `Net` call returns waits for the next addon major, or ships as a new call
+  beside the old one by the deprecation path below.
+- **No release promises that two different builds interoperate.** One build on every peer in a session is the
+  supported configuration, before and after 1.0.
+
+The wire stays free to change because a session is symmetric. Every peer in one runs a build the game
+shipped, so a wire change costs a coordinated upgrade and no source edit. Freezing the wire at 1.0 would
+instead fix the frame layout for the life of 1.x — the manifest delta and the interest table each forced a
+major inside the 0.3 line alone — or make one header field cost a 2.0.
+
+### The wire version moves independently of the addon version
+
+**A `PROTOCOL_VERSION` major bump does not force an addon major.** It forces an addon minor at least, and the
+release notes name it.
+
+- An **addon major** means game code may have to change.
+- A **wire major** means every peer in a session must be on a build speaking that major, and says nothing
+  about game code.
+- A release may carry either, both, or neither, and states which. Neither number is derivable from the other.
+
+### Two protocol majors never interoperate
+
+**Major must match exactly, and that is permanent.** The handshake's own compatibility check refuses a
+mismatched major and names both version strings in the log of the peer that refused. There is no per-field
+capability negotiation, no dual-decode window, and no plan for either — [Compatibility, stated rather than
+hidden](#compatibility-stated-rather-than-hidden) states the same for the resume token's own fields.
+
+What that means for a game running a live service:
+
+- **The session is the upgrade unit.** Every peer in a session moves together, and a session is never
+  upgraded in place. A server on the new build accepts only peers speaking its major, and refuses the rest at
+  the handshake instead of decoding their frames into garbage.
+- Carrying both across a transition means running both server builds and sending each client to the one
+  matching its own. Nothing in the addon routes that; it belongs to the game's lobby or matchmaker.
+- **The refusal is visible on the accepting peer only.** `handle_hello` logs the mismatch with both version
+  strings and drops the hello. There is no reject frame kind, no refusal signal on `Net`, and no callback in
+  [api.md](api.md), so the joining peer sees a welcome that never arrives. A mismatch in either direction is
+  refused by the accepting side, so the joiner learns nothing either way.
+- **An "update to continue" prompt is the game's own build-version exchange, not this one.** OrbitNet
+  compares protocol majors and nothing about game content or rules. A game that wants a client-visible
+  reason sends its own version over its lobby or matchmaker, above the addon.
+
+What the project gets for that cost is a frame layout free to change, because no receiver ever decodes two
+majors. A negotiated wire would keep every retired field on the hot path for as long as the negotiation
+offered it.
+
+### Deprecation path for a `Net` call whose meaning changes
+
+Three 0.3 changes altered what an existing call means and raised nothing; the README's [Upgrading from
+0.2.x](../README.md#upgrading-from-02x) table is how they were communicated. From 1.0 that is not the path.
+
+This is the path the next such change takes. **No `Net` call is deprecated today**, so api.md carrying no
+deprecation marker is accurate rather than an omission, and nothing in `net.gd` yet emits the warning step 2
+asks for.
+
+| Step | Rule |
+| --- | --- |
+| 1 | The new meaning ships under a **new name**. The existing call keeps the behavior it documented. |
+| 2 | The superseded call is marked deprecated in [api.md](api.md), naming what to move to, and pushes a warning on its first call in a run. |
+| 3 | It is removed no earlier than the next addon major, and its removal is a release-notes line. |
+
+Inside 1.x an existing `Net` call therefore behaves as its documentation says. A call whose meaning changes
+in place is a 0.x-only event.
+
+### Pending wire breaks ship together
+
+**Rule: a change that forces a protocol major waits for the other pending majors, and they ship in one
+release.** Several pending majors landing in separate releases costs every consumer one coordinated upgrade of
+every peer each; landing them in one release costs one.
+
+- A merged change still bumps `PROTOCOL_VERSION` as it lands, so no build is ever wrong about its own frame
+  layout. Batching applies to the release rather than to the commit.
+- A pull request that forces a major says so in its body. That is what keeps the pending set visible at
+  release time.
+- **The maintainer cutting the release decides** whether to drain the pending set or ship one major alone. A
+  release forced by a fix does not wait on a wire change that is not ready.

@@ -153,5 +153,8 @@ Apache-2.0 / BSD / MPL-2.0 needs a conversation first.
 - One change per PR, please.
 - Say what the change is *for* in the description. The diff already says what it does.
 - If you changed a decision, update the comment or doc page that recorded it.
+- If the change forces a **protocol major**, say so in the description. Pending majors ship together in one
+  release, and that batching needs the pending set visible at release time — see
+  [protocol.md](docs/protocol.md#pending-wire-breaks-ship-together).
 - CI runs on GitHub-hosted runners with `pull_request`, so a fork PR gets no secrets and needs no approval to
   run.

@@ -30,6 +30,10 @@ just rts-host                    # then `just rts-join` in another terminal
 > behavior. **A minor version may change what an existing `Net` call returns**, alongside the wire format and
 > the Rust internals. Pin a tag, and read [Upgrading from 0.2.x](#upgrading-from-02x) before moving one.
 > [ROADMAP.md](ROADMAP.md) ranks what is open.
+>
+> [Versioning across releases](docs/protocol.md#versioning-across-releases) states the **policy past 0.x** —
+> what 1.0 freezes, how the wire version moves against the addon version, why two protocol majors never
+> interoperate, and how a superseded `Net` call is retired.
 
 ## Three lanes
 
@@ -77,7 +81,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 | [hockey-demo.md](docs/hockey-demo.md) | The rollback lane on an object nobody authors, and the correction measured in millimeters. |
 | [arena-demo.md](docs/arena-demo.md) | Three interest axes, several seats on one connection, and a rewind sized per shooter and per target. |
 | [architecture.md](docs/architecture.md) | Crate layout, batching, history, prop roles, threading. |
-| [protocol.md](docs/protocol.md) | Wire format, clock, `is_fresh`, entity lifecycle. |
+| [protocol.md](docs/protocol.md) | Wire format, clock, `is_fresh`, entity lifecycle, versioning across releases. |
 | [netbench.md](docs/netbench.md) | Impairment relay, bot fleet, tick-domain gates. |
 | [building.md](docs/building.md) | Rust toolchain and the binary distribution policy. |
 | [steam.md](docs/steam.md) | The Steam transport contract. |
