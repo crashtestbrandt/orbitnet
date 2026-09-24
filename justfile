@@ -294,11 +294,15 @@ arena-lint: (lint-project "demos/arena")
 netbench CLIENTS="4" PROFILE="congested_wifi" SECONDS="20" SEED="1" POLICY="strafe" DEMO="arena":
     tools/netbench/bench.sh {{CLIENTS}} {{PROFILE}} {{SECONDS}} {{SEED}} {{POLICY}} {{DEMO}}
 
-# Multi-machine bench: one SSH controller drives a server host plus bot-client hosts. Needs real reachable
-# hosts, passwordless SSH and Godot on each. GAUNTLET_DRYRUN=1 prints the plan without running it. DEMO=<name>
-# picks the demo project every host runs, and every host must run the same one.
-netbench-gauntlet:
-    tools/netbench/gauntlet.sh
+# THE ONLY BENCH THAT MEASURES A REAL LINK. bench.sh conditions a loopback socket, which cannot produce a
+# bandwidth cap, a NAT, or the shape of a relayed transport -- see docs/netbench.md, "Which bench supports which
+# claim". Needs real reachable hosts, passwordless SSH and Godot 4 on each, plus `just native-install` run once
+# ON EACH (a native library is per-platform and the rsync deliberately does not carry one). DEMO=<name> picks the
+# demo project every host runs, and every host must run the same one.
+#
+# Multi-machine bench over SSH: --dry-run prints the plan, --preflight validates the hosts, no flag runs it.
+netbench-gauntlet *ARGS:
+    tools/netbench/gauntlet.sh {{ARGS}}
 
 # =====================================================================================================
 # exports
