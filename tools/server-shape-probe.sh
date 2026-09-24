@@ -91,8 +91,10 @@ run_shape() {
 		>"$CLIENT_LOG" 2>&1 &
 	CLIENT_PID=$!
 
-	# A hung session must fail loudly rather than hang CI forever.
-	( sleep "$WATCHDOG_S"; kill -9 "$SERVER_PID" "$CLIENT_PID" 2>/dev/null ) &
+	# A hung session must fail loudly rather than hang CI forever. Redirected because the subshell's `sleep`
+	# outlives the kill below -- it is reparented to init and would hold this script's stdout, and any consumer
+	# reading the probe through a pipe would block for the full watchdog after the verdict was printed.
+	( sleep "$WATCHDOG_S"; kill -9 "$SERVER_PID" "$CLIENT_PID" 2>/dev/null ) >/dev/null 2>&1 &
 	WATCH_PID=$!
 
 	wait "$CLIENT_PID" 2>/dev/null; local client_rc=$?

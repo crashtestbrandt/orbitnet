@@ -8,8 +8,8 @@ just check           # everything a PR must pass
 ```
 
 `check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → `descriptor-parity` →
-`version-parity` → `bench-check` → cargo gates → lint → unit suites → the server-shape probe → the two-peer
-RTS probe → the arena probe.
+`version-parity` → `bench-check` → cargo gates → lint → unit suites → the determinism probe → the
+server-shape probe → the two-peer RTS probe → the arena probe.
 
 **One version, three files.** `addons/orbitnet/plugin.cfg`, the `[workspace.package]` version in
 `native/Cargo.toml` and the member entries in `native/Cargo.lock` must agree. `tools/version-parity.sh` is
@@ -89,19 +89,28 @@ instrumentation inside the project it drives (`tools/instr/` in a demo, a scene 
 a probe gates PRs **only** if it guards a fundamental netcode regression: rollback determinism, prediction and
 reconciliation, two-peer sync, dedicated-server boot, interest filtering, the facade, or the transport factory.
 
-Three probes gate PRs today, and each reaches one item on that list the other two cannot:
+Four probes gate PRs today, and each reaches one item on that list the other three cannot:
 
 | Probe | What it guards |
 | --- | --- |
 | `tools/rts-probe.sh` | two-peer sync: identical worlds, orders replicated, a forged order refused |
 | `tools/server-shape-probe.sh` | both **server shapes** end to end -- a joining client's own state channel delivers rows against a dedicated server and against a listen server alike |
 | `tools/arena-probe.sh` | **interest filtering**: membership across three worlds, a per-peer veto, several seats on one connection, a declared anchor, and a session resume |
+| `tools/determinism-probe.sh` | **rollback determinism**: two unconnected peers replay one input tape over the same tick range and their restored state matches column by column, per tick |
 
-**A fourth needs a line on that list none of the three already covers.** If a probe's assertions are pure math,
+**Why the determinism probe gates.** The other three compare a world SIGNATURE across peers, which gates
+deterministic node naming and therefore entity-id agreement. None of them gates whether two peers handed the
+same inputs compute the same STATE, and the unit-level determinism suites are each one function called twice
+with the same seed in one process -- repeatability on one machine. Rollback determinism is the first item on
+the list above, so the probe reaches a line none of the other three covers. It costs about six seconds, binds
+no socket, and reports the FIRST divergent tick and the property rather than a boolean.
+
+**A fifth needs a line on that list none of the four already covers.** If a probe's assertions are pure math,
 port them to a unit test and delete the redundant block. And a probe that can only ever pass is not coverage:
-the shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL)
-and the arena probe asserts a withheld entity's rows stop while its neighbors keep arriving, for exactly that
-reason.
+the shape probe carries its own negative control (a run with the channel under test vetoed, asserted to FAIL),
+the arena probe asserts a withheld entity's rows stop while its neighbors keep arriving, and the determinism
+probe runs a third peer with a one-ULP divergence injected at a named tick and asserts the comparison catches
+it at that tick -- all for exactly that reason.
 
 An empty run is a failure, not a pass — the runner exits non-zero on no suites or no `test_*` methods.
 

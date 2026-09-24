@@ -94,6 +94,13 @@ harness-smoke:
     # --quit-after is a frame-count backstop only: smoke.gd quits itself as soon as it has a verdict.
     "{{godot}}" --headless --path harness --quit-after 600
 
+# Cross-peer SIMULATION DETERMINISM, in the harness project: two unconnected peers replay one input tape over
+# the same tick range and their RESTORED state is compared column by column, per tick, with the first divergent
+# tick and property reported. A third peer runs with a one-ULP nudge injected at a named tick and the
+# comparison must catch it there. It binds no socket, so it runs first among the probes.
+determinism-probe:
+    GODOT="{{godot}}" tools/determinism-probe.sh
+
 # Both SERVER SHAPES end to end, in the harness project: a joining client's own state channel delivers rows
 # against a dedicated server and against a listen server alike, and a third run with that channel vetoed
 # proves the assertion can see a channel that delivers none.
@@ -104,17 +111,16 @@ server-shape-probe:
 rts-probe:
     GODOT="{{godot}}" tools/rts-probe.sh
 
-# The three-process networked gate: a DEDICATED server and two clients. It covers the interest axis neither
-# other probe reaches -- membership filtering across three worlds, a per-peer veto, several seats on one
-# connection, a declared anchor, and a session resume. See CONTRIBUTING.md for why three probes gate rather
-# than one.
+# The three-process networked gate: a DEDICATED server and two clients. It covers the interest axis no other
+# probe reaches -- membership filtering across three worlds, a per-peer veto, several seats on one connection,
+# a declared anchor, and a session resume. See CONTRIBUTING.md for why four probes gate rather than one.
 arena-probe:
     GODOT="{{godot}}" tools/arena-probe.sh
 
-# Everything a PR must pass, in the order that fails fastest first. The shape probe runs before the two demo
-# probes because it is the addon's own project: a failure there is the addon, where a failure in a demo could
-# be either.
-check: addon-tracked addon-drift net-check descriptor-parity version-parity bench-check native-test lint test server-shape-probe rts-probe arena-probe
+# Everything a PR must pass, in the order that fails fastest first. Both harness probes run before the two demo
+# probes because the harness is the addon's own project: a failure there is the addon, where a failure in a demo
+# could be either. The determinism probe leads the four because it binds no socket and costs about six seconds.
+check: addon-tracked addon-drift net-check descriptor-parity version-parity bench-check native-test lint test determinism-probe server-shape-probe rts-probe arena-probe
 
 # =====================================================================================================
 # the native backend (Rust)
