@@ -18,6 +18,20 @@ class_name SteamTransport
 ##     builds this file is never reached and the singleton is never looked up.
 ## When GodotSteam IS vendored the dynamic calls resolve against the real singleton with no code change.
 ##
+## THE TEST SEAM: `_resolve_singleton` and `_new_steam_peer` are the only two places a Steamworks name is
+## looked up, so they are the only two places a test has to displace. [method use_platform_double] swaps in a
+## [PlatformDouble] -- declared at the bottom of THIS file -- and both lookups answer from it instead of from
+## `Engine`/`ClassDB`. Everything between them (the lobby lifecycle, the metadata rows, the callback-code
+## mapping, the guarded degradations) then runs unmodified under `just test`.
+##
+## THE DOUBLE'S LOCATION. [PlatformDouble] is declared in this file, not in the suite that uses it:
+## - It has to answer the same Steamworks method names and signals the dynamic calls ask for, and this file is
+##   the only one allowed to name them. Writing it under harness/tests/unit would put those names in a second
+##   file and break the boundary this file exists to hold.
+## - It exposes a Steam-blind API instead -- `rows()`, `lobby_requests`, `ok_result()`, `emit_lobby_created()` --
+##   so the suite names no Steamworks class, method or signal.
+## - Cost: about 250 lines in the addon payload. The alternative costs a second file exempted from the boundary.
+##
 ## VERIFY-ON-A-STEAM-BUILD: the Steamworks call SIGNATURES below (steamInitEx / gameServerInitEx / create_host /
 ## create_client / auth tickets) are written against the current GodotSteam GDExtension API and CANNOT be
 ## exercised in a headless CI sandbox (no Steam client, no Steamworks runtime). Each is guarded (has_method /
@@ -295,10 +309,7 @@ func create_client(target: String, _port: int) -> MultiplayerPeer:
 	if host_id <= 0:
 		push_warning("SteamTransport: create_client got a non-Steam-ID target %s (expected a 64-bit Steam ID)" % target)
 		return null
-	if not ClassDB.class_exists(&"SteamMultiplayerPeer"):
-		push_warning("SteamTransport: SteamMultiplayerPeer class not registered (GodotSteam MultiplayerPeer not vendored)")
-		return null
-	var obj: Object = ClassDB.instantiate(&"SteamMultiplayerPeer")
+	var obj: Object = _new_steam_peer()
 	if obj == null:
 		return null
 	if not obj.has_method(&"create_client"):
@@ -318,10 +329,7 @@ func create_client(target: String, _port: int) -> MultiplayerPeer:
 # its host socket on Steam's networking sockets / relay. Returns null (with a warning) if GodotSteam's
 # MultiplayerPeer is not vendored or the socket fails to open.
 func _create_host_peer(_max_clients: int) -> MultiplayerPeer:
-	if not ClassDB.class_exists(&"SteamMultiplayerPeer"):
-		push_warning("SteamTransport: SteamMultiplayerPeer class not registered (GodotSteam MultiplayerPeer not vendored)")
-		return null
-	var obj: Object = ClassDB.instantiate(&"SteamMultiplayerPeer")
+	var obj: Object = _new_steam_peer()
 	if obj == null:
 		return null
 	if not obj.has_method(&"create_host"):
@@ -712,7 +720,8 @@ func _lobby_host_id(lobby_id: int) -> int:
 # --- play invites (accept an invite, send an invite) ----------------------------------------------------
 ## Parse a Steam launch command line for the `+connect_lobby <id>` token Steam appends when a player accepts an
 ## invite while the game is NOT running, returning the lobby id (0 when absent/malformed). PURE + static so the
-## cold-start path is unit-testable without Steam, a scene tree, or a process relaunch (tests/unit/steam_invite_test.gd).
+## cold-start path is unit-testable without Steam, a scene tree, or a process relaunch
+## (harness/tests/unit/steam_transport_test.gd).
 static func parse_connect_lobby(command_line: String) -> int:
 	var tokens: PackedStringArray = command_line.split(" ", false)
 	for i: int in range(tokens.size() - 1):
@@ -894,9 +903,24 @@ func _config_enum(steam: Object, const_name: StringName) -> int:
 
 # --- dynamic-Steam helpers -----------------------------------------------------------------------
 
+# Instantiate GodotSteam's MultiplayerPeer, or the injected double's stand-in. The ONE place the concrete peer
+# class is named, which is what lets both the host and the client path share a single guard -- and the second
+# of the two lookups a test displaces (see the header).
+func _new_steam_peer() -> Object:
+	if _double != null:
+		return _double.make_peer()
+	if not ClassDB.class_exists(&"SteamMultiplayerPeer"):
+		push_warning("SteamTransport: SteamMultiplayerPeer class not registered (GodotSteam MultiplayerPeer not vendored)")
+		return null
+	var made: Variant = ClassDB.instantiate(&"SteamMultiplayerPeer")
+	var obj: Object = made if made is Object else null
+	return obj
+
 # The first of `names` registered as an Engine singleton, or null when none are (GodotSteam not vendored / not a
 # steam build). Lets the client path resolve `Steam` and the dedicated path prefer `SteamServer`, from one place.
 func _resolve_singleton(names: Array[StringName]) -> Object:
+	if _double != null:
+		return _double
 	for n: StringName in names:
 		if Engine.has_singleton(n):
 			return Engine.get_singleton(n)
@@ -936,3 +960,297 @@ func _init_ok(result: Variant) -> bool:
 	if result is int:
 		return result == 0
 	return false
+
+# --- the test seam: a platform double, declared inside the boundary ------------------------------
+# WHY THIS IS IN THE ADDON AND NOT IN THE SUITE: see THE TEST SEAM in the header. A double has to answer the
+# same Steamworks method names and signals the dynamic calls above ask for, and this is the only file allowed
+# to name them. So the double is declared here and exposes a Steam-blind API to the suite, which then names no
+# Steamworks class, method or signal. Nothing in a shipped build ever constructs one -- `_double` is null
+# unless a test installs it, and both lookups fall through to `Engine` / `ClassDB` exactly as before.
+
+## Stands in for GodotSteam's MultiplayerPeer class under [method use_platform_double]. It records the two
+## calls the transport makes on a freshly instantiated peer and answers with [member open_result]; nothing
+## polls it, so none of [MultiplayerPeerExtension]'s transfer virtuals are reached.
+class DoublePeer extends MultiplayerPeerExtension:
+	## The error the socket-opening call answers with. OK == the socket opened.
+	var open_result: int = OK
+	## The host id this peer was pointed at (0 == it was opened as a host, not a client).
+	var target_host_id: int = 0
+	## Whether this peer was opened as a host rather than as a client.
+	var opened_as_host: bool = false
+
+	func create_host(_virtual_port: int) -> int:
+		opened_as_host = true
+		return open_result
+
+	func create_client(host_id: int, _virtual_port: int) -> int:
+		target_host_id = host_id
+		return open_result
+
+## Stands in for the Steamworks singleton under [method use_platform_double]: it answers every dynamic call
+## this file makes, records what it was asked to do, and re-emits the platform callbacks on demand. The suite
+## reads it through the Steam-blind members below -- [member lobby_requests], [method rows],
+## [method ok_result], [method emit_lobby_created] -- and never writes a Steamworks name of its own.
+class PlatformDouble extends RefCounted:
+	# The platform callbacks this file connects to. Declared with the names the vendored extension uses, so
+	# _wire_lobby_signals / _connect_auth_response connect to them unmodified; the suite fires them through
+	# the emit_* helpers below instead of naming them.
+	signal lobby_created(result: int, lobby_id: int)
+	signal lobby_match_list(lobbies: Array)
+	signal lobby_joined(lobby_id: int, permissions: int, locked: bool, response: int)
+	signal join_requested(lobby_id: int, friend_id: int)
+	signal join_game_requested(user: int, connect_string: String)
+	signal validate_auth_ticket_response(auth_id: int, response: int, owner_id: int)
+
+	# --- what the transport asked the platform to do, in order ---
+	## One entry per lobby the transport asked to create: `{"max_members": int, "friends_only": bool}`.
+	var lobby_requests: Array[Dictionary] = []
+	## Lobby ids the transport joined, left, and opened the invite overlay for.
+	var lobbies_joined: Array[int] = []
+	var lobbies_left: Array[int] = []
+	var invite_overlays: Array[int] = []
+	## Every flip of the dedicated server's browser listing, in order (true == listed).
+	var server_listing: Array[bool] = []
+	## How many discovery sweeps were requested, and how many callback pumps ran.
+	var list_requests: int = 0
+	var callback_pumps: int = 0
+	## The member cap the transport published per lobby, and the auth sessions it opened and closed.
+	var member_limits: Dictionary[int, int] = {}
+	var auth_sessions_begun: Array[int] = []
+	var auth_sessions_ended: Array[int] = []
+	## The ticket length passed alongside each validation -- a separate argument the platform needs.
+	var auth_ticket_sizes: Array[int] = []
+
+	# --- what the platform answers with; set these before the call under test ---
+	var steam_id: int = 0
+	var persona: String = ""
+	## Display names the platform has cached, by account id. A missing id is the not-yet-cached case.
+	var friend_names: Dictionary[int, String] = {}
+	## Live member counts and owners per lobby, for the discovery reader's fallbacks.
+	var member_counts: Dictionary[int, int] = {}
+	var owners: Dictionary[int, int] = {}
+	## The ownership ticket bytes this account issues, and the synchronous verdict on validating one.
+	var ticket: PackedByteArray = PackedByteArray()
+	var begin_auth_result: int = OK
+	## What the two init entry points answer. The transport accepts a `{status}` record, a bool or an int.
+	var client_init_reply: Variant = {"status": 0}
+	var server_init_reply: Variant = {"status": 0}
+	## The launch command line the platform reports, for the cold-start invite route.
+	var launch_command_line: String = ""
+	## Whether a newly instantiated peer opens its socket, and whether the peer class exists at all.
+	var peer_opens: bool = true
+	var peer_class_missing: bool = false
+	## Every peer the transport instantiated, newest last.
+	var peers: Array[DoublePeer] = []
+
+	var _rows: Dictionary[int, Dictionary] = {}
+	var _presence: Dictionary[String, String] = {}
+
+	# --- the Steam-blind API the suite uses ---
+
+	## Every metadata row stamped on `lobby_id` -- what a browsing peer reads back off that lobby.
+	func rows(lobby_id: int) -> Dictionary:
+		var found: Dictionary = _rows[lobby_id] if _rows.has(lobby_id) else {}
+		return found
+
+	## One metadata row, "" when it was never stamped.
+	func row(lobby_id: int, key: String) -> String:
+		var found: Dictionary = rows(lobby_id)
+		var raw: Variant = found.get(key, "")
+		var value: String = raw if raw is String else ""
+		return value
+
+	## Stamp a row as if another host had published it -- how the suite seeds a discoverable lobby.
+	func publish_row(lobby_id: int, key: String, value: String) -> void:
+		var found: Dictionary = _rows[lobby_id] if _rows.has(lobby_id) else {}
+		found[key] = value
+		_rows[lobby_id] = found
+
+	## The player cap of the most recent lobby-creation request (-1 when none was made).
+	func last_lobby_cap() -> int:
+		if lobby_requests.is_empty():
+			return -1
+		var request: Dictionary = lobby_requests[lobby_requests.size() - 1]
+		var raw: Variant = request.get("max_members", -1)
+		var cap: int = raw if raw is int else -1
+		return cap
+
+	## Whether the most recent lobby-creation request asked for the friends-only (unlisted) lobby type.
+	func last_lobby_is_friends_only() -> bool:
+		if lobby_requests.is_empty():
+			return false
+		var request: Dictionary = lobby_requests[lobby_requests.size() - 1]
+		var raw: Variant = request.get("friends_only", false)
+		var narrow: bool = raw if raw is bool else false
+		return narrow
+
+	## The member cap published on `lobby_id` (0 when none was).
+	func published_cap(lobby_id: int) -> int:
+		return member_limits[lobby_id] if member_limits.has(lobby_id) else 0
+
+	## The join string published next to this account's name, and whether any presence is published at all.
+	func presence_connect() -> String:
+		var raw: Variant = _presence.get(SteamTransport._RICH_PRESENCE_CONNECT, "")
+		var value: String = raw if raw is String else ""
+		return value
+
+	func has_presence() -> bool:
+		return not _presence.is_empty()
+
+	## The result code a lobby callback carries on success, and one it carries on a definite failure.
+	func ok_result() -> int:
+		return SteamTransport._RESULT_OK
+
+	func rejected_result() -> int:
+		return 2   # k_EResultFail -- any value but _RESULT_OK is a failure to the transport
+
+	## The lobby-entry response on success, and one on a definite refusal.
+	func joined_response() -> int:
+		return SteamTransport._CHAT_ROOM_ENTER_SUCCESS
+
+	func refused_response() -> int:
+		return 2   # k_EChatRoomEnterResponseDoesntExist
+
+	## The ownership verdict for an account that owns the app, and one for an account that does not.
+	func owns_response() -> int:
+		return SteamTransport._AUTH_RESPONSE_OK
+
+	func disowns_response() -> int:
+		return 2   # k_EAuthSessionResponseNoLicenseOrExpired
+
+	## Fire the platform callbacks the transport connected to.
+	func emit_lobby_created(result: int, lobby_id: int) -> void:
+		lobby_created.emit(result, lobby_id)
+
+	func emit_lobby_list(lobby_ids: Array) -> void:
+		lobby_match_list.emit(lobby_ids)
+
+	func emit_lobby_joined(lobby_id: int, response: int) -> void:
+		lobby_joined.emit(lobby_id, 0, false, response)
+
+	func emit_join_request(lobby_id: int, friend_id: int) -> void:
+		join_requested.emit(lobby_id, friend_id)
+
+	func emit_join_game_request(user: int, connect_string: String) -> void:
+		join_game_requested.emit(user, connect_string)
+
+	func emit_auth_verdict(account_id: int, response: int) -> void:
+		validate_auth_ticket_response.emit(account_id, response, account_id)
+
+	## Build the stand-in peer. Null when the suite is exercising the "peer class not vendored" path.
+	func make_peer() -> Object:
+		if peer_class_missing:
+			return null
+		var peer: DoublePeer = DoublePeer.new()
+		peer.open_result = OK if peer_opens else FAILED
+		peers.push_back(peer)
+		return peer
+
+	# --- the Steamworks vocabulary, answered from the state above ---
+
+	func steamInitEx(_app_id: int, _embed_callbacks: bool) -> Variant:
+		return client_init_reply
+
+	func serverInitEx(_ip: String, _game_port: int, _query_port: int, _mode: int, _version: String) -> Variant:
+		return server_init_reply
+
+	func logOnAnonymous() -> void:
+		pass
+
+	func run_callbacks() -> void:
+		callback_pumps += 1
+
+	func getSteamID() -> int:
+		return steam_id
+
+	func getPersonaName() -> String:
+		return persona
+
+	func getFriendPersonaName(account_id: int) -> String:
+		return friend_names[account_id] if friend_names.has(account_id) else ""
+
+	func getLaunchCommandLine() -> String:
+		return launch_command_line
+
+	func createLobby(lobby_type: int, max_members: int) -> void:
+		lobby_requests.push_back({
+			"max_members": max_members,
+			"friends_only": lobby_type == SteamTransport._LOBBY_TYPE_FRIENDS_ONLY,
+		})
+
+	func setLobbyData(lobby_id: int, key: String, value: String) -> bool:
+		publish_row(lobby_id, key, value)
+		return true
+
+	func getLobbyData(lobby_id: int, key: String) -> String:
+		return row(lobby_id, key)
+
+	func setLobbyMemberLimit(lobby_id: int, limit: int) -> void:
+		member_limits[lobby_id] = limit
+
+	func getLobbyMemberLimit(lobby_id: int) -> int:
+		return member_limits[lobby_id] if member_limits.has(lobby_id) else 0
+
+	func getNumLobbyMembers(lobby_id: int) -> int:
+		return member_counts[lobby_id] if member_counts.has(lobby_id) else 0
+
+	func getLobbyOwner(lobby_id: int) -> int:
+		return owners[lobby_id] if owners.has(lobby_id) else 0
+
+	func joinLobby(lobby_id: int) -> void:
+		lobbies_joined.push_back(lobby_id)
+
+	func leaveLobby(lobby_id: int) -> void:
+		lobbies_left.push_back(lobby_id)
+
+	func requestLobbyList() -> void:
+		list_requests += 1
+
+	func addRequestLobbyListStringFilter(_key: String, _value: String, _comparison: int) -> void:
+		pass
+
+	func addRequestLobbyListDistanceFilter(_distance: int) -> void:
+		pass
+
+	func addRequestLobbyListResultCountFilter(_limit: int) -> void:
+		pass
+
+	func setRichPresence(key: String, value: String) -> bool:
+		_presence[key] = value
+		return true
+
+	func clearRichPresence() -> void:
+		_presence.clear()
+
+	func activateGameOverlayInviteDialog(lobby_id: int) -> void:
+		invite_overlays.push_back(lobby_id)
+
+	func setAdvertiseServerActive(on: bool) -> void:
+		server_listing.push_back(on)
+
+	func getAuthSessionTicket() -> Dictionary:
+		var record: Dictionary[String, PackedByteArray] = {"buffer": ticket}
+		return record
+
+	func beginAuthSession(_ticket: PackedByteArray, size: int, account_id: int) -> int:
+		auth_sessions_begun.push_back(account_id)
+		auth_ticket_sizes.push_back(size)
+		return begin_auth_result
+
+	func endAuthSession(account_id: int) -> void:
+		auth_sessions_ended.push_back(account_id)
+
+# The installed double, or null -- which is every shipped build, because nothing but a test ever installs one.
+static var _double: PlatformDouble = null
+
+## Route both Steamworks lookups at `double` instead of at `Engine` / `ClassDB`, for the addon's own unit
+## suite. Static, because the lookups are reached from an instance the suite constructs itself rather than
+## through [method service]. Pair every call with [method clear_platform_double].
+static func use_platform_double(double: PlatformDouble) -> void:
+	_double = double
+
+## Restore the real lookups. `_double` is process-global and the unit-test harness has no teardown hook, so the
+## suite both clears before it installs and clears at the end of every case. A case aborted by a runtime error
+## before its clear leaves the double installed for whatever runs next.
+static func clear_platform_double() -> void:
+	_double = null
