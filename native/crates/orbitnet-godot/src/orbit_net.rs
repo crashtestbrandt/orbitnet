@@ -31,16 +31,16 @@ use godot::classes::{
 use godot::prelude::*;
 
 use orbitnet_core::auth::{
-    compress_secret, confirm_tag, derive_session_key, siphash24, MAX_INPUT_BLOCKS_PER_TICK,
-    REPLAY_WINDOW, TRAILER_LEN,
+    compress_secret, confirm_tag, derive_session_key, session_nonce, siphash24,
+    MAX_INPUT_BLOCKS_PER_TICK, REPLAY_WINDOW, TRAILER_LEN,
 };
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
     decode_manifest_delta, decode_manifest_full, decode_state_block_meta, diff_manifest,
     encode_interest_delta, encode_interest_table, encode_manifest_delta, encode_manifest_full,
-    input_block_row, skip_input_block_body, skip_state_block_body, FrameHeader, FrameKind,
-    Handshake, InterestDeltaSection, ManifestDelta, ManifestEntry, Ping, Pong, Reader, Welcome,
-    Writer, MAGIC, MAX_FRAME_PAYLOAD,
+    input_block_row, skip_input_block_body, skip_state_block_body, Challenge, FrameHeader,
+    FrameKind, Handshake, InterestDeltaSection, ManifestDelta, ManifestEntry, Ping, Pong, Reader,
+    Welcome, Writer, MAGIC, MAX_FRAME_PAYLOAD,
 };
 use orbitnet_core::interest::{
     ConnectionInterest, InterestCandidate, InterestDelta, InterestGrid, InterestOccupancy,
@@ -690,6 +690,10 @@ struct PeerState {
     ///
     /// `None` until the handshake lands, and that is the gate: [`OrbitNet::open_datagram`] drops
     /// everything from a peer that has none, so a peer that never handshook cannot even draw a pong.
+    ///
+    /// **It is seated by the joiner's SECOND leg, not its first.** An opening hello is answered with a
+    /// challenge and nothing else, so a peer that never confirms holds no key, no seat and no identity
+    /// — and no entry in this table. See [`OrbitNet::challenges`].
     auth: Option<SessionAuth>,
     /// What this peer has spent of the server's receive path in the current tick.
     budget: ReceiveBudget,
@@ -1870,6 +1874,30 @@ pub struct OrbitNet {
     rollback_entities: BTreeMap<u64, Gd<OrbitRollbackSynchronizer>>,
     state_entities: BTreeMap<u64, Gd<OrbitStateSynchronizer>>,
     peers: HashMap<i32, PeerState>,
+    /// SERVER: the two halves of the session nonce each UNCONFIRMED connection is being challenged on
+    /// — the [`Handshake::joiner_nonce`] its opening hello carried, and the acceptor half this server
+    /// drew in answer. Absent before a connection's first hello.
+    ///
+    /// **It is a table of its own rather than a field on [`PeerState`] so that an unconfirmed
+    /// connection costs 32 bytes and nothing else.** A `PeerState` is four hash maps, two ring buffers
+    /// and an interest set; allocating one off an opening hello would be per-connection state spent on
+    /// a peer that has proved nothing, which is exactly what a replayed join would then be buying. The
+    /// 32 bytes here are the figure `docs/protocol.md` spends to justify making the confirmation a
+    /// whole handshake rather than a 25-byte frame of its own.
+    ///
+    /// **Minted once per `(connection, joiner half)`, and a retried hello is answered with the SAME
+    /// acceptor half.** Re-minting deadlocks a lossy join: the new half refuses the confirmation the
+    /// joiner is already sending against the old one, which provokes another hello, and the two ends
+    /// chase each other for as long as the loss lasts. Re-sending what was issued costs nothing.
+    ///
+    /// **A DIFFERENT joiner half is a client that restarted its session**, and it gets a fresh acceptor
+    /// half — which is what makes the key change, and therefore what [`OrbitNet::handle_hello`]'s rekey
+    /// comparison detects.
+    ///
+    /// **The row survives the confirmation that seats the session**, because a confirmation is retried
+    /// until the welcome lands and every retry has to be answered with the half already issued. It is
+    /// dropped where the peer entry is: `_on_peer_disconnected` and [`Self::stop`].
+    challenges: HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])>,
     /// This peer's own session identity, sent in its handshake. `0` claims none.
     session_id: u64,
     /// Client: the **resume token** a server issued for [`Self::session_id`], quoted back in every later
@@ -1892,18 +1920,31 @@ pub struct OrbitNet {
     /// one grace window, which is 30 s by default.
     resume_token: u64,
     /// Client: the key this session's datagrams are authenticated with, and the window that refuses a
-    /// replayed one from the server. Seated in [`OrbitNet::start`] from [`Self::session_nonce`].
+    /// replayed one from the server.
     ///
-    /// The server holds no session key of its own — a session's key is derived from what the client
-    /// minted, and the server keeps one [`SessionAuth`] per connected peer on [`PeerState`].
+    /// **`None` until the server's challenge lands, and that is the cost of the join's second round
+    /// trip.** The key folds both halves of the session nonce, so [`OrbitNet::start`] cannot seat it —
+    /// it is seated in [`OrbitNet::handle_challenge`], and until then [`OrbitNet::send_to`] refuses to
+    /// put anything on the wire. That refusal is the enforcement: a client may not send until the
+    /// acceptor has answered.
+    ///
+    /// The server holds no session key of its own — it keeps one [`SessionAuth`] per connected peer on
+    /// [`PeerState`].
     session_auth: Option<SessionAuth>,
-    /// Client: the 16 bytes drawn fresh for this session and carried in the handshake.
+    /// Client: the **joiner's half** of this session's nonce, drawn fresh in [`OrbitNet::start`] and
+    /// carried in every leg of the handshake.
     ///
-    /// **It is the key itself when no [`Self::session_secret`] is set, and only a nonce when one is.**
-    /// The draw is the same either way; what changes is whether [`Self::session_auth`] is seated with
-    /// these bytes or with what they and the secret derive. Held separately from the key because under a
-    /// secret the two differ and the handshake carries this one.
-    session_nonce: Option<[u8; KEY_LEN]>,
+    /// Held separately from the key because it is only half of the key's input, and because the
+    /// handshake carries this and not the key under either regime.
+    joiner_nonce: Option<[u8; KEY_LEN]>,
+    /// Client: the **acceptor's half**, as the server's [`Challenge`] delivered it. `None` until that
+    /// frame lands.
+    ///
+    /// **A second challenge replaces it, and re-seats the key with it.** A server that forgot this
+    /// connection's pending half — or a client that restarted its session on a live connection — issues
+    /// a new one, and adopting it is what lets the join converge instead of retrying against a half
+    /// nobody holds. Gated on the session not yet being synced, so nothing can re-key a live client.
+    acceptor_nonce: Option<[u8; KEY_LEN]>,
     /// The **shared session secret**, already folded to [`KEY_LEN`] bytes, or `None` for a session that
     /// configured none.
     ///
@@ -1913,7 +1954,7 @@ pub struct OrbitNet {
     ///
     /// | | No secret | A secret |
     /// | --- | --- | --- |
-    /// | What the handshake carries | the session key, in the clear | a nonce, in the clear |
+    /// | What the key is | the two nonce halves, folded | the secret and that fold, derived |
     /// | What an on-path observer can do | everything the client can | read the traffic, forge nothing |
     ///
     /// **THE SECRET IS A DERIVATION INPUT AND IS NEVER SEATED AS THE SESSION KEY**, however much shorter
@@ -2321,10 +2362,12 @@ impl INode for OrbitNet {
             rollback_entities: BTreeMap::new(),
             state_entities: BTreeMap::new(),
             peers: HashMap::new(),
+            challenges: HashMap::new(),
             session_id: 0,
             resume_token: 0,
             session_auth: None,
-            session_nonce: None,
+            joiner_nonce: None,
+            acceptor_nonce: None,
             session_secret: None,
             resume: ResumeTable::default(),
             pending_seat_releases: Vec::new(),
@@ -2680,14 +2723,14 @@ impl OrbitNet {
             self.running = false;
             // A FRESH DRAW per session, never the previous one. Restarting the sequence numbers under
             // a key an observer already saw would make every datagram captured from the last session
-            // replayable into this one — equally true of the key these 16 bytes ARE with no secret set
-            // and of the key they DERIVE with one.
-            let nonce = Self::mint_session_key();
-            self.session_nonce = Some(nonce);
-            self.session_auth = Some(SessionAuth::new(session_key_from(
-                self.session_secret.as_ref(),
-                nonce,
-            )));
+            // replayable into this one, under both regimes.
+            self.joiner_nonce = Some(Self::mint_session_key());
+            // **AND NO KEY YET.** Half of the key's input is the acceptor's, so there is nothing to
+            // seat until its challenge lands — see `handle_challenge`. `send_to` refuses to send
+            // anything while this is `None`, which is what makes "a client may not send until the
+            // server has answered" a property of the send path rather than of each call site.
+            self.acceptor_nonce = None;
+            self.session_auth = None;
             self.send_hello();
         } else {
             // Server, host, and the sessionless smoke path are their own ground truth.
@@ -2704,12 +2747,17 @@ impl OrbitNet {
         self.synced = false;
         self.hello_pending = false;
         self.peers.clear();
+        // The pending halves name connections of THIS session, and the next session hands the same peer
+        // ids to different people. A row that outlived its session would answer a stranger's opening
+        // hello with a half drawn for somebody else, and the join would converge only on the retry.
+        self.challenges.clear();
         // The key describes a session that has ended, and its sequence numbers are spent. The next
-        // session draws its own 16 bytes. The SECRET is not cleared here: it describes an agreement
-        // between the game and its peer, not a session, and a game that set it once expects the next
-        // join to use it.
+        // session draws its own half and is challenged for a fresh one. The SECRET is not cleared here:
+        // it describes an agreement between the game and its peer, not a session, and a game that set it
+        // once expects the next join to use it.
         self.session_auth = None;
-        self.session_nonce = None;
+        self.joiner_nonce = None;
+        self.acceptor_nonce = None;
         self.auth_warned = false;
         // A held session describes a player who can come back to THIS session. There is no session to come
         // back to now, and carrying the table into the next one would resume a stranger.
@@ -3013,8 +3061,12 @@ impl OrbitNet {
     ///
     /// | | No secret | A secret |
     /// | --- | --- | --- |
-    /// | The handshake's 16 bytes | the session key, in the clear | a nonce, in the clear |
+    /// | The key | the two exchanged nonce halves, folded | the secret and that fold, derived |
     /// | An on-path observer | can do everything the client can | can read the traffic and forge nothing |
+    ///
+    /// **It does not change the frame sequence.** The join is two round trips under both regimes — the
+    /// acceptor contributes half of the nonce either way, which is what refuses a replayed join. See
+    /// [`session_key_from`].
     ///
     /// **THE SECRET IS A DERIVATION INPUT AND IS NEVER THE SESSION KEY.** See [`session_key_from`] for why
     /// seating it is the obvious wrong implementation and what it re-opens.
@@ -3839,6 +3891,10 @@ impl OrbitNet {
             .peers
             .remove(&peer)
             .map_or((0, 0), |state| (state.session_id, state.resume_token));
+        // The pending halves go with the connection, beside the peer entry. A rejoiner arrives on a new
+        // socket and is challenged fresh; a row left behind would answer whoever the transport hands
+        // this id to next with a half drawn for the peer that left.
+        self.challenges.remove(&peer);
         let server = self.mode == MODE_SERVER || self.mode == MODE_HOST;
         let grace_ms = (self.reconnect_grace.max(0.0) * 1000.0) as u64;
         let held = hold_on_drop(session_id, grace_ms, server)
@@ -3915,10 +3971,12 @@ impl OrbitNet {
 
     /// Authenticate one datagram and hand it to the transport.
     ///
-    /// **Everything but the handshake goes through here, and a datagram this cannot authenticate is
-    /// not sent.** The fail-safe direction is deliberate: a frame added later is sealed by default,
-    /// and only [`OrbitNet::send_hello`] — which is what carries the key — opts out by calling
-    /// [`OrbitNet::send_raw`].
+    /// **Everything but the handshake and the challenge goes through here, and a datagram this cannot
+    /// authenticate is not sent.** The fail-safe direction is deliberate: a frame added later is sealed
+    /// by default, and only the two frames that ESTABLISH the key — [`OrbitNet::send_hello`] and the
+    /// challenge `handle_hello` answers an opening leg with — opt out by calling
+    /// [`OrbitNet::send_raw`]. There is no key to seal either of them under: each carries one half of
+    /// the pair the key is folded from.
     ///
     /// The sealed datagram is [`TRAILER_LEN`] bytes longer than the payload. That rides above
     /// `MAX_FRAME_PAYLOAD` the same way the frame header does.
@@ -3969,11 +4027,22 @@ impl OrbitNet {
         *self.win_peer_bytes.entry(peer).or_insert(0) += sent;
     }
 
-    /// Send the join handshake if the transport is actually connected; otherwise stay pending.
+    /// Send whichever leg of the join handshake this client is on, if the transport is actually
+    /// connected; otherwise stay pending.
     ///
-    /// A hello fired while the peer is still CONNECTING is silently lost (there is no routable
-    /// destination yet), so the send is gated on the peer's connection status and retried from
-    /// [`Self::client_handshake_upkeep`] until the server's welcome lands.
+    /// **One function for both legs, because the retry does not care which it is on.** A hello fired
+    /// while the peer is still CONNECTING is silently lost (there is no routable destination yet), so
+    /// the send is gated on the peer's connection status and retried from
+    /// [`Self::client_handshake_upkeep`] until the server's welcome lands — and whatever leg is current
+    /// when the timer fires is the one that goes out again.
+    ///
+    /// | [`Self::acceptor_nonce`] | What goes out | What answers it |
+    /// | --- | --- | --- |
+    /// | `None` | the opening hello: this client's half, no confirmation | a [`Challenge`] |
+    /// | `Some` | the confirmation: both halves, and a tag under a secret | the welcome |
+    ///
+    /// **Both legs are unauthenticated**, because together with the challenge they are what establish
+    /// the key everything else is authenticated with.
     fn send_hello(&mut self) {
         self.hello_pending = true;
         let Some(api) = self.base().get_multiplayer() else {
@@ -3989,36 +4058,91 @@ impl OrbitNet {
         if peer.get_connection_status() != ConnectionStatus::CONNECTED {
             return;
         }
-        // The one datagram sent unauthenticated, because it is what carries the bytes everything else
-        // is authenticated with. `start()` draws them; this covers the transport connecting first.
-        let secret = self.session_secret;
-        let nonce = *self
-            .session_nonce
-            .get_or_insert_with(Self::mint_session_key);
-        self.session_auth
-            .get_or_insert_with(|| SessionAuth::new(session_key_from(secret.as_ref(), nonce)));
+        // `start()` draws the half; `get_or_insert_with` covers the transport connecting first.
+        let joiner = *self.joiner_nonce.get_or_insert_with(Self::mint_session_key);
         let hello = Handshake::local(self.tickrate.clamp(1, 240) as u16)
             .with_session(self.session_id)
-            .with_nonce(nonce)
+            .with_joiner_nonce(joiner)
             .with_resume_token(self.resume_token);
-        // The CONFIRMATION, and only when a secret is set. It is tagged over the version this frame
-        // actually carries, because the accepting side recomputes it against the version it reads —
-        // major must match but minor and patch may legitimately differ.
-        let hello = match secret {
-            Some(secret) => {
-                let key = derive_session_key(&secret, &nonce);
-                hello.with_confirm(confirm_tag(&key, &nonce, hello.protocol_version))
+        let hello = match self.acceptor_nonce {
+            // The CONFIRMATION. The acceptor's half is quoted back so the server can match this frame
+            // to the challenge it issued, and the tag — only under a secret — is taken over the FOLD of
+            // the two halves, which is what a confirmation captured off another join cannot recompute.
+            // It is tagged over the version this frame actually carries, because the accepting side
+            // recomputes it against the version it reads: major must match, minor and patch may differ.
+            Some(acceptor) => {
+                let hello = hello.with_acceptor_nonce(acceptor);
+                match self.session_secret {
+                    Some(secret) => {
+                        let nonce = session_nonce(&joiner, &acceptor);
+                        let key = derive_session_key(&secret, &nonce);
+                        hello.with_confirm(confirm_tag(&key, &nonce, hello.protocol_version))
+                    }
+                    None => hello,
+                }
             }
+            // The OPENING hello, which cannot carry a confirmation: the key it would be tagged under
+            // depends on a half this client has not been given yet.
             None => hello,
         };
         self.send_raw(SERVER_PEER, &hello.encode(), TransferMode::RELIABLE);
     }
 
+    /// CLIENT: adopt the acceptor's half of the session nonce, seat the key, and confirm.
+    ///
+    /// This is the frame that ends the client's send embargo: [`Self::session_auth`] is `None` from
+    /// [`OrbitNet::start`] until here, and [`Self::send_to`] puts nothing on the wire while it is.
+    ///
+    /// **A challenge that does not echo this client's own half is ignored.** A client that restarted its
+    /// session on a live connection can have the previous join's challenge still in flight, and adopting
+    /// it would derive a key the server does not hold — the join would then converge only on a retry.
+    ///
+    /// **A LATER CHALLENGE REPLACES AN EARLIER ONE**, which is what makes the join self-healing: a
+    /// server that no longer holds this connection's pending half issues a new one rather than refusing
+    /// the confirmation for ever. Re-seating the key is safe here and nowhere else, because the session
+    /// has sent nothing — `synced` gates the whole function, so nothing can re-key a live client.
+    fn handle_challenge(&mut self, bytes: &[u8]) {
+        if self.mode != MODE_CLIENT || self.synced || !self.hello_pending {
+            return;
+        }
+        let mut reader = Reader::new(bytes);
+        let _ = reader.u8();
+        let Ok(challenge) = Challenge::decode(&mut reader) else {
+            return;
+        };
+        match challenge_answer(self.joiner_nonce, self.acceptor_nonce, &challenge) {
+            ChallengeAnswer::Ignore => {}
+            // A re-sent challenge, which a retried hello provokes. The key is already seated and its
+            // send counter has been spent on nothing; re-seating would be a no-op that reset it.
+            //
+            // The retry timer restarts here for the reason it does in the arm below: it measures the
+            // interval since the last confirmation ACTUALLY sent, and leaving it running would put a
+            // second confirmation on the wire a fraction of a second after this one.
+            ChallengeAnswer::Confirm => {
+                self.hello_timer = 0.0;
+                self.send_hello();
+            }
+            ChallengeAnswer::Adopt => {
+                self.acceptor_nonce = Some(challenge.acceptor_nonce);
+                self.session_auth = Some(SessionAuth::new(session_key_from(
+                    self.session_secret.as_ref(),
+                    challenge.joiner_nonce,
+                    challenge.acceptor_nonce,
+                )));
+                // Confirm immediately rather than waiting out the retry timer, which is what keeps the
+                // second round trip to one round trip of added join time.
+                self.hello_timer = 0.0;
+                self.send_hello();
+            }
+        }
+    }
+
     /// 16 unpredictable bytes, drawn fresh.
     ///
-    /// **Three unrelated values come from here and each one is its own draw**: the client's session
-    /// nonce, a connection's ack-token salt, and the high bits of a resume token. Sharing the draw
-    /// would let a peer that learns one compute another, and the nonce is the one that is transmitted.
+    /// **Four unrelated values come from here and each one is its own draw**: the joiner's half of a
+    /// session nonce, the acceptor's half, a connection's ack-token salt, and the high bits of a resume
+    /// token. Sharing the draw would let a peer that learns one compute another, and both halves are
+    /// transmitted by definition.
     ///
     /// `Crypto` is Godot's platform CSPRNG. `RandomNumberGenerator` is the fallback for a build
     /// without the mbedtls module, and it is **not** cryptographic: an attacker who can predict its
@@ -6584,6 +6708,14 @@ impl OrbitNet {
             self.handle_hello(sender, bytes);
             return;
         }
+        // **THE CHALLENGE IS THE SECOND DATAGRAM THIS SESSION DOES NOT AUTHENTICATE**, so it is taken
+        // off in front of `open_datagram` the way the hello is. It cannot be sealed: the key it would be
+        // sealed under is derived from the very bytes it carries. Keyed on the frame kind byte, which no
+        // sealed frame shares — a sealed payload leads with a kind of its own and `0x05` is this one.
+        if bytes[0] == FrameKind::Challenge.tag() && sender == SERVER_PEER {
+            self.handle_challenge(bytes);
+            return;
+        }
         let Some(payload) = self.open_datagram(sender, bytes) else {
             return;
         };
@@ -6629,6 +6761,11 @@ impl OrbitNet {
                     }
                 }
             }
+            // A CHALLENGE THAT REACHED HERE ARRIVED SEALED, and a sealed challenge is not one: the
+            // key it would be sealed under is derived from the bytes it carries. The unsealed frame is
+            // taken off in front of `open_datagram`, so this arm is where a peer that wrapped one in a
+            // session trailer lands, and it is dropped.
+            FrameKind::Challenge => {}
             FrameKind::Welcome => {
                 if self.mode == MODE_CLIENT && sender == SERVER_PEER {
                     let _ = reader.u8();
@@ -6915,6 +7052,19 @@ impl OrbitNet {
         );
     }
 
+    /// SERVER: both legs of a joining peer's handshake.
+    ///
+    /// **The leg is read off [`Handshake::acceptor_nonce`], and only the second one seats anything.**
+    ///
+    /// | Leg | What this does |
+    /// | --- | --- |
+    /// | the half this connection is challenged on is absent or does not match | mint or re-send it, answer with a [`Challenge`], return |
+    /// | it matches | check the confirmation, seat the key, the identity and the seat, and reply with the welcome |
+    ///
+    /// **A REPLAYED JOIN GETS NO FURTHER THAN THE FIRST ROW.** An observer presenting a recorded hello
+    /// is challenged on a half drawn for this connection now, cannot produce the confirmation that half
+    /// demands, and so never reaches the key, the resume decision, the seat or `peer_joined`. Under
+    /// protocol major 8 the hello was one frame and seated all of it.
     fn handle_hello(&mut self, sender: i32, bytes: &[u8]) {
         if self.mode != MODE_SERVER && self.mode != MODE_HOST {
             return;
@@ -6923,15 +7073,47 @@ impl OrbitNet {
             return;
         };
         let ours = Handshake::local(self.effective_rate().hz() as u16);
+        // The version and the joiner's half, which is everything decidable before a challenge — and
+        // therefore everything decided before this server spends a nonce and a datagram on the peer.
+        if let Err(err) = ours.check_hello(&hello) {
+            godot_error!("OrbitNet: rejecting peer {sender}: {err}");
+            return;
+        }
+        // WHICH LEG THIS IS, and the acceptor's half for this join. Minted once per
+        // `(connection, joiner half)`: a retried hello repeats its half and is answered with the same
+        // one, because re-minting refuses the confirmation the joiner is already sending and the two
+        // ends then chase each other. A DIFFERENT joiner half is a restarted session and draws a fresh
+        // acceptor half, which is what makes the key change and the rekey comparison below notice.
+        //
+        // **THE OPENING LEG, AND A CONFIRMATION AGAINST A HALF THIS SERVER DID NOT ISSUE**, are both
+        // answered with the challenge rather than a rejection, and neither seats anything — no key, no
+        // identity, no [`PeerState`]. The decision is [`hello_leg`], which is where the reason and the
+        // tests for it are.
+        let acceptor = match hello_leg(&mut self.challenges, sender, &hello, Self::mint_session_key)
+        {
+            HelloLeg::Challenge(acceptor) => {
+                let challenge = Challenge {
+                    joiner_nonce: hello.joiner_nonce,
+                    acceptor_nonce: acceptor,
+                };
+                self.send_raw(sender, &challenge.encode(), TransferMode::RELIABLE);
+                return;
+            }
+            HelloLeg::Confirm(acceptor) => acceptor,
+        };
+        // The confirmation, which is where a peer that does not hold this session's secret is refused —
+        // and where a REPLAYED one is, because the tag is over the fold of both halves and the
+        // acceptor's was drawn here.
         if let Err(err) = ours.check_compatibility(&hello, self.session_secret.as_ref()) {
             godot_error!("OrbitNet: rejecting peer {sender}: {err}");
             return;
         }
         // THE SESSION KEY, DERIVED BEFORE THE REKEY COMPARISON BELOW so that the comparison is
-        // derived-key against derived-key. Comparing the wire nonce instead and re-deriving on every
+        // derived-key against derived-key. Comparing the wire halves instead and re-deriving on every
         // hello would reset the replay window on each RETRY of one join, which is exactly the property
         // that comparison exists to preserve.
-        let session_key = session_key_from(self.session_secret.as_ref(), hello.session_nonce);
+        let session_key =
+            session_key_from(self.session_secret.as_ref(), hello.joiner_nonce, acceptor);
         // The whole resume decision, and the two mutations it implies — stripping a superseded incumbent's
         // identity, and spending the held window. It is a free function over the two plain tables so the
         // rule this defect lived in is one thing a test can call with no `SceneTree`; see [`seat_hello`].
@@ -6959,9 +7141,10 @@ impl OrbitNet {
         // the same trust the transport's sender id already carries: nothing but the connection says
         // who sent it.
         //
-        // Under a session secret the key is derived rather than read off the wire, and the comparison
-        // is unchanged because it was already derived above: a retried hello repeats its nonce, derives
-        // the same key, and keeps its window.
+        // A retried confirmation repeats BOTH halves — its own, and the one it was challenged with,
+        // which this server re-issues rather than re-mints — so it derives the same key and keeps its
+        // window. A restarted session changes the joiner half, which draws a fresh acceptor half, which
+        // changes the key: one comparison covers both.
         let rekeyed = peer.auth.is_some_and(|auth| auth.key() != session_key);
         if peer.auth.is_none_or(|auth| auth.key() != session_key) {
             peer.auth = Some(SessionAuth::new(session_key));
@@ -6970,9 +7153,9 @@ impl OrbitNet {
             // manifest went with it. Zeroed in the same block that replaces the auth, because these
             // are one fact: everything this connection held is gone. A delta sent against the
             // generation it held before would apply cleanly to a table it no longer has, and the
-            // rebind of a reissued slot is the record it would then be missing. A RETRIED hello
-            // repeats its nonce, derives the same key and does not enter here, so it keeps the
-            // table it is still holding.
+            // rebind of a reissued slot is the record it would then be missing. A RETRIED
+            // confirmation repeats both halves, derives the same key and does not enter here, so it
+            // keeps the table it is still holding.
             peer.forget_manifest();
             // AND THE DELTA BASES WITH IT. `stop()` cleared every row the client held, so an
             // `acked_base` entry here names a row that no longer exists on the other end. `want_full`
@@ -8817,30 +9000,167 @@ fn session_directions(mode: i64) -> Option<(Direction, Direction)> {
     }
 }
 
-/// The key one session's datagrams are authenticated with, from the shared secret and the 16 bytes the
-/// handshake carries.
+/// SERVER: the acceptor's half of the session nonce this connection is challenged on.
 ///
-/// A free function so that both ends run the same line: the client seats it in [`OrbitNet::start`], the
-/// server in `handle_hello`, and a peer that derived differently from the other refuses every datagram
-/// the other sends. It touches no Godot type, so a test calls it directly.
+/// A free function over [`OrbitNet::challenges`] so that the mint-once rule is one thing a test can call
+/// with no `SceneTree`, the way [`seat_hello`] is; `draw` is [`OrbitNet::mint_session_key`] in production
+/// and a fixed value in a test. It is called before a lazy draw rather than after one, so a peer spamming
+/// retried hellos costs no CSPRNG reads.
 ///
-/// | `secret` | The key | What the handshake's 16 bytes are |
-/// | --- | --- | --- |
-/// | `None` | those 16 bytes, verbatim | the key |
-/// | `Some` | [`derive_session_key`] of the two | a nonce |
+/// | What arrived | What comes back |
+/// | --- | --- |
+/// | the first hello on this connection | a fresh draw, stored |
+/// | a hello repeating the joiner half already held | the half already issued |
+/// | a hello carrying a DIFFERENT joiner half | a fresh draw, replacing the stored pair |
+///
+/// **A RETRIED HELLO MUST BE ANSWERED WITH THE HALF ALREADY ISSUED.** Re-minting deadlocks a lossy join:
+/// the new half refuses the confirmation the joiner is already sending against the old one, which provokes
+/// another hello, and the two ends chase each other for as long as the loss lasts.
+///
+/// **A DIFFERENT JOINER HALF IS A CLIENT THAT RESTARTED ITS SESSION**, and a fresh acceptor half is what
+/// makes the key change — which is what `handle_hello`'s rekey comparison detects, and what stops the
+/// restarted session inheriting the replay window of the one before it.
+fn challenge_half(
+    challenges: &mut HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])>,
+    peer: i32,
+    joiner: [u8; KEY_LEN],
+    draw: impl FnOnce() -> [u8; KEY_LEN],
+) -> [u8; KEY_LEN] {
+    match challenges.get(&peer) {
+        Some(&(held, half)) if held == joiner => half,
+        _ => {
+            let half = draw();
+            challenges.insert(peer, (joiner, half));
+            half
+        }
+    }
+}
+
+/// SERVER: which leg of the join an arriving [`Handshake`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelloLeg {
+    /// Answer with a [`Challenge`] carrying this half, and seat nothing.
+    Challenge([u8; KEY_LEN]),
+    /// A confirmation quoting the half this acceptor issued. Check it and seat the session.
+    Confirm([u8; KEY_LEN]),
+}
+
+/// SERVER: read the leg off the handshake, minting or re-sending this connection's acceptor half.
+///
+/// A free function beside [`challenge_half`] and [`challenge_answer`], for the same reason both of those
+/// are: **the comparison it makes is the whole of what a replayed join is refused by**, and a rule the
+/// join turns on needs no `SceneTree` to state or to test.
+///
+/// | What arrived | What comes back |
+/// | --- | --- |
+/// | an opening hello — an all-zero [`Handshake::acceptor_nonce`] | [`HelloLeg::Challenge`] |
+/// | a confirmation quoting a half this acceptor did not issue | [`HelloLeg::Challenge`] |
+/// | a confirmation quoting the half it did issue | [`HelloLeg::Confirm`] |
+///
+/// **A CONFIRMATION MUST QUOTE THE HALF THIS ACCEPTOR ISSUED, and that comparison is the replay
+/// defence.** Seating on any nonzero half would let an observer presenting a recorded handshake derive
+/// the key that join had used, which is what protocol major 8 did.
+///
+/// **A mismatch is answered with a challenge rather than a rejection**, which is what makes the join
+/// self-healing: a client holding a stale half — its own session restarted, or this connection
+/// re-challenged — is handed the current one and converges, where a refusal would leave it retrying
+/// against a half nobody holds.
+fn hello_leg(
+    challenges: &mut HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])>,
+    peer: i32,
+    hello: &Handshake,
+    draw: impl FnOnce() -> [u8; KEY_LEN],
+) -> HelloLeg {
+    let acceptor = challenge_half(challenges, peer, hello.joiner_nonce, draw);
+    if hello.acceptor_nonce == acceptor {
+        HelloLeg::Confirm(acceptor)
+    } else {
+        HelloLeg::Challenge(acceptor)
+    }
+}
+
+/// CLIENT: what to do with an arriving [`Challenge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChallengeAnswer {
+    /// Not for this join, or carrying no half. Wait for the handshake retry.
+    Ignore,
+    /// The half already held, re-sent. Confirm again without disturbing the key.
+    Confirm,
+    /// A new half. Seat the key from it and confirm.
+    Adopt,
+}
+
+/// CLIENT: whether an arriving challenge names this join, and whether its half is news.
+///
+/// A free function over the two halves this client holds, for the reason [`challenge_half`] is one: the
+/// rule is what the join turns on and it needs no `SceneTree` to state.
+///
+/// **A challenge that does not echo this client's own half is ignored.** A client that restarted its
+/// session on a live connection can have the previous join's challenge still in flight, and adopting it
+/// would derive a key the acceptor does not hold — the join would then converge only on a retry.
+///
+/// **An all-zero acceptor half is ignored** for the reason the joiner's own is refused at the handshake:
+/// it is what a frame that carried nothing would decode to, and it is the one value a lazy acceptor would
+/// repeat across joins.
+///
+/// **A DIFFERENT half is adopted rather than refused**, which is what makes the join self-healing: an
+/// acceptor that no longer holds this connection's pending half issues a new one, and a client that
+/// refused it would retry against a half nobody holds for ever. Re-seating the key is safe only because
+/// the caller gates this on the session not yet being synced.
+fn challenge_answer(
+    joiner: Option<[u8; KEY_LEN]>,
+    acceptor: Option<[u8; KEY_LEN]>,
+    challenge: &Challenge,
+) -> ChallengeAnswer {
+    if joiner != Some(challenge.joiner_nonce) || challenge.acceptor_nonce == [0u8; KEY_LEN] {
+        return ChallengeAnswer::Ignore;
+    }
+    if acceptor == Some(challenge.acceptor_nonce) {
+        return ChallengeAnswer::Confirm;
+    }
+    ChallengeAnswer::Adopt
+}
+
+/// The key one session's datagrams are authenticated with, from the shared secret and the two halves of
+/// that join's session nonce.
+///
+/// A free function so that both ends run the same line: the client seats it in
+/// [`OrbitNet::handle_challenge`], the server in `handle_hello`, and a peer that derived differently
+/// from the other refuses every datagram the other sends. It touches no Godot type, so a test calls it
+/// directly.
+///
+/// | `secret` | The key |
+/// | --- | --- |
+/// | `None` | [`session_nonce`] of the two halves |
+/// | `Some` | [`derive_session_key`] over the secret and that |
+///
+/// **BOTH HALVES ARE INPUTS, AND THE ACCEPTOR'S IS WHAT REFUSES A REPLAYED JOIN.** Keying on `joiner`
+/// alone is the shorter implementation and is what protocol major 8 did: an observer presenting a
+/// recorded handshake had the accepting side derive the key that join had used, and every datagram it
+/// had captured then verified in the session it had just opened. The acceptor draws its half per join,
+/// so a replayed half is half of a nonce whose other half the replayer never saw.
 ///
 /// **THE SECRET IS AN INPUT AND IS NEVER SEATED AS THE KEY.** Returning `*secret` here is one character
 /// shorter and re-opens cross-session replay: [`SessionAuth`] starts every session's sequence counter at
 /// 1 and the replay window only ever knows the session in front of it, so under a key that did not change
 /// between joins every datagram captured in one session is a valid, unreplayed datagram in the next. The
-/// per-join nonce is the only thing keeping the key per-join, which is why an all-zero nonce is refused
+/// per-join nonce is the only thing keeping the key per-join, which is why an all-zero half is refused
 /// at the handshake as well.
+///
+/// **The fold runs with no secret too, and buys nothing there.** Both halves are in the clear, so an
+/// on-path observer computes the key either way; running it regardless is what keeps one derivation and
+/// one frame sequence over a configuration decision neither end puts on the wire.
 ///
 /// **It changes who can forge, not how hard forging is.** The tag is still 64 bits and the key still 128,
 /// and a derived key is worth exactly the entropy of the secret it came from. Nothing here encrypts
 /// anything.
 #[must_use]
-fn session_key_from(secret: Option<&[u8; KEY_LEN]>, nonce: [u8; KEY_LEN]) -> [u8; KEY_LEN] {
+fn session_key_from(
+    secret: Option<&[u8; KEY_LEN]>,
+    joiner: [u8; KEY_LEN],
+    acceptor: [u8; KEY_LEN],
+) -> [u8; KEY_LEN] {
+    let nonce = session_nonce(&joiner, &acceptor);
     match secret {
         Some(secret) => derive_session_key(secret, &nonce),
         None => nonce,
@@ -9139,18 +9459,19 @@ mod tests {
     use super::{
         admit_input_blocks, adopt_whole_set, anchor_conflicts_owed, apply_interest_section,
         band_for_row, build_interest_section, candidate_for_own_row, candidate_for_row,
-        clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
-        delta_reference, encode_interest_delta, filter_connection, full_block_due, hold_on_drop,
-        input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
-        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
-        queue_seat_release, replayed_depth, resim_input_from, resolve_observer, resume_grant,
-        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
-        seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
-        session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
+        challenge_answer, challenge_half, clamp_resume_policy, clamp_seat_release_policy,
+        clamp_unanchored_policy, classify_rx, delta_reference, encode_interest_delta,
+        filter_connection, full_block_due, hello_leg, hold_on_drop, input_frame_is_owed,
+        interest_delta_reserve, interest_table_due, interest_table_to_send, is_located,
+        manifest_owed, note_input_tick, owned_rows_into, owned_rows_of, queue_seat_release,
+        replayed_depth, resim_input_from, resolve_observer, resume_grant, retire_unnamed_interest,
+        rtt_at_ceiling_peers, seat_hello, seat_observer, seat_observers_into,
+        seat_release_policy_of, section_is_news, select_interest_path, session_directions,
+        session_is_filtering, session_key_from, snapshot_frame_is_skipped,
         state_whole_interest_set, table_is_resolvable, unseeded_departures, veto_announces_leave,
-        AckOutcome, EntityRow, FrameHeader, InterestPass, ManifestOwed, OrbitNet, PeerAnchor,
-        PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant, ResumeTable,
-        RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        AckOutcome, ChallengeAnswer, EntityRow, FrameHeader, HelloLeg, InterestPass, ManifestOwed,
+        OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
+        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
         StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED,
         AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
         INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
@@ -9160,7 +9481,7 @@ mod tests {
         SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
         UNLOCATABLE_CENTER,
     };
-    use orbitnet_core::codec::InterestDeltaSection;
+    use orbitnet_core::codec::{Challenge, Handshake, InterestDeltaSection};
     use std::collections::HashMap;
 
     use orbitnet_core::interest::{
@@ -9171,8 +9492,9 @@ mod tests {
     use orbitnet_core::priority::Band;
     use orbitnet_core::seats::releases_seats;
     use orbitnet_core::{
-        compress_secret, AuthError, ColumnarHistory, Confidence, Direction, FreshnessLedger,
-        PropKind, PropRole, ResimPlanner, ResimRange, SchemaBuilder, SessionAuth, KEY_LEN,
+        compress_secret, session_nonce, AuthError, ColumnarHistory, Confidence, Direction,
+        FreshnessLedger, PropKind, PropRole, ResimPlanner, ResimRange, SchemaBuilder, SessionAuth,
+        KEY_LEN,
     };
 
     use crate::sync::{input_restore_row, integrate_input_row, InputIntegration};
@@ -13706,8 +14028,8 @@ mod tests {
         // window only ever knows the session in front of it, so two joins landing on one key would make
         // every datagram captured in the first a valid, unreplayed datagram in the second.
         let secret = compress_secret(b"a secret the lobby handed both ends");
-        let first = session_key_from(Some(&secret), nonce_bytes(1));
-        let second = session_key_from(Some(&secret), nonce_bytes(2));
+        let first = session_key_from(Some(&secret), nonce_bytes(1), nonce_bytes(101));
+        let second = session_key_from(Some(&secret), nonce_bytes(2), nonce_bytes(102));
         assert_ne!(first, second, "a fresh nonce is a fresh key");
         // The trap, named: seating the secret AS the key is the shorter implementation, and it is what
         // makes the two sessions above identical.
@@ -13734,34 +14056,37 @@ mod tests {
     }
 
     #[test]
-    fn a_session_with_no_secret_seals_exactly_the_bytes_it_did_before() {
-        // THE COMPATIBILITY PROMISE. With no secret set, the handshake's 16 bytes are the session key,
-        // verbatim, exactly as they were before a secret was a thing — so a session that configures
-        // nothing puts identical bytes on the wire.
-        let nonce = nonce_bytes(7);
-        assert_eq!(session_key_from(None, nonce), nonce);
-
-        let mut derived_path = b"snapshot".to_vec();
-        SessionAuth::new(session_key_from(None, nonce))
-            .seal(Direction::ToClient, &mut derived_path)
-            .unwrap();
-        let mut old_path = b"snapshot".to_vec();
-        SessionAuth::new(nonce)
-            .seal(Direction::ToClient, &mut old_path)
-            .unwrap();
-        assert_eq!(
-            derived_path, old_path,
-            "sequence number and tag both, byte for byte"
-        );
+    fn a_session_with_no_secret_still_folds_both_halves_into_its_key() {
+        // WITH NO SECRET THE FOLD IS THE KEY, and it is still a fold: neither half is seated verbatim.
+        // That buys nothing against an on-path observer — both halves are in the clear — and it is run
+        // anyway so that one derivation and one frame sequence cover a decision neither end transmits.
+        let joiner = nonce_bytes(7);
+        let acceptor = nonce_bytes(107);
+        let key = session_key_from(None, joiner, acceptor);
+        assert_ne!(key, joiner, "the joiner's half is not the key");
+        assert_ne!(key, acceptor, "nor the acceptor's");
+        assert_eq!(key, session_nonce(&joiner, &acceptor));
+        // And the acceptor's half decides it here too, so a replayed join is keyed on bytes the
+        // replayer never saw under this regime as well — it just learns them by reading the challenge.
+        assert_ne!(key, session_key_from(None, joiner, nonce_bytes(108)));
     }
 
     #[test]
     fn a_peer_with_a_different_secret_derives_a_key_that_opens_nothing() {
         // What refuses a peer that does not hold the secret, once it is past the handshake: its key is
         // not the session's, so nothing it sends verifies and nothing sent to it does either.
-        let nonce = nonce_bytes(3);
-        let ours = session_key_from(Some(&compress_secret(b"the right secret")), nonce);
-        let theirs = session_key_from(Some(&compress_secret(b"the wrong secret")), nonce);
+        let joiner = nonce_bytes(3);
+        let acceptor = nonce_bytes(103);
+        let ours = session_key_from(
+            Some(&compress_secret(b"the right secret")),
+            joiner,
+            acceptor,
+        );
+        let theirs = session_key_from(
+            Some(&compress_secret(b"the wrong secret")),
+            joiner,
+            acceptor,
+        );
         assert_ne!(ours, theirs, "the same nonce, a different secret");
         let mut datagram = b"input".to_vec();
         SessionAuth::new(theirs)
@@ -13773,20 +14098,240 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // The two decisions the join turns on, as free functions over plain values. Neither needs a
+    // `SceneTree`; both are what a replayed join, a retried hello and a restarted session meet.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_acceptor_half_is_minted_once_per_connection_and_joiner_half() {
+        let mut challenges: HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])> = HashMap::new();
+        let joiner = nonce_bytes(31);
+        let first = challenge_half(&mut challenges, 7, joiner, || nonce_bytes(131));
+        assert_eq!(first, nonce_bytes(131), "the first hello draws");
+        // A RETRIED HELLO REPEATS ITS HALF AND MUST GET THE SAME ANSWER. Re-minting would refuse the
+        // confirmation the joiner is already sending, which provokes another hello, and the two ends
+        // chase each other for as long as the loss lasts. The closure panics to prove no draw happened.
+        for _ in 0..3 {
+            assert_eq!(
+                challenge_half(&mut challenges, 7, joiner, || panic!(
+                    "a retry must not re-mint"
+                )),
+                first
+            );
+        }
+        // ANOTHER CONNECTION IS ANOTHER JOIN, even carrying the same joiner half — which is the shape
+        // an observer replaying a recorded hello from its own socket arrives in.
+        assert_eq!(
+            challenge_half(&mut challenges, 8, joiner, || nonce_bytes(138)),
+            nonce_bytes(138)
+        );
+        // A DIFFERENT JOINER HALF IS A RESTARTED SESSION, and it draws again — which is what makes the
+        // key change and `handle_hello`'s rekey comparison notice.
+        let restarted = challenge_half(&mut challenges, 7, nonce_bytes(32), || nonce_bytes(132));
+        assert_eq!(restarted, nonce_bytes(132));
+        assert_ne!(restarted, first);
+        assert_eq!(
+            challenges.get(&7),
+            Some(&(nonce_bytes(32), nonce_bytes(132)))
+        );
+        // And the half the restarted session replaced is gone, so a confirmation against it is not
+        // seated. A replayed join is exactly that shape: a joiner half this connection is not on.
+        assert_eq!(
+            challenge_half(&mut challenges, 7, joiner, || nonce_bytes(133)),
+            nonce_bytes(133),
+            "the old pair was replaced, not kept beside the new one"
+        );
+    }
+
+    #[test]
+    fn only_a_confirmation_quoting_the_issued_half_is_seated() {
+        let mut challenges: HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])> = HashMap::new();
+        let joiner = nonce_bytes(51);
+        let issued = nonce_bytes(151);
+        let opening = Handshake {
+            joiner_nonce: joiner,
+            acceptor_nonce: [0u8; KEY_LEN],
+            ..Handshake::local(60)
+        };
+        // THE OPENING LEG is challenged and seats nothing.
+        assert_eq!(
+            hello_leg(&mut challenges, 7, &opening, || issued),
+            HelloLeg::Challenge(issued)
+        );
+        // A RETRIED OPENING HELLO is challenged again with the SAME half, and draws nothing.
+        assert_eq!(
+            hello_leg(&mut challenges, 7, &opening, || panic!(
+                "a retry must not re-mint"
+            )),
+            HelloLeg::Challenge(issued)
+        );
+        // A CONFIRMATION QUOTING A HALF THIS ACCEPTOR NEVER ISSUED is challenged, not seated. This is
+        // the case a replayed join lands in, and the case a client holding a stale half converges from.
+        for forged in [nonce_bytes(199), nonce_bytes(1), [0xffu8; KEY_LEN]] {
+            assert_ne!(forged, issued);
+            let confirmation = Handshake {
+                acceptor_nonce: forged,
+                ..opening
+            };
+            assert_eq!(
+                hello_leg(&mut challenges, 7, &confirmation, || panic!(
+                    "a mismatch must not re-mint"
+                )),
+                HelloLeg::Challenge(issued),
+                "a nonzero half this acceptor did not issue is still only challenged"
+            );
+        }
+        // THE CONFIRMATION THIS ACCEPTOR CHALLENGED FOR, and the only one that seats.
+        let confirmation = Handshake {
+            acceptor_nonce: issued,
+            ..opening
+        };
+        assert_eq!(
+            hello_leg(&mut challenges, 7, &confirmation, || panic!(
+                "a confirmation must not re-mint"
+            )),
+            HelloLeg::Confirm(issued)
+        );
+        // AND IT IS STILL SEATED ON THE RETRY, because a confirmation is retried until the welcome
+        // lands and the row has to outlive the leg that seats the session.
+        assert_eq!(
+            hello_leg(&mut challenges, 7, &confirmation, || panic!(
+                "a retried confirmation must not re-mint"
+            )),
+            HelloLeg::Confirm(issued)
+        );
+        // THE SAME CONFIRMATION FROM ANOTHER CONNECTION IS NOT SEATED. An observer that recorded a
+        // whole join and replays both legs from its own socket is challenged on a half drawn now.
+        assert_eq!(
+            hello_leg(&mut challenges, 8, &confirmation, || nonce_bytes(158)),
+            HelloLeg::Challenge(nonce_bytes(158))
+        );
+    }
+
+    #[test]
+    fn a_challenge_is_adopted_only_when_it_names_this_join() {
+        let joiner = nonce_bytes(41);
+        let acceptor = nonce_bytes(141);
+        let named = Challenge {
+            joiner_nonce: joiner,
+            acceptor_nonce: acceptor,
+        };
+        // Nothing to answer yet, and a challenge for somebody else's join.
+        assert_eq!(
+            challenge_answer(None, None, &named),
+            ChallengeAnswer::Ignore,
+            "a client that has drawn no half of its own"
+        );
+        assert_eq!(
+            challenge_answer(Some(nonce_bytes(42)), None, &named),
+            ChallengeAnswer::Ignore,
+            "a challenge echoing a half this client is not on"
+        );
+        // A STALE CHALLENGE FROM A PREVIOUS JOIN ON A LIVE CONNECTION is exactly that case, and
+        // adopting it would derive a key the acceptor does not hold.
+        assert_eq!(
+            challenge_answer(
+                Some(joiner),
+                None,
+                &Challenge {
+                    joiner_nonce: nonce_bytes(40),
+                    acceptor_nonce: acceptor,
+                }
+            ),
+            ChallengeAnswer::Ignore
+        );
+        // An all-zero acceptor half is what a frame that carried nothing decodes to.
+        assert_eq!(
+            challenge_answer(
+                Some(joiner),
+                None,
+                &Challenge {
+                    joiner_nonce: joiner,
+                    acceptor_nonce: [0u8; KEY_LEN],
+                }
+            ),
+            ChallengeAnswer::Ignore
+        );
+        // The forward: a first challenge is adopted, a re-send of the same half is confirmed without
+        // disturbing the key, and a DIFFERENT half is adopted rather than refused — which is what makes
+        // the join self-healing when the acceptor no longer holds the pending half.
+        assert_eq!(
+            challenge_answer(Some(joiner), None, &named),
+            ChallengeAnswer::Adopt
+        );
+        assert_eq!(
+            challenge_answer(Some(joiner), Some(acceptor), &named),
+            ChallengeAnswer::Confirm
+        );
+        assert_eq!(
+            challenge_answer(Some(joiner), Some(nonce_bytes(142)), &named),
+            ChallengeAnswer::Adopt
+        );
+    }
+
+    #[test]
+    fn a_replayed_join_derives_a_key_the_replayer_never_saw() {
+        // **THE REPLAYED JOIN, AT THE KEY.** An on-path observer records a whole join and presents the
+        // joiner's half again. The acceptor draws its own half per join, so the session that comes out
+        // is keyed on bytes the observer never saw, and every datagram it captured under the recorded
+        // key is refused. Under protocol major 8 `session_key_from` took the joiner's half alone and
+        // the two keys below were one key.
+        let secret = compress_secret(b"a secret the lobby handed both ends");
+        let recorded_joiner = nonce_bytes(21);
+        let recorded = session_key_from(Some(&secret), recorded_joiner, nonce_bytes(121));
+        let replayed = session_key_from(Some(&secret), recorded_joiner, nonce_bytes(122));
+        assert_ne!(
+            recorded, replayed,
+            "the same joiner half, a fresh acceptor half"
+        );
+
+        let mut captured = b"input for tick 1".to_vec();
+        SessionAuth::new(recorded)
+            .seal(Direction::ToServer, &mut captured)
+            .unwrap();
+        assert_eq!(
+            SessionAuth::new(replayed).open(Direction::ToServer, &captured),
+            Err(AuthError::BadTag),
+            "the replayed join refuses what the recorded one sealed"
+        );
+        assert!(
+            SessionAuth::new(recorded)
+                .open(Direction::ToServer, &captured)
+                .is_ok(),
+            "the negative control: it opens under the join that sealed it"
+        );
+        // And with no secret either. The observer can compute this key by reading the challenge, so the
+        // fold buys nothing there — what it must not do is make the REPLAYED session reuse the
+        // recorded one's key, because that is what restarts sequence numbers under a known key.
+        assert_ne!(
+            session_key_from(None, recorded_joiner, nonce_bytes(121)),
+            session_key_from(None, recorded_joiner, nonce_bytes(122))
+        );
+    }
+
     #[test]
     fn a_retried_hello_derives_the_same_key_and_keeps_its_replay_window() {
         // A hello is retried until the welcome lands, so `handle_hello` runs again for a peer already
-        // seated. It compares DERIVED KEY against derived key, and a repeated nonce derives the same
-        // one — which is what makes the comparison answer "unchanged" and leave the window alone.
-        // Re-deriving into a fresh `SessionAuth` on every retry would reset the window instead, and
-        // anything captured from that peer could then be replayed by sending one copy of its handshake.
+        // seated. It compares DERIVED KEY against derived key, and a retry that repeats BOTH halves —
+        // its own, and the one this server re-issues rather than re-mints — derives the same one, which
+        // is what makes the comparison answer "unchanged" and leave the window alone. Re-deriving into
+        // a fresh `SessionAuth` on every retry would reset the window instead, and anything captured
+        // from that peer could then be replayed by sending one copy of its handshake.
         let secret = compress_secret(b"a secret the lobby handed both ends");
-        let nonce = nonce_bytes(11);
-        let seated = session_key_from(Some(&secret), nonce);
+        let joiner = nonce_bytes(11);
+        let acceptor = nonce_bytes(111);
+        let seated = session_key_from(Some(&secret), joiner, acceptor);
         assert_eq!(
-            session_key_from(Some(&secret), nonce),
+            session_key_from(Some(&secret), joiner, acceptor),
             seated,
-            "the retry's nonce is the same nonce, so the comparison sees no rekey"
+            "the retry repeats both halves, so the comparison sees no rekey"
+        );
+        // And the case the comparison must NOT answer "unchanged": a restarted session draws a new
+        // joiner half, which draws a fresh acceptor half, which is a rekey.
+        assert_ne!(
+            session_key_from(Some(&secret), nonce_bytes(12), nonce_bytes(112)),
+            seated
         );
 
         let mut window = SessionAuth::new(seated);

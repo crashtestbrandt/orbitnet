@@ -30,9 +30,10 @@ last N ticks for redundancy, so a single lost packet costs nothing.
 **A block names its entity by a 16-bit session slot, not by the 64-bit entity id.** See
 [entity slots](#entity-slots) for what that costs and what it saves.
 
-**Control frames** — reliable and **ordered**: handshake, welcome, entity manifest, entity manifest
-delta, and the interest table. All but the handshake carry the same 12-byte trailer. Ordering is what a manifest delta needs
-and a snapshot does not; every frame goes out `TRANSFER_MODE_RELIABLE` on one channel.
+**Control frames** — reliable and **ordered**: handshake, challenge, welcome, entity manifest, entity
+manifest delta, and the interest table. All but the handshake and the challenge carry the same 12-byte
+trailer. Ordering is what a manifest delta needs and a snapshot does not; every frame goes out
+`TRANSFER_MODE_RELIABLE` on one channel.
 
 **Reliable means retransmitted, not delivered.** Every datagram of a session — reliable and unreliable alike —
 draws from one sequence counter and is checked against one `REPLAY_WINDOW`-wide replay window, so a
@@ -40,11 +41,39 @@ retransmission that lands more than that many datagrams behind the newest is ref
 Anything that depends on a control frame arriving has to notice that it did, rather than assume it: the
 interest table is owed until the client's echo says it holds it, and is re-sent meanwhile.
 
-**Handshake** — magic, protocol version, tick rate, a **session id**, the **session nonce**, the
-**resume token**, then the **confirm tag**:
+### The join: four frames, two round trips
+
+A joining client sends its handshake, the server answers with a **challenge** carrying its own half of the
+session nonce, the client repeats its handshake quoting that half back, and the server replies with the
+welcome. Both ends fold the two halves into the key.
+
+| # | Direction | Frame | Sealed |
+| --- | --- | --- | --- |
+| 1 | client → server | handshake, `acceptor nonce` all zeroes and `confirm` `0` | no |
+| 2 | server → client | challenge | no |
+| 3 | client → server | handshake, `acceptor nonce` quoted back, `confirm` tagged over both halves | no |
+| 4 | server → client | welcome | yes, under the key the pair derives |
+
+- **The client may not send anything until frame 2 lands.** Half of the key's input is the server's, so
+  there is no key to seal with before then. That is the cost of closing the replay; [what the join
+  costs](#what-the-join-costs) measures it.
+- **Frames 1 and 2 are the two datagrams a session does not authenticate**, because together they are what
+  establish the key. Frame 3 is a repeat of frame 1's shape and is unauthenticated for the same reason.
+- **The server seats nothing on frame 1.** No key, no session identity, no seat, no `peer_joined` — it
+  stores the two nonce halves against the connection and answers. A join that never confirms costs 32
+  bytes of state and a 33-byte datagram.
+- **Frame 1 is retried every 0.5 s until the welcome lands, and so is frame 3.** Whichever leg the client
+  is on is the one that goes out again. A retried frame 1 is answered with the **same** challenge, never a
+  fresh one: re-minting would refuse the confirmation the client is already sending, and the two ends would
+  chase each other for as long as the loss lasted.
+- **A confirmation quoting a half the server does not hold is answered with a challenge, not a rejection.**
+  That is what makes the join self-healing when either end forgot where it was.
+
+**Handshake** — magic, protocol version, tick rate, a **session id**, the **joiner nonce**, the **resume
+token**, the **acceptor nonce**, then the **confirm tag**:
 
 ```
-magic | protocol version (u32) | tickrate (u16) | session id (u64) | session nonce (16 bytes) | resume token (u64) | confirm (u64)
+magic | protocol version (u32) | tickrate (u16) | session id (u64) | joiner nonce (16 bytes) | resume token (u64) | acceptor nonce (16 bytes) | confirm (u64)
 ```
 
 | Field | Width | What it is |
@@ -53,9 +82,10 @@ magic | protocol version (u32) | tickrate (u16) | session id (u64) | session non
 | protocol version | 4 | `(major << 16) \| (minor << 8) \| patch` |
 | tickrate | 2 | the sender's rate in hertz |
 | session id | 8 | the player identity, client-asserted |
-| session nonce | 16 | **the session key itself with no secret configured, a nonce with one** |
+| joiner nonce | 16 | **the client's half of the session nonce**, drawn fresh per join |
 | resume token | 8 | the server-minted value a claim on the identity quotes |
-| confirm | 8 | proof the sender holds the shared secret; `0` proves none |
+| acceptor nonce | 16 | **the server's half**, quoted back off the challenge; all zeroes on the opening hello |
+| confirm | 8 | proof the sender holds the shared secret, over both halves; `0` proves none |
 
 The session id is what makes a reconnecting player recognizable: a peer id names the connection and is
 reassigned every time, this names the player and is resent verbatim on every join. It is **asserted by the
@@ -65,17 +95,38 @@ that must not be forged. `0` means "no identity"; see [api.md](api.md#session-id
 The resume token is what makes that claim checkable. It is **minted by the server**, one per identity, sent
 in the welcome, and quoted back here; `0` quotes none. See [the resume token](#the-resume-token).
 
-The session nonce and the confirm tag are the two regimes of
-[datagram authentication](#datagram-authentication). The 16-byte field kept its offset and its width when it
-became a nonce, and which regime is in force is a local decision neither end puts on the wire.
+The two nonce halves and the confirm tag are the substance of
+[datagram authentication](#datagram-authentication), and which secret regime is in force is a local decision
+neither end puts on the wire.
 
-Everything after the protocol version decodes **best-effort**, to a zero tick rate, no session id, an
-all-zero nonce, a `0` resume token and a `0` confirmation. `handle_hello` answers a decode error by returning,
-so a peer whose handshake is short would otherwise be dropped in silence; decoding it far enough to reach
-the compatibility check is what produces the operator-readable version mismatch. An all-zero nonce is then
-refused with a message of its own. A `0` resume token is refused nothing — it is what a first-time joiner
-sends, and it costs that peer only its resume. A `0` confirmation is refused nothing either, unless the
-reading peer holds a secret.
+**The confirmation is a whole handshake rather than a smaller frame of its own.** That costs 41 bytes it
+could have saved. What it buys is that the server stores nothing about an unconfirmed connection but the two
+nonce halves — the identity, the token and the tick rate arrive again on the leg that seats them, rather
+than being stashed off a hello that has proved nothing.
+
+Everything after the protocol version decodes **best-effort**, to a zero tick rate, no session id, two
+all-zero nonces, a `0` resume token and a `0` confirmation. `handle_hello` answers a decode error by
+returning, so a peer whose handshake is short would otherwise be dropped in silence; decoding it far enough
+to reach the compatibility check is what produces the operator-readable version mismatch. An all-zero joiner
+nonce is then refused with a message of its own. A `0` resume token is refused nothing — it is what a
+first-time joiner sends, and it costs that peer only its resume. An all-zero acceptor nonce is refused
+nothing either: it is the opening hello, and it is answered with a challenge. A `0` confirmation is refused
+nothing unless the reading peer holds a secret.
+
+**Challenge** — the server's half of the session nonce, and the only frame it sends before the key exists:
+
+```
+frame kind 0x05 | joiner nonce echoed (16 bytes) | acceptor nonce (16 bytes)
+```
+
+**Neither field decodes best-effort.** Both are required, unlike the handshake's trailing options: reading a
+short challenge as all-zero bytes would have the client derive its key off a field that was never sent, and
+then fail every tag with nothing to say why. A client answers the error by waiting out its own handshake
+retry, which is the same recovery a lost challenge gets.
+
+**The echo is what lets a client tell this challenge from a stale one.** A client that restarted its session
+on a live connection can have the previous join's challenge still in flight; adopting it would derive a key
+the server does not hold.
 
 **Welcome** — the join reply, carrying the token the client stores for its next join:
 
@@ -98,6 +149,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 | 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
 | 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. A client input frame also carries, before its blocks, the interest generation that client holds, so the server builds a section only for a peer that provably holds the baseline it is diffed against. The leading generation shifts the offsets of the section's own counts and the echo shifts every block's, which is what makes this a major rather than a trailing addition. |
+| 9 | **The join is two round trips and both ends contribute to the key.** The handshake's 16 bytes are the client's half of the session nonce; the server answers with a **challenge** frame (kind `0x05`) carrying a half of its own, and the client repeats its handshake quoting that half back in a new trailing **acceptor nonce** field. The key is derived from the fold of the two, and the confirm tag is taken over that fold. What it closes is a **replayed join**: under major 8 the nonce was the client's alone, so an on-path observer presenting a recorded handshake had the server derive the key that join had used. A peer predating this seats its own half as the key and fails every MAC, so the major is what refuses it — the new field would otherwise decode as an absent trailing value rather than a mismatch. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -592,8 +644,8 @@ is two players behind one socket — and each is anchored, culled and world-filt
 
 ## Datagram authentication
 
-Every datagram but the handshake carries a **32-bit sequence number and a 64-bit MAC tag**, and is dropped
-before a single field is decoded unless both check out.
+Every datagram but the handshake and the challenge carries a **32-bit sequence number and a 64-bit MAC
+tag**, and is dropped before a single field is decoded unless both check out.
 
 - **The MAC** is SipHash-2-4 over the payload, the sequence number, and a **direction byte that is not
   transmitted**. Each side authenticates with the direction it expects to receive, so a datagram reflected
@@ -605,48 +657,64 @@ before a single field is decoded unless both check out.
 - The server keeps one key per connected peer; a peer that has not handshaken has none, and everything it
   sends is refused — including the ping a server used to answer for any connected sender.
 
-### Two regimes, and which one you are in
+### Both ends contribute a nonce
 
-The key is 16 bytes either way, and the handshake's 16-byte field is 16 bytes either way. What differs is
-whether those are the same 16 bytes. `Net.set_session_secret()` chooses, on both ends, before
-`Net.set_mode()`.
+**Neither end alone decides a session's key.** The client draws 16 bytes and sends them in its handshake; the
+server draws 16 of its own and answers with them; both fold the pair with `session_nonce()` and key on the
+result. It is the same exchange under both secret regimes, so [the join](#the-join-four-frames-two-round-trips)
+has one shape whatever a game configured.
+
+**What the server's half closes is a REPLAYED JOIN.** An on-path observer that recorded a whole join can
+present the client's half again — but the half it is challenged with was drawn for this join, so:
+
+- the confirm tag it captured recomputes against nothing, and the join is refused by name at the handshake;
+- even without a secret configured, the session the replay would open is keyed on bytes that are not the
+  recorded key, so nothing it captured verifies there.
+
+Under protocol major 8 the nonce was the client's alone and that replay was admitted: the server derived the
+key that join had used, and the observer got a session in which its captured datagrams verified. It learned
+no key and authored nothing new, and the datagrams landed nowhere — an input block is checked against the
+entity's live multiplayer authority, which is bound to the connection rather than to the key, and the ticks
+it carried had rotated out of history. The session it got was the whole of the finding, and it is closed.
+
+**It buys nothing against an observer that can also inject.** This refuses a replay. An attacker able to
+answer the server's challenge in the client's place is authoring a fresh join, and a shared session secret is
+what refuses that.
+
+### Two secret regimes, and which one you are in
+
+`Net.set_session_secret()` chooses, on both ends, before `Net.set_mode()`.
 
 | | **No secret** — the default | **A shared secret** |
 | --- | --- | --- |
-| The handshake's 16 bytes | the session key itself | a **nonce** |
-| Where the key comes from | the client's `Crypto` draw | `derive_session_key(secret, nonce)` on both ends |
-| What an on-path observer learns | everything the client knows | the nonce, and nothing else |
+| Where the key comes from | the fold of the two nonce halves | that fold, with the secret folded in |
+| What an on-path observer learns | both halves, and therefore the key | both halves, and nothing else |
 | Can an on-path observer forge? | **yes, anything the client can** | no |
-| Who may join | anyone the transport accepts | anyone holding the secret — or, on-path, anyone who recorded a join under it |
-| What the confirm tag holds | `0` | the tag |
+| Can it replay a recorded join? | no | no |
+| Who may join | anyone the transport accepts | anyone holding the secret |
+| What the confirm tag holds | `0` | the tag, over the folded nonce |
 
-- **With no secret the key crosses the wire in the clear**, so this authenticates a datagram's membership in
-  a session, not a peer's identity. An attacker who cannot read the session's traffic cannot forge a datagram
-  at all, whatever sender id it puts on one, and one connected peer cannot forge another's. **An on-path
-  observer who can read the handshake can do everything the client can.** Recorded as a limit in the
+- **With no secret both halves cross the wire in the clear**, so this authenticates a datagram's membership
+  in a session, not a peer's identity. An attacker who cannot read the session's traffic cannot forge a
+  datagram at all, whatever sender id it puts on one, and one connected peer cannot forge another's. **An
+  on-path observer who can read the exchange can do everything the client can.** Recorded as a limit in the
   [README](../README.md#limits).
-- **With a secret only the nonce is in the clear.** The secret never crosses the wire, so an on-path observer
-  reads every payload and derives no key — it cannot forge a datagram, take a session identity, or quote a
-  resume token into a session it can authenticate.
-- **What it does not close: an on-path observer can REPLAY a join it recorded.** The nonce is chosen by the
-  client and the confirm tag is a pure function of it, so presenting the same pair again derives the same key
-  and is admitted. The observer still learns no secret and can author nothing new; what it gets is a session
-  in which the datagrams it captured under that nonce verify. They land nowhere: an input block is checked
-  against the entity's live multiplayer authority, which is bound to the connection rather than to the key,
-  and the ticks it carries have long rotated out of history. The nonce still buys what it is for — without it
-  a constant key would make every captured datagram valid in **every** later session, including honest ones the
-  attacker never observed. Closing the replay as well needs a value the acceptor contributes, and therefore a
-  second round trip before a client may send anything.
+- **With a secret the halves are still in the clear and the key is not.** The secret never crosses the wire,
+  so an on-path observer reads every payload and derives no key — it cannot forge a datagram, take a session
+  identity, or quote a resume token into a session it can authenticate.
 - **The secret is a derivation input and is never seated as the key.** Sequence numbers restart at 1 on every
   join and the replay window only ever knows the session in front of it, so a key that did not change between
   joins would make every datagram captured in one session a valid, unreplayed datagram in the next. The
-  per-join nonce is the only thing keeping the key per-join, which is why an all-zero nonce is refused at the
+  per-join nonce is the only thing keeping the key per-join, which is why an all-zero half is refused at the
   handshake under both regimes.
-- **The confirm tag** is `SipHash(derived key, "orbitnet-confirm" ‖ nonce ‖ protocol version)`, and it is
-  checked against the version the sender stamped on its own frame — major must already match, and minor and
-  patch are allowed to differ.
+- **The confirm tag** is `SipHash(derived key, "orbitnet-confirm" ‖ folded nonce ‖ protocol version)`, and it
+  is checked against the version the sender stamped on its own frame — major must already match, and minor
+  and patch are allowed to differ.
 
 ### Three ceilings a secret does not lift
+
+The replayed join used to be a fourth. It is closed by the exchange above, under both regimes, and these
+three are what is left.
 
 - **The tag is still 64 bits and the key still 128.** A secret changes *who* can forge a datagram. It does
   not change how hard forging one is for somebody who cannot read the secret.
@@ -656,18 +724,52 @@ whether those are the same 16 bytes. `Net.set_session_secret()` chooses, on both
 - **None of this encrypts anything.** Every payload is still on the wire in the clear, under both regimes. A
   MAC says a datagram was not written by somebody outside the session, and says nothing else.
 
-### What it costs
+### What the join costs
 
-| | Bytes |
+**The cost is the second round trip, and it is charged per join under both regimes.** Nothing at rest
+changes.
+
+| | Cost |
 |---|---|
-| the handshake's 16-byte field | **0 new** — it kept its offset and its width and changed meaning |
-| the handshake's trailing confirm tag | 8, present under both regimes and `0` under the first |
-| per join, both directions | **8**, on a frame that is already reliable, and only from the joining side |
+| **time to synced** | **two one-way latencies more** — four legs instead of two |
+| **time until a client holds a key** | **two one-way latencies**, where it was none: the key needs the server's half |
+| bytes per join, both directions | **115 new** (80 → 195): the handshake grew 16 for the acceptor half and is sent twice, plus a 33-byte challenge |
+| derivation per join, per end | **0.03 µs added** (0.05 → 0.08 µs): one extra pair of SipHash passes |
 | at rest — every snapshot, input, manifest and welcome frame | **0** |
+| per-connection state before a join confirms | **32 bytes**, the two nonce halves |
 
-**Configuring a secret costs nothing beyond that.** The 8 bytes are the field, not the tag: a session with no
-secret writes `0` into it and pays the same 8. The derivation itself is two SipHash passes over 16 bytes, run
-once per join on each end.
+**The row that moves for a player is the first one.** A client ticks only once the welcome lands under both
+majors, so the key arriving later than it used to costs nothing on its own — what costs is that the welcome is
+now two legs further away.
+
+**The table below is arithmetic, not a measurement.** It is legs multiplied by the one-way latency of each
+impairment profile in [netbench.md](netbench.md#profiles); no stopwatch has been put on a live join at
+either major. It bounds the cost rather than reporting it — a real join also pays the server's poll interval
+and whatever the transport adds.
+
+| Profile | One-way | Time to synced, major 8 | major 9 |
+|---|---|---|---|
+| `lan` | 1 ms | 2 ms | **4 ms** |
+| `broadband` | 30 ms | 60 ms | **120 ms** |
+| `congested_wifi` | 50 ms | 100 ms | **200 ms** |
+| `mobile_4g` | 100 ms | 200 ms | **400 ms** |
+| `worst_case` | 250 ms | 500 ms | **1000 ms** |
+
+**And loss now has twice as many legs to hit.** The handshake channel is reliable, so ENet usually
+retransmits a lost leg before OrbitNet's own 0.5 s retry fires — that retry is the backstop for a server that
+was not yet in `SERVER` mode. A join that does fall through to it waits 0.5 s, and the chance of that is the
+chance any leg is lost:
+
+| Per-leg loss | major 8 (2 legs) | major 9 (4 legs) |
+|---|---|---|
+| 0.5% | 1.00% | 1.99% |
+| 2% (`congested_wifi`) | 3.96% | 7.76% |
+| 5% (`worst_case`) | 9.75% | 18.55% |
+| 10% (`torture`) | 19.00% | 34.39% |
+
+**Configuring a secret costs nothing beyond that.** The frame sequence and every byte above are the same with
+and without one; the secret adds one pair of SipHash passes per join per end, and the 8-byte confirm field is
+paid either way because a session with no secret writes `0` into it.
 
 ### What a misconfiguration looks like
 
@@ -678,7 +780,7 @@ retries. What differs is whether the other end can say why.
 
 | Server | Client | What happens |
 | --- | --- | --- |
-| no secret | no secret | the cleartext-key regime; every existing session |
+| no secret | no secret | the default regime; every session that configures nothing |
 | secret | the same secret | keys derive equal, the session runs |
 | **secret** | **none, or a different one** | one readable rejection in the server's log; the join is refused |
 | **none** | **a secret** | nothing is logged anywhere; the join hangs |
@@ -688,18 +790,19 @@ retries. What differs is whether the other end can say why.
   reading the server's log is told which configuration is wrong. Without the tag the server would seat the
   session, refuse every datagram from it as unauthenticated, and log a generic warning about a forged or
   replayed packet.
-- **Client with a secret, server without** cannot be reported at all, in either direction. The server derives
-  the nonce as the key and seals its welcome under it; the client, holding a different key, refuses that
+- **Client with a secret, server without** cannot be reported at all, in either direction. The server keys
+  on the folded nonce alone and seals its welcome under it; the client, holding a different key, refuses that
   welcome as a bad tag and never reads a byte of it — including a rejection, if one were written. The server
-  meanwhile sees a hello it has no reason to refuse. **Compare `Net.has_session_secret()` on both ends when a
-  join hangs**; it is the only thing that distinguishes this from a dead link.
+  meanwhile sees a confirmation it has no reason to refuse, because it is not checking one. **Compare
+  `Net.has_session_secret()` on both ends when a join hangs**; it is the only thing that distinguishes this
+  from a dead link.
 
 **Why not a key exchange instead.** An X25519 exchange inside `orbitnet-core` is roughly 400 lines of new
 field arithmetic in a crate with zero dependencies and `overflow-checks` on, and the only constant-time
 groundwork this repository has is the ten-line tag compare. And an **unauthenticated** exchange does not
-close the hole above anyway: the attacker in question is on-path, and an exchange with no key the client
-already trusts is substituted by exactly that attacker. It would demote the adversary from on-path to
-passive-only, at that cost. A secret the game already authenticated closes both.
+close the on-path forgery above anyway: an exchange with no key the client already trusts is substituted by
+exactly that attacker. It would demote the adversary from on-path to passive-only, at that cost. A secret the
+game already authenticated closes it, and it needs no new primitive.
 
 **What holds the tag compare to constant time.** `native/crates/orbitnet-core/tests/constant_time.rs`, in two
 assertions that fail for different reasons.
@@ -750,9 +853,10 @@ alive. The incumbent kept its socket, received no error, and stopped driving its
 screenshot. It never saw the token.
 
 **What it does not close on its own**: an on-path observer, who reads the welcome and can then quote the token
-verbatim. That is the same boundary [the cleartext session key](#datagram-authentication) has, and it closes
-the same way — a **shared session secret**. Under one, that observer can still copy the token but cannot
-authenticate the handshake that quotes it, so the claim never reaches the resume decision.
+verbatim. That is the same boundary [a key with no secret folded into
+it](#two-secret-regimes-and-which-one-you-are-in) has, and it closes the same way — a **shared session
+secret**. Under one, that observer can still copy the token but cannot confirm the handshake that quotes it,
+so the claim never reaches the resume decision.
 
 **A client stores one token, naming whichever server last issued one.** Joining a second server under the
 same identity replaces it and forfeits the resume on the first. Storing one per server would need a server
@@ -839,7 +943,9 @@ The backend checks the wire. It does not check your game.
 | An ack for a frame the peer cannot prove it received | The frame token; see above. The rest of that frame's input blocks are still processed. |
 | Anything from a peer that has not handshaken | Including pings. |
 | A peer speaking a different protocol major | Rejected at the handshake with a readable message. |
-| A handshake carrying an all-zero session nonce | An older build, or a truncated frame. Rejected by name. |
+| A handshake carrying an all-zero joiner nonce | An older build, or a truncated frame. Rejected by name. |
+| A handshake quoting a nonce half this server did not issue | Answered with a challenge rather than seated, which covers both an opening hello and a client holding a stale half. Nothing is seated until the half comes back. |
+| A **replayed join** | The server's half of the session nonce is drawn per join, so a recorded handshake presented again is challenged on bytes its confirmation cannot answer. See [both ends contribute a nonce](#both-ends-contribute-a-nonce). |
 | A handshake that cannot confirm this peer's session secret | Only when this peer holds one. Rejected at the handshake rather than after the first failed tag; see [datagram authentication](#datagram-authentication). |
 | A resume claim that does not quote the server's token | Seated as a newcomer; the incumbent keeps its identity and the held window is not spent. See [the resume token](#the-resume-token). |
 | A block naming a slot with no binding | The spawn or the manifest is still in flight. Skipped cleanly; the rest of the frame decodes. |

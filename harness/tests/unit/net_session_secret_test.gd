@@ -2,17 +2,18 @@ extends UnitTest
 ## Scene-free coverage for the SHARED SESSION SECRET on the [code]Net[/code] facade: the two calls a game
 ## makes, the empty-array clear, and the degraded answer against a cdylib that predates them.
 ##
-## WHAT THE SECRET IS FOR. Without one, the per-datagram key is minted by the client and carried in the join
-## handshake in the clear, so what the MAC authenticates is a datagram's membership in a session rather than a
-## peer's identity -- an on-path observer who reads the handshake can forge anything the client can. With one,
-## the handshake carries only a NONCE, both ends derive the key from `(secret, nonce)`, and that observer
-## learns the nonce and nothing else.
+## WHAT THE SECRET IS FOR. The join exchanges two 16-byte nonce halves under both regimes -- the client's in
+## the handshake, the server's in its challenge -- and the key is folded from the pair. Without a secret that
+## fold is all the key is and both halves are in the clear, so what the MAC authenticates is a datagram's
+## membership in a session rather than a peer's identity: an on-path observer who reads the exchange can forge
+## anything the client can. With one, the secret is folded in as well and that observer learns both halves and
+## nothing else.
 ##
 ## WHAT IS WORTH PINNING HERE is not the derivation -- that lives in the Rust suites, where it is exercised
 ## against pinned byte vectors -- but the four facade contracts a game can break from GDScript:
 ##
-## - A SESSION SETS NOTHING BY DEFAULT. The cleartext-key regime is what every existing project is on, and a
-##   facade that came up holding some secret would change the wire for a game that never asked.
+## - A SESSION SETS NOTHING BY DEFAULT. A key with no secret folded into it is what every existing project is
+##   on, and a facade that came up holding some secret would change the wire for a game that never asked.
 ## - THE EMPTY ARRAY CLEARS. It is the only way back to that default, and a game that clears between lobbies
 ##   has to be able to trust it.
 ## - THERE IS NO GETTER FOR THE BYTES. [method Net.has_session_secret] answers whether one is set and nothing
@@ -51,15 +52,16 @@ func _backend_carries_the_calls() -> bool:
 
 func test_a_session_that_configures_nothing_holds_no_secret() -> void:
 	# THE DEFAULT-DRIFT GUARD. No secret is the regime every existing project is on, and it is the one where
-	# the handshake's 16 bytes ARE the session key. A facade that came up holding one would change the wire
-	# for a game that never asked, and change it in the direction that refuses every peer without it.
+	# the two exchanged nonce halves ARE the whole of the session key. A facade that came up holding one would
+	# change the wire for a game that never asked, and change it in the direction that refuses every peer
+	# without it.
 	Net.set_session_secret(PackedByteArray())
 	assert_false(_held(), "nothing has set one")
 
 func test_setting_a_secret_either_takes_or_degrades_to_holding_none() -> void:
 	# The forward, and the only shape it can have against a binary older than these sources: the write is a
-	# no-op and the read answers false. Both are non-errors, and the game runs either way -- on the cleartext
-	# key in the degraded case, which is exactly what that binary would have done anyway.
+	# no-op and the read answers false. Both are non-errors, and the game runs either way -- on a key with no
+	# secret folded in, in the degraded case, which is exactly what that binary would have done anyway.
 	var carried: bool = _backend_carries_the_calls()
 	Net.set_session_secret(_token_secret())
 	if carried:
@@ -85,7 +87,7 @@ func test_any_length_of_secret_is_accepted() -> void:
 	Net.set_session_secret(PackedByteArray())
 
 func test_an_empty_array_clears_the_secret() -> void:
-	# THE ONLY WAY BACK TO THE CLEARTEXT DEFAULT. A game that joins a secret-carrying lobby and then a plain
+	# THE ONLY WAY BACK TO THE NO-SECRET DEFAULT. A game that joins a secret-carrying lobby and then a plain
 	# one has to be able to put the session back; without this it would have to restart the process.
 	var carried: bool = _backend_carries_the_calls()
 	Net.set_session_secret(_token_secret())
