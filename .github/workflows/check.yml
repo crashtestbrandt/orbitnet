@@ -1,8 +1,7 @@
 name: check
 
-# The PR gate. Deliberately small and deliberately in this order: the two gates that need no Godot at all
-# run first (a grep and a cargo run), so the common failures report in seconds rather than after a Godot
-# download.
+# The PR gate. Deliberately small and deliberately in this order: the gates that need no Godot at all run
+# first, so the common failures report in seconds rather than after a Godot download.
 #
 # GITHUB-HOSTED RUNNERS, NOT SELF-HOSTED. A public repository must never point fork-PR CI at a self-hosted
 # runner: a fork PR can change the workflow, and a self-hosted runner executes it on your machine with your
@@ -32,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No Godot needed for either of these.
+      # No Godot needed for any of these.
       # Called directly rather than through `just`: the recipes are one line each and a hosted runner has
       # no `just` installed, so adding one would be a dependency bought for nothing.
       #
@@ -40,6 +39,11 @@ jobs:
       # --check would correctly report every one of them "missing" -- it is a LOCAL gate against editing a
       # copy instead of the canonical source, and it needs the copies to exist. What can actually go wrong
       # in a COMMIT is that a copy was committed, creating a second source of truth; that is this gate.
+      #
+      # `addon-drift` is the one `just check` recipe this job omits, and the omission is deliberate: that
+      # recipe diffs the synced copies against the canonical source, and the copies are gitignored, so a
+      # fresh checkout has nothing to diff. The half of it a commit can actually break -- a copy committed
+      # -- is the `--check-tracked` gate here. Do not "fix" the omission by adding the full drift check.
       - name: No synced addon copy is committed
         run: tools/sync-addons.sh --check-tracked
 
@@ -51,6 +55,14 @@ jobs:
       # lists instead of testing for files CI cannot see.
       - name: Descriptor / build-matrix parity
         run: tools/check-descriptor-parity.sh
+
+      # `tools/netbench/compare.py` judges every bench column. Its relative tolerances, its
+      # `NOISE_FLOOR_ABS` absolute floors and its fault-counter handling are what separate a regression from
+      # run-to-run noise, and `--self-test` asserts those verdicts against cases the script carries itself.
+      # Standard library only, reads no bench artifacts, no Godot and no Rust -- which is why it belongs in
+      # this job rather than the Godot one.
+      - name: Bench comparator self-test
+        run: python3 tools/netbench/compare.py --self-test
 
   native:
     runs-on: ubuntu-latest
