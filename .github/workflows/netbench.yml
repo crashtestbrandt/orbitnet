@@ -1,0 +1,441 @@
+name: netbench
+
+# Run the netcode bench on a SCHEDULE and keep its CSVs, so the send path has a history.
+#
+# Every other workflow here is driven by a push, a pull request or a tag, so netbench ran only when a
+# contributor typed `just netbench`. Two things follow from that, and this workflow is what fixes both:
+#
+#   - A send-path regression was caught only if somebody remembered to measure. CONTRIBUTING.md makes
+#     running the bench a convention for changes to the send path, the interest pass or the wire format.
+#   - No column had a history, so no column could be given a threshold. tools/netbench/bench.sh says this
+#     directly about `want_full_nacks_s`: a threshold picked from one run asserts the number that run
+#     happened to see. A real one needs a week of runs behind it, and this is what produces the week.
+#
+# SELF-HOSTED, AND SAFE FOR THE SAME REASON binaries.yml IS. A public repository must never point fork-PR
+# CI at a self-hosted runner, because a fork PR can change the workflow and the runner executes it on your
+# machine with your filesystem. This workflow has no `pull_request` trigger at all. `schedule` fires only
+# from the default branch of this repository and carries no fork path into it; `workflow_dispatch`
+# requires write access. That is the same argument binaries.yml's matrix leg makes, and it is why the
+# bench can run on the box instead of on a hosted runner that has no persistent Rust cache.
+#
+# GITHUB-HOSTED RUNNERS ARE THE WRONG PLACE FOR THIS ONE ANYWAY. The bench measures timing under a
+# conditioned UDP link. A shared hosted runner's CPU share moves between jobs, so two runs would differ by
+# the machine rather than by the netcode -- which is the one thing a comparison must not depend on. This
+# workflow therefore pins the box, the bench arguments and the engine version.
+#
+# REPORT, DO NOT GATE. The numbers are machine-dependent. The comparison against the previous run goes in
+# the step summary and never in the exit code. The job fails only when the bench produced NO MEASUREMENT --
+# a bringup failure, a cdylib that would not load -- because that is a broken nightly rather than a
+# finding. See the verdict step.
+#
+# THAT REQUIRES `set +e`, WHICH IS WHY TWO STEPS BELOW CLEAR IT. Every bash GitHub runs for a `run:` body
+# already carries `-e`: the implicit default is `bash -e {0}` and `shell: bash` is
+# `bash --noprofile --norc -eo pipefail {0}`. `set -uo pipefail` adds `-u` and `pipefail` and leaves `-e`
+# on, so a non-zero exit from `bench.sh` or from `compare.py` would kill the step mid-body -- the bench
+# step before it records its status, the report step with an unterminated code fence in the summary. Both
+# steps therefore start `set +e -uo pipefail`. Do not drop the `+e`.
+#
+# Every `run:` step names `shell: bash` for the same reason binaries.yml does: the body is then run by the
+# documented shell rather than by the runner's platform default.
+#
+# It does not gate PRs. docs/netbench.md's closing section says why.
+
+on:
+  schedule:
+    # 07:17 UTC daily. Off the hour on purpose -- GitHub queues scheduled workflows fleet-wide and runs on
+    # an exact hour boundary are the most delayed. Nightly rather than per-push: one run takes minutes of
+    # wall clock on a box that also builds the release binaries, and a daily series is already dense enough
+    # to set a threshold from.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    # The scheduled run takes the defaults below and NOTHING ELSE, so every scheduled run is comparable to
+    # every other one. A dispatch can move any argument for a one-off investigation; the comparison step
+    # then notices the arguments differ and declines to compare rather than comparing two different
+    # networks. `compare.py`'s header states that rule: two runs are comparable only when every argument
+    # matched, seed included.
+    inputs:
+      clients:
+        description: 'bot clients joining through the relay'
+        default: '4'
+      profile:
+        description: 'NetProfiles catalog name (clean, congested_wifi, worst_case, ...)'
+        default: 'congested_wifi'
+      seconds:
+        description: 'steady-state measurement window, seconds'
+        default: '25'
+      seed:
+        description: 'base RNG seed for the relay and the bots'
+        default: '1'
+      policy:
+        description: 'bot policy (idle, strafe, orbit, wander, strafe_fire)'
+        default: 'strafe_fire'
+      demo:
+        description: 'demo project to drive (arena, rts, hockey)'
+        default: 'arena'
+
+permissions:
+  contents: read
+  # To download the PREVIOUS run's artifact and diff against it. Read-only, and the only thing this
+  # workflow does with it is `actions/download-artifact` against another run id of this same workflow.
+  actions: read
+
+concurrency:
+  # ONE AT A TIME, AND NEVER CANCELLED. The bench binds fixed UDP ports (47800 and 47810) and sweeps stray
+  # processes by command line, so two runs on one box would fight over the ports and each would kill the
+  # other's server. `cancel-in-progress: false` because a half-run produces a truncated CSV that the next
+  # comparison would read as a real series.
+  group: netbench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    runs-on: [self-hosted, Linux, X64, legion]
+
+    # A WEDGED RUN MUST NOT HOLD THE BOX. The concurrency group above is never cancelled and this fleet is
+    # one physical machine that binaries.yml's linux leg also uses, so a hung run blocks every later
+    # netbench run and the next release build. The default job timeout is 360 minutes. bench.sh is
+    # internally time-bounded, but the cold `cargo build` of both descriptor profiles and the Godot
+    # download in front of it are not. Raise this if a first real run comes close to it.
+    timeout-minutes: 45
+
+    env:
+      # THE FIXED RUN. These are the scheduled defaults, and they are the arguments CONTRIBUTING.md and
+      # docs/netbench.md already give for a before/after comparison -- so a contributor's local run of the
+      # documented recipe is directly comparable to this one. Argument order is bench.sh's:
+      # CLIENTS PROFILE SECONDS SEED POLICY DEMO.
+      #
+      # `arena` seats 24, so a fleet of 4 is seated rather than admitted as observers, and it is the only demo
+      # that fills the hit-registration columns. `strafe_fire` keeps every bot generating input, state churn
+      # and events for the whole window.
+      #
+      # DISPATCH INPUTS REACH THE SHELL AS ENVIRONMENT VARIABLES, NEVER AS `${{ }}` INSIDE A `run:` BODY.
+      # Expression interpolation splices the value into the script source before bash parses it, so a crafted
+      # input would run as code on a persistent self-hosted runner. Read as an env var it is data.
+      # release.yml's version stamp makes the same choice for the same reason.
+      NB_CLIENTS: ${{ inputs.clients || '4' }}
+      NB_PROFILE: ${{ inputs.profile || 'congested_wifi' }}
+      NB_SECONDS: ${{ inputs.seconds || '25' }}
+      NB_SEED: ${{ inputs.seed || '1' }}
+      NB_POLICY: ${{ inputs.policy || 'strafe_fire' }}
+      NB_DEMO: ${{ inputs.demo || 'arena' }}
+      # Pinned, and part of what makes two runs comparable. An engine upgrade moves the numbers as surely as a
+      # netcode change does, which is why the version is recorded in params.txt beside the bench arguments and
+      # a mismatch stops the comparison.
+      GODOT_VERSION: 4.4.1-stable
+      # SET AT JOB LEVEL SO EVERY `if: always()` STEP CAN READ IT. Four steps below run even when an earlier
+      # one failed, and three of them name this directory. Exported from inside the bench step instead, a
+      # failure in the cdylib build or the Godot download would skip that export and those three steps would
+      # each abort with `NETBENCH_OUT: unbound variable` under `set -u`, hiding the real failure behind three
+      # spurious ones. Declared here, it is also provably the same directory the upload paths name.
+      NETBENCH_OUT: ${{ github.workspace }}/netbench-out
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The arguments are data from a dispatch, and they are passed to bench.sh and written into
+      # params.txt. Quoting alone already stops them being re-parsed; this refuses anything that is not a
+      # plain identifier as well, so a typo fails here rather than three steps later as "never bound".
+      - name: Validate the bench arguments
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in NB_CLIENTS NB_PROFILE NB_SECONDS NB_SEED NB_POLICY NB_DEMO; do
+            value="${!name}"
+            case "$value" in
+              ''|*[!A-Za-z0-9._-]*) echo "::error::refusing $name='$value'"; exit 1 ;;
+            esac
+          done
+          echo "netbench args: $NB_CLIENTS $NB_PROFILE $NB_SECONDS $NB_SEED $NB_POLICY $NB_DEMO"
+
+      # NO dtolnay/rust-toolchain AND NO Swatinem/rust-cache HERE, for the reason binaries.yml states at
+      # length: both exist to provision a fresh hosted runner, this box already carries rustup and a
+      # persistent `target/`, and both actions run `rustc` directly to build a cache key -- which is how a
+      # box whose rustup SHIMS had gone missing failed with "rustc: command not found" while `rustup
+      # toolchain install` reported success. This is binaries.yml's repair step, Linux-only.
+      #
+      # `cargo` is what the build invokes, and the rustup cargo shim resolves rustc for its own children,
+      # so cargo resolving is the condition that matters. native/rust-toolchain.toml pins the version and
+      # rustup honors it from inside that directory with no help from CI.
+      - name: Check the Rust toolchain on this runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in \
+            "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
+            "${CARGO_HOME:-}/bin" \
+            "$HOME/.cargo/bin"
+          do
+            [ -n "$dir" ] && [ -d "$dir" ] || continue
+            case ":$PATH:" in *":$dir:"*) ;; *) echo "$dir" >> "$GITHUB_PATH"; PATH="$dir:$PATH" ;; esac
+            break
+          done
+          if ! command -v cargo >/dev/null 2>&1; then
+            # THE RUSTUP PROXIES ARE MISSING, NOT THE TOOLCHAIN. rustup installs `cargo`, `rustc` and the
+            # rest as copies of the rustup binary in one directory; when those copies are deleted, rustup
+            # still answers and still reports its toolchains while nothing else on PATH exists.
+            # `rustup self update` reinstalls them, which is the sanctioned repair; recreating them by
+            # copying the rustup binary under each name is exactly what rustup does internally.
+            rustup_bin="$(command -v rustup || true)"
+            if [ -z "$rustup_bin" ]; then
+              echo "::error::neither cargo nor rustup is on this runner. Install rustup for the account the runner service runs as."
+              exit 1
+            fi
+            bindir="$(dirname "$rustup_bin")"
+            echo "::warning::cargo is missing from ${bindir}; repairing the rustup proxies"
+            rustup self update || echo "rustup self update did not run; recreating the proxies directly"
+            if ! command -v cargo >/dev/null 2>&1; then
+              for tool in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+                [ -e "${bindir}/${tool}" ] || cp "$rustup_bin" "${bindir}/${tool}"
+              done
+              chmod 0755 "${bindir}"/* 2>/dev/null || true
+              hash -r 2>/dev/null || true
+            fi
+          fi
+          command -v cargo >/dev/null 2>&1 || {
+            echo "::error::cargo still does not resolve after repair. Reinstall rustup for the account the runner service runs as."
+            exit 1; }
+          ( cd native && cargo --version )
+
+      # THE BENCH LOADS WHAT THIS COMMIT BUILDS. `addons/orbitnet_native/bin/` is gitignored, so a fresh
+      # checkout carries no library at all and every demo would parse against a missing extension. Same
+      # two steps, same order, as check.yml's godot job: build first, then mirror, so each project gets
+      # the freshly built bin/ rather than a stale copy.
+      - name: Build this commit's own cdylib
+        shell: bash
+        run: tools/build-native.sh build linux addons/orbitnet_native/bin
+
+      - name: Sync the addon into every project
+        shell: bash
+        run: tools/sync-addons.sh
+
+      # PINNED, AND CACHED BY THE BOX RATHER THAN BY actions/cache. This runner's disk is persistent, so
+      # the download happens once per engine version and every later run finds it. bench.sh takes the
+      # binary from `$GODOT`, so nothing needs to be put on PATH.
+      - name: Provision the pinned Godot
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$HOME/.cache/orbitnet-godot/${GODOT_VERSION}"
+          bin="$dir/godot"
+          if [ ! -x "$bin" ]; then
+            base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}"
+            mkdir -p "$dir"
+            curl -fsSL -o "$dir/godot.zip" "${base}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+            unzip -q -o "$dir/godot.zip" -d "$dir"
+            mv "$dir/Godot_v${GODOT_VERSION}_linux.x86_64" "$bin"
+            chmod +x "$bin"
+            rm -f "$dir/godot.zip"
+          fi
+          echo "GODOT=$bin" >> "$GITHUB_ENV"
+          "$bin" --version
+
+      # NETBENCH_OUT (job env, above) names a stable artifact directory instead of a temp one, which is what
+      # makes the CSVs collectable at all -- see docs/netbench.md, "Comparing two runs". bench.sh clears its
+      # own files in there first, so a workspace checked out over a previous run does not pool two fleets.
+      #
+      # The exit code is CAPTURED, NOT PROPAGATED. bench.sh exits non-zero both when a client failed its
+      # own tick-domain gate and when nothing came up at all, and only the second is a broken nightly. The
+      # verdict step below tells the two apart by whether a measurement exists.
+      #
+      # `set +e` CLEARS THE `-e` GITHUB'S SHELL SUPPLIES. Without it this step dies on the `tee` pipeline
+      # the moment bench.sh reports a FAIL verdict, `status` is never written to `$GITHUB_OUTPUT`, and the
+      # step is red -- the opposite of the report-do-not-gate rule in the header.
+      - name: Run the bench
+        id: bench
+        shell: bash
+        run: |
+          set +e -uo pipefail
+          mkdir -p "$NETBENCH_OUT"
+          tools/netbench/bench.sh \
+            "$NB_CLIENTS" "$NB_PROFILE" "$NB_SECONDS" "$NB_SEED" "$NB_POLICY" "$NB_DEMO" \
+            2>&1 | tee "$NETBENCH_OUT/bench-console.log"
+          status="${PIPESTATUS[0]}"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "netbench exited $status"
+
+      # params.txt IS WHAT MAKES THE NEXT RUN'S COMPARISON HONEST. It records the six bench arguments and
+      # the engine version, and the comparison below refuses to run when the previous artifact's line
+      # differs -- two runs on different seeds are measuring two different networks, and `compare.py` says
+      # so in its own header. It is deliberately not a `.csv`: compare.py pools every `.csv` in the
+      # directory except `server.csv` as a client series.
+      - name: Record the run's parameters
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The bench step creates this directory, and this step also runs when the bench step was skipped.
+          mkdir -p "$NETBENCH_OUT"
+          printf 'clients=%s profile=%s seconds=%s seed=%s policy=%s demo=%s godot=%s\n' \
+            "$NB_CLIENTS" "$NB_PROFILE" "$NB_SECONDS" "$NB_SEED" "$NB_POLICY" "$NB_DEMO" \
+            "$GODOT_VERSION" > "$NETBENCH_OUT/params.txt"
+          cat "$NETBENCH_OUT/params.txt"
+
+      # 90 DAYS, WHICH IS THE MAXIMUM A PUBLIC REPOSITORY MAY SET. The default is also 90 today, but it is
+      # an organisation setting that can be lowered, and this workflow's whole purpose is the history --
+      # so it is stated here rather than inherited. Why the longest available:
+      #
+      #   - compare.py needs TWO runs. At the 7-day retention the failure-log artifacts elsewhere in this
+      #     repository use, a gap of one quiet week leaves the next run with nothing to compare against.
+      #   - A regression is often noticed weeks after it landed. 90 nightly runs means the bisect window
+      #     is the same length as the window in which anybody is still looking.
+      #   - Setting a threshold on `want_full_nacks_s` needs a week or more of runs behind it, and the
+      #     numbers have to still be downloadable when somebody sits down to pick one.
+      #
+      # Only the CSVs and params.txt go in this one, so it stays small enough that 90 days of them costs
+      # little.
+      - name: Upload the run's CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # A FIXED NAME, not one carrying the run number. The comparison step asks for this artifact by
+          # name from the previous run id, which only works if every run spells it the same way.
+          name: netbench-csv
+          path: |
+            netbench-out/client*.csv
+            netbench-out/server.csv
+            netbench-out/params.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+      # The logs are for triaging a run that failed, which is something somebody does within days, and
+      # they are far larger than the CSVs. Short retention on purpose.
+      - name: Upload the run's logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netbench-logs
+          path: |
+            netbench-out/*.log
+            netbench-out/*.log.snap
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # The most recent SUCCESSFUL earlier run of this workflow on this branch. Read through the REST API
+      # with curl and python3 rather than by adding another action: python3 is already a hard dependency of
+      # bench.sh, so nothing new is provisioned on the box for it.
+      #
+      # `status=success` is the right filter precisely because this workflow does not gate: a run that
+      # measured anything at all is green, so the newest green run is the newest run with artifacts.
+      - name: Find the previous run
+        id: previous
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/netbench.yml/runs"
+          url="${url}?status=success&branch=${GITHUB_REF_NAME}&per_page=20"
+          # THE TOKEN GOES IN ON STDIN, NEVER IN argv. This runner is persistent and shared, so a header
+          # passed as `curl -H "Authorization: Bearer $GH_TOKEN"` would sit in /proc/<pid>/cmdline for the
+          # life of the request and be readable by every account on the box. `--config -` reads the same
+          # headers from a curl config file on stdin, and `printf` is a bash builtin, so the token is never
+          # an argument to anything that forks.
+          body="$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' \
+                    "$GH_TOKEN" | curl -fsSL --config - "$url" || true)"
+          # ONE PYTHON EXPRESSION, ON ONE LINE. A `run:` body is a YAML block scalar, so a line at column
+          # zero would end it -- an indented multi-line script is not an option and Python would reject
+          # the indentation anyway. Malformed or empty JSON exits non-zero and leaves `run_id` empty,
+          # which the steps below read as "no baseline".
+          run_id="$(printf '%s' "$body" | python3 -c 'import json,os,sys; runs=(json.loads(sys.stdin.read() or "{}") or {}).get("workflow_runs",[]); ids=[str(r.get("id")) for r in runs if str(r.get("id")) != os.environ.get("GITHUB_RUN_ID","")]; print(ids[0] if ids else "")' 2>/dev/null || true)"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+          echo "previous run: ${run_id:-none}"
+
+      - name: Download the previous run's CSVs
+        id: download-previous
+        if: always() && steps.previous.outputs.run_id != ''
+        continue-on-error: true   # a run whose artifact has expired must not stop the report
+        uses: actions/download-artifact@v4
+        with:
+          name: netbench-csv
+          run-id: ${{ steps.previous.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: netbench-previous
+
+      # THE REPORT. Everything a reader needs is in the step summary, and nothing here changes the job's
+      # conclusion -- `compare.py` exits 1 whenever it judges a column REGRESSED, and that exit code is
+      # swallowed on purpose. What a healthy number is depends on the box and the fleet size.
+      #
+      # `set +e` AGAIN, AND IT IS LOAD-BEARING HERE. `compare.py | tail -80` runs inside a `{ } >> summary`
+      # block with `pipefail` on. Under the `-e` GitHub's shell supplies, a REGRESSED verdict aborts the
+      # block mid-write: the closing ``` fence and the line explaining that REGRESSED does not fail the job
+      # are never emitted, and the step goes red on the one run the nightly exists to surface.
+      - name: Report the run and the comparison
+        if: always()
+        shell: bash
+        env:
+          BENCH_STATUS: ${{ steps.bench.outputs.status }}
+          PREVIOUS_RUN: ${{ steps.previous.outputs.run_id }}
+        run: |
+          set +e -uo pipefail
+          out="$NETBENCH_OUT"
+          {
+            echo "## netbench"
+            echo
+            echo "\`$(cat "$out/params.txt" 2>/dev/null || echo 'parameters unrecorded')\`"
+            echo
+            echo "bench exit status: \`${BENCH_STATUS:-unknown}\` (reported, never gated)"
+            echo
+            echo '```'
+            # The verdict block: every client's BENCH-RESULT line, the relay, and the server send-path
+            # summary that only this run can produce.
+            grep -aE 'client[0-9]+:|RELAY-RESULT|want_full nacks|=== netbench' \
+              "$out/bench-console.log" 2>/dev/null | tail -40 || echo 'no console output'
+            echo '```'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          prev="$GITHUB_WORKSPACE/netbench-previous"
+          {
+            echo "### Compared with the previous run"
+            echo
+            if [ ! -d "$prev" ] || [ -z "$(ls -A "$prev" 2>/dev/null)" ]; then
+              echo "No previous artifact was available (run \`${PREVIOUS_RUN:-none}\`), so this run is the baseline."
+            elif ! diff -q "$prev/params.txt" "$out/params.txt" >/dev/null 2>&1; then
+              # compare.py's own rule: two runs are comparable only when every argument matched, seed
+              # included, because the impairment scheduler replays a different link on a different seed.
+              echo "Not compared. The previous run used different arguments:"
+              echo
+              echo '```'
+              echo "previous: $(cat "$prev/params.txt" 2>/dev/null || echo unknown)"
+              echo "this run: $(cat "$out/params.txt" 2>/dev/null || echo unknown)"
+              echo '```'
+            else
+              echo "Baseline: run [\`${PREVIOUS_RUN}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${PREVIOUS_RUN})"
+              echo
+              echo '```'
+              python3 tools/netbench/compare.py "$prev" "$out" 2>&1 | tail -80
+              echo '```'
+              echo
+              echo "A \`REGRESSED\` row above does not fail this job. Read it, then reproduce it locally with the arguments printed at the top."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # THE ONE FAILURE THIS WORKFLOW KEEPS. A bench that failed its own tick-domain gates still measured
+      # something, and that is a finding for a person to read in the summary above. A bench that wrote no
+      # client CSV measured NOTHING -- the cdylib did not load, the port was squatted, the demo did not
+      # parse. The job fails on the absence of a measurement and on nothing else.
+      #
+      # THE DEFAULT FOR AN UNSET BENCH_STATUS IS `unknown`, NOT `0`. The bench step is skipped entirely when
+      # an earlier step failed, and `${BENCH_STATUS:-0}` substitutes on the empty string as well as on the
+      # unset one -- so a `0` default would report a skipped bench as a passing one. Anything that is not
+      # `0` warns.
+      - name: The run produced a measurement
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! ls "$NETBENCH_OUT"/client*.csv >/dev/null 2>&1; then
+            echo "::error::netbench produced no client CSV -- the bench did not run. See the netbench-logs artifact."
+            exit 1
+          fi
+          for csv in "$NETBENCH_OUT"/client*.csv; do
+            test -s "$csv" || { echo "::error::$csv is empty"; exit 1; }
+          done
+          echo "measured: $(ls "$NETBENCH_OUT"/client*.csv | wc -l | tr -d ' ') client CSV(s)"
+          status="${BENCH_STATUS:-unknown}"
+          if [ "$status" != "0" ]; then
+            echo "::warning::netbench reported a FAIL verdict (bench exit status ${status}); the measurement is in the step summary and the artifacts."
+          fi
+        env:
+          BENCH_STATUS: ${{ steps.bench.outputs.status }}
