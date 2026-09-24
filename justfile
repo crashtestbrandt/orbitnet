@@ -48,6 +48,16 @@ net-check:
 descriptor-parity:
     tools/check-descriptor-parity.sh
 
+# The plugin version and the cargo workspace version are one version. This fails the PR that moves one
+# without the other; release.yml runs the same check after stamping both from the tag. Pure awk, no cargo.
+version-parity:
+    tools/version-parity.sh check
+
+# Write a version to every site at once -- plugin.cfg, the cargo workspace package, and the member entries
+# in Cargo.lock. Release tags do this automatically; this recipe is for a local pre-tag bump.
+version-stamp VERSION:
+    tools/version-parity.sh stamp {{VERSION}}
+
 # The bench comparison decides every performance claim this repository makes, and three of its
 # judgement rules were wrong at some point -- a column zero on both sides, a column zero only on the
 # baseline, and a relative tolerance below the columns' own run-to-run spread. Standard library only,
@@ -104,7 +114,7 @@ arena-probe:
 # Everything a PR must pass, in the order that fails fastest first. The shape probe runs before the two demo
 # probes because it is the addon's own project: a failure there is the addon, where a failure in a demo could
 # be either.
-check: addon-tracked addon-drift net-check descriptor-parity bench-check native-test lint test server-shape-probe rts-probe arena-probe
+check: addon-tracked addon-drift net-check descriptor-parity version-parity bench-check native-test lint test server-shape-probe rts-probe arena-probe
 
 # =====================================================================================================
 # the native backend (Rust)

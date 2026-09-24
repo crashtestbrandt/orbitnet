@@ -3,7 +3,11 @@ resolver = "2"
 members = ["crates/orbitnet-core", "crates/orbitnet-godot"]
 
 [workspace.package]
-version = "0.1.0"
+# STAMPED FROM THE RELEASE TAG by tools/version-parity.sh, which writes this line, `version=` in
+# addons/orbitnet/plugin.cfg and the member entries in Cargo.lock together. The three must agree:
+# `just version-parity` fails a pull request that moves one without the others, and release.yml re-runs
+# the same check after stamping. Both crates inherit this with `version.workspace = true`.
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
