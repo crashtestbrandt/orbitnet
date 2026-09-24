@@ -12,6 +12,10 @@ class_name NetProfiles
 ##   * Overwatch's 250ms lag-compensation ceiling (GDC 2017) -- the canonical worst-case a shooter is built to.
 ##   * Gears of War 3's "conditioner forced on in daily builds", with an extreme 400ms+/10%-loss profile reserved
 ##     for deliberate programmer torture sessions.
+##   * Hosted UDP relay services (Valve's Steam Datagram Relay is the published reference design) -- a middlebox
+##     path with multi-route redundancy, where DUPLICATION and REORDERING rather than loss are what the session
+##     sees. That is a different link shape from every wireless profile above, and `relayed` is the one that
+##     models it.
 ## PURE (no scene / socket dependency): a static catalog, unit-tested directly.
 
 # The catalog, built lazily once. Values are ONE-WAY ms / [0,1] probabilities. Keep names lowercase-with-underscores
@@ -63,6 +67,32 @@ static func _ensure_built() -> void:
 	# cross_region: a well-provisioned but distant server (e.g. NA-east client on an EU server) -- steady 150ms,
 	# low jitter/loss. Tests prediction/reconcile under real one-way lead without a degraded link.
 	_add(_make("cross_region", 150.0, 15.0, 0.01))
+	# relayed: models a hosted UDP RELAY SERVICE carrying the session. Every other profile models the LAST HOP --
+	# a contended radio, where loss and jitter dominate and packets keep their order. A relay is a middlebox on
+	# the path: it terminates the datagram, forwards it over its own backbone, and may carry a copy on a second
+	# route for redundancy. That shape inverts the wireless one, which is why the numbers do:
+	#   * latency 60ms one-way -- two short access legs (client->nearest point of presence, point of presence->
+	#     server) plus a backbone middle. Higher than `broadband` because the path is a detour, lower than
+	#     `cross_region` because the backbone is the provisioned part.
+	#   * jitter 10ms -- LOW relative to the latency, the opposite of `congested_wifi`'s 50/50. A provisioned
+	#     backbone is steady; the variance a relayed session shows is route changes, not queueing on a radio.
+	#   * loss 0.5% -- also low. Loss is not the story on a relay, which is exactly why a loss-dominated profile
+	#     is the wrong stand-in for one.
+	#   * dup 2% -- the story. A relay that duplicates across two routes for redundancy delivers the copy, and the
+	#     receiver sees a genuine duplicate datagram. Every other shipped profile leaves dup at 0, so before this
+	#     one no bench run exercised the receive path's duplicate handling at all.
+	#   * reorder 5% at reorder_ms 30 -- the other half of the story. When the two routes have different transit
+	#     times, the packet that took the slower one arrives after packets sent later. 30ms is the spread between
+	#     two routes, not a queue delay.
+	# WHAT THIS PROFILE CANNOT MODEL: a relay also applies its OWN MTU and can reroute mid-session. The relay
+	# shell conditions timing and delivery only -- it never resizes or fragments a datagram -- so an MTU clamp has
+	# no knob here and a conditioned loopback socket cannot produce one. docs/netbench.md records that as a
+	# standing gap the multi-host gauntlet covers and this profile approximates.
+	var r: NetProfile = _make("relayed", 60.0, 10.0, 0.005)
+	r.dup = 0.02
+	r.reorder = 0.05
+	r.reorder_ms = 30.0
+	_add(r)
 	# worst_case: the ceiling a shooter is DESIGNED to still function at -- Overwatch stops lag-compensating past
 	# 250ms. A per-PR-adjacent gate should stay green here; beyond it, "shoot where you see them" degrades by design.
 	_add(_make("worst_case", 250.0, 25.0, 0.05))

@@ -170,6 +170,7 @@ One source of truth: `addons/orbitnet/bench/net_profiles.gd`.
 | `congested_wifi` | 50 / 50 / 2% — the everyday bad case; jitter is the story, not mean latency |
 | `mobile_4g` | 100 / 20 / 4% |
 | `cross_region` | 150 / 15 / 1% |
+| `relayed` | 60 / 10 / 0.5%, **plus 2% duplication and 5% reordering at +30ms** — a hosted relay service |
 | `mobile_3g` | 300 / 30 / 7% |
 | `worst_case` | 250 / 25 / 5% — the ceiling a shooter is designed to still function at |
 | `worst_case_burst` | same latency, **bursty** (Gilbert–Elliott) loss instead of uniform |
@@ -177,6 +178,13 @@ One source of truth: `addons/orbitnet/bench/net_profiles.gd`.
 
 The scheduler is **seeded and deterministic**: the same seed replays the same link exactly, which is what makes
 two runs comparable. Different seeds give different links, so a fleet is not one correlated waveform.
+
+**`relayed` is the only profile whose story is duplication and reordering.** The others model a last hop, where
+loss and jitter dominate and packets keep their order. A relay is a middlebox that forwards over its own
+backbone and may carry a copy on a second route, so `relayed` is steadier and cleaner than `congested_wifi` and
+is the only shipped profile that exercises the receive path's duplicate and out-of-order handling at all. It
+still models none of a relay's **own MTU** or its mid-session reroute — the relay shell conditions timing and
+delivery, never datagram size.
 
 ## Bot policies
 
@@ -238,12 +246,56 @@ cascade is longer than a tail, and the first script it names is the one to read.
 
 ## Multi-machine
 
+Every mode validates the same arguments first, so `--dry-run` and `--preflight` need the full environment a
+real run needs — `--dry-run` resolves it into the printed plan without contacting a host, `--preflight` is the
+mode that contacts them.
+
 ```sh
-SERVER_HOST=… CLIENT_HOSTS="…" just netbench-gauntlet
+export SERVER_HOST=box-a CLIENT_HOSTS="box-b box-c" PROFILE=relayed
+just netbench-gauntlet --dry-run     # print the ssh/rsync/scp plan and the resolved arguments; contact nothing
+just netbench-gauntlet --preflight   # contact every host and validate it; launch nothing
+just netbench-gauntlet               # preflight, then the full run
 ```
 
 One SSH controller drives a server host plus bot-client hosts. Needs reachable hosts, passwordless SSH and
-Godot on each. `GAUNTLET_DRYRUN=1` prints the plan without touching anything.
+Godot 4 on each. A real run preflights first; `SKIP_PREFLIGHT=1` bypasses that.
+
+- **`PROFILE` means two different things.** Under `RELAY=1` it is the impairment the relay injects. Under
+  `RELAY=0` — the default — nothing is injected and it is only the RTT gate's reference, so it must be set
+  explicitly to the link the operator expects (`clean` for a LAN, `broadband` / `cross_region` / `relayed` for
+  a WAN). The script refuses `RELAY=0` with no `PROFILE` rather than gate a real link against an imaginary one.
+- **Each host keeps its own native binary.** The rsync carries the GDScript and the projects but excludes
+  `addons/orbitnet_native/bin/`: a library is per-platform, and this bench exists to run cross-OS. Run
+  `just native-install` once on every host. Preflight fails when a host has none, including a host with no
+  checkout yet — the rsync that creates the checkout still brings no library.
+- **Every host imports the demo before launch**, for the same reason the single-box bench does — a stale global
+  class cache resolves every `class_name` to `Variant`. A host whose import fails stops the run there.
+- **Each host appears once.** `CLIENT_HOSTS` must name distinct hosts: each entry wipes its own remote artifact
+  directory at bringup, so a repeat would delete the logs of the clients the first pass launched. Use
+  `CLIENTS_PER_HOST=<n>` to put several clients on one host.
+- **The verdict counts the clients it expected**, not the logs that arrived, so an unreachable host cannot
+  shrink the fleet and still pass.
+- **No real-host run is recorded yet.** Every number on this page comes from a loopback run.
+
+## Which bench supports which claim
+
+| Claim | Bench that can support it |
+| --- | --- |
+| a send-path, interest or wire-format change moved p50/p95 bytes, blocks or RTT | `bench.sh` — seeded, so two runs differ only by the change |
+| the netcode holds up at a given latency / jitter / loss | `bench.sh` |
+| prediction reconverges under **bursty** loss | `bench.sh`, `worst_case_burst` |
+| duplicate and out-of-order datagrams are handled | `bench.sh`, `relayed` — an approximation of the shape, on loopback |
+| the session survives a **NAT** between the peers | `gauntlet.sh` only |
+| the path's real **MTU** does not split or drop a fat channel's frames | `gauntlet.sh` only |
+| a **relayed transport** delivers remote poses at the rate the game expects | `gauntlet.sh`, and only over a path the operator has confirmed is relayed — see below |
+| the send rate fits a real uplink's **bandwidth** | neither — nothing here caps bandwidth |
+
+`gauntlet.sh` launches clients with `--join=<server>:<port>` over ENet, which is the direct path between the
+two machines or, under `RELAY=1`, this repository's own local impairment relay. Neither is a hosted relay
+service. A mesh VPN's fallback relay can carry the traffic incidentally, but the script neither forces that nor
+detects it, so a run supports the relay row only when the operator establishes the path is relayed and records
+that alongside the numbers. The **Steam transport**, which is the consumer that actually rides a relay service,
+is launched by neither bench: that path has no coverage here today.
 
 ## What it deliberately does not do
 
@@ -251,3 +303,8 @@ Godot on each. `GAUNTLET_DRYRUN=1` prints the plan without touching anything.
 - **It does not assert cross-client determinism.** The server is authoritative; bots need only be
   reproducible.
 - **It does not simulate bandwidth caps or NAT.** Latency, jitter, loss, duplication and reordering only.
+- **A conditioned loopback socket reproduces only part of a relayed link.** The `relayed` profile models a
+  relay's reordering and duplication as probabilities. It has no knob for the relay's own **MTU**, its
+  mid-session reroute, or the extra hop's queueing, because the relay shell conditions timing and delivery and
+  never resizes a datagram. A conclusion about behaviour **over a relay** needs a gauntlet run on a confirmed
+  relayed path.
