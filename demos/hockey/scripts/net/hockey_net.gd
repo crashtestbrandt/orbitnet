@@ -169,7 +169,11 @@ func join(target: String) -> bool:
 	# RULE 1, first half. Seats are owned by nobody until the roster lands; see the header.
 	_build_rink()
 
-	var peer: MultiplayerPeer = NetTransport.create_client(target_address(target), target_port(target))
+	# The transport owns the `ADDR[:PORT]` / `[LITERAL]:PORT` rule -- one parser for every caller, and the
+	# demo still never learns which transport it is talking to (a Steam target carries no colon).
+	var host: String = NetTransport.target_address(target)
+	var port: int = NetTransport.target_port(target)
+	var peer: MultiplayerPeer = NetTransport.create_client(host, port)
 	if peer == null:
 		_fail("could not create a client peer for '%s'" % target)
 		return false
@@ -179,62 +183,8 @@ func join(target: String) -> bool:
 	Net.set_remote_resim(true)   # RULE 2
 	rink.bind_net_all()          # RULE 1, second half
 	_set_state(State.CONNECTING)
-	print("HOCKEY: joining %s:%d (%s)" % [
-		target_address(target), target_port(target), NetTransport.preferred_kind_name()])
+	print("HOCKEY: joining %s:%d (%s)" % [host, port, NetTransport.preferred_kind_name()])
 	return true
-
-# --- join targets ----------------------------------------------------------------------------------
-# `ADDR` or `ADDR:PORT`, split here rather than by the caller.
-#
-# The host recipe takes a port, so without this a session hosted on anything but the default was unreachable:
-# `NetTransport.create_client` takes the port as its own argument and would have handed ENet the whole
-# "1.2.3.4:47900" string as a hostname to resolve. The flag's own documentation promised the suffix worked.
-#
-# A Steam target is a 64-bit Steam ID and carries no colon, so it falls through unchanged -- the demo still
-# never learns which transport it is talking to.
-
-## The address half of a join target.
-static func target_address(target: String) -> String:
-	var separator: int = _port_separator(target)
-	var address: String = target if separator < 0 else target.substr(0, separator)
-	# `[::1]` and `[::1]:47800` both name the address `::1`. ENet takes the literal; the brackets are there
-	# to keep the port unambiguous in the string, and stop at the string.
-	if address.length() > 1 and address.begins_with("[") and address.ends_with("]"):
-		return address.substr(1, address.length() - 2)
-	return address
-
-## The port half of a join target, or the transport's default when it carries none.
-static func target_port(target: String) -> int:
-	var separator: int = _port_separator(target)
-	if separator < 0:
-		return NetTransport.DEFAULT_PORT
-	return clampi(target.substr(separator + 1).to_int(), 1, 65535)
-
-# The index of the ':' that introduces a port, or -1. ONE rule, so the two accessors above can never disagree
-# about where the split is and hand ENet an address and a port that came from different readings of the string.
-static func _port_separator(target: String) -> int:
-	# A BRACKETED IPv6 LITERAL NAMES ITS OWN PORT: `[::1]:47800`. The split goes after the bracket, so no
-	# colon inside the literal can be mistaken for the one that introduces a port.
-	var close: int = target.rfind("]")
-	if close >= 0:
-		var after: int = target.find(":", close)
-		if after < 0 or after >= target.length() - 1:
-			return -1
-		if not target.substr(after + 1).is_valid_int():
-			return -1
-		return after
-	# A BARE IPv6 LITERAL CARRIES SEVERAL COLONS AND NO PORT, and `::1` and `fe80::1` end in digits -- so a
-	# rule that split on the last colon with a numeric suffix handed ENet the address `:` on port 1. Only a
-	# SINGLE colon introduces a port. A target with more is an address in its own right, and naming a port
-	# beside one needs the brackets above, because `a:b:47900` cannot be told apart from a literal otherwise.
-	if target.count(":") != 1:
-		return -1
-	var separator: int = target.rfind(":")
-	if separator <= 0 or separator >= target.length() - 1:
-		return -1
-	if not target.substr(separator + 1).is_valid_int():
-		return -1
-	return separator
 
 ## Tear the session down and return the process to a clean OFFLINE state.
 func leave() -> void:

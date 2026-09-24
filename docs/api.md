@@ -626,6 +626,8 @@ config, so a build's transport is a build-time fact.
 | `kind_name(kind)` / `preferred_kind_name()` | `"offline"` / `"enet"` / `"steam"`. |
 | `create_server(port, max_clients, friends_only=false) -> MultiplayerPeer` | Null on failure. |
 | `create_client(address, port) -> MultiplayerPeer` | Null on failure. |
+| `target_address(target) -> String` | The address half of one join-target string. A bracketed literal is unwrapped (`[::1]:47800` → `::1`); anything else is returned whole. |
+| `target_port(target) -> int` | The port half of the same string, clamped to `1..65535`, or `DEFAULT_PORT` when the target names none. |
 | `hold_through_hitches(peer, peer_id=0) -> int` | Raise an established connection's ENet timeout floor to `SESSION_TIMEOUT_MIN_MS` (20 s), ceiling unchanged at 30 s, so a host stalled by a long synchronous frame is not dropped mid-build. `peer_id` 0 means every open connection; an id that names no live connection sets nothing. Returns how many took the floor. A no-op on Steam and offline. |
 | `set_local_display_name(name)` / `local_display_name()` | A local override, so the name pipeline is exercisable with no platform present. |
 
