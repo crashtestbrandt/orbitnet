@@ -129,3 +129,96 @@ jobs:
           name: orbitnet-${{ matrix.platform }}
           path: staged/
           retention-days: 30
+
+      # =================================================================================================
+      # WINDOWS AND MACOS RUN A TEST HERE, AND NOWHERE ELSE.
+      #
+      # Both legs used to compile the library, upload it and stop, so a release shipped two platforms on
+      # which no unit suite, no probe and no load smoke had ever run. `check.yml` runs all of its jobs on
+      # `ubuntu-latest` and its own header says it cannot speak for the other two. The failure that leaves
+      # open is the one the .gdextension header describes for a bad `[libraries]` entry: it fails at
+      # `dlopen` on the affected platform and nowhere else, so every Linux gate stays green while a
+      # Windows checkout takes the `Net` autoload down.
+      #
+      # AFTER THE UPLOAD, deliberately. The artifact is what you need in order to debug a smoke failure, so
+      # it is published before anything can fail.
+      #
+      # THE LINUX LEG SKIPS ALL OF THIS. check.yml's `godot` job already runs the load smoke and the four
+      # unit suites on Linux for every pull request; repeating them here would buy nothing and would need
+      # Godot installed on a third box.
+      # =================================================================================================
+      - name: Check Godot on this runner
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Named separately from the steps that use it so an absent Godot reports what to install rather
+          # than surfacing as `godot: command not found` inside a test script. GODOT_BIN is the same
+          # override tools/godot-quiet.sh honors, so a runner with Godot somewhere non-standard sets that
+          # one variable and every step below follows.
+          bin="${GODOT_BIN:-godot}"
+          if ! command -v "$bin" >/dev/null 2>&1; then
+            echo "::error::Godot is not installed for this ${{ matrix.platform }} runner: '$bin' does not resolve on PATH."
+            echo "This leg runs the extension load smoke and the unit suites, both of which need the Godot"
+            echo "editor binary (headless is enough). Install Godot 4.4 or newer for the account the runner"
+            echo "service runs as and put it on PATH as 'godot', or set GODOT_BIN to its full path."
+            exit 1
+          fi
+          echo "godot: $(command -v "$bin")"
+          "$bin" --version
+
+      # The smoke loads what the build step produced, so the staged libraries are copied where the
+      # .gdextension resolves them and `--skip-build` is passed. Building a second copy into bin/ would
+      # compile the same two profiles again and prove less: it would no longer be the uploaded artifact
+      # under test.
+      - name: Install the freshly built library where the descriptor resolves it
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p addons/orbitnet_native/bin
+          for name in $(tools/build-native.sh names ${{ matrix.platform }}); do
+            cp "staged/$name" "addons/orbitnet_native/bin/$name"
+          done
+          # The unit suites run inside harness/ and the three demos, and every one of those projects gets
+          # its addon as a gitignored COPY. Nothing in a fresh checkout has them until this runs.
+          tools/sync-addons.sh
+
+      # Magic bytes, the entry symbol, then a throwaway Godot project that asserts the classes register,
+      # exported properties bind, signals reach GDScript, ticks advance, and freeing a registered entity
+      # does not panic the frame. See the script header for which half proves what.
+      - name: Extension load smoke (throwaway project)
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: tools/orbitnet-smoke.sh --skip-build
+
+      # The cheap second layer is the addon's own GDScript, on this platform, with no scene tree, no
+      # physics and no sockets. The probes are the expensive third layer and are deliberately not here --
+      # they are multi-process, they bind UDP ports, and they are slow.
+      - name: Unit suites
+        if: matrix.platform != 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          godot="${GODOT_BIN:-godot}"
+          # macOS headless creates a Metal RenderingDevice during the resource import pass and can fault
+          # inside MoltenVK there, regardless of --headless and regardless of --rendering-driver.
+          # tools/lint-gdscript.sh carries these two arguments for that exact fault and runs every pass
+          # with them; this leg does the same. They word-split to nothing on Windows.
+          render_args=""
+          if [ "$(uname)" = "Darwin" ]; then
+            render_args="--rendering-driver opengl3 --audio-driver Dummy"
+          fi
+          for project in harness demos/rts demos/hockey demos/arena; do
+            # PRIME THE IMPORT CACHE FIRST. A cold project has no global class cache, so the runner script
+            # fails to resolve the test base class it extends -- "Could not find type" on correct code that
+            # loads fine on the next run. `.gitignore` ignores `.godot/` and actions/checkout removes
+            # ignored files, so EVERY run here is cold and this prime is load-bearing on all of them.
+            # Best-effort but retried once: a real script error recurs on the checked pass below, while a
+            # renderer fault part way through leaves a half-built class cache that the checked pass has no
+            # fallback for.
+            "$godot" --headless --no-header $render_args --path "$project" --import >/dev/null 2>&1 \
+              || "$godot" --headless --no-header $render_args --path "$project" --import >/dev/null 2>&1 \
+              || true
+            "$godot" --headless $render_args --path "$project" --script tests/support/run_unit_tests.gd
+          done
