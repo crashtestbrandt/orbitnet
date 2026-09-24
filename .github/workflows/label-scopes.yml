@@ -1,37 +1,31 @@
-# COPY -- DO NOT EDIT HERE.
-#
-# Source of truth: crashtestbrandt/spaceman, .github/workflows/label-scopes.yml. This file is copied into
-# every repo .github/labels.yml names, because enforcement answers `issues.labeled` and a workflow in
-# spaceman never sees this repo's events.
-#
-# EXCLUSIVE_SCOPES below must match spaceman's labels.yml. spaceman's own gate (tools/check-labels.sh) can
-# only see spaceman's copy, so when a scope's exclusivity changes, every copy has to be updated together.
-# Re-copy from spaceman rather than editing the value here. docs/labels.md in spaceman is the authority.
-#
 name: Label scopes
 
 # GitLab's scoped-label rule, rebuilt on GitHub: an issue carries at most one member of an EXCLUSIVE scope,
-# and applying one removes its siblings.
+# and applying one removes its siblings. GitHub enforces nothing itself -- `::` is just characters to it.
 #
-# WHY IT LIVES IN EACH REPO RATHER THAN BESIDE label-sync.yml. Enforcement is event-driven -- it answers
-# `issues.labeled` -- and a workflow in spaceman never sees another repo's events. A central scheduled sweep
-# was the alternative and it is worse: minutes of latency, and a label the user just applied vanishing under
-# them. So this file is COPIED INTO each repo labels.yml names. docs/labels.md, "Installing enforcement".
+# THIS FILE IS DISTRIBUTED. One copy runs in every repository that shares a label set, because enforcement is
+# event-driven: it answers `issues.labeled`, and a workflow in one repository never sees another's events. A
+# central scheduled sweep was the alternative and it is worse -- minutes of latency, and a label the user just
+# applied vanishing under them a few minutes later.
 #
-# It needs no secret. It edits issues in its OWN repo, which the built-in GITHUB_TOKEN can do, and a label
-# removed by GITHUB_TOKEN raises no further workflow run, so there is no loop to guard against.
+# Edit every copy together or none: they are meant to be byte-identical, and a copy edited on its own silently
+# stops matching the set it enforces.
 #
-# EXCLUSIVE_SCOPES IS GENERATED. It is `ruby tools/label-plan.rb --exclusive-scopes` over spaceman's
-# .github/labels.yml, and tools/check-labels.sh fails the PR when this literal and that file disagree. It is a
-# literal rather than a read of labels.yml because the sibling repos do not carry that file.
+# IT NEEDS NO SECRET. It edits issues in its OWN repository, which the built-in GITHUB_TOKEN can do, and a
+# label removed by GITHUB_TOKEN raises no further workflow run, so there is no loop to guard against. The
+# repository's default workflow token may be read-only; the `permissions:` block below grants what this needs.
 #
-# IT IS EMPTY TODAY. The only declared scope, `topic`, is non-exclusive -- an issue can be about the scripting
-# layer and about performance at once. Every step below no-ops until a scope declares `exclusive: true`, which
-# is a one-line change in labels.yml.
+# EXCLUSIVE_SCOPES IS GENERATED from the label set this workflow enforces, and is a literal because a copy
+# cannot read a definition that lives outside its own repository. It is the one value that must agree across
+# every copy, so change it at the source and redistribute rather than editing a single copy.
+#
+# IT IS EMPTY WHENEVER NO SCOPE IS EXCLUSIVE, and it is empty now: a scope whose members can legitimately
+# co-occur on one issue -- two subject areas, say -- must not be exclusive, or enforcement silently strips one
+# of them off. Every step below no-ops until some scope declares itself exclusive.
 
-# `pull_request_target` runs with write permissions against the BASE repo, which is only safe because this
-# job never checks out the pull request's code -- there is no `actions/checkout` below, and the only input it
-# reads is the event's label name. Do not add a checkout here.
+# `pull_request_target` runs with write permissions against the BASE repository, which is only safe because
+# this job never checks out the pull request's code -- there is no `actions/checkout` below, and the only
+# input it reads is the event's label name. Do not add a checkout here.
 on:
   issues:
     types: [labeled]
@@ -88,7 +82,7 @@ jobs:
           #
           # `gh issue` on a PULL REQUEST number is correct, not an oversight: every GitHub pull request is an
           # issue, and both `gh issue view` and `gh issue edit --remove-label` resolve a PR number and act on
-          # it. Verified against a live PR rather than assumed (PR #1191). Do not "fix" this into a
+          # it. Verified against a live pull request rather than assumed. Do not "fix" this into a
           # gh pr / gh issue branch on github.event_name.
           current="$(gh issue view "$NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')"
 
