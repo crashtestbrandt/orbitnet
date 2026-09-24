@@ -7,7 +7,21 @@ license.workspace = true
 repository.workspace = true
 description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 
-# Deliberately ZERO dependencies, and deliberately NO dependency on `godot`.
+# Deliberately ZERO RUNTIME dependencies, and deliberately NO dependency on `godot`.
 # Everything here is a pure function of plain data so it runs under `cargo test`
-# in milliseconds and can be reused outside Godot.
+# in milliseconds and can be reused outside Godot. The one entry below this table is
+# `[dev-dependencies]`, which is compiled for tests and linked into nothing.
 [dependencies]
+
+# The generator behind `tests/wire_properties.rs`, and the ONLY dependency this crate has of any
+# kind. A `[dev-dependencies]` entry is compiled for `cargo test` and for nothing else: it is absent
+# from `cargo build`, from the cdylib `orbitnet-godot` links, and from every release asset, so the
+# zero-dependency rule above still describes what ships. `[dependencies]` stays empty.
+#
+# Default features off. `fork` and `timeout` run each case in a subprocess to survive an abort or a
+# hang; this crate is `#![forbid(unsafe_code)]`, so a failing case panics and `std`'s own
+# `catch_unwind` already reports it, and the two features would add `rusty-fork`, `wait-timeout` and
+# `tempfile` to the dev tree for nothing. `bit-set` only picks a faster shrinker for
+# `proptest::sample`, which this suite does not use.
+[dev-dependencies]
+proptest = { version = "1.11", default-features = false, features = ["std"] }
