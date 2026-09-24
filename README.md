@@ -221,8 +221,15 @@ are game decisions, and any default here would be wrong for somebody.
   therefore a second round trip before a client may send anything. An X25519 exchange was considered and
   declined — unauthenticated ECDH is substituted by exactly the on-path attacker these bullets are about, so
   it would demote the adversary to passive-only in exchange for several hundred lines of hand-written
-  constant-time field arithmetic in a zero-dependency crate with no timing harness to prove it stayed
-  constant-time. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+  constant-time field arithmetic in a zero-dependency crate whose only constant-time groundwork is the
+  ten-line tag compare. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+- **A harness holds the tag compare to constant time.**
+  `native/crates/orbitnet-core/tests/constant_time.rs` asserts that the compare's own source, compiled on its
+  own under each shipped profile's flags, emits no branch, and measures whether two refused datagrams
+  differing in which tag byte is wrong are separable by timing. The branch assertion runs on every pull
+  request; the measurement is `just native-timing`, run by hand, because a shared CI runner's noise floor is
+  too high for its verdict to mean anything. **It covers that ten-line compare and nothing else** — not the
+  field arithmetic an exchange would need.
 - **Encryption comes from the transport, and OrbitNet supplies none of it.** An ENet session carries every
   payload in the clear. A Steam session's packets are encrypted and its peer identity authenticated by
   SteamNetworkingSockets. A game inherits that from the `custom_features="steam"` export-preset tag, not from

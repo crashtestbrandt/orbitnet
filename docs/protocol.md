@@ -694,11 +694,30 @@ retries. What differs is whether the other end can say why.
   join hangs**; it is the only thing that distinguishes this from a dead link.
 
 **Why not a key exchange instead.** An X25519 exchange inside `orbitnet-core` is roughly 400 lines of new
-field arithmetic in a crate with zero dependencies and `overflow-checks` on, with no constant-time groundwork
-past a ten-line tag compare and no timing harness to prove the compiler did not reintroduce a branch. And an
-**unauthenticated** exchange does not close the hole above anyway: the attacker in question is on-path, and an
-exchange with no key the client already trusts is substituted by exactly that attacker. It would demote the
-adversary from on-path to passive-only, at that cost. A secret the game already authenticated closes both.
+field arithmetic in a crate with zero dependencies and `overflow-checks` on, and the only constant-time
+groundwork this repository has is the ten-line tag compare. And an **unauthenticated** exchange does not
+close the hole above anyway: the attacker in question is on-path, and an exchange with no key the client
+already trusts is substituted by exactly that attacker. It would demote the adversary from on-path to
+passive-only, at that cost. A secret the game already authenticated closes both.
+
+**What holds the tag compare to constant time.** `native/crates/orbitnet-core/tests/constant_time.rs`, in two
+assertions that fail for different reasons.
+
+| Assertion | How | Where it runs |
+|---|---|---|
+| The compare's source emits no conditional branch and no call | `fn tags_equal`'s text is read out of `auth.rs`, compiled **on its own** with `rustc --emit=asm` under each shipped profile's flags, and the emitted mnemonics scanned | `just native-test`, every pull request |
+| Two refused datagrams differing in which tag byte is wrong are not separable by timing | a dudect-style Welch t-test against a tolerance measured on the box in the same run, with a deliberately leaky compare as the control | `just native-timing`, by hand on an idle machine |
+
+Two limits on that table, both recorded at length in the test's header comment.
+
+- **The codegen assertion judges the compare compiled in isolation.** The shipped library contains no
+  `tags_equal` symbol: the fold is inlined into `SessionAuth::open`. A rewrite that compiles branchless on
+  its own and branchy once inlined at that call site would pass.
+- **The measurement is not a pull-request gate, and today runs in no job.** A shared CI runner is a noisy
+  virtual machine whose noise floor is higher than the difference being measured, so there the tolerance
+  inflates until the test passes on anything. The test asserts that the leaky control clears the tolerance by
+  4x and fails if it does not, so a box too noisy to resolve a known leak reports a failure rather than a
+  pass.
 
 ## The resume token
 

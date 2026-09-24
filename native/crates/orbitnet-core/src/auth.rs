@@ -36,9 +36,16 @@
 //!   An X25519 exchange was considered and declined. It would demote this adversary to passive-only,
 //!   which is a real narrowing rather than none -- but unauthenticated ECDH is substituted by exactly
 //!   the on-path attacker in question, so the price is several hundred lines of hand-written
-//!   constant-time field arithmetic in a zero-dependency crate with no timing harness to prove it
-//!   stayed constant-time. `README.md` records the same decision for a reader who never opens this
-//!   file.
+//!   constant-time field arithmetic in a zero-dependency crate. `README.md` records the same decision
+//!   for a reader who never opens this file.
+//!
+//!   **`tests/constant_time.rs` is the timing harness that decision said was missing.** It asserts
+//!   that `tags_equal`'s source, compiled on its own under each shipped profile's flags, emits no
+//!   branch, and that two refused datagrams differing in which tag byte is wrong are not separable
+//!   by a t-test against a tolerance it measures on the box it runs on. It covers this compare and
+//!   nothing else: field arithmetic written here later would need its own coverage on top of it.
+//!   The branch assertion is in `just native-test`; `just native-timing` runs the measurement by
+//!   hand, and no job runs it.
 //!
 //! ## Deriving the key from a secret both ends already hold
 //!
