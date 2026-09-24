@@ -156,7 +156,23 @@ What Valve's own documentation supports, read 2026-09-24:
 ## Testing without Steam
 
 Everything above is inert on an ENet build, so the whole netcode surface — including `just netbench` and the
-demos — runs with no Steam installed. What genuinely cannot be tested that way: persona names, lobby
-discovery, invites, ticket validation, and the link encryption and peer-identity authentication in the table
-above. Those need a real Steam build, two accounts and a manual pass — the encryption and identity rows also
-need a packet capture.
+demos — runs with no Steam installed.
+
+The transport's own logic runs there too, behind a **platform double**:
+
+- `SteamTransport.use_platform_double()` points the file's two Steamworks lookups — the singleton and the
+  `MultiplayerPeer` class — at a stand-in.
+- `harness/tests/unit/steam_transport_test.gd` drives the real transport code through it under `just test`.
+- The double is declared inside `steam_transport.gd`: it has to answer the same Steamworks method names and
+  signals the dynamic calls ask for, and that file is the only one allowed to name them.
+- The suite reads the double through a Steam-blind API and names no Steamworks symbol at all.
+
+| Covered by `just test` | Still needs a real build, two accounts and a human |
+|---|---|
+| lobby create, advertise, publish-later, release | that the call signatures match the GodotSteam version you vendor |
+| the metadata rows a browser reads, and the reader's fallbacks | lobby discovery across accounts and regions |
+| the invite accept path, live and cold-start, and the staged-lobby invariant | invites delivered through the real overlay |
+| platform result codes mapped onto the states the facade publishes | persona names resolved by the real backend |
+| ticket issue, validate and release, and where the gate is inert | ticket validation against Valve |
+| every "no platform" and "not yet cached" path | the advertised headcount, which counts live session peers |
+| — | the link encryption and peer-identity authentication in the table above, which also need a packet capture |
