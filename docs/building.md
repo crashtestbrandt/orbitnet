@@ -187,8 +187,8 @@ down. The two self-hosted legs of `binaries.yml` already hold the library they j
   (`nm`, or `dumpbin` on Windows); where none does, the step says so and continues into the Godot run rather
   than failing a build that is fine.
 - **Both steps need Godot on the runner.** The leg checks for it first and fails naming what to install,
-  rather than reporting `godot: command not found` from inside a test script. `GODOT_BIN` names a binary that
-  is not on `PATH` as `godot`.
+  rather than reporting `godot: command not found` from inside a test script. Set **`GODOT_BIN`** to the
+  binary's path on a runner where Godot is not on `PATH` under the name `godot`.
 - **The probes stay Linux-only.** They are multi-process, they bind UDP ports and they are slow.
 - **The Linux leg runs neither.** `check.yml` already runs both on Linux for every pull request.
 
