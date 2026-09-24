@@ -34,6 +34,21 @@
 //! | restore | the row onto the restored roles | `restore_tick` |
 //! | apply | a received row onto every role | `apply_pending_display`, `apply_pending` |
 //! | apply | the quantized write-back | `record_tick`, gated on two or more quantized properties |
+//!
+//! **What is unit-tested here, and what is not.** The `#[cfg(test)]` module at the bottom gates
+//! seven rules, each extracted behind a plain-data function: the bulk-hook order derivation, the
+//! input send ring's contiguity, the memo guards, the mispredict compare, the interest anchor and
+//! the two declaration clamps. Anything holding a `Gd<Node>` — the property walks, the resolved
+//! bindings, the hook calls themselves — cannot be constructed without an engine and is covered by
+//! the probes instead. A rule that stops needing a node moves behind a plain-data function rather
+//! than staying untested; that is the same split `orbitnet-core` holds, applied inside the binding
+//! crate.
+//!
+//! **One gap remains.** `integrate_authoritative_row` decides four rules over plain fields before
+//! any node is touched — the `tick_i <= latest_state_tick` ordering gate, the
+//! `simulates() || predicts_remotely()` display-versus-reconcile split, the `is_stale` window and
+//! the `tick >= current_tick` buffer branch — and all four stay probe-only. Extracting them behind
+//! a plain-data function takes eight parameters and trips `clippy::too_many_arguments`.
 
 use godot::classes::Node;
 use godot::prelude::*;
@@ -326,6 +341,189 @@ pub(crate) fn input_restore_row<'h>(
         ledger.set_confidence(tick, Confidence::Extrapolated);
     }
     Some(row)
+}
+
+/// The newest input rows to put on the wire, newest first, and the tick the first of them carries.
+///
+/// A free function over the ring, like [`integrate_input_row`] and for the same reason: the
+/// contiguity rule below is a wire invariant and is gated by a test rather than only by a probe.
+/// [`OrbitRollbackSynchronizer::input_rows_for_send`] is the only caller.
+///
+/// **The rows must be contiguous, descending from `newest`.** The block puts one tick on the wire
+/// — `newest` — and the receiver derives every later row's tick as `newest - index`, so a walk that
+/// skipped a hole in the ring would hand every row after that hole to the wrong tick, silently and
+/// on a lane the game never sees decoded. The walk therefore stops at the first missing tick rather
+/// than continuing past it, and a short list is the correct answer.
+///
+/// `None` when the ring holds nothing. `checked_sub` stops the walk at tick `0` rather than
+/// wrapping to `u64::MAX`, which `[profile.template-debug]` would panic on and a release build
+/// would turn into a lookup miles outside the window.
+pub(crate) fn newest_input_rows(
+    history: &ColumnarHistory,
+    redundancy: usize,
+) -> Option<(u64, Vec<Vec<u8>>)> {
+    let newest = history.latest_tick()?;
+    let mut rows = Vec::with_capacity(redundancy);
+    for offset in 0..redundancy as u64 {
+        let Some(tick) = newest.checked_sub(offset) else {
+            break;
+        };
+        match history.row(tick) {
+            Some(row) => rows.push(row.to_vec()),
+            None => break,
+        }
+    }
+    if rows.is_empty() {
+        None
+    } else {
+        Some((newest, rows))
+    }
+}
+
+/// The depth an entity's history rings and its freshness ledger are built at.
+///
+/// **Floored at two rows.** `history_limit` is a game-set process-wide export, and
+/// [`ColumnarHistory::new`] floors at one row on its own — a ring that deep holds only the tick the
+/// simulation just recorded, so a received row for any earlier tick is refused as stale and the
+/// reconcile path never confirms or corrects anything. Two rows is the floor the rollback loop
+/// needs on top of the ring's own.
+pub(crate) fn ring_capacity(limit: usize) -> usize {
+    limit.max(2)
+}
+
+/// The depth the per-tick memo ring is built at: **twice the history depth**.
+///
+/// The two rings do not turn over on the same schedule. History takes one row per tick at the
+/// frontier, while a memo is written by game code keyed on `rollback_tick()` — the tick being
+/// replayed, which trails the frontier through a resim. Sizing the memo ring past the history
+/// window is what keeps a tick's memo resident across every replayed pass over that tick, at a
+/// cost of one empty pair list per extra slot.
+pub(crate) fn memo_capacity(limit: usize) -> usize {
+    ring_capacity(limit) * 2
+}
+
+/// Record a per-tick memo value, refusing a negative tick.
+///
+/// **A negative tick is refused rather than reinterpreted.** `tick as u64` maps `-1` to
+/// `u64::MAX`, and [`MemoRing::set`] refuses a write to a slot holding a *newer* tick — so one call
+/// with a game's own "unset" sentinel would claim the slot `u64::MAX` addresses, and every real
+/// tick landing on that slot afterwards would be dropped for the rest of the session with nothing
+/// erroring.
+pub(crate) fn memo_write(memo: &mut MemoRing, tick: i64, key: i64, value: i64) {
+    if tick >= 0 {
+        memo.set(tick as u64, key, value);
+    }
+}
+
+/// Read a per-tick memo value, or `fallback` when none was recorded.
+///
+/// A negative tick answers `fallback` without addressing the slot `u64::MAX` maps to. That check
+/// is a short-circuit rather than a correctness gate: [`memo_write`] refuses negatives, so no slot
+/// can ever hold tick `u64::MAX` and the lookup would miss and answer `fallback` regardless.
+pub(crate) fn memo_read(memo: &MemoRing, tick: i64, key: i64, fallback: i64) -> i64 {
+    if tick < 0 {
+        return fallback;
+    }
+    memo.get(tick as u64, key).unwrap_or(fallback)
+}
+
+/// The binding indices each of a lane's three bulk-hook directions marshals, derived together.
+///
+/// Derived in one place because the relationship between the three lists is the thing that fails
+/// silently, and six separate `resolve_hook` call sites is where it failed: see
+/// [`OrbitRollbackSynchronizer::bulk_apply_method`].
+pub(crate) struct HookSlots {
+    /// Every binding in the lane, in schema order — the order the row is encoded in.
+    pub(crate) capture: Vec<usize>,
+    /// The subset the rollback loop writes back: `State` and `Input`, never `Cosmetic`.
+    pub(crate) restore: Vec<usize>,
+    /// Every binding in the lane, in schema order. **The same list as [`Self::capture`].**
+    pub(crate) apply: Vec<usize>,
+}
+
+/// Derive one lane's three bulk-hook slot lists from its resolved schema.
+///
+/// **The apply list is the capture list, not the restore list**, and the two differ by exactly the
+/// lane's `Cosmetic` entries — captured and replicated, never restored. Resolving apply over
+/// [`SchemaBuilder::restored`] hands a receiving peer an array one slot short of the row it
+/// decoded, so every slot from the first cosmetic onward reads a different property's value with
+/// nothing erroring. That is the failure `docs/api.md` warns about, and it is why the three lists
+/// are built here rather than at the call sites.
+///
+/// `bindings` is the resolved binding count, which `binding::resolve_entries` keeps index-aligned
+/// with `schema` — the slot lists index the binding list and the schema's props interchangeably.
+pub(crate) fn hook_slots(schema: &SchemaBuilder, bindings: usize) -> HookSlots {
+    let every: Vec<usize> = (0..bindings).collect();
+    HookSlots {
+        restore: schema.restored(),
+        capture: every.clone(),
+        apply: every,
+    }
+}
+
+/// Whether a received authoritative row differs from the recorded prediction in a way that costs a
+/// resimulation.
+///
+/// **Only `State`-role props are compared.** A `Cosmetic` entry is captured and replicated but
+/// never restored, so a resim started by a cosmetic difference would replay the same inputs to the
+/// same result and buy nothing — a whole-row `recorded != row` compare turns every cosmetic the
+/// game writes outside the tick loop into a per-tick replay on every predicting peer.
+///
+/// `recorded` is `None` when the receiver has no row of its own at that tick, which is a
+/// misprediction by definition: there is no prediction to have been right.
+pub(crate) fn row_mispredicts(props: &[PropSchema], recorded: Option<&[u8]>, row: &[u8]) -> bool {
+    let Some(recorded) = recorded else {
+        return true;
+    };
+    props
+        .iter()
+        .filter(|prop| prop.role.triggers_resim())
+        .any(|prop| {
+            let end = prop.offset + prop.kind.stride();
+            recorded.get(prop.offset..end) != row.get(prop.offset..end)
+        })
+}
+
+/// The interest anchor carried by a state row: the **first `Vec3` `State`-role property**.
+///
+/// **Register position first.** The choice is positional, not by name, so a body that declares a
+/// velocity or a scale ahead of its position anchors the interest filter on that instead and is
+/// culled against a point it never occupies. A `Vec3` declared `Cosmetic` is skipped — it is not
+/// restored, so it is not a pose the simulation agrees on.
+///
+/// `None` when the lane has no such property, or when the row is shorter than the offset it would
+/// be read from — a truncated row reads as unlocatable, which the filter answers by replicating the
+/// body everywhere rather than by deleting it from somebody's world.
+pub(crate) fn position_in_row(props: &[PropSchema], row: &[u8]) -> Option<[f32; 3]> {
+    let prop = props
+        .iter()
+        .find(|p| p.kind == PropKind::Vec3 && p.role == PropRole::State)?;
+    let o = prop.offset;
+    if o + 12 > row.len() {
+        return None;
+    }
+    let f = |i: usize| f32::from_le_bytes([row[i], row[i + 1], row[i + 2], row[i + 3]]);
+    Some([f(o), f(o + 4), f(o + 8)])
+}
+
+/// A declared `priority` export, clamped into the range the send-rota scorer accepts.
+///
+/// The clamp is what keeps the `as u32` honest: a game writing its own "unset" as `-1` would
+/// otherwise reinterpret to `u32::MAX` and put that body permanently at the head of every peer's
+/// rota. `0` is not a valid priority either — the scorer multiplies by it.
+pub(crate) fn clamp_send_priority(declared: i32) -> u32 {
+    declared.clamp(1, orbitnet_core::priority::PRIORITY_MAX as i32) as u32
+}
+
+/// A declared `seat` export, clamped into the range the interest pass keys an anchor on.
+///
+/// A negative value is a game writing its own "unset" into an `int` export, and it reads as seat
+/// `0` — the same fail-onto-the-default direction the rest of these declarations take. Without the
+/// clamp `-1 as SeatIndex` is `65535`, a seat no connection ever resolves, and the body would
+/// anchor nobody's interest. The cost of the clamp getting it wrong is one connection's two
+/// viewpoints sharing an anchor, which is the behavior that predates seats.
+pub(crate) fn clamp_seat(declared: i32) -> SeatIndex {
+    declared.clamp(0, i32::from(SeatIndex::MAX)) as SeatIndex
 }
 
 /// Rollback state + input replication for one entity.
@@ -890,18 +1088,13 @@ impl OrbitRollbackSynchronizer {
     /// same value back on every replayed pass, trimmed with history.
     #[func]
     fn memo_set(&mut self, tick: i64, key: i64, value: i64) {
-        if tick >= 0 {
-            self.memo.set(tick as u64, key, value);
-        }
+        memo_write(&mut self.memo, tick, key, value);
     }
 
     /// Read a per-tick memo value, or `fallback` when none was recorded.
     #[func]
     fn memo_get(&self, tick: i64, key: i64, fallback: i64) -> i64 {
-        if tick < 0 {
-            return fallback;
-        }
-        self.memo.get(tick as u64, key).unwrap_or(fallback)
+        memo_read(&self.memo, tick, key, fallback)
     }
 
     /// Hash of the resolved state schema. Peers must agree on this exactly.
@@ -1177,36 +1370,36 @@ impl OrbitRollbackSynchronizer {
         let capture_target = binding::hook_target(state_root.as_ref(), &capture, &label);
         let restore_target = binding::hook_target(state_root.as_ref(), &restore, &label);
         let apply_target = binding::hook_target(state_root.as_ref(), &apply, &label);
-        let state_all: Vec<usize> = (0..self.state_bindings.len()).collect();
-        let input_all: Vec<usize> = (0..self.input_bindings.len()).collect();
-        let state_restored = self.state_schema.restored();
-        let input_restored = self.input_schema.restored();
+        // [`hook_slots`] derives all three lists of a lane together, so the apply list cannot
+        // drift onto the restored subset at one of six call sites.
+        let state_slots = hook_slots(&self.state_schema, self.state_bindings.len());
+        let input_slots = hook_slots(&self.input_schema, self.input_bindings.len());
         self.state_capture_hook = binding::resolve_hook(
             capture_target.as_ref(),
             &capture,
             LANE_STATE,
-            state_all,
+            state_slots.capture,
             &label,
         );
         self.input_capture_hook = binding::resolve_hook(
             capture_target.as_ref(),
             &capture,
             LANE_INPUT,
-            input_all,
+            input_slots.capture,
             &label,
         );
         self.state_restore_hook = binding::resolve_hook(
             restore_target.as_ref(),
             &restore,
             LANE_STATE,
-            state_restored,
+            state_slots.restore,
             &label,
         );
         self.input_restore_hook = binding::resolve_hook(
             restore_target.as_ref(),
             &restore,
             LANE_INPUT,
-            input_restored,
+            input_slots.restore,
             &label,
         );
         // The apply hook is resolved over the FULL list of each lane, the same list capture uses,
@@ -1215,14 +1408,14 @@ impl OrbitRollbackSynchronizer {
             apply_target.as_ref(),
             &apply,
             LANE_STATE,
-            (0..self.state_bindings.len()).collect(),
+            state_slots.apply,
             &label,
         );
         self.input_apply_hook = binding::resolve_hook(
             apply_target.as_ref(),
             &apply,
             LANE_INPUT,
-            (0..self.input_bindings.len()).collect(),
+            input_slots.apply,
             &label,
         );
         // The write-back gate, decided here and read as a bool per replayed tick. Two quantized
@@ -1262,11 +1455,11 @@ impl OrbitRollbackSynchronizer {
 
         binding::warn_unresolved(&label, &self.unresolved);
 
-        let capacity = self.history_limit.max(2);
+        let capacity = ring_capacity(self.history_limit);
         self.state_history = ColumnarHistory::new(self.state_schema.row_stride(), capacity);
         self.input_history = ColumnarHistory::new(self.input_schema.row_stride(), capacity);
         self.ledger = FreshnessLedger::with_capacity(capacity);
-        self.memo = MemoRing::with_capacity(capacity * 2);
+        self.memo = MemoRing::with_capacity(memo_capacity(self.history_limit));
         self.auth_rows = None;
         self.latest_state_tick = -1;
         self.latest_received_tick = -1;
@@ -1292,7 +1485,7 @@ impl OrbitRollbackSynchronizer {
     /// the rings in place — registration precedes any session traffic for the entity, so the drop
     /// loses nothing.
     pub(crate) fn set_history_limit(&mut self, limit: usize) {
-        let limit = limit.max(2);
+        let limit = ring_capacity(limit);
         if limit == self.history_limit {
             return;
         }
@@ -1300,7 +1493,7 @@ impl OrbitRollbackSynchronizer {
         self.state_history = ColumnarHistory::new(self.state_schema.row_stride(), limit);
         self.input_history = ColumnarHistory::new(self.input_schema.row_stride(), limit);
         self.ledger = FreshnessLedger::with_capacity(limit);
-        self.memo = MemoRing::with_capacity(limit * 2);
+        self.memo = MemoRing::with_capacity(memo_capacity(limit));
         self.auth_rows = None;
         self.latest_state_tick = -1;
         self.latest_received_tick = -1;
@@ -1350,8 +1543,7 @@ impl OrbitRollbackSynchronizer {
 
     /// The declared send-rota priority, clamped into the range the scorer accepts.
     pub(crate) fn send_priority(&self) -> u32 {
-        self.priority
-            .clamp(1, orbitnet_core::priority::PRIORITY_MAX as i32) as u32
+        clamp_send_priority(self.priority)
     }
 
     /// The declared seat, clamped into the range the interest pass keys an anchor on.
@@ -1361,7 +1553,7 @@ impl OrbitRollbackSynchronizer {
     /// The cost of getting it wrong is one connection's two viewpoints sharing an anchor, which is
     /// the behavior that predates seats, not a body deleted from somebody's world.
     pub(crate) fn seat_hint(&self) -> SeatIndex {
-        self.seat.clamp(0, i32::from(SeatIndex::MAX)) as SeatIndex
+        clamp_seat(self.seat)
     }
 
     /// Whether this peer simulates the entity in the rollback loop.
@@ -1378,19 +1570,8 @@ impl OrbitRollbackSynchronizer {
     /// newest state row, so register position FIRST. `None` when the entity has no
     /// positional prop or no recorded row yet — the AOI filter then keeps it always-replicated.
     pub(crate) fn position_hint(&self) -> Option<[f32; 3]> {
-        let prop = self
-            .state_schema
-            .props()
-            .iter()
-            .find(|p| p.kind == PropKind::Vec3 && p.role == PropRole::State)?;
         let tick = self.state_history.latest_tick()?;
-        let row = self.state_history.row(tick)?;
-        let o = prop.offset;
-        if o + 12 > row.len() {
-            return None;
-        }
-        let f = |i: usize| f32::from_le_bytes([row[i], row[i + 1], row[i + 2], row[i + 3]]);
-        Some([f(o), f(o + 4), f(o + 8)])
+        position_in_row(self.state_schema.props(), self.state_history.row(tick)?)
     }
 
     /// The world this body is in, read live from `membership_property`.
@@ -1495,24 +1676,10 @@ impl OrbitRollbackSynchronizer {
         Some(writer.into_inner())
     }
 
-    /// Collect this entity's newest input rows for the wire, newest first.
+    /// Collect this entity's newest input rows for the wire, newest first. See
+    /// [`newest_input_rows`] for the contiguity rule they have to satisfy.
     pub(crate) fn input_rows_for_send(&self, redundancy: usize) -> Option<(u64, Vec<Vec<u8>>)> {
-        let newest = self.input_history.latest_tick()?;
-        let mut rows = Vec::with_capacity(redundancy);
-        for offset in 0..redundancy as u64 {
-            let Some(tick) = newest.checked_sub(offset) else {
-                break;
-            };
-            match self.input_history.row(tick) {
-                Some(row) => rows.push(row.to_vec()),
-                None => break,
-            }
-        }
-        if rows.is_empty() {
-            None
-        } else {
-            Some((newest, rows))
-        }
+        newest_input_rows(&self.input_history, redundancy)
     }
 
     /// Decode one WIRE input row and integrate it (server side).
@@ -1610,7 +1777,7 @@ impl OrbitRollbackSynchronizer {
     /// refuses a tick already outside its window.
     fn keep_auth_row(&mut self, tick: u64, row: &[u8]) {
         let stride = self.state_schema.row_stride();
-        let capacity = self.history_limit.max(2);
+        let capacity = ring_capacity(self.history_limit);
         let rows = self
             .auth_rows
             .get_or_insert_with(|| ColumnarHistory::new(stride, capacity));
@@ -1713,25 +1880,10 @@ impl OrbitRollbackSynchronizer {
             // as unusable, so this must not raise a NACK either.
             return StateIntegration::Stale;
         }
-        let mispredicted = match self.state_history.row(tick) {
-            Some(recorded) => {
-                // Compare only resim-triggering (State-role) props: a cosmetic difference must
-                // not cost a resimulation.
-                let mut differs = false;
-                for prop in self.state_schema.props() {
-                    if !prop.role.triggers_resim() {
-                        continue;
-                    }
-                    let end = prop.offset + prop.kind.stride();
-                    if recorded.get(prop.offset..end) != row.get(prop.offset..end) {
-                        differs = true;
-                        break;
-                    }
-                }
-                differs
-            }
-            None => true,
-        };
+        // Compare only resim-triggering (State-role) props: a cosmetic difference must not cost a
+        // resimulation. See [`row_mispredicts`].
+        let mispredicted =
+            row_mispredicts(self.state_schema.props(), self.state_history.row(tick), row);
         self.state_history.write_row(tick, row);
         if !mispredicted {
             return StateIntegration::Confirmed;
@@ -2158,19 +2310,24 @@ impl OrbitStateSynchronizer {
         binding::warn_unresolved(&label, &self.unresolved);
         // After the schema, because the slot list is the schema's own order. Both directions
         // marshal every binding: this lane has one role, so its capture order and its apply order
-        // are the same list.
+        // are the same list, and `HookSlots::restore` is the same list again rather than a subset.
         let capture = self.bulk_capture_method.clone();
         let apply = self.bulk_apply_method.clone();
         let capture_target = binding::hook_target(root.as_ref(), &capture, &label);
         let apply_target = binding::hook_target(root.as_ref(), &apply, &label);
-        let slots: Vec<usize> = (0..self.bindings.len()).collect();
-        self.capture_hook =
-            binding::resolve_hook(capture_target.as_ref(), &capture, LANE_STATE, slots, &label);
+        let slots = hook_slots(&self.schema, self.bindings.len());
+        self.capture_hook = binding::resolve_hook(
+            capture_target.as_ref(),
+            &capture,
+            LANE_STATE,
+            slots.capture,
+            &label,
+        );
         self.apply_hook = binding::resolve_hook(
             apply_target.as_ref(),
             &apply,
             LANE_STATE,
-            (0..self.bindings.len()).collect(),
+            slots.apply,
             &label,
         );
         if let Some(root) = &root {
@@ -2402,8 +2559,7 @@ impl OrbitStateSynchronizer {
 
     /// The declared send-rota priority, clamped into the range the scorer accepts.
     pub(crate) fn send_priority(&self) -> u32 {
-        self.priority
-            .clamp(1, orbitnet_core::priority::PRIORITY_MAX as i32) as u32
+        clamp_send_priority(self.priority)
     }
 
     /// This channel's world-space interest anchor, read live from `anchor_property`.
@@ -2587,5 +2743,677 @@ impl OrbitStateSynchronizer {
         self.latest_tick = -1;
         self.latest_received_tick = -1;
         self.pending = None;
+    }
+}
+
+// ======================================================================================
+// The parts of this module that are pure functions of plain data.
+//
+// Everything below runs with no `SceneTree` and no engine: a `Gd<Node>` cannot be constructed in
+// a unit test, so the property walks, the resolved bindings and the hook *calls* stay out and are
+// covered by the probes. What is reachable is seven rules, each extracted behind a plain-data
+// function — the bulk-hook order derivation, the input send ring, the memo guards, the mispredict
+// compare, the interest anchor and the two declaration clamps.
+//
+// `integrate_authoritative_row` is the gap. Its tick-ordering gate, display-versus-reconcile split,
+// staleness window and buffer branch are decided over plain fields too, but extracting them takes
+// eight parameters and trips `clippy::too_many_arguments`, so they stay probe-only.
+//
+// The receive path's other half is driven from `orbit_net`'s own test module, which folds
+// `integrate_input_row`'s answer into a `ResimPlanner` the way `handle_client_input` does. The
+// tests here are about the answer itself.
+// ======================================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lane declaring a cosmetic **between** two restored entries. With the cosmetic last, a
+    /// restore list used where a capture list belongs is merely short, and every slot before it
+    /// still reads the right property. In the middle, every slot from there on reads a different
+    /// property — the failure that has no error attached.
+    fn lane_with_a_cosmetic() -> SchemaBuilder {
+        let mut schema = SchemaBuilder::new();
+        schema.push("pose", PropKind::Vec3, PropRole::State);
+        schema.push("trail", PropKind::Vec3, PropRole::Cosmetic);
+        schema.push("orient", PropKind::Quat, PropRole::State);
+        schema
+    }
+
+    /// The declared entry names a slot list marshals, in array order — what `binding::hook_order`
+    /// publishes to a game, without the `PackedStringArray` that needs an engine to build.
+    fn names<'p>(props: &'p [PropSchema], slots: &[usize]) -> Vec<&'p str> {
+        slots
+            .iter()
+            .map(|&index| props[index].name.as_str())
+            .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // The bulk-hook order derivation, and the capture/restore/apply split.
+    // ------------------------------------------------------------------
+
+    /// **The apply order is the capture order.** `docs/api.md` calls this the one thing in the
+    /// bulk-hook feature that fails silently, and this is the assertion that holds it: resolving
+    /// the apply direction over the restored subset hands a receiving peer an array one slot short
+    /// of the row it decoded, so every slot from the first cosmetic onward reads a different
+    /// property's value with nothing erroring.
+    ///
+    /// Catches a derivation that reused `SchemaBuilder::restored()` for apply, which is the
+    /// plausible wrong implementation: one of the three directions genuinely does want that list.
+    #[test]
+    fn the_apply_order_is_the_capture_order_and_not_the_restore_order() {
+        let schema = lane_with_a_cosmetic();
+        let slots = hook_slots(&schema, schema.len());
+
+        assert_eq!(
+            slots.apply, slots.capture,
+            "the apply direction marshals every binding, cosmetics included"
+        );
+        assert_eq!(
+            names(schema.props(), &slots.capture),
+            ["pose", "trail", "orient"],
+            "capture carries the whole row in declaration order"
+        );
+        assert_eq!(
+            names(schema.props(), &slots.restore),
+            ["pose", "orient"],
+            "the restore order is shorter by exactly the cosmetic entries"
+        );
+
+        // THE SHIFT, spelled out: slot 1 of the restore list is `orient` while slot 1 of the row
+        // the apply direction decodes is `trail`. A game that passed its restore method to
+        // `set_bulk_apply` would write the trail value into its orientation field.
+        assert_eq!(names(schema.props(), &slots.restore)[1], "orient");
+        assert_eq!(names(schema.props(), &slots.apply)[1], "trail");
+        assert_ne!(
+            names(schema.props(), &slots.restore)[1],
+            names(schema.props(), &slots.apply)[1],
+            "the two lists disagree from the first cosmetic onward"
+        );
+    }
+
+    /// The other half of the documented contract: a lane that declares no cosmetics has three
+    /// identical lists and **cannot** hit the shift above, which is why one game method may serve
+    /// every direction on such a body.
+    ///
+    /// Catches a derivation that made the apply list unconditionally shorter (dropping the last
+    /// slot, say) — the assertions above would still pass on a lane with a cosmetic.
+    #[test]
+    fn a_lane_that_declares_no_cosmetics_has_three_identical_hook_orders() {
+        let mut schema = SchemaBuilder::new();
+        schema.push("pose", PropKind::Vec3, PropRole::State);
+        schema.push("orient", PropKind::Quat, PropRole::State);
+        let slots = hook_slots(&schema, schema.len());
+
+        assert_eq!(slots.capture, [0, 1]);
+        assert_eq!(slots.restore, slots.capture);
+        assert_eq!(slots.apply, slots.capture);
+
+        // An input lane is restored too, so it behaves the same way: `Cosmetic` is the only role
+        // the loop does not write back.
+        let mut input = SchemaBuilder::new();
+        input.push("move", PropKind::Vec3, PropRole::Input);
+        input.push("fire", PropKind::Bool, PropRole::Input);
+        let input_slots = hook_slots(&input, input.len());
+        assert_eq!(input_slots.restore, input_slots.capture);
+        assert_eq!(input_slots.apply, input_slots.capture);
+    }
+
+    /// **Declaration order, not role order.** The orders are the schema's own, so a game may
+    /// assert them and write its hook against them; grouping the restored entries ahead of the
+    /// cosmetics would reorder the row a game already marshals and shear every value in it.
+    ///
+    /// Catches a derivation that sorted or partitioned by role, which would read as correct on
+    /// any lane that happens to declare its cosmetics last.
+    #[test]
+    fn the_hook_orders_follow_declaration_order_rather_than_role() {
+        let mut schema = SchemaBuilder::new();
+        schema.push("trail", PropKind::Vec3, PropRole::Cosmetic);
+        schema.push("pose", PropKind::Vec3, PropRole::State);
+        schema.push("glow", PropKind::F32, PropRole::Cosmetic);
+        schema.push("orient", PropKind::Quat, PropRole::State);
+        let slots = hook_slots(&schema, schema.len());
+
+        assert_eq!(
+            names(schema.props(), &slots.capture),
+            ["trail", "pose", "glow", "orient"],
+            "a cosmetic declared first stays first"
+        );
+        assert_eq!(slots.restore, [1, 3], "the restored subset keeps its order");
+
+        // And the shift starts at slot 0 on this lane: the restore list's first slot is `pose`
+        // while the row's first slot is `trail`.
+        assert_eq!(names(schema.props(), &slots.restore)[0], "pose");
+        assert_eq!(names(schema.props(), &slots.apply)[0], "trail");
+    }
+
+    /// A lane with nothing in it derives no slots, which is what `binding::resolve_hook` answers
+    /// with the per-property walk rather than a crossing that marshals an empty array.
+    #[test]
+    fn an_empty_lane_derives_no_slots_in_any_direction() {
+        let slots = hook_slots(&SchemaBuilder::new(), 0);
+        assert!(slots.capture.is_empty());
+        assert!(slots.restore.is_empty());
+        assert!(slots.apply.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // The input send ring: the rows a block carries must be contiguous.
+    // ------------------------------------------------------------------
+
+    /// One 4-byte input row per tick, so a row's bytes name the tick that wrote it.
+    fn tick_row(tick: u64) -> Vec<u8> {
+        (tick as u32).to_le_bytes().to_vec()
+    }
+
+    fn ring_holding(ticks: &[u64], capacity: usize) -> ColumnarHistory {
+        let mut history = ColumnarHistory::new(4, capacity);
+        for &tick in ticks {
+            assert!(history.write_row(tick, &tick_row(tick)), "tick {tick}");
+        }
+        history
+    }
+
+    /// **The block puts one tick on the wire and the receiver derives the rest by position.** A
+    /// walk that skipped a hole in the ring would hand every row after that hole to the wrong
+    /// tick: the receiver reads `newest - index`, so row `17` arriving at index `2` of a block
+    /// whose newest is `20` is integrated as tick `18`. Nothing errors — the row is the right
+    /// stride and decodes fine — and the body acts on intent it was never sent.
+    ///
+    /// Catches `continue` where the walk has `break`, which is the one-character version of this
+    /// bug and leaves every other assertion about the block intact.
+    #[test]
+    fn the_send_walk_stops_at_the_first_missing_tick_rather_than_skipping_it() {
+        let history = ring_holding(&[17, 19, 20], 8);
+        let (newest, rows) = newest_input_rows(&history, 4).expect("the ring holds rows");
+
+        assert_eq!(newest, 20);
+        assert_eq!(
+            rows,
+            vec![tick_row(20), tick_row(19)],
+            "the walk stops at the hole at 18 and the resident row for 17 is left behind"
+        );
+
+        // The invariant the receiver leans on, asserted as the receiver derives it.
+        for (index, row) in rows.iter().enumerate() {
+            let tick = newest - index as u64;
+            assert_eq!(
+                history.row(tick),
+                Some(row.as_slice()),
+                "row at index {index} must be the row for tick {tick}"
+            );
+        }
+    }
+
+    /// The walk stops at tick `0` rather than wrapping past it. `template_debug` — the build every
+    /// editor and source run loads — sets `overflow-checks`, so a plain `newest - offset` would
+    /// panic in the middle of assembling a frame; a release build would read `u64::MAX` and miss.
+    ///
+    /// Catches the subtraction losing its `checked_sub`, which is invisible on every tick but the
+    /// first few of a session.
+    #[test]
+    fn the_send_walk_stops_at_tick_zero_rather_than_wrapping_past_it() {
+        let history = ring_holding(&[0, 1], 8);
+        let (newest, rows) = newest_input_rows(&history, 8).expect("the ring holds rows");
+        assert_eq!(newest, 1);
+        assert_eq!(rows, vec![tick_row(1), tick_row(0)]);
+    }
+
+    /// A ring holding less than the redundancy window sends what it holds, an empty one sends
+    /// nothing, and a redundancy of zero sends nothing — a short list is a correct block, so none
+    /// of these is an error.
+    #[test]
+    fn a_short_ring_sends_what_it_holds_and_an_empty_one_sends_no_block() {
+        let history = ring_holding(&[5], 8);
+        let (newest, rows) = newest_input_rows(&history, 4).expect("one row is still a block");
+        assert_eq!((newest, rows.len()), (5, 1));
+
+        assert!(
+            newest_input_rows(&ColumnarHistory::new(4, 8), 4).is_none(),
+            "a ring nobody has captured into sends no block"
+        );
+        assert!(
+            newest_input_rows(&history, 0).is_none(),
+            "and a redundancy of zero asks for no rows"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The receive path's gates, and what each of them leaves the ledger holding.
+    // ------------------------------------------------------------------
+
+    /// Two `i64` state-role-free input props: no float lanes, so `row_is_finite` is trivially
+    /// true and these tests isolate the ordering gates from the poison gate (which
+    /// `orbit_net`'s module covers).
+    fn axis_schema() -> SchemaBuilder {
+        let mut schema = SchemaBuilder::new();
+        schema.push("throttle", PropKind::I64, PropRole::Input);
+        schema.push("fire", PropKind::Bool, PropRole::Input);
+        schema
+    }
+
+    fn axis_row(throttle: i64, fire: bool) -> Vec<u8> {
+        let mut row = throttle.to_le_bytes().to_vec();
+        row.push(u8::from(fire));
+        row
+    }
+
+    /// **A redundant copy of a row already stored is `Ignored`, not `Landed`.** Every input block
+    /// carries a window of ticks so one lost datagram costs nothing, and on an unlossy link only
+    /// the newest of them is new. A gate that answered `Landed` for the repeats would mark the
+    /// resim planner at the oldest tick in the window on *every* received block, so the server
+    /// would replay the whole redundancy window every tick for every client, forever, with the
+    /// simulation coming out identical each time.
+    ///
+    /// Catches the novelty compare being dropped, or being made against the wrong tick's row.
+    #[test]
+    fn a_redundant_copy_of_a_stored_row_is_ignored_rather_than_replanning_a_resim() {
+        let schema = axis_schema();
+        let mut history = ColumnarHistory::new(schema.row_stride(), 8);
+        let mut ledger = FreshnessLedger::with_capacity(8);
+        let mut latest: i64 = -1;
+        let row = axis_row(3, true);
+
+        let first = integrate_input_row(
+            schema.props(),
+            &mut history,
+            &mut ledger,
+            &mut latest,
+            10,
+            &row,
+        );
+        assert_eq!(first, InputIntegration::Landed(10));
+        assert_eq!(ledger.confidence(10), Confidence::Authoritative);
+
+        // The same bytes for the same tick, twice more: the next block's redundancy window.
+        for _ in 0..2 {
+            assert_eq!(
+                integrate_input_row(
+                    schema.props(),
+                    &mut history,
+                    &mut ledger,
+                    &mut latest,
+                    10,
+                    &row,
+                ),
+                InputIntegration::Ignored,
+                "a byte-identical row for a stored tick is not news"
+            );
+        }
+        assert_eq!(history.row(10), Some(row.as_slice()));
+        assert_eq!(latest, 10, "and the frontier did not move");
+
+        // THE NEGATIVE CONTROL: a gate that ignored everything would satisfy all of the above. A
+        // *different* row for the same tick is a correction and still lands.
+        let corrected = axis_row(3, false);
+        assert_eq!(
+            integrate_input_row(
+                schema.props(),
+                &mut history,
+                &mut ledger,
+                &mut latest,
+                10,
+                &corrected,
+            ),
+            InputIntegration::Landed(10),
+        );
+        assert_eq!(history.row(10), Some(corrected.as_slice()));
+    }
+
+    /// **A tick the ring has already rotated past is `Ignored`.** `ColumnarHistory::write_row`
+    /// refuses such a tick on its own, so without this gate the row would not be stored and the
+    /// answer would still be `Landed` — the caller would then plan a resimulation from a tick
+    /// history cannot restore, on every reordered or duplicated datagram. Reordering is routine on
+    /// a relayed link and absent on loopback, which is exactly the asymmetry that hides it.
+    ///
+    /// Catches the staleness gate being dropped, or being written as `<` where the ring's own
+    /// window is `<=`.
+    #[test]
+    fn a_tick_the_ring_has_rotated_past_is_ignored_and_leaves_the_ledger_alone() {
+        let schema = axis_schema();
+        // Capacity 4: with tick 10 resident and newest, the ring's window is 7..=10.
+        let mut history = ColumnarHistory::new(schema.row_stride(), 4);
+        let mut ledger = FreshnessLedger::with_capacity(4);
+        let mut latest: i64 = -1;
+        integrate_input_row(
+            schema.props(),
+            &mut history,
+            &mut ledger,
+            &mut latest,
+            10,
+            &axis_row(1, false),
+        );
+        assert_eq!(latest, 10);
+
+        let late = axis_row(9, true);
+        assert_eq!(
+            integrate_input_row(
+                schema.props(),
+                &mut history,
+                &mut ledger,
+                &mut latest,
+                6,
+                &late,
+            ),
+            InputIntegration::Ignored,
+            "tick 6 has fallen out of a four-row ring whose newest is 10"
+        );
+        assert!(history.row(6).is_none());
+        assert_eq!(
+            ledger.confidence(6),
+            Confidence::Predicted,
+            "and nothing stamped a tick that holds no row"
+        );
+        assert_eq!(latest, 10, "the frontier only ever moves forward");
+
+        // The negative control: the oldest tick the ring still holds is NOT stale, so a genuinely
+        // late-but-usable row lands. A gate one tick too wide would refuse this one too.
+        assert_eq!(
+            integrate_input_row(
+                schema.props(),
+                &mut history,
+                &mut ledger,
+                &mut latest,
+                7,
+                &late,
+            ),
+            InputIntegration::Landed(7),
+        );
+        assert_eq!(ledger.confidence(7), Confidence::Authoritative);
+    }
+
+    /// The ledger transition the refusal path leans on: a tick with **no row of its own** restores
+    /// the newest row at or before it and is stamped [`Confidence::Extrapolated`], so it is not
+    /// fresh and no one-shot fires on it; a tick that **has** its own row keeps
+    /// [`Confidence::Authoritative`] and is fresh exactly once.
+    ///
+    /// Catches two defects. Stamping the carry-forward [`Confidence::Authoritative`] makes a tick
+    /// with no row of its own read *fresh*, so every `is_fresh`-gated one-shot fires on input the
+    /// player never sent. Narrowing the resolution to an exact tick match applies nothing at all on
+    /// a lost datagram, and the body freezes instead of coasting.
+    ///
+    /// The `input_tick != tick` guard itself is a short-circuit rather than a correctness gate —
+    /// [`FreshnessLedger::set_confidence`] only ever upgrades, so stamping unconditionally is a
+    /// no-op on a tick already authoritative.
+    #[test]
+    fn a_carry_forward_is_extrapolated_while_a_tick_with_its_own_row_stays_fresh() {
+        let schema = axis_schema();
+        let mut history = ColumnarHistory::new(schema.row_stride(), 8);
+        let mut ledger = FreshnessLedger::with_capacity(8);
+        let mut latest: i64 = -1;
+        let row = axis_row(7, true);
+        integrate_input_row(
+            schema.props(),
+            &mut history,
+            &mut ledger,
+            &mut latest,
+            10,
+            &row,
+        );
+
+        // Tick 10 owns its row: authoritative, and fresh exactly once.
+        assert_eq!(
+            input_restore_row(&history, &mut ledger, 10),
+            Some(row.as_slice())
+        );
+        assert_eq!(ledger.confidence(10), Confidence::Authoritative);
+        assert!(
+            ledger.begin_sim(10),
+            "the first pass over real input is fresh"
+        );
+        assert!(!ledger.begin_sim(10), "and only the first");
+
+        // Tick 11 has none: the same bytes come back, stamped extrapolated and never fresh.
+        assert_eq!(
+            input_restore_row(&history, &mut ledger, 11),
+            Some(row.as_slice())
+        );
+        assert_eq!(ledger.confidence(11), Confidence::Extrapolated);
+        assert!(!ledger.begin_sim(11));
+
+        // Nothing at or before the tick applies nothing, rather than an invented zero row.
+        let empty = ColumnarHistory::new(schema.row_stride(), 8);
+        assert!(input_restore_row(&empty, &mut ledger, 4).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // The tick-memo ring: the guards this file puts in front of it.
+    // ------------------------------------------------------------------
+
+    /// **A negative tick is refused rather than reinterpreted.** `tick as u64` maps `-1` to
+    /// `u64::MAX`, and `MemoRing::set` refuses a write to a slot already holding a *newer* tick —
+    /// so one call with a game's own "unset" sentinel would claim the slot `u64::MAX` addresses and
+    /// silently drop every real tick that lands on it for the rest of the session. At a capacity of
+    /// eight that is one tick in eight, forever, with no error and no pattern a game could see.
+    ///
+    /// Catches `memo_write`'s `tick >= 0` guard being dropped: the sentinel then claims slot 7,
+    /// tick 7's own write is refused as older, and the first assertion fails. `memo_read`'s
+    /// `tick < 0` check is a short-circuit rather than a correctness gate — `memo_write`'s guard
+    /// means no slot can ever hold tick `u64::MAX`, so dropping it leaves the read answering the
+    /// fallback anyway and this test stays green.
+    #[test]
+    fn a_negative_memo_tick_is_refused_rather_than_poisoning_the_slot_it_would_claim() {
+        let mut memo = MemoRing::with_capacity(8);
+        // The slot `u64::MAX` addresses, and the real ticks that share it.
+        let shared = (u64::MAX % 8) as i64;
+        assert_eq!(shared, 7);
+
+        memo_write(&mut memo, -1, 1, 99);
+        memo_write(&mut memo, shared, 1, 42);
+        assert_eq!(
+            memo_read(&memo, shared, 1, 0),
+            42,
+            "the real tick still owns its slot"
+        );
+        assert_eq!(
+            memo_read(&memo, -1, 1, 0),
+            0,
+            "and a negative read answers the fallback rather than the slot's contents"
+        );
+
+        // The negative control: an ordinary tick and key round-trips, and an unrecorded key
+        // answers the fallback rather than another key's value.
+        memo_write(&mut memo, 3, 2, 7);
+        assert_eq!(memo_read(&memo, 3, 2, -1), 7);
+        assert_eq!(memo_read(&memo, 3, 5, -1), -1, "an unrecorded key");
+        assert_eq!(memo_read(&memo, 4, 2, -1), -1, "an unrecorded tick");
+    }
+
+    /// **Eviction is by tick, not by slot.** A memo is recorded on a tick's fresh pass and read
+    /// back on every replayed pass of that tick, so a read that answered from the slot without
+    /// checking which tick owns it would hand a replay another tick's memo — the precise failure
+    /// the memo ring exists to remove.
+    ///
+    /// Catches a read that dropped the residency check, which would pass every single-tick test.
+    #[test]
+    fn a_memo_evicted_by_a_newer_tick_reads_as_absent_rather_than_as_the_newer_value() {
+        let mut memo = MemoRing::with_capacity(4);
+        memo_write(&mut memo, 2, 1, 200);
+        assert_eq!(memo_read(&memo, 2, 1, -1), 200);
+
+        // Tick 6 shares tick 2's slot in a four-deep ring and evicts it.
+        memo_write(&mut memo, 6, 1, 600);
+        assert_eq!(memo_read(&memo, 6, 1, -1), 600);
+        assert_eq!(
+            memo_read(&memo, 2, 1, -1),
+            -1,
+            "the evicted tick reads as absent, not as tick 6's value"
+        );
+    }
+
+    /// The ring depths the rollback rings are built at: **floored at two rows**, and the memo ring
+    /// at twice the history depth.
+    ///
+    /// Catches the floor being dropped. `history_limit` is a game-set export, and a declared `0`
+    /// or `1` leaves a one-row ring that holds only the tick just recorded, so a received row for
+    /// any earlier tick is refused as stale and the reconcile path never corrects anything.
+    #[test]
+    fn the_ring_depths_are_floored_at_two_rows_and_the_memo_ring_is_twice_as_deep() {
+        assert_eq!(ring_capacity(0), 2, "a declared zero cannot build a ring");
+        assert_eq!(ring_capacity(1), 2, "nor can a single row");
+        assert_eq!(ring_capacity(2), 2);
+        assert_eq!(ring_capacity(64), 64, "and a real depth is left alone");
+
+        assert_eq!(memo_capacity(0), 4, "the floor applies before the doubling");
+        assert_eq!(memo_capacity(64), 128);
+    }
+
+    // ------------------------------------------------------------------
+    // The mispredict compare: which differences cost a resimulation.
+    // ------------------------------------------------------------------
+
+    /// **A cosmetic difference is replicated without costing a resimulation.** A `Cosmetic` entry
+    /// is never restored, so replaying a tick because one changed would replay the same inputs to
+    /// the same result. A whole-row `recorded != row` compare turns every cosmetic the game writes
+    /// outside the tick loop into a per-tick replay on every predicting peer — a resim depth floor
+    /// no real mispredict could be measured against.
+    ///
+    /// Catches the compare widening to a whole-row `recorded != row`, which is the shortest way to
+    /// write it and is what the rule exists to rule out.
+    #[test]
+    fn a_cosmetic_difference_is_replicated_without_costing_a_resimulation() {
+        let schema = lane_with_a_cosmetic();
+        let stride = schema.row_stride();
+        let recorded = vec![0u8; stride];
+
+        // `trail` is the Cosmetic Vec3 at offset 12. Change it alone.
+        let mut cosmetic_only = recorded.clone();
+        cosmetic_only[12] = 0xFF;
+        assert!(
+            !row_mispredicts(schema.props(), Some(&recorded), &cosmetic_only),
+            "a cosmetic-only difference is not a mispredict"
+        );
+
+        // THE NEGATIVE CONTROL: one byte of a State prop, at each end of the row, is.
+        for offset in [0usize, stride - 1] {
+            let mut state_differs = recorded.clone();
+            state_differs[offset] = 0xFF;
+            assert!(
+                row_mispredicts(schema.props(), Some(&recorded), &state_differs),
+                "a difference at byte {offset} is inside a State prop"
+            );
+        }
+
+        // An identical row is confirmed, and a tick with no recorded row is a mispredict by
+        // definition: there was no prediction to have been right.
+        assert!(!row_mispredicts(schema.props(), Some(&recorded), &recorded));
+        assert!(row_mispredicts(schema.props(), None, &recorded));
+    }
+
+    /// A lane whose every entry is cosmetic can never mispredict, which is the same rule read from
+    /// the other side: such a channel is replicated and displayed and never re-simulated.
+    #[test]
+    fn a_lane_of_nothing_but_cosmetics_never_mispredicts() {
+        let mut schema = SchemaBuilder::new();
+        schema.push("trail", PropKind::Vec3, PropRole::Cosmetic);
+        schema.push("glow", PropKind::F32, PropRole::Cosmetic);
+        let recorded = vec![0u8; schema.row_stride()];
+        let changed = vec![0xFFu8; schema.row_stride()];
+        assert!(!row_mispredicts(schema.props(), Some(&recorded), &changed));
+        // But a missing row still is, because that answer is about history and not about roles.
+        assert!(row_mispredicts(schema.props(), None, &changed));
+    }
+
+    // ------------------------------------------------------------------
+    // The interest anchor a state row carries.
+    // ------------------------------------------------------------------
+
+    /// **Register position first, and register it as `State`.** The anchor is chosen positionally,
+    /// so a body that declares a cosmetic or non-positional `Vec3` ahead of its pose is culled
+    /// against a point it never occupies — replicated to the wrong peers, withheld from the right
+    /// ones, and nothing erroring anywhere.
+    ///
+    /// Catches the search dropping the role filter (which would pick the cosmetic `Vec3` here) or
+    /// the kind filter.
+    #[test]
+    fn the_anchor_is_the_first_state_role_vec3_and_a_cosmetic_one_is_skipped() {
+        let mut schema = SchemaBuilder::new();
+        schema.push("trail", PropKind::Vec3, PropRole::Cosmetic);
+        schema.push("pose", PropKind::Vec3, PropRole::State);
+        schema.push("velocity", PropKind::Vec3, PropRole::State);
+
+        let mut row = vec![0u8; schema.row_stride()];
+        write_vec3(&mut row, 0, [-1.0, -1.0, -1.0]); // trail, must be ignored
+        write_vec3(&mut row, 12, [1.0, 2.0, 3.0]); // pose, the anchor
+        write_vec3(&mut row, 24, [9.0, 9.0, 9.0]); // velocity, must not win
+
+        assert_eq!(position_in_row(schema.props(), &row), Some([1.0, 2.0, 3.0]));
+
+        // A lane with no positional State prop is unlocatable, which the filter answers by
+        // replicating the body everywhere rather than by deleting it from somebody's world.
+        let mut flat = SchemaBuilder::new();
+        flat.push("health", PropKind::I64, PropRole::State);
+        assert!(position_in_row(flat.props(), &vec![0u8; flat.row_stride()]).is_none());
+    }
+
+    /// A row shorter than the offset the anchor would be read from reads as unlocatable rather
+    /// than panicking. The bound matters because the row can be a decoded wire row.
+    ///
+    /// Catches the length check being dropped or written as `>=`, which would panic on exactly the
+    /// row that fits.
+    #[test]
+    fn a_row_too_short_for_the_anchor_reads_as_unlocatable() {
+        let mut schema = SchemaBuilder::new();
+        schema.push("health", PropKind::I64, PropRole::State);
+        schema.push("pose", PropKind::Vec3, PropRole::State);
+        let full = schema.row_stride();
+        assert_eq!(full, 20);
+
+        for short in 0..full {
+            assert!(
+                position_in_row(schema.props(), &vec![0u8; short]).is_none(),
+                "a row of {short} bytes cannot carry the anchor at offset 8"
+            );
+        }
+        // The row that exactly fits does read.
+        assert_eq!(
+            position_in_row(schema.props(), &vec![0u8; full]),
+            Some([0.0, 0.0, 0.0])
+        );
+    }
+
+    fn write_vec3(row: &mut [u8], offset: usize, value: [f32; 3]) {
+        for (index, component) in value.iter().enumerate() {
+            let at = offset + index * 4;
+            row[at..at + 4].copy_from_slice(&component.to_le_bytes());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The two declaration clamps: an `int` export reaching an unsigned field.
+    // ------------------------------------------------------------------
+
+    /// A declared `priority` is clamped into the scorer's range. Both ends matter: `0` is not a
+    /// valid priority because the scorer multiplies by it, and a game writing its own "unset" as
+    /// `-1` would reinterpret to `u32::MAX` and put that body permanently at the head of every
+    /// peer's send rota.
+    ///
+    /// Catches either bound being dropped from the clamp ahead of the `as u32`.
+    #[test]
+    fn a_negative_priority_reads_as_the_lowest_rather_than_as_the_highest() {
+        assert_eq!(clamp_send_priority(-1), 1);
+        assert_eq!(clamp_send_priority(i32::MIN), 1);
+        assert_eq!(clamp_send_priority(0), 1);
+        assert_eq!(clamp_send_priority(1), 1);
+        assert_eq!(clamp_send_priority(4), 4, "a declared value is left alone");
+        assert_eq!(
+            clamp_send_priority(i32::MAX),
+            orbitnet_core::priority::PRIORITY_MAX
+        );
+    }
+
+    /// A declared `seat` is clamped onto the range the interest pass keys an anchor on, and a
+    /// negative one reads as seat `0` — the same fail-onto-the-default direction the rest of these
+    /// declarations take. Without the clamp `-1 as SeatIndex` is `65535`, a seat no connection
+    /// ever resolves, so the body would anchor nobody's interest at all.
+    ///
+    /// Catches the clamp being dropped ahead of the `as SeatIndex`.
+    #[test]
+    fn a_negative_seat_reads_as_seat_zero_rather_than_as_the_top_of_the_range() {
+        assert_eq!(clamp_seat(-1), 0);
+        assert_eq!(clamp_seat(i32::MIN), 0);
+        assert_eq!(clamp_seat(0), 0);
+        assert_eq!(clamp_seat(1), 1);
+        assert_eq!(clamp_seat(i32::MAX), SeatIndex::MAX);
     }
 }
