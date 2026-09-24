@@ -39,6 +39,12 @@
 /// **A row above records every wire change that landed at that major**, including one a minor bump alone
 /// could have carried. Major 7's confirm tag is an optional trailing field on the handshake and rode a bump
 /// the other changes had already forced.
+///
+/// **Pending majors ship in one release.** A change bumps this constant as it lands, so no build is ever
+/// wrong about its own frame layout, but the release carrying it waits for the other pending majors — one
+/// coordinated upgrade for every consumer instead of several. A pull request that forces a major says so in
+/// its body, which is what keeps the pending set visible at release time. See `docs/protocol.md`, "Pending
+/// wire breaks ship together".
 pub const PROTOCOL_VERSION: u32 = 0x0008_0000;
 
 /// Extract the major component of a protocol version.
