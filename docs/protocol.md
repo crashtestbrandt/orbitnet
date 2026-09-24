@@ -158,6 +158,95 @@ be distributed and held.
 - **A client sends no input block for a body whose slot has not arrived.** Input rides `INPUT_REDUNDANCY`
   ticks of history, so the first block after the binding lands re-sends what those ticks held.
 
+### A re-parent changes the id
+
+**Decision: a re-parent is a despawn, and the respawn takes an explicit `process_settings()` call.** The id
+stays a pure function of the synchronizer root's node path, so moving that root to another parent, another
+sub-tree or another world derives a different id.
+
+**The re-registration is not automatic.** The synchronizer implements no `enter_tree` and no `ready` hook, so
+the unregister and the register do not pair up on their own.
+
+- **Leaving the tree unregisters whatever id the synchronizer is holding.** `exit_tree` unregisters the stored
+  id, which is the one derived at the last `process_settings()`.
+- **The id is re-derived only inside `process_settings()`.** Nothing else reads the node path again.
+- **A re-parent with no such call leaves the body unregistered rather than respawned.** The old id is gone, no
+  new id exists, no manifest row is emitted, and the body replicates to nobody for the rest of the session.
+- **Call `NetRollbackHandle.process_settings()` (or `NetStateHandle.process_settings()`) after the move.**
+  That re-derives the id from the new path and registers it. `Net.register_rollback_body()` makes that call
+  once, at registration; a later move needs the call from game code.
+
+Moving the root back to its old path and calling `process_settings()` again reclaims the old id, because the
+derivation reads nothing but the path.
+
+**What that keeps.** Two properties rest on the id being computable from the path alone:
+
+- **No binding RPC.** Every peer derives the same id from the same path, so an entity replicates from the tick
+  it registers, with nothing distributed first.
+- **A reconnecting client re-derives its ids with no handshake**, because it rebuilds the same tree and hashes
+  the same paths.
+
+**The two rejected options**, and which of those two each gives up:
+
+| Option | What it costs |
+| --- | --- |
+| A **rename** that keeps the id across the move. | **Both.** The id stops being computable from the tree, so a rename has to be distributed to every peer, and a reconnecting client cannot re-derive a renamed id from the tree it rebuilds. |
+| A **server-assigned id** distributed on the manifest, replacing the derivation. | **The derivation.** The manifest already carries a server-assigned 16-bit slot per entity, so half the machinery exists — but every id then has to be distributed and held before a block naming it resolves, and a reconnecting client holds none of them until the manifest arrives. |
+
+Both change the manifest layout, so either is a `PROTOCOL_VERSION` major.
+
+**What the re-register costs**, once that `process_settings()` call lands:
+
+| | |
+| --- | --- |
+| **history ring** | dropped with the old entity; the new id starts with no recorded ticks |
+| **delta base** | cleared on every peer, because it describes the departed entity — see [entity lifecycle](#entity-lifecycle-the-registry-outlives-the-node-briefly) |
+| **a full-state burst** | the first block under the new id is a full block, and a manifest row `(slot, id, state hash, input hash, owner, seat)` goes with it |
+| **the wire slot** | the old one is released and quarantined for 256 ticks before reissue, so a run of re-parents raises the live slot count — see [reissuing a freed slot](#reissuing-a-freed-slot) |
+| **interest** | `Net.entity_left_interest` fires for the old id on every peer holding it, and the new id arrives as an entry |
+| **owner and seat** | re-declared on the new entity; the roster is a projection of the manifest and follows the new row |
+| **lag-compensation residency** | the ring keeps recording the collider, and what it holds from before the move is the old world's pose — see below |
+
+### Moving between worlds without re-registering
+
+**Membership moves an entity between worlds with no re-register**, and it is what a game needing that move uses
+instead of re-parenting.
+
+- **Membership is a per-entity world int**, declared with `NetRollbackHandle.set_membership(entry)` or
+  `NetStateHandle.set_membership(entry)` naming an `int` property on the body. The interest filter reads it live
+  on the authority each tick; it is not replicated and costs no wire bytes.
+- **Writing that int is the world change.** The node does not move, so the path, the id, the slot, the manifest
+  row and the history ring are all untouched, and so is the delta base held by any peer whose own world did not
+  change — membership `0` included. **A mass move is that write on every body in the set**, on one tick.
+- **The transition itself costs a full block per peer that gains the entity.** A membership write is an
+  interest leave for peers in the old world and an interest enter for peers in the new one, so the entity's
+  per-peer `last_sent`, `last_full` and `acked_base` are cleared on every peer it leaves, and every peer it
+  enters gets a full block for it. Size a mass move as one full block per moved body per peer now seeing it,
+  not as zero bytes.
+- **Peers see an interest transition rather than a spawn.** The entities leave the interest of peers in the old
+  world and enter the interest of peers in the new one, through
+  [the interest-delta section](#per-peer-relevancy-the-interest-delta-section). `entity_left_interest` does not
+  distinguish that from a cull, and the addon frees nothing on it.
+- **A seat follows its anchor body.** A seat's world is read off the lowest-id body whose input authority is
+  that peer, which declares that seat, and which resolved an anchor, so writing that body's membership moves
+  the seat with it. A peer with no such body is in the unanchored fallback instead — see
+  [api.md](api.md#interest-three-axes-distance-membership-and-the-veto). `Net.set_peer_anchor(peer, position,
+  membership)` states a peer's center and world directly, which is what a peer driving bodies in more than one
+  world — or driving none — uses instead.
+
+The three interest axes are listed in [api.md](api.md#interest-three-axes-distance-membership-and-the-veto).
+
+### History and interpolation across the move
+
+Neither is addressed by the id, and they behave differently.
+
+| | |
+| --- | --- |
+| **`NetLagComp` history survives the move** | The ring is indexed by tick, and each slot holds `Sample`s — a collider reference, a recorded world transform and a capsule descriptor — supplied by the game's `hittable_provider`. Nothing in it names an entity id, so the new id is invisible to it and recorded ticks stay resolvable against the same colliders. |
+| **its recorded poses are the old world's** | Independently rebased worlds overlap in coordinates, so a rewind reaching a tick recorded before the move tests a capsule at the body's former coordinates. There is no per-entity forget — `clear()` drops the whole ring and is a session-teardown call — so those ticks age out only through the retention window, which is `rewind_ticks_for(max_delay_ms, hz) + 8` slots capped at 127 (`NetLagComp.retain_ticks()`). At the default `max_delay_ms` that is 23 slots / 383 ms at 60 Hz and 16 slots / 533 ms at 30 Hz; raising `max_delay_ms` keeps the old world's poses rewindable for proportionally longer. |
+| **`NetInterpolatorHandle` survives a re-parent** | The interpolator is a child of the node passed to `Net.make_interpolator()`, and its entries are node paths relative to that root, so re-parenting the node carries both and the handle stays valid. An entry added for a node outside that root's sub-tree does not survive: its stored path is relative and leads out with `../`, so after the move it resolves to a different node or to none, and `process_settings()` reports it unresolved. Freeing and re-instancing the node takes the interpolator with it, and the handle is remade through `Net.make_interpolator()`. |
+| **its endpoints are stale either way** | Both hold the pre-move values, so the first row after the move blends from the old pose across one tick. Call `NetInterpolatorHandle.teleport()` after the move — the same call a re-entry into interest needs. |
+
 ### The manifest states a change, not the table
 
 The manifest was rebuilt and broadcast whole whenever anything dirtied it — a registration, an

@@ -21,6 +21,18 @@ extends Node
 ##       it would be clobbered by the next restore.
 ##   COMMAND -- [NetCommand]. Sparse, discrete, reliable, server-validated requests.
 ##
+## ENTITY IDENTITY IS THE NODE PATH. The id a registration gets is derived from the synchronizer root's node
+## path, which is what lets every peer derive the same id with no binding RPC and a reconnecting client
+## re-derive its ids with no handshake. A re-parent therefore changes the id, and the respawn is not automatic:
+## leaving the tree unregisters the id the synchronizer is holding, and the id is re-derived only inside
+## process_settings(), so a re-parent with no process_settings() call on the new path leaves the body
+## unregistered and replicating to nobody rather than respawned under a new id. That is the decided behavior;
+## call [method NetRollbackHandle.process_settings] after the move. An entity that must change WORLD inside one
+## session changes its membership instead of moving -- [method NetRollbackHandle.set_membership] and
+## [method NetStateHandle.set_membership] move a body between worlds with no re-register at all.
+## docs/protocol.md, "A re-parent changes the id", records the decision, the options rejected, what a
+## re-register costs, and what happens to [NetLagComp] history and [NetInterpolatorHandle] across the move.
+##
 ## At boot the facade is OFFLINE and every method no-ops, returning inert handles. That is deliberate and it
 ## is load-bearing: a single-player launch runs the exact same code path with no networking spun up at all, so
 ## "does it work offline" is not a separate mode to maintain.
