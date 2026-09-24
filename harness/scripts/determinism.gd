@@ -148,6 +148,11 @@ class DetBody extends Node3D:
 	## Ticks where the quantized column came back with a different value than the simulation wrote. Zero means
 	## canonicalization did not run, so the quantized column is not testing the quantizer.
 	var canon_writebacks: int = 0
+	## Sampled ticks whose input row carried the fire flag, and whose row carried a turn. Both terms feed
+	## `sim_drift`, and a tape that never sets one leaves that term dead for the whole run -- the comparison
+	## still passes, having compared a column the input never moved. Asserted in the report.
+	var fire_ticks: int = 0
+	var turn_ticks: int = 0
 	var fresh_ticks: int = 0
 	var replay_ticks: int = 0
 
@@ -189,6 +194,10 @@ class DetBody extends Node3D:
 		sim_pos = (sim_pos + move * _SPEED_M).clamp(
 			Vector3(-_BOUND_M, -_BOUND_M, -_BOUND_M), Vector3(_BOUND_M, _BOUND_M, _BOUND_M))
 		var kick: float = _FIRE_KICK if input.nin_fire else 0.0
+		if input.nin_fire:
+			fire_ticks += 1
+		if not is_zero_approx(turn):
+			turn_ticks += 1
 		sim_drift = sim_drift * _DRIFT_DECAY + (float(sim_pos.x) + turn * _TURN_RAD + kick) * _DRIFT_GAIN
 		sim_odometer = sim_odometer + _ODOMETER_STEP
 		var angle: float = float(sim_pos.z) * _HEADING_SCALE
@@ -281,7 +290,14 @@ const _RESIM_FORCE: int = 8
 ## The seeded policy the record pass drives, and its seed. `BenchPolicy` is a pure function of (policy, t,
 ## seed), so the tape is reproducible from these two values alone. Named rather than taken as an enum value so
 ## the report prints the name the bench itself uses.
+## TWO policies, not one, and the switch is inside the sampled range. `wander` drives translation on both
+## axes and a turn, which is what moves `sim_heading` and the quantized column; it never sets the fire flag.
+## `strafe_fire` sets the flag in bursts and drives no turn. Under either policy alone one term of `sim_drift`
+## is dead for the whole run and the comparison passes having compared a column the input never moved, which
+## is the failure a probe that can only pass is made of. The report asserts both terms were exercised.
 const _TAPE_POLICY: String = "wander"
+const _TAPE_POLICY_LATE: String = "strafe_fire"
+const _TAPE_POLICY_SWITCH: int = 180
 const _TAPE_SEED: int = 4171
 ## Seconds of drive time per recorded frame. One frame per tick at the harness project's 60 Hz.
 const _TAPE_STEP_S: float = 1.0 / 60.0
@@ -317,8 +333,10 @@ func _total_ticks() -> int:
 ## hand the two peers different input and look exactly like a desync.
 func _record_tape() -> void:
 	var frames: int = _frames if _frames > 0 else _total_ticks()
-	var policy: BenchPolicy.Policy = BenchPolicy.policy_from_name(_TAPE_POLICY)
+	var early: BenchPolicy.Policy = BenchPolicy.policy_from_name(_TAPE_POLICY)
+	var late: BenchPolicy.Policy = BenchPolicy.policy_from_name(_TAPE_POLICY_LATE)
 	for index: int in frames:
+		var policy: BenchPolicy.Policy = early if index < _TAPE_POLICY_SWITCH else late
 		_tape.record(BenchPolicy.frame(policy, float(index) * _TAPE_STEP_S, _TAPE_SEED))
 	var err: Error = _tape.save(_tape_path)
 	if err != OK:
@@ -326,8 +344,8 @@ func _record_tape() -> void:
 		print("DET-RESULT label=%s FAIL" % _label)
 		get_tree().quit(1)
 		return
-	print("DET-TAPE path=%s frames=%d policy=%s seed=%d" % [
-		_tape_path, _tape.length(), _TAPE_POLICY, _TAPE_SEED])
+	print("DET-TAPE path=%s frames=%d policy=%s+%s@%d seed=%d" % [
+		_tape_path, _tape.length(), _TAPE_POLICY, _TAPE_POLICY_LATE, _TAPE_POLICY_SWITCH, _TAPE_SEED])
 	print("DET-RESULT label=%s PASS" % _label)
 	get_tree().quit(0)
 
@@ -398,6 +416,8 @@ func _report() -> void:
 		_label, _body.restore_bad_tick, _body.restore_bad_col])
 	print("DET-WRITEBACK label=%s bad_tick=%d bad_col=%s canon=%d" % [
 		_label, _body.writeback_bad_tick, _body.writeback_bad_col, _body.canon_writebacks])
+	print("DET-TERMS label=%s fire_ticks=%d turn_ticks=%d" % [
+		_label, _body.fire_ticks, _body.turn_ticks])
 
 	var ticks: Array[int] = []
 	for tick: int in _body.entry_marks.keys():
@@ -431,6 +451,12 @@ func _report() -> void:
 		_finish(false, "column %s came back changed entering tick %d -- the history row does not hold what the
        simulation wrote, so a replayed tick starts from a different value than the live one did" % [
 			_body.writeback_bad_col, _body.writeback_bad_tick])
+	elif _body.fire_ticks <= 0:
+		_finish(false, "no sampled tick carried the fire flag, so `sim_drift`'s event term was never added --
+       this run compared a column one of its inputs never moved. Check _TAPE_POLICY_LATE and the switch.")
+	elif _body.turn_ticks <= 0:
+		_finish(false, "no sampled tick carried a turn, so `sim_drift`'s rotation term was never added --
+       this run compared a column one of its inputs never moved. Check _TAPE_POLICY and the switch.")
 	elif _body.canon_writebacks <= 0:
 		_finish(false, "the quantized column was never canonicalized, so this run says nothing about the
        quantizer path")
