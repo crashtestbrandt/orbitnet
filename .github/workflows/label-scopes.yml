@@ -1,0 +1,99 @@
+name: Label scopes
+
+# GitLab's scoped-label rule, rebuilt on GitHub: an issue carries at most one member of an EXCLUSIVE scope,
+# and applying one removes its siblings. GitHub enforces nothing itself -- `::` is just characters to it.
+#
+# THIS FILE IS DISTRIBUTED. One copy runs in every repository that shares a label set, because enforcement is
+# event-driven: it answers `issues.labeled`, and a workflow in one repository never sees another's events. A
+# central scheduled sweep was the alternative and it is worse -- minutes of latency, and a label the user just
+# applied vanishing under them a few minutes later.
+#
+# Edit every copy together or none: they are meant to be byte-identical, and a copy edited on its own silently
+# stops matching the set it enforces.
+#
+# IT NEEDS NO SECRET. It edits issues in its OWN repository, which the built-in GITHUB_TOKEN can do, and a
+# label removed by GITHUB_TOKEN raises no further workflow run, so there is no loop to guard against. The
+# repository's default workflow token may be read-only; the `permissions:` block below grants what this needs.
+#
+# EXCLUSIVE_SCOPES IS GENERATED from the label set this workflow enforces, and is a literal because a copy
+# cannot read a definition that lives outside its own repository. It is the one value that must agree across
+# every copy, so change it at the source and redistribute rather than editing a single copy.
+#
+# IT IS EMPTY WHENEVER NO SCOPE IS EXCLUSIVE, and it is empty now: a scope whose members can legitimately
+# co-occur on one issue -- two subject areas, say -- must not be exclusive, or enforcement silently strips one
+# of them off. Every step below no-ops until some scope declares itself exclusive.
+
+# `pull_request_target` runs with write permissions against the BASE repository, which is only safe because
+# this job never checks out the pull request's code -- there is no `actions/checkout` below, and the only
+# input it reads is the event's label name. Do not add a checkout here.
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+# Two labels applied at once fire two runs. Serializing per issue keeps the second from reading the label set
+# the first is still editing.
+concurrency:
+  group: label-scopes-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  EXCLUSIVE_SCOPES: ""
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Strip siblings of the applied label's scope
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLIED: ${{ github.event.label.name }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${EXCLUSIVE_SCOPES// /}" ]; then
+            echo "No exclusive scopes declared; nothing to enforce."
+            exit 0
+          fi
+          case "$APPLIED" in
+            *::*) ;;
+            *) echo "'$APPLIED' is not scoped; nothing to enforce."; exit 0 ;;
+          esac
+
+          scope="${APPLIED%%::*}"
+          exclusive=0
+          for s in $EXCLUSIVE_SCOPES; do
+            [ "$s" = "$scope" ] && exclusive=1
+          done
+          if [ "$exclusive" -ne 1 ]; then
+            echo "Scope '$scope' is not exclusive; nothing to enforce."
+            exit 0
+          fi
+
+          # Re-read the live label set rather than trusting the event payload: by the time this runs, another
+          # run may already have changed it.
+          #
+          # `gh issue` on a PULL REQUEST number is correct, not an oversight: every GitHub pull request is an
+          # issue, and both `gh issue view` and `gh issue edit --remove-label` resolve a PR number and act on
+          # it. Verified against a live pull request rather than assumed. Do not "fix" this into a
+          # gh pr / gh issue branch on github.event_name.
+          current="$(gh issue view "$NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')"
+
+          # The label just applied is the winner, which is GitLab's rule. Everything else in its scope goes.
+          printf '%s\n' "$current" | while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            [ "$name" != "$APPLIED" ] || continue
+            case "$name" in
+              "$scope"::*) ;;
+              *) continue ;;
+            esac
+            echo "Removing '$name' (sibling of '$APPLIED' in exclusive scope '$scope')"
+            gh issue edit "$NUMBER" --repo "$REPO" --remove-label "$name" < /dev/null
+          done
