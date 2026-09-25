@@ -6331,23 +6331,25 @@ impl OrbitNet {
                     // nothing in it yet still carries its first block rather than ending the stream,
                     // and a block that states nothing would satisfy that branch while sending no state.
                     //
-                    // **Every arm but `Defer` advances `index` before it leaves.** The cursor is what
-                    // the frame's next datagram resumes from, so an arm that leaves it standing offers
-                    // the same candidate again: `UnWrite` and the oversize drop would spin on it inside
-                    // this datagram, and an admitted block would be encoded twice at one tick. `Defer`
-                    // leaves it standing on purpose -- that candidate has been written and un-written,
-                    // not sent, and the next datagram opens on it with a whole budget.
-                    match block_admission(un_written, body.len() <= admit_budget, sent.is_empty()) {
+                    // **The cursor moves for every decision but `Defer`**, and
+                    // [`admission_advances_cursor`] is that rule. It runs before the arms so no arm can
+                    // forget it: leaving the cursor standing offers this candidate again, which spins
+                    // inside one datagram on an un-write and encodes a block twice on an admit.
+                    let admission =
+                        block_admission(un_written, body.len() <= admit_budget, sent.is_empty());
+                    if admission_advances_cursor(admission) {
+                        index += 1;
+                    }
+                    match admission {
                         BlockAdmission::UnWrite => {
                             body.truncate(body_before);
                             self.acc_blocks_culled += 1;
-                            index += 1;
                             continue;
                         }
                         // IT DID NOT FIT, and the datagram carries nothing yet. Deferring is right whenever
                         // the datagram already carries something -- but if it carries NOTHING, deferring this
-                        // block sends no frame at all, which ends the stream rather than delaying it. An entity
-                        // that has never been sent scores `u64::MAX` staleness, so it is first again next tick,
+                        // block sends no datagram at all, which ends the stream rather than delaying it. An
+                        // entity that has never been sent scores `u64::MAX` staleness, so it is first again next tick,
                         // does not fit again, and defers again: this peer never receives another snapshot for
                         // the rest of the session, for every entity, silently. (The first implementation had no
                         // un-write at all -- an oversized block simply went out, which is where ENet's over-MTU
@@ -6366,7 +6368,6 @@ impl OrbitNet {
                                 }
                                 self.acc_band_sends[band.index()] += 1;
                                 peer_sends += 1;
-                                index += 1;
                                 break;
                             }
                             // No tick came back, so there is no row to admit. Nothing was written either
@@ -6374,7 +6375,6 @@ impl OrbitNet {
                             // practice -- but if it happens, drop it and let the rest of the order run
                             // rather than ending the datagram on an entity that contributed nothing.
                             body.truncate(body_before);
-                            index += 1;
                             continue;
                         }
                         // The cursor stays on this candidate, so the frame's next datagram opens on it
@@ -9679,7 +9679,7 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 /// Whether the entity block just written is un-written again instead of admitted, because it
 /// states nothing the peer does not already hold.
 ///
-/// The three arguments describe the block now sitting at the end of the frame body.
+/// The three arguments describe the block now sitting at the end of the datagram body.
 /// [`OrbitRollbackSynchronizer::encode_block`] and [`OrbitStateSynchronizer::encode_block`] return
 /// `full` and leave `mask` in the scratch buffer they were handed whenever they wrote a delta;
 /// `state_lane` is which of the two wrote it. A free function so the rule the send path runs is the
@@ -9739,14 +9739,10 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 /// state block's absence and no new reading of one. The lane term above keeps a rollback block's
 /// absence meaning what it always meant.
 ///
-/// **A frame whose whole admitted set was un-written is not sent.** [`snapshot_frame_is_skipped`]
-/// ends a peer's tick when no block was admitted, no interest news rides along and no interest gate
-/// is shut, so a quiet state-lane session sends its snapshots — and with them the header's
-/// `ack_tick`, `ack_token` and `margin_ticks` — at about the keyframe cadence rather than every
-/// tick. The client's clock-lead controller samples `margin_ticks` on snapshot arrival, so it
-/// corrects more slowly on such a session. Nothing is silenced by it: [`input_frame_is_owed`] keeps
-/// a peer that drives no body sending, and interest news or a shut gate sends the header on its own
-/// tick.
+/// **A frame whose whole admitted set was un-written is not sent.** [`snapshot_frame_is_skipped`] answers
+/// the frame's FIRST datagram; a later one is skipped when it admitted nothing. Either way a rota that
+/// un-writes end to end leaves the cursor at `order.len()`, so [`send_pass_is_due`] stops the frame rather
+/// than spending another datagram on it.
 ///
 /// **`history_limit` must stay above the keyframe interval plus the ack round trip.** `acked_base`
 /// advances only when a frame carrying that entity is acked, and an un-written channel is carried
@@ -9804,6 +9800,20 @@ fn block_admission(un_written: bool, fits: bool, frame_is_empty: bool) -> BlockA
     } else {
         BlockAdmission::Defer
     }
+}
+
+/// Whether an admission moves the rota cursor off this candidate.
+///
+/// **Every decision but [`BlockAdmission::Defer`] does.** The cursor is what the frame's next datagram
+/// resumes from, so a decision that leaves it standing offers the same candidate again: an un-written
+/// block would spin on it inside one datagram, and an admitted one would be encoded twice at a single
+/// tick. `Defer` leaves it standing deliberately — that candidate was written and un-written rather than
+/// sent, and the next datagram opens on it against a whole budget.
+///
+/// Stated here rather than left implicit in the admit loop's arms because the loop cannot be driven from
+/// a test: it needs live `Gd<Node>` handles. This is the half of the rule that can be.
+fn admission_advances_cursor(admission: BlockAdmission) -> bool {
+    !matches!(admission, BlockAdmission::Defer)
 }
 
 /// The stored `seat_release_policy`, reduced to a value this build knows.
@@ -9940,15 +9950,16 @@ mod interest_search;
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_input_blocks, adopt_whole_set, anchor_conflicts_owed, apply_interest_section,
-        band_for_row, block_admission, block_is_un_written, build_interest_section,
-        candidate_for_own_row, candidate_for_row, challenge_answer, challenge_half, charge_window,
-        clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
-        delta_reference, encode_interest_delta, filter_connection, frame_charge, full_block_due,
-        hello_leg, hold_on_drop, input_frame_is_owed, interest_delta_reserve, interest_table_due,
-        interest_table_to_send, is_located, manifest_owed, note_input_tick, owned_rows_into,
-        owned_rows_of, queue_seat_release, replayed_depth, resim_input_from, resolve_observer,
-        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        admission_advances_cursor, admit_input_blocks, adopt_whole_set, anchor_conflicts_owed,
+        apply_interest_section, band_for_row, block_admission, block_is_un_written,
+        build_interest_section, candidate_for_own_row, candidate_for_row, challenge_answer,
+        challenge_half, charge_window, clamp_resume_policy, clamp_seat_release_policy,
+        clamp_unanchored_policy, classify_rx, delta_reference, encode_interest_delta,
+        filter_connection, frame_charge, full_block_due, hello_leg, hold_on_drop,
+        input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
+        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
+        queue_seat_release, replayed_depth, resim_input_from, resolve_observer, resume_grant,
+        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
         send_pass_is_due, session_directions, session_is_filtering, session_key_from,
         snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
@@ -13675,6 +13686,44 @@ mod tests {
         // An empty mask is an empty schema: no property exists whose change could earn a block. Its
         // keyframes still go out, so the peer keeps a row for it.
         assert!(block_is_un_written(true, false, &[]));
+    }
+
+    /// The cursor moves off a candidate for every decision but `Defer`.
+    ///
+    /// **The failure this pins is a hang, not a wrong frame.** The admit loop runs
+    /// `while index < order.len()`, so a decision that neither advances the cursor nor leaves the loop
+    /// offers the same candidate again forever. `UnWrite` is the one that would: it `continue`s, where
+    /// the oversize drop and `Defer` both break out. Before this rule was stated in one place, the
+    /// increment lived in each arm and omitting it from that arm was invisible to every test here.
+    #[test]
+    fn every_admission_but_a_defer_moves_the_cursor_on() {
+        assert!(
+            admission_advances_cursor(BlockAdmission::UnWrite),
+            "an un-written candidate is done with; leaving the cursor on it spins this datagram"
+        );
+        assert!(admission_advances_cursor(BlockAdmission::Admit));
+        assert!(admission_advances_cursor(BlockAdmission::Oversize));
+        assert!(
+            !admission_advances_cursor(BlockAdmission::Defer),
+            "a deferred candidate was written and un-written rather than sent, so the frame's next \
+             datagram opens on it against a whole budget"
+        );
+    }
+
+    /// The rule holds for what the admit loop actually decides, rather than for the four variants in
+    /// the abstract: a state-lane delta carrying no change un-writes, and that must move the cursor.
+    #[test]
+    fn a_state_delta_with_nothing_to_say_still_moves_the_cursor_on() {
+        let admission = block_admission(
+            block_is_un_written(true, false, &[false, false]),
+            true,
+            false,
+        );
+        assert_eq!(admission, BlockAdmission::UnWrite);
+        assert!(
+            admission_advances_cursor(admission),
+            "the candidate the send path culls most often is the one a standing cursor would spin on"
+        );
     }
 
     #[test]
