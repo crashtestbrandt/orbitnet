@@ -211,6 +211,10 @@ jobs:
           # already carrying an NDK keeps it. Any r23 or newer works -- the clang wrappers this build
           # links with have been in the same place since the side-by-side layout arrived.
           ANDROID_NDK_VERSION: '26.3.11579264'
+          # The same NDK as a downloadable archive, for a box with no `sdkmanager`. The two must name the
+          # same release: r26d is 26.3.11579264.
+          ANDROID_NDK_ARCHIVE: 'android-ndk-r26d-linux.zip'
+          ANDROID_NDK_ARCHIVE_DIR: 'android-ndk-r26d'
         run: |
           set -euo pipefail
           ndk="$(tools/build-native.sh ndk-root)"
@@ -222,6 +226,46 @@ jobs:
             # every licence is already accepted.
             yes | sdkmanager --licenses >/dev/null 2>&1 || true
             sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+            installed=1
+            ndk="$(tools/build-native.sh ndk-root)"
+          fi
+
+          # NO `sdkmanager`, SO FETCH THE ARCHIVE. The command-line tools are a separate download from the
+          # NDK and a box can have the second without the first, which is what this fleet turned out to be.
+          # Installing them to get a downloader is a longer road than downloading what they would fetch.
+          #
+          # It lands in `$HOME/Android/Sdk/ndk/<version>`, one of the directories `tools/build-native.sh
+          # ndk-root` already searches, so nothing has to be told where it went. A box that already carries
+          # it skips this entirely -- the runner is persistent, so the cost is paid once rather than per run.
+          if [ -z "$ndk" ]; then
+            dest="$HOME/Android/Sdk/ndk/${ANDROID_NDK_VERSION}"
+            if [ ! -d "$dest" ]; then
+              echo "no NDK and no sdkmanager; fetching ${ANDROID_NDK_ARCHIVE}"
+              tmp="$(mktemp -d)"
+              # Unpinned, like the Godot download this fleet already does in check.yml and netbench.yml.
+              curl -fsSL -o "$tmp/ndk.zip" \
+                "https://dl.google.com/android/repository/${ANDROID_NDK_ARCHIVE}"
+              # `unzip` PREFERRED BECAUSE IT KEEPS THE MODE BITS. This box has neither `zip` nor `unzip` --
+              # tools/make-assetlib-zip.py's header records the same discovery -- and python's zipfile
+              # DROPS the executable bit, which the NDK's clang wrappers and `ndk-build` need. So the
+              # fallback restores it on every `bin` directory rather than hoping.
+              if command -v unzip >/dev/null 2>&1; then
+                unzip -q "$tmp/ndk.zip" -d "$tmp"
+              else
+                python3 -m zipfile -e "$tmp/ndk.zip" "$tmp"
+                find "$tmp/${ANDROID_NDK_ARCHIVE_DIR}" -type d -name bin -exec chmod -R +x {} +
+                # An `if`, not `a && b`: the repository has been bitten by a false `&&` list under
+                # `set -e` before, and these names differ between NDK releases.
+                for f in ndk-build ndk-gdb ndk-stack ndk-which; do
+                  if [ -e "$tmp/${ANDROID_NDK_ARCHIVE_DIR}/$f" ]; then
+                    chmod +x "$tmp/${ANDROID_NDK_ARCHIVE_DIR}/$f"
+                  fi
+                done
+              fi
+              mkdir -p "$(dirname "$dest")"
+              mv "$tmp/${ANDROID_NDK_ARCHIVE_DIR}" "$dest"
+              rm -rf "$tmp"
+            fi
             installed=1
             ndk="$(tools/build-native.sh ndk-root)"
           fi
@@ -239,11 +283,11 @@ jobs:
             exit 1
           fi
           if [ -z "$ndk" ]; then
-            echo "::error::no Android NDK on this runner, and no sdkmanager to install one."
-            echo "This leg cross-compiles the extension for one android ABI and links it with the NDK's"
-            echo "clang wrapper. Install the NDK for the account the runner service runs as -- Android"
-            echo "Studio's SDK Manager, or 'sdkmanager --install \"ndk;${ANDROID_NDK_VERSION}\"' from the"
-            echo "command-line tools -- and set ANDROID_NDK_HOME to its root."
+            echo "::error::no Android NDK on this runner, and neither sdkmanager nor the archive download"
+            echo "produced one. This leg cross-compiles the extension for one android ABI and links it with"
+            echo "the NDK's clang wrapper. Install the NDK for the account the runner service runs as --"
+            echo "Android Studio's SDK Manager, or 'sdkmanager --install \"ndk;${ANDROID_NDK_VERSION}\"'"
+            echo "from the command-line tools -- and set ANDROID_NDK_HOME to its root."
             exit 1
           fi
           echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
