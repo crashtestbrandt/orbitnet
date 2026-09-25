@@ -1,0 +1,307 @@
+name: constant-time
+
+# Run `just native-timing` on a schedule, on the self-hosted Linux box, so the dudect-style measurement
+# over the receive path's tag compare executes on some machine.
+#
+# `native/crates/orbitnet-core/tests/constant_time.rs` ships three tests. Two of them gate every pull
+# request through `just native-test`. The third is `#[ignore]`d, `cargo test --workspace` only compiles
+# it, and before this workflow nothing executed it anywhere -- a timing regression in the compare was
+# seen by nobody. This job runs it and reports the verdict.
+#
+# **Not a pull-request gate.** The verdict is a statistic and it is only as good as the box's noise
+# floor. A shared GitHub-hosted runner is a virtual machine with neighbours, so the tolerance the test
+# derives from its own null inflates until the test passes on anything, or the floor moves mid-run and
+# it fails on nothing. The test's header states that, and it is why the test is `#[ignore]`d. A schedule
+# puts the run in front of a person instead of in front of a merge.
+#
+# **Self-hosted, and safe for the reason binaries.yml and netbench.yml give.** A public repository must
+# never point fork-PR CI at a self-hosted runner, because a fork PR can change the workflow and the
+# runner executes it on the maintainer's machine. This workflow has no `pull_request` trigger at all.
+# `schedule` fires only from the default branch of this repository and carries no fork path into it, and
+# `workflow_dispatch` requires write access.
+#
+# **Its own job rather than a step in the netbench nightly.** Sharing a box with the bandwidth benchmark
+# is the thing this measurement is most sensitive to, and the two jobs also disagree about failure:
+#
+#   - netbench drives a Godot server, four bot clients and a conditioned UDP relay for a 25-second
+#     window on the same machine. The timing harness resolves a difference of a fraction of a nanosecond
+#     per `open` -- the `SAMPLES` doc comment in `constant_time.rs` records the range measured so far and
+#     is the one place that figure is maintained. Appended to that job it would measure the bench's
+#     residue, and the box would still be settling when the first null ran.
+#   - netbench reports and never gates -- its header says so at length, because its numbers are
+#     machine-dependent and a REGRESSED column is a reading rather than a defect. A leak verdict here is
+#     a defect in the receive path and has to be red. One job cannot hold both policies.
+#   - The two produce different artifacts for different readers -- netbench a CSV series its next run
+#     diffs against, this job a console log carrying a verdict.
+#
+# They do share the one physical box, so this runs at 04:41 UTC and netbench at 07:17. An overlap that
+# happens anyway does not produce a wrong answer -- the test refuses to render a verdict when the leaky
+# control has not cleared the tolerance by 4x, which is what a busy box produces.
+#
+# **What a failure does.** The measurement has four outcomes and this workflow treats them differently:
+#
+#   | Outcome | What it means | Job |
+#   | --- | --- | --- |
+#   | pass | both profiles measured, judged draw under the run's own tolerance | green |
+#   | unresolvable | the leaky control did not clear the tolerance by 4x, so the box was too noisy to resolve a known leak | warning, green, after one retry |
+#   | leak | the judged arm cleared the tolerance in every draw on a run whose control did clear 4x | error, red |
+#   | broken | no harness output at all -- the build failed, or `cargo` or `just` did not resolve | error, red |
+#
+# `unresolvable` is the one that is deliberately not red. A nightly that goes red because the box was
+# busy stops being read, which is the failure mode netbench's header argues against, and a run that
+# cannot resolve the control asserts nothing about the compare either way. It is retried once
+# inside the job first, because a whole run of the harness costs about 5 seconds per profile and a busy
+# minute is the common cause. A run that is still unresolvable on the second attempt leaves a warning
+# annotation and a line in the step summary. `leak` and `broken` are red: the first is a finding in the
+# receive path, the second is the "produced no measurement" rule netbench's verdict step already sets.
+#
+# **`set +e` in two steps below, on purpose.** Every bash body GitHub runs for a `run:` already carries
+# `-e`; `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`. `set -uo pipefail` adds `-u` and
+# `pipefail` and leaves `-e` on, so both steps clear it explicitly and neither may drop the `+e`:
+#
+#   - `Run the measurement` -- the recipe exits non-zero on three of the four outcomes above, and under
+#     `-e` the step would die before classifying anything and before writing `$GITHUB_OUTPUT`, which is
+#     the opposite of what the table says.
+#   - `Report the measurement` -- its `grep ... | tail` pipeline runs inside a `{ ... } >> summary` block
+#     with `pipefail` on, and a `broken` log the grep matches nothing in exits 1. Under `-e` the block
+#     would abort mid-write, leaving the summary with an unterminated code fence and turning the report
+#     step red on top of the failure it was reporting.
+#
+# Every `run:` step names `shell: bash` for the reason binaries.yml does: the body is then run by the
+# documented shell rather than by the runner's platform default.
+
+on:
+  schedule:
+    # 04:41 UTC daily. Off the hour because GitHub queues scheduled workflows fleet-wide and runs on an
+    # exact hour boundary are the most delayed, and well clear of netbench's 07:17 on the same box.
+    # Daily rather than per-push: the run costs seconds of measurement behind a warm cargo build, and a
+    # daily series is what would let SPREAD and HEADROOM be re-derived for this box if they ever need to
+    # be.
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One at a time, and never cancelled. The measurement is a noise-floor reading, so a second copy on
+  # the same box is the one thing guaranteed to invalidate the first. `cancel-in-progress: false`
+  # because a cancelled run leaves a truncated log that classifies as `broken` and goes red for no
+  # reason.
+  group: constant-time
+  cancel-in-progress: false
+
+jobs:
+  timing:
+    runs-on: [self-hosted, Linux, X64, legion]
+
+    # A wedged run must not hold the box. The concurrency group above is never cancelled and this fleet
+    # is one physical machine that binaries.yml and netbench.yml also use, so a hung run blocks the next
+    # release build. The default job timeout is 360 minutes. The harness is internally bounded at about
+    # 5 seconds per profile; the cold `cargo build` of both descriptor profiles in front of it is not.
+    timeout-minutes: 30
+
+    env:
+      # Set at job level so every `if: always()` step can read it. Three steps below name this
+      # directory, including ones that run when the measurement step was skipped. Exported from inside
+      # that step instead, a failure in the toolchain preflight would skip the export and those steps
+      # would abort with `TIMING_OUT: unbound variable` under `set -u`, hiding the real failure behind
+      # spurious ones. Declared here, it is also provably the same directory the upload path names.
+      TIMING_OUT: ${{ github.workspace }}/timing-out
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No dtolnay/rust-toolchain and no Swatinem/rust-cache here, for the reason binaries.yml states at
+      # length: both exist to provision a fresh hosted runner, this box already carries rustup and a
+      # persistent `target/`, and both actions run `rustc` directly to build a cache key -- which is how
+      # a box whose rustup shims had gone missing failed with "rustc: command not found" while `rustup
+      # toolchain install` reported success. This is binaries.yml's repair step, the same one
+      # netbench.yml carries.
+      #
+      # `cargo` is what the recipe invokes, and the rustup cargo shim resolves rustc for its own
+      # children, so cargo resolving is the condition that matters. native/rust-toolchain.toml pins the
+      # version and rustup honors it from inside that directory with no help from CI.
+      - name: Check the Rust toolchain on this runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in \
+            "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
+            "${CARGO_HOME:-}/bin" \
+            "$HOME/.cargo/bin"
+          do
+            [ -n "$dir" ] && [ -d "$dir" ] || continue
+            case ":$PATH:" in *":$dir:"*) ;; *) echo "$dir" >> "$GITHUB_PATH"; PATH="$dir:$PATH" ;; esac
+            break
+          done
+          if ! command -v cargo >/dev/null 2>&1; then
+            # The rustup proxies are missing, not the toolchain. rustup installs `cargo`, `rustc` and
+            # the rest as copies of the rustup binary in one directory; when those copies are deleted,
+            # rustup still answers and still reports its toolchains while nothing else on PATH exists.
+            # `rustup self update` reinstalls them, which is the sanctioned repair; recreating them by
+            # copying the rustup binary under each name is exactly what rustup does internally.
+            rustup_bin="$(command -v rustup || true)"
+            if [ -z "$rustup_bin" ]; then
+              echo "::error::neither cargo nor rustup is on this runner. Install rustup for the account the runner service runs as."
+              exit 1
+            fi
+            bindir="$(dirname "$rustup_bin")"
+            echo "::warning::cargo is missing from ${bindir}; repairing the rustup proxies"
+            rustup self update || echo "rustup self update did not run; recreating the proxies directly"
+            if ! command -v cargo >/dev/null 2>&1; then
+              for tool in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+                [ -e "${bindir}/${tool}" ] || cp "$rustup_bin" "${bindir}/${tool}"
+              done
+              chmod 0755 "${bindir}"/* 2>/dev/null || true
+              hash -r 2>/dev/null || true
+            fi
+          fi
+          command -v cargo >/dev/null 2>&1 || {
+            echo "::error::cargo still does not resolve after repair. Reinstall rustup for the account the runner service runs as."
+            exit 1; }
+          ( cd native && cargo --version )
+
+      # This workflow runs the recipe rather than the two cargo invocations under it, so that the job
+      # and a contributor's local run are the same command and cannot drift. `just` is the one tool that
+      # requirement adds to this box, and no other workflow here needs it -- check.yml calls
+      # `tools/*.sh` directly on hosted runners. A missing `just` therefore fails here, with the fix
+      # named, rather than as an opaque "command not found" inside the measurement step.
+      - name: Check that just is on this runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v just >/dev/null 2>&1 || {
+            echo "::error::\`just\` does not resolve on this runner. Install it for the account the runner service runs as (\`cargo install just\` puts it in the same directory as the rustup proxies)."
+            exit 1; }
+          just --version
+
+      # The recipe stops at the first failing profile, because every line of a `just` recipe runs under
+      # its own shell and a non-zero exit ends the recipe. So a run that fails under `template-debug`
+      # leaves `template_release` unmeasured, and the classification below counts the harness banners to
+      # notice that rather than reading a single exit code.
+      #
+      # The retry exists only for `unresolvable`. A leak verdict is systematic and reproduces, so
+      # re-running it would only delay the report; a `broken` run has nothing to re-measure.
+      #
+      # `attempts_max` matches the loop's literal list and guards the retry notice. The notice announces
+      # a re-measurement, so it fires only on an attempt a re-measurement follows. Printed after the last
+      # attempt it would put a second retry claim in the run's Annotations while only one retry ran, on
+      # the one outcome whose reading depends on how many attempts produced it.
+      - name: Run the measurement
+        id: measure
+        shell: bash
+        run: |
+          set +e -uo pipefail
+          mkdir -p "$TIMING_OUT"
+          rm -f "$TIMING_OUT"/*.log
+          verdict=broken
+          attempt=0
+          attempts_max=2
+          for attempt in 1 2; do
+            log="$TIMING_OUT/native-timing-${attempt}.log"
+            just native-timing > "$log" 2>&1
+            status=$?
+            banners="$(grep -c 'constant-time harness:' "$log")"
+            if grep -q 'THE TAG COMPARE LEAKS' "$log"; then
+              verdict=leak
+            elif grep -q 'cannot resolve a deliberately leaky compare' "$log"; then
+              verdict=unresolvable
+            elif [ "$status" -eq 0 ] && [ "${banners:-0}" -ge 2 ]; then
+              verdict=pass
+            else
+              verdict=broken
+            fi
+            echo "attempt ${attempt}: exit ${status}, ${banners:-0} profile(s) measured, verdict ${verdict}"
+            [ "$verdict" = "unresolvable" ] || break
+            if [ "$attempt" -lt "$attempts_max" ]; then
+              echo "::notice::the box was too noisy to render a verdict; re-measuring once"
+            fi
+          done
+          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
+          echo "attempts=${attempt}" >> "$GITHUB_OUTPUT"
+          echo "log=${log}" >> "$GITHUB_OUTPUT"
+
+      # The report. Everything a reader needs is the harness's own printout: the ten null runs, the
+      # tolerance derived from them, what per-open difference that tolerance corresponds to, the leaky
+      # control's multiple of it, and each judged draw. Both profiles print one block each.
+      #
+      # The filter is for a run that produced harness output. A `broken` run has none, and none of the
+      # filter's patterns matches a compiler diagnostic, a linker failure or a `just` recipe error, so
+      # filtering that log yields the echoed recipe line and nothing about why it failed. `broken` is
+      # the likeliest outcome on any run where the toolchain moved, so that case prints the tail of the
+      # log raw. A reader learns the cause from the summary rather than from a 90-day artifact.
+      - name: Report the measurement
+        if: always()
+        shell: bash
+        env:
+          VERDICT: ${{ steps.measure.outputs.verdict }}
+          ATTEMPTS: ${{ steps.measure.outputs.attempts }}
+        run: |
+          set +e -uo pipefail
+          {
+            echo "## constant-time measurement"
+            echo
+            echo "verdict: \`${VERDICT:-not measured}\` after \`${ATTEMPTS:-0}\` attempt(s)"
+            echo
+            echo '```'
+            for log in "$TIMING_OUT"/native-timing-*.log; do
+              [ -e "$log" ] || { echo 'no harness output'; break; }
+              echo "--- $(basename "$log")"
+              case "${VERDICT:-}" in
+                pass|leak|unresolvable)
+                  grep -aE 'constant-time harness:|\|t\| =|tolerance =|per-open difference|judged:|cargo test|TAG COMPARE LEAKS|cannot resolve' \
+                    "$log" | tail -80
+                  ;;
+                *)
+                  echo "(no harness output to filter; last 40 lines verbatim)"
+                  tail -40 "$log"
+                  ;;
+              esac
+            done
+            echo '```'
+            echo
+            echo "The tolerance is measured on this box in this run and says nothing about machines in general. \`native/crates/orbitnet-core/tests/constant_time.rs\` records what each line means."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 90 days, which is the maximum a public repository may set, and the same figure and the same
+      # reason netbench.yml states: the value of a scheduled measurement is the series. The harness
+      # derives its tolerance from a noise floor it measures each run, and SPREAD and HEADROOM are set
+      # against fifteen runs on one laptop -- re-deriving either for this box takes months of this
+      # workflow's logs still being downloadable. They are small text files.
+      - name: Upload the measurement logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: constant-time-logs
+          path: timing-out/*.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # The conclusion, and the only step that sets it. The default for an unset verdict is `broken`,
+      # not `pass`: the measurement step is skipped entirely when a preflight failed, and a `pass`
+      # default would report a job that measured nothing as a healthy one.
+      - name: Verdict
+        if: always()
+        shell: bash
+        env:
+          VERDICT: ${{ steps.measure.outputs.verdict }}
+          LOG: ${{ steps.measure.outputs.log }}
+        run: |
+          set -euo pipefail
+          case "${VERDICT:-broken}" in
+            pass)
+              echo "both shipped profiles measured; the judged draw stayed under the run's own tolerance"
+              ;;
+            unresolvable)
+              echo "::warning::the timing measurement rendered no verdict on two attempts: the leaky control did not clear the run's tolerance by the 4x margin a verdict needs, so this box was too noisy to resolve a known leak. Nothing is asserted about the tag compare by this run. Read the step summary; if this repeats for several nights the box has a new tenant."
+              ;;
+            leak)
+              echo "::error::the tag compare is separable by timing. Two refused datagrams differing only in which tag byte is wrong cleared the tolerance in every draw, on a run whose leaky control did clear the 4x margin, so the measurement was resolvable. Read the step summary and the constant-time-logs artifact, then reproduce with \`just native-timing\`."
+              exit 1
+              ;;
+            *)
+              echo "::error::the measurement produced no harness output under one or both shipped profiles -- the build failed, or a tool did not resolve. The step summary carries the tail of the log; the whole log is in the constant-time-logs artifact, and on the runner at ${LOG:-\$TIMING_OUT}."
+              exit 1
+              ;;
+          esac

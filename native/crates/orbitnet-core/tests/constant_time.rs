@@ -13,7 +13,7 @@
 //! | --- | --- | --- |
 //! | `the_tag_compare_compiles_without_a_branch` | the compare's own source, compiled on its own, emits no conditional branch and no call under either profile's flags | `just native-test`, every PR |
 //! | `the_branch_scanner_reads_both_architectures` | the scanner's line parsing and four branch spellings, from x86-64 and AArch64 fixtures, on whichever host it runs | `just native-test`, every PR |
-//! | `the_tag_compare_is_not_distinguishable_by_timing` | two refused datagrams differing in which tag byte is wrong are not separable by a Welch t-test | `just native-timing`, by hand; no workflow runs it |
+//! | `the_tag_compare_is_not_distinguishable_by_timing` | two refused datagrams differing in which tag byte is wrong are not separable by a Welch t-test | the nightly `constant-time` workflow on the self-hosted box, and `just native-timing` by hand |
 //!
 //! ## The codegen assertion, and why it needs no disassembler
 //!
@@ -133,9 +133,23 @@
 //! nothing. So it is `#[ignore]`d and `just native-timing` runs it under both shipped profiles. As
 //! a PR gate it would flake.
 //!
-//! **No workflow runs it today.** `cargo test --workspace` compiles it, so it cannot rot at compile
-//! time, but nothing executes the measurement on any machine. Wiring it onto the self-hosted Linux
-//! leg is the open follow-up, tracked in `ROADMAP.md`.
+//! **A nightly runs it on the self-hosted Linux box**, which is the only machine in this project's
+//! CI whose noise floor the measurement can use. `.github/workflows/constant-time.yml` runs
+//! `just native-timing` there on a schedule, off a pull request entirely, and its header carries the
+//! rest of the reasoning. What that job does with each outcome:
+//!
+//! | Outcome | The job |
+//! | --- | --- |
+//! | both profiles measured, judged draw under the tolerance | green |
+//! | the control fell short of the [`HEADROOM`] margin, so no verdict was rendered | a warning, after one retry, and green |
+//! | the judged arm cleared the tolerance in every draw on a resolvable run | red |
+//! | no harness output at all | red |
+//!
+//! A noisy box leaving a warning rather than a red build is deliberate. This test invalidates itself
+//! when it cannot resolve the control, so a busy night produces no claim rather than a false pass,
+//! and a nightly that goes red because the box was busy stops being read.
+//!
+//! Run it by hand on an idle machine with:
 //!
 //! ```text
 //! just native-timing

@@ -144,10 +144,14 @@ native-test:
 # NOT in `just check`, and deliberately `#[ignore]`d so `native-test` skips it. Its verdict is only as
 # good as the machine's noise floor. A shared GitHub-hosted runner is a noisy virtual machine with
 # neighbours, where the tolerance inflates until the test passes on anything, or the floor moves mid-run
-# and it fails on nothing. Run it on an idle machine. No job runs it today -- wiring it onto the
-# self-hosted Linux leg is a `ROADMAP.md` row. The test derives its own tolerance from a noise floor it
-# measures each run, and asserts that a deliberately leaky compare clears that tolerance by 4x, so a box
-# too noisy to resolve a known leak fails rather than passing.
+# and it fails on nothing. Run it on an idle machine. The test derives its own tolerance from a noise
+# floor it measures each run, and asserts that a deliberately leaky compare clears that tolerance by 4x,
+# so a box too noisy to resolve a known leak fails rather than passing.
+#
+# `.github/workflows/constant-time.yml` runs this recipe nightly on the self-hosted Linux box, which is
+# the only machine in this project's CI quiet enough for the verdict to mean anything. That job reports a
+# too-noisy run as a warning and goes red only on a leak verdict or on no output at all; its header says
+# why.
 #
 # The other half of that file -- the assertion that the compare emits no branch -- is a plain unit test
 # and DOES run in `native-test` on every PR. See the header of
