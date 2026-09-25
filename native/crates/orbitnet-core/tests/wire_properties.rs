@@ -48,12 +48,12 @@
 //!
 //! | Module | Entry points | Count |
 //! | --- | --- | --- |
-//! | `codec` frames and blocks | `FrameKind::from_tag`, `FrameHeader::decode`, `Handshake::decode`, `decode_state_block_meta`, `decode_state_block_into`, `skip_state_block_body`, `decode_input_block_meta`, `input_block_row`, `skip_input_block_body`, `Welcome::decode`, `Ping::decode`, `Pong::decode`, `decode_manifest_full`, `decode_manifest_delta`, `decode_interest_delta`, `decode_interest_table` | 16 |
+//! | `codec` frames and blocks | `FrameKind::from_tag`, `FrameHeader::decode`, `Handshake::decode`, `decode_state_block_meta`, `decode_state_block_into`, `skip_state_block_body`, `decode_input_block_meta`, `input_block_row`, `skip_input_block_body`, `Challenge::decode`, `Welcome::decode`, `Ping::decode`, `Pong::decode`, `decode_manifest_full`, `decode_manifest_delta`, `decode_interest_delta`, `decode_interest_table` | 17 |
 //! | `codec::Reader` primitives | `u8`, `i8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bytes`, `peek_bytes`, `varint`, `zigzag`, `bitmask_into` | 12 |
 //! | `quant` | `decode_row`, `apply_masked_wire`, `row_is_finite`, `f16_bits_to_f32`, `ss3_to_quat` | 5 |
 //! | `columnar` | `apply_masked` | 1 |
 //! | `auth` receive path | `SessionAuth::open`, `ReplayWindow::accept`, `siphash24`, `SipHasher::write`, `SipHasher::finish`, `compress_secret` | 6 |
-//! | **Total** | | **40** |
+//! | **Total** | | **41** |
 //!
 //! Deliberately outside that table:
 //!
@@ -113,8 +113,9 @@ use orbitnet_core::codec::{
     decode_manifest_delta, decode_manifest_full, decode_state_block_into, decode_state_block_meta,
     diff_manifest, encode_input_block, encode_interest_delta, encode_interest_table,
     encode_manifest_delta, encode_manifest_full, encode_state_block, input_block_row,
-    skip_input_block_body, skip_state_block_body, CodecError, FrameHeader, FrameKind, Handshake,
-    InterestDeltaSection, ManifestDelta, ManifestEntry, Ping, Pong, Reader, Welcome, Writer,
+    skip_input_block_body, skip_state_block_body, Challenge, CodecError, FrameHeader, FrameKind,
+    Handshake, InterestDeltaSection, ManifestDelta, ManifestEntry, Ping, Pong, Reader, Welcome,
+    Writer,
 };
 use orbitnet_core::columnar::{apply_masked, changed_mask, masked_size, write_masked};
 use orbitnet_core::protocol::{PropKind, PropRole, PropSchema, QuantKind, SchemaBuilder};
@@ -193,11 +194,12 @@ const ALL_QUANTS: [QuantKind; 3] = [QuantKind::None, QuantKind::Ss3, QuantKind::
 const ALL_ROLES: [PropRole; 3] = [PropRole::State, PropRole::Input, PropRole::Cosmetic];
 
 /// Every `FrameKind`. Kept complete by `frame_kind_index`.
-const ALL_FRAME_KINDS: [FrameKind; 8] = [
+const ALL_FRAME_KINDS: [FrameKind; 9] = [
     FrameKind::ServerSnapshot,
     FrameKind::ClientInput,
     FrameKind::Ping,
     FrameKind::Pong,
+    FrameKind::Challenge,
     FrameKind::Welcome,
     FrameKind::EntityManifest,
     FrameKind::EntityManifestDelta,
@@ -239,10 +241,11 @@ fn frame_kind_index(kind: FrameKind) -> usize {
         FrameKind::ClientInput => 1,
         FrameKind::Ping => 2,
         FrameKind::Pong => 3,
-        FrameKind::Welcome => 4,
-        FrameKind::EntityManifest => 5,
-        FrameKind::EntityManifestDelta => 6,
-        FrameKind::InterestTable => 7,
+        FrameKind::Challenge => 4,
+        FrameKind::Welcome => 5,
+        FrameKind::EntityManifest => 6,
+        FrameKind::EntityManifestDelta => 7,
+        FrameKind::InterestTable => 8,
     }
 }
 
@@ -452,16 +455,26 @@ fn arb_handshake() -> impl Strategy<Value = Handshake> {
         any::<u64>(),
         any::<[u8; KEY_LEN]>(),
         any::<u64>(),
+        any::<[u8; KEY_LEN]>(),
         any::<u64>(),
     )
         .prop_map(
-            |(protocol_version, tickrate, session_id, session_nonce, resume_token, confirm)| {
+            |(
+                protocol_version,
+                tickrate,
+                session_id,
+                joiner_nonce,
+                resume_token,
+                acceptor_nonce,
+                confirm,
+            )| {
                 Handshake {
                     protocol_version,
                     tickrate,
                     session_id,
-                    session_nonce,
+                    joiner_nonce,
                     resume_token,
+                    acceptor_nonce,
                     confirm,
                 }
             },
@@ -731,6 +744,10 @@ fn drive_every_decoder(bytes: &[u8], schema: &SchemaBuilder) -> Result<(), TestC
     }
 
     // --- Frame-level decoders that read from a cursor, each from the start of the buffer.
+    {
+        let mut reader = Reader::new(bytes);
+        let _ = Challenge::decode(&mut reader);
+    }
     let mut reader = Reader::new(bytes);
     let _ = Welcome::decode(&mut reader);
     let mut reader = Reader::new(bytes);
@@ -1217,6 +1234,22 @@ proptest! {
     #[test]
     fn a_handshake_round_trips(handshake in arb_handshake()) {
         prop_assert_eq!(Handshake::decode(&handshake.encode())?, handshake);
+    }
+
+    /// The challenge, which carries both nonce halves and nothing else. Fixed width, so the property
+    /// that matters is that neither half is swapped for the other on the way back -- a swap is
+    /// invisible to a length check and would key the two ends differently.
+    #[test]
+    fn a_challenge_round_trips(
+        joiner_nonce in any::<[u8; KEY_LEN]>(),
+        acceptor_nonce in any::<[u8; KEY_LEN]>(),
+    ) {
+        let challenge = Challenge { joiner_nonce, acceptor_nonce };
+        let bytes = challenge.encode();
+        let mut reader = Reader::new(&bytes);
+        prop_assert_eq!(reader.u8()?, FrameKind::Challenge.tag());
+        prop_assert_eq!(Challenge::decode(&mut reader)?, challenge);
+        prop_assert!(reader.is_exhausted());
     }
 
     /// The three control frames that carry a clock or a join reply.
