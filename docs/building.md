@@ -106,7 +106,7 @@ reasons:
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `check.yml` | every PR and push | Builds both descriptor profiles for Linux, confirms each is a real ELF object, and runs every gate against them. |
-| `binaries.yml` | push to main touching `native/**` | Builds both descriptor profiles on every platform leg, uploads them as **artifacts**. |
+| `binaries.yml` | push to main touching `native/**` | Builds both descriptor profiles on every platform leg, uploads them as **artifacts**. The Windows and macOS legs then run the load smoke and the four unit suites against what they just built. |
 | `release.yml` | a `v*` tag | Builds all three profiles on every platform leg, publishes the binaries and the AssetLib zip as Release assets, and commits the manifest. |
 
 So main is always *proven* to build on every platform, and history carries digests rather than bytes.
@@ -169,6 +169,32 @@ artifact and fail the tag after every other platform had already built.
 
 On an arm64 Linux host none of this applies. `tools/build-native.sh host` reports `linux_arm64` there, and
 `just native-install` builds and stages the library that host's Godot will load.
+
+### Windows and macOS test where they build
+
+`check.yml` runs all of its jobs on `ubuntu-latest` and cannot speak for the other two platforms. A bad
+`[libraries]` entry, a wrong-architecture build or a missing entry symbol fails at `dlopen` on the affected
+platform and nowhere else, so a Linux-only gate stays green while a Windows checkout takes the `Net` autoload
+down. The Windows and macOS legs of `binaries.yml` already hold a library their own runner can load, so they
+test it:
+
+| Step | What it proves |
+|---|---|
+| `tools/orbitnet-smoke.sh --skip-build` | A throwaway Godot project asserts the classes register, exported properties bind, signals reach GDScript, ticks advance, and freeing a registered entity does not panic the frame. Before that it checks the staged file's magic bytes against this platform's object format, and its exported symbols for `gdext_rust_init`. |
+| The four unit suites | The addon's GDScript, on this platform. No scene tree, no physics, no sockets. |
+
+- **The Godot assertions are the part that always gates.** The binary check fails only on positive evidence
+  that a file is wrong. The **symbol check** runs where the platform carries a reader the script can drive
+  (`nm`, or `dumpbin` on Windows); where none does, the step says so and continues into the Godot run rather
+  than failing a build that is fine.
+- **Both steps need Godot on the runner.** The leg checks for it first and fails naming what to install,
+  rather than reporting `godot: command not found` from inside a test script. Set **`GODOT_BIN`** to the
+  binary's path on a runner where Godot is not on `PATH` under the name `godot`.
+- **The probes stay Linux-only.** They are multi-process, they bind UDP ports and they are slow.
+- **Neither Linux leg runs either step, for different reasons.** `linux` skips them because `check.yml`
+  already runs both on Linux for every pull request. **`linux_arm64` cannot run them at all**: it is
+  cross-built on the x86_64 box, so the runner that produced the artifact cannot load it. The steps name the
+  two legs that do run rather than excluding the ones that do not, so a future cross-built leg has to opt in.
 
 ## CI runs on GitHub-hosted runners
 

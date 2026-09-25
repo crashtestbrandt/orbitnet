@@ -13,7 +13,24 @@
 # Usage: tools/orbitnet-smoke.sh [--skip-build]
 # Env:   GODOT (binary or wrapper to run; default: tools/godot-quiet.sh)
 #
-# Linux only: it reads ELF magic and asks `nm -D` for the entry symbol.
+# RUNS ON ALL THREE PLATFORMS. `binaries.yml` runs it on the Windows and macOS legs, which until then
+# built a library and shipped it without a single test ever having run on either platform; `check.yml`
+# runs it on Linux for every pull request.
+#
+# TWO CHECKS, AND THE GODOT RUN IS THE ONE THAT PROVES ANYTHING. The split is deliberate and both halves
+# are kept:
+#
+#   1. A binary sanity check -- magic bytes and the entry symbol -- before Godot starts. It cannot prove
+#      the library works. It names the cause. A Git LFS pointer, a library built for another platform
+#      staged under this one's name, and a build that dropped `gdext_rust_init` all reach Godot as the
+#      same unhelpful load failure, and the cheapest place to tell them apart is here.
+#   2. The Godot assertions further down, which are the real gate: the classes register, exported
+#      properties bind, signals reach GDScript, ticks advance, and freeing a registered entity does not
+#      panic the frame.
+#
+# So the binary check fails only on POSITIVE evidence that a file is wrong. Where a platform carries no
+# symbol reader this script can drive, it says so and continues into the Godot run rather than failing a
+# build that is fine.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -45,43 +62,125 @@ if [ -n "$missing" ]; then
 	exit 1
 fi
 
+# WHAT THIS PLATFORM'S LOADER ACCEPTS AS AN OBJECT FILE, as the first bytes on disk. A library staged
+# under the right NAME but built for the wrong platform passes every check above and then fails at
+# `dlopen` on that platform and nowhere else.
+#
+#   linux    7f454c46                       ELF.
+#   windows  4d5a                           the "MZ" DOS stub every PE image still begins with.
+#   macos    cffaedfe feedfacf              a thin 64-bit Mach-O, either byte order (cefaedfe / feedface
+#                                           for 32-bit).
+#            cafebabe bebafeca              a FAT (universal) archive, and cafebabf / bfbafeca its 64-bit
+#                                           form. THE SHIPPED MACOS LIBRARIES ARE UNIVERSAL -- both
+#                                           descriptor profiles are two architectures lipo'd together --
+#                                           so a passing run sees the fat magic and not a Mach-O's. A thin
+#                                           dylib is accepted as well: a developer who built one
+#                                           architecture locally is not doing anything wrong.
+#
+# `cafebabe` is also a Java class file's magic. Telling them apart needs a real Mach-O parse, and the only
+# file reaching this check is one this repository's own build just staged, so the ambiguity is left alone.
+case "$HOST" in
+	linux)   MAGICS="7f454c46" ;;
+	windows) MAGICS="4d5a" ;;
+	macos)   MAGICS="cffaedfe feedfacf cefaedfe feedface cafebabe bebafeca cafebabf bfbafeca" ;;
+	*)       MAGICS="" ;;
+esac
+
+ENTRY_SYMBOL="gdext_rust_init"
+
+# THE SYMBOL READERS THIS PLATFORM HAS, in order, because no one tool reads all three formats:
+#
+#   linux    `nm -D` is how GNU binutils spells an ELF's dynamic symbols.
+#   macos    `nm -arch all` first. Apple's nm refuses `-D`, and on a UNIVERSAL dylib it refuses a plain
+#            dynamic read too ("File format has no dynamic symbol table") because a fat file holds one
+#            symbol table per architecture rather than one overall; `-arch all` is what asks for every
+#            slice.
+#   windows  `dumpbin -exports`, the MSVC toolchain's own reader, because an MSVC box need not carry `nm`
+#            at all. Then an LLVM or mingw `nm`, which does read PE. Then a raw byte scan, which is weak
+#            evidence but real -- a DLL stores its exported names as plain text in the export name table --
+#            and is the only reader left on a runner carrying nothing but rustup and Godot.
+case "$HOST" in
+	linux)   READERS="nm-dynamic nm-plain" ;;
+	macos)   READERS="nm-fat nm-plain" ;;
+	windows) READERS="dumpbin nm-plain raw" ;;
+	*)       READERS="nm-plain" ;;
+esac
+
+# Print whatever symbol listing `reader` can get out of `lib`, and nothing at all when that reader is
+# absent or cannot read the format. EVERY BRANCH SWALLOWS ITS OWN FAILURE: an absent reader must not abort
+# the script under `set -e`, and it is not evidence that the library is wrong.
+read_symbols() {
+	case "$1" in
+		nm-dynamic) if command -v nm >/dev/null 2>&1; then nm -D "$2" 2>/dev/null || true; fi ;;
+		nm-fat)     if command -v nm >/dev/null 2>&1; then nm -arch all "$2" 2>/dev/null || true; fi ;;
+		nm-plain)   if command -v nm >/dev/null 2>&1; then nm "$2" 2>/dev/null || true; fi ;;
+		dumpbin)    if command -v dumpbin >/dev/null 2>&1; then dumpbin -exports "$2" 2>/dev/null || true; fi ;;
+		raw)        LC_ALL=C grep -ao "$ENTRY_SYMBOL" "$2" 2>/dev/null || true ;;
+	esac
+	return 0
+}
+
 for name in $NAMES; do
 	lib="$BIN/$name"
-	# A pointer file is a few hundred bytes of text that dlopen rejects with "invalid ELF header" behind
-	# a confusing cascade. Name the real cause here rather than letting Godot guess at it.
+	# A pointer file is a few hundred bytes of text. Every platform's loader rejects it and each one words
+	# the rejection differently -- a bad ELF header, a bad PE image, a bad Mach-O -- none of which mentions
+	# Git LFS. Name the real cause here rather than leaving the reader to decode their platform's message.
 	if head -c 64 "$lib" | grep -q 'git-lfs.github.com' 2>/dev/null; then
 		printf 'orbitnet-smoke FAILED: %s is a Git LFS POINTER, not a library.\n' "$lib" >&2
 		exit 1
 	fi
+
+	magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
+	matched=0
+	for want in $MAGICS; do
+		case "$magic" in "$want"*) matched=1; break ;; esac
+	done
+	if [ -n "$MAGICS" ] && [ "$matched" != "1" ]; then
+		# Name the format the bytes actually are, so the reader learns which platform the file was built
+		# for instead of only that it is wrong here.
+		case "$magic" in
+			7f454c46*) actual="a Linux ELF object" ;;
+			4d5a*) actual="a Windows PE image" ;;
+			cffaedfe*|feedfacf*|cefaedfe*|feedface*) actual="a macOS Mach-O object" ;;
+			cafebabe*|bebafeca*|cafebabf*|bfbafeca*) actual="a macOS universal archive" ;;
+			*) actual="not an object format this script recognizes" ;;
+		esac
+		printf 'orbitnet-smoke FAILED: %s does not begin like a %s object file (magic=%s).\n' \
+			"$lib" "$HOST" "$magic" >&2
+		printf 'Those first bytes are %s. Rebuild for this host with `just native-install`.\n' "$actual" >&2
+		exit 1
+	fi
+
 	# The entry symbol the .gdextension names. If this is absent the library will load and then do
 	# nothing, which presents as "class not found" far from the real cause.
 	#
-	# TWO SPELLINGS, BECAUSE `nm` IS NOT ONE TOOL. GNU binutils wants `-D` for an ELF's dynamic symbols;
-	# Apple's refuses `-D` and, on a UNIVERSAL dylib, refuses a plain read too ("File format has no dynamic
-	# symbol table") because a fat file holds one table per architecture rather than one overall. `-arch all`
-	# is what asks it for every slice. Neither flag is portable, so both are tried and the check only fails
-	# when a reader that WORKED found no symbol -- a `nm` that cannot read the file at all is not evidence
-	# that the file is wrong.
-	if command -v nm >/dev/null 2>&1; then
-		# EVERY SPELLING IS TRIED SEPARATELY, and one that errors is not allowed to end the search. Grouping
-		# them into one pipeline does not work under `set -e`: the first reader that exits non-zero aborts the
-		# whole group, so the spelling that would have worked is never reached.
-		read_ok=0
-		found=0
-		for reader in "-D" "-arch all" ""; do
-			# shellcheck disable=SC2086 -- `reader` is a deliberate word split of a fixed flag list.
-			out="$(nm $reader "$lib" 2>/dev/null || true)"
-			[ -z "$out" ] && continue
-			read_ok=1
-			printf '%s' "$out" | grep -q 'gdext_rust_init' && found=1 && break
-		done
-		if [ "$read_ok" = "1" ] && [ "$found" != "1" ]; then
-			printf 'orbitnet-smoke FAILED: %s exports no gdext_rust_init symbol.\n' "$lib" >&2
-			exit 1
-		fi
-		if [ "$read_ok" != "1" ]; then
-			printf 'orbitnet-smoke: no nm on this host could read %s; skipping the symbol check\n' "$lib"
-		fi
+	# EVERY READER IS TRIED SEPARATELY, and one that errors is not allowed to end the search. Grouping
+	# them into one pipeline does not work under `set -e`: the first reader that exits non-zero aborts the
+	# whole group, so the reader that would have worked is never reached. The check fails only when a
+	# reader that WORKED found no symbol.
+	read_ok=0
+	found=0
+	for reader in $READERS; do
+		out="$(read_symbols "$reader" "$lib")"
+		[ -z "$out" ] && continue
+		read_ok=1
+		# MATCHED WITHOUT A PIPE, on purpose. `printf ... | grep -q` exits at the first match and leaves the
+		# writer holding a closed pipe; under `set -o pipefail` that EPIPE becomes the pipeline's status
+		# whenever more output trails the match than the 64 KB pipe buffer holds. A library that DOES export
+		# the symbol then reports as one that does not. `nm -arch all` on a universal dylib emits ~693 KB
+		# with the match near the middle, so the reader this script prefers on macOS is exactly the one the
+		# pipe form loses. A `case` glob reads the captured string inside the shell and cannot fail that way.
+		case "$out" in
+			*"$ENTRY_SYMBOL"*) found=1; break ;;
+		esac
+	done
+	if [ "$read_ok" = "1" ] && [ "$found" != "1" ]; then
+		printf 'orbitnet-smoke FAILED: %s exports no %s symbol.\n' "$lib" "$ENTRY_SYMBOL" >&2
+		exit 1
+	fi
+	if [ "$read_ok" != "1" ]; then
+		printf 'orbitnet-smoke: no symbol reader on this %s host could read %s; the Godot run below is the check\n' \
+			"$HOST" "$lib"
 	fi
 done
 
@@ -328,14 +427,26 @@ func _process(_delta: float) -> bool:
 	return false
 LIFECYCLE
 
+# macOS headless creates a Metal RenderingDevice during the resource import pass and can fault inside
+# MoltenVK there, regardless of --headless and regardless of --rendering-driver. tools/lint-gdscript.sh
+# carries these two arguments for that fault and runs every pass with them; this script does the same on
+# Darwin. RENDER_ARGS word-splits to nothing everywhere else, so Linux and Windows are untouched.
+RENDER_ARGS=""
+if [ "$(uname)" = "Darwin" ]; then
+	RENDER_ARGS="--rendering-driver opengl3 --audio-driver Dummy"
+fi
+
 # Godot discovers .gdextension files while scanning the project, and a fresh project has no scan
 # cache. Without this pass the library is never loaded and the classes simply do not exist, which
-# presents identically to a genuinely broken build.
-"$GODOT" --headless --path "$WORK" --import >/dev/null 2>&1 || true
+# presents identically to a genuinely broken build. Retried once because the checked runs below have no
+# fallback of their own and a renderer fault part way through leaves the scan half done.
+"$GODOT" --headless $RENDER_ARGS --path "$WORK" --import >/dev/null 2>&1 \
+	|| "$GODOT" --headless $RENDER_ARGS --path "$WORK" --import >/dev/null 2>&1 \
+	|| true
 
 LOG="$WORK/smoke.log"
 set +e
-"$GODOT" --headless --path "$WORK" --script smoke.gd 2>&1 | tee "$LOG"
+"$GODOT" --headless $RENDER_ARGS --path "$WORK" --script smoke.gd 2>&1 | tee "$LOG"
 status="${PIPESTATUS[0]}"
 set -e
 
@@ -355,7 +466,7 @@ fi
 # Entity lifecycle: freeing a registered body must not panic the frame (see lifecycle.gd's header).
 LIFE_LOG="$WORK/lifecycle.log"
 set +e
-"$GODOT" --headless --path "$WORK" --script lifecycle.gd 2>&1 | tee "$LIFE_LOG"
+"$GODOT" --headless $RENDER_ARGS --path "$WORK" --script lifecycle.gd 2>&1 | tee "$LIFE_LOG"
 life_status="${PIPESTATUS[0]}"
 set -e
 
