@@ -283,6 +283,11 @@ done
 # registered yet drops the block and still acks the frame, so every join costs one keyframe interval of
 # NACKs per affected channel. That residual is real, bounded and correct; reading it as the steady-state
 # rate reports bring-up.
+#
+# The figure is per wall second, like every other `*_s` column. The window is charged the wall time of every
+# frame whether or not that frame advanced a tick. An artifact captured before the window ran on one time
+# base reports this and every other per-second column low, by a factor that depends on how far the server's
+# frame rate ran above its net tick rate -- see docs/netbench.md. Compare like with like.
 echo "--- server send path ---"
 nacks="$(grep -ao 'want_full_nacks_s=[0-9.]*' "$OUT/server.log.snap" | cut -d= -f2 | tail -n +2 || true)"
 nack_n="$(printf '%s' "$nacks" | grep -c . || true)"
