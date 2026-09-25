@@ -16,8 +16,13 @@ frame kind | tick | ack tick (zigzag delta) | 32-bit ack bitfield | 32-bit ack t
 CLIENT TO SERVER ONLY, before the blocks: the interest generation this client holds (varint)
 then per entity:  { slot (u16) | frame-tick delta | body length | flags | changed-property bitmask | packed payload }
 then, SERVER TO CLIENT, if the header's flags say so: the interest-delta section
-then the trailer: { sequence (u32) | MAC tag (u64) }
+then the trailer: { sequence (u32) | tag }
 ```
+
+**The trailer and the payload both depend on the secret regime.** With no session secret the tag is 8
+bytes of SipHash-2-4 and the payload above it is plaintext; with one, the payload is ChaCha20-Poly1305
+ciphertext of the same length and the tag is 16 bytes of Poly1305. See
+[datagram authentication](#datagram-authentication).
 
 **The client's interest generation rides BEFORE the blocks**, because the server's block loop stops early
 when its receive budget refuses one — so anything after them is not reliably reached. It is what lets the
@@ -31,9 +36,10 @@ last N ticks for redundancy, so a single lost packet costs nothing.
 [entity slots](#entity-slots) for what that costs and what it saves.
 
 **Control frames** — reliable and **ordered**: handshake, challenge, welcome, entity manifest, entity
-manifest delta, and the interest table. All but the handshake and the challenge carry the same 12-byte
-trailer. Ordering is what a manifest delta needs and a snapshot does not; every frame goes out
-`TRANSFER_MODE_RELIABLE` on one channel.
+manifest delta, and the interest table. All but the handshake and the challenge carry the same trailer as a
+hot frame — 12 bytes, or 20 under a session secret — and are encrypted where a hot frame is. Ordering is
+what a manifest delta needs and a snapshot does not; every frame goes out `TRANSFER_MODE_RELIABLE` on one
+channel.
 
 **Reliable means retransmitted, not delivered.** Every datagram of a session — reliable and unreliable alike —
 draws from one sequence counter and is checked against one `REPLAY_WINDOW`-wide replay window, so a
@@ -149,7 +155,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 | 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
 | 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. A client input frame also carries, before its blocks, the interest generation that client holds, so the server builds a section only for a peer that provably holds the baseline it is diffed against. The leading generation shifts the offsets of the section's own counts and the echo shifts every block's, which is what makes this a major rather than a trailing addition. |
-| 9 | **The join is two round trips and both ends contribute to the key.** The handshake's 16 bytes are the client's half of the session nonce; the server answers with a **challenge** frame (kind `0x05`) carrying a half of its own, and the client repeats its handshake quoting that half back in a new trailing **acceptor nonce** field. The key is derived from the fold of the two, and the confirm tag is taken over that fold. What it closes is a **replayed join**: under major 8 the nonce was the client's alone, so an on-path observer presenting a recorded handshake had the server derive the key that join had used. A peer predating this seats its own half as the key and fails every MAC, so the major is what refuses it — the new field would otherwise decode as an absent trailing value rather than a mismatch. |
+| 9 | **The join is two round trips and both ends contribute to the key.** The handshake's 16 bytes are the client's half of the session nonce; the server answers with a **challenge** frame (kind `0x05`) carrying a half of its own, and the client repeats its handshake quoting that half back in a new trailing **acceptor nonce** field. The key is derived from the fold of the two, and the confirm tag is taken over that fold. What it closes is a **replayed join**: under major 8 the nonce was the client's alone, so an on-path observer presenting a recorded handshake had the server derive the key that join had used. A peer predating this seats its own half as the key and fails every MAC, so the major is what refuses it — the new field would otherwise decode as an absent trailing value rather than a mismatch. **Also at this major: under a session secret every payload is encrypted**, with ChaCha20-Poly1305 over a cipher key derived from the same secret and fold, and the 8-byte SipHash trailer tag becomes a 16-byte Poly1305 one. A session that configures no secret is unchanged byte for byte. A peer predating it reads a snapshot out of ciphertext and its trailer off the wrong offset, so the major is what refuses that too. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -644,12 +650,14 @@ is two players behind one socket — and each is anchored, culled and world-filt
 
 ## Datagram authentication
 
-Every datagram but the handshake and the challenge carries a **32-bit sequence number and a 64-bit MAC
-tag**, and is dropped before a single field is decoded unless both check out.
+Every datagram but the handshake and the challenge carries a **32-bit sequence number and a tag**, and is
+dropped before a single field is decoded unless both check out. Under a session secret the payload beneath
+them is also encrypted — see [what a session secret encrypts](#what-a-session-secret-encrypts).
 
-- **The MAC** is SipHash-2-4 over the payload, the sequence number, and a **direction byte that is not
-  transmitted**. Each side authenticates with the direction it expects to receive, so a datagram reflected
-  back at its sender fails the tag check.
+- **The tag** is SipHash-2-4 over the payload, the sequence number, and a **direction byte that is not
+  transmitted**; under a session secret it is Poly1305 over the ciphertext and the same two values. Each
+  side authenticates with the direction it expects to receive, so a datagram reflected back at its sender
+  fails the tag check.
 - **The replay window** is a 64-entry sliding bitmap, the same construction IPsec uses. A sequence number is
   accepted once; a repeat, or one more than 64 behind the newest accepted, is refused. A datagram whose tag
   fails does not advance the window, so a forger cannot burn sequence numbers the real peer has yet to send.
@@ -690,6 +698,9 @@ what refuses that.
 | Where the key comes from | the fold of the two nonce halves | that fold, with the secret folded in |
 | What an on-path observer learns | both halves, and therefore the key | both halves, and nothing else |
 | Can an on-path observer forge? | **yes, anything the client can** | no |
+| Can an on-path observer **read a payload**? | **yes** | **no** |
+| What authenticates a datagram | SipHash-2-4, an 8-byte tag | Poly1305, a 16-byte tag |
+| What the payload is | plaintext | ChaCha20 ciphertext, same length |
 | Can it replay a recorded join? | no | no |
 | Who may join | anyone the transport accepts | anyone holding the secret |
 | What the confirm tag holds | `0` | the tag, over the folded nonce |
@@ -700,8 +711,8 @@ what refuses that.
   on-path observer who can read the exchange can do everything the client can.** Recorded as a limit in the
   [README](../README.md#limits).
 - **With a secret the halves are still in the clear and the key is not.** The secret never crosses the wire,
-  so an on-path observer reads every payload and derives no key — it cannot forge a datagram, take a session
-  identity, or quote a resume token into a session it can authenticate.
+  so an on-path observer derives no key — it cannot forge a datagram, take a session identity, or quote a
+  resume token into a session it can authenticate, and it cannot read a payload either.
 - **The secret is a derivation input and is never seated as the key.** Sequence numbers restart at 1 on every
   join and the replay window only ever knows the session in front of it, so a key that did not change between
   joins would make every datagram captured in one session a valid, unreplayed datagram in the next. The
@@ -711,23 +722,75 @@ what refuses that.
   is checked against the version the sender stamped on its own frame — major must already match, and minor
   and patch are allowed to differ.
 
+### What a session secret encrypts
+
+Under a secret, `SessionAuth::seal` runs **ChaCha20-Poly1305** (RFC 8439) over every payload it sends. The
+implementation is the `chacha20poly1305` crate rather than one written here; the header of
+`Cargo.toml` in `native/crates/orbitnet-core/` carries what that dependency had to clear.
+
+| | Bytes | Where it comes from |
+|---|---|---|
+| cipher key | 32 | `derive_cipher_key(secret, folded nonce)` — the twin of the session key, under labels of its own |
+| nonce | 12 | the direction byte, then the 32-bit sequence number, then seven reserved zero bytes |
+| associated data | 5 | the sequence number, then the direction byte |
+| tag | 16 | Poly1305, over the ciphertext and that associated data |
+
+Five things decide whether this is right, and each one is a test.
+
+- **Authenticate, then check the replay window, then decode.** Poly1305 covers the ciphertext, so the tag
+  is checked before a byte is deciphered, and the sequence number the window is handed is one the tag
+  covered. Advancing the window first would let a forger burn sequence numbers the real peer has yet to
+  send; decoding first is the failure this construction is known for.
+- **A refused datagram releases nothing.** The decryption scratch is cleared on every refusal, so no
+  unauthenticated plaintext survives for a later caller to find.
+- **The nonce never repeats under one key.** Sequence numbers are issued once and [refused rather than
+  wrapped](#datagram-authentication); the direction byte separates the two flows that share the key. A
+  repeated nonce would hand an observer the exclusive-or of two payloads, which is a silent failure
+  rather than a refused datagram, so the refusal has a test under each regime rather than only the
+  clear one.
+- **The sequence number stays readable**, because the receiver needs it to build the nonce. It is named as
+  associated data, so altering it is a tag failure rather than a decryption under a nonce nobody sealed
+  with.
+- **The cipher key is derived from the secret, not from the session key.** Separate labels over the same
+  folded nonce, so the key that hides a payload and the key that authenticated it are two values neither of
+  which computes the other.
+
+**The Poly1305 tag replaces the SipHash one rather than joining it.** One pass over the datagram instead of
+two, and it retires the 64-bit tag ceiling for a session that configured a secret.
+
+**What a secret does not hide.**
+
+- **How many datagrams a peer sends, when, and how long each one is.** A snapshot frame is as long as the
+  entities it carries, so an observer counting bytes still sees a session's shape. Length hiding would cost
+  padding on every frame and is not done.
+- **The handshake and the challenge**, which are the two frames that establish the key and cannot be sealed
+  under it. So the session id, the resume token a rejoining client quotes, and both nonce halves stay
+  readable under either regime. What refuses a claim built on them is the confirm tag, not their secrecy.
+
+**With no secret configured, nothing here runs.** The wire is the SipHash tag and the plaintext payload it
+has always been, byte for byte. Encrypting there would buy nothing: both halves of the nonce the key is
+folded from cross the wire, so an observer that read the join computes the key that hid the payload.
+
 ### Three ceilings a secret does not lift
 
-The replayed join used to be a fourth. It is closed by the exchange above, under both regimes, and these
-three are what is left.
+The replayed join used to be a fourth, and so did the payload in the clear. Both are closed above, and
+these three are what is left.
 
-- **The tag is still 64 bits and the key still 128.** A secret changes *who* can forge a datagram. It does
-  not change how hard forging one is for somebody who cannot read the secret.
+- **The key is still 128 bits**, and the tag is 64 without a secret. A secret changes *who* can forge a
+  datagram. It does not change how hard forging one is for somebody who cannot read the secret.
 - **The derivation adds no strength beyond the secret's own entropy.** A secret a lobby prints on screen, or
-  one short enough to guess, derives a key worth exactly that much. Any length is accepted and folded to 16
-  bytes; the fold cannot add entropy that was not supplied.
-- **None of this encrypts anything.** Every payload is still on the wire in the clear, under both regimes. A
-  MAC says a datagram was not written by somebody outside the session, and says nothing else.
+  one short enough to guess, derives a key worth exactly that much — the MAC key, the cipher key and every
+  confirmation alike. Any length is accepted and folded to 16 bytes; the fold cannot add entropy that was
+  not supplied, and the cipher key's 32 bytes cannot either.
+- **A secret hides a payload from somebody outside the session, and from nobody inside it.** Everyone the
+  game handed the secret to derives the same key from the same join, so a peer holding it reads every
+  payload the session carries.
 
 ### What the join costs
 
 **The cost is the second round trip, and it is charged per join under both regimes.** Nothing at rest
-changes.
+changes; the payload cipher is what costs at rest, and only under a secret — [that is the next
+section](#what-the-payload-cipher-costs).
 
 | | Cost |
 |---|---|
@@ -767,9 +830,41 @@ chance any leg is lost:
 | 5% (`worst_case`) | 9.75% | 18.55% |
 | 10% (`torture`) | 19.00% | 34.39% |
 
-**Configuring a secret costs nothing beyond that.** The frame sequence and every byte above are the same with
-and without one; the secret adds one pair of SipHash passes per join per end, and the 8-byte confirm field is
-paid either way because a session with no secret writes `0` into it.
+**Configuring a secret no longer costs nothing beyond that.** The frame sequence and every join byte above
+are the same with and without one, and the confirm field is paid either way because a session with no secret
+writes `0` into it. What a secret adds is four passes of SipHash per join per end for the cipher key, and then
+a per-datagram cost at rest — which the section below measures.
+
+### What the payload cipher costs
+
+**Only a session that configures a secret pays any of this.** With none, every figure below is zero.
+
+| | Cost |
+|---|---|
+| bytes per datagram, each direction | **8** — a 16-byte Poly1305 tag in place of the 8-byte SipHash one |
+| the trailer riding above `MAX_FRAME_PAYLOAD` | **20 bytes where it was 12**; the frame header rides above it either way, and the headroom under a 1500-byte path MTU covers both |
+| per-peer bandwidth at 60 Hz | **+480 B/s each way**, about 0.7% of a peer on a full 73 KB/s budget |
+| derivation per join, per end | **+0.06 µs**: four more SipHash passes for the cipher key, twice what the session key's pair costs |
+| per-connection state | **+32 bytes**, the cipher key beside the session key |
+
+And the processor cost per datagram, measured by
+`native/crates/orbitnet-core/tests/cipher_bench.rs` — 200,000 seal/open pairs per arm, `--release`, on an
+Apple M-series laptop. Run it yourself with the command in that file's header.
+
+| Payload | Clear, per pass | Encrypted, per pass | Added |
+|---|---|---|---|
+| 40 B — a ping | 0.034 µs | 0.409 µs | **+0.38 µs** |
+| 200 B — a client input frame | 0.092 µs | 0.723 µs | **+0.63 µs** |
+| 1200 B — a full snapshot frame | 0.432 µs | 1.625 µs | **+1.19 µs** |
+
+**What that is as a share of a frame.** A 60 Hz server with 8 peers, each sent a full 1200-byte snapshot and
+each sending a 200-byte input frame, spends about **15 µs per frame** on the cipher — under 0.1% of a 16.7 ms
+frame. The fixed part dominates at small payloads: ChaCha20 generates a block for the Poly1305 key whatever
+the payload's length, which is why a 40-byte ping costs a third of what a 1200-byte snapshot does.
+
+**It is the same single pass over the datagram the SipHash tag was**, and a more expensive one — the
+Poly1305 tag replaces that tag rather than joining it. It lands on the hot path at every peer, every tick.
+The figures above are what it costs there; no netbench run has been taken across the change.
 
 ### What a misconfiguration looks like
 
@@ -796,6 +891,9 @@ retries. What differs is whether the other end can say why.
   meanwhile sees a confirmation it has no reason to refuse, because it is not checking one. **Compare
   `Net.has_session_secret()` on both ends when a join hangs**; it is the only thing that distinguishes this
   from a dead link.
+- **The two regimes also disagree about the trailer**, by the 8 bytes above, so a short datagram from one is
+  refused by the other as truncated rather than as a bad tag. Both refusals are counted the same way and
+  neither is reported to the sender; the symptom is the hung join either way.
 
 **Why not a key exchange instead.** An **unauthenticated** exchange does not close the on-path forgery above
 anyway: an exchange with no key the client already trusts is substituted by exactly that attacker. It would
@@ -803,10 +901,10 @@ demote the adversary from on-path to passive-only and nothing more. A secret the
 closes it, and it needs no new primitive.
 
 **An authenticated exchange is open work, and its price has changed.** Writing X25519 here was roughly 400
-lines of new field arithmetic in a crate with zero dependencies and `overflow-checks` on, whose only
+lines of new field arithmetic in a crate with no dependencies and `overflow-checks` on, whose only
 constant-time groundwork is the ten-line tag compare. That estimate was the answer, and it rested on reading
-the empty `[dependencies]` as a rule. That reading has been settled against — `orbitnet-core` may take a
-**vetted** cryptographic dependency — so an exchange is ordinary work against a reviewed implementation.
+the empty `[dependencies]` as a rule. That reading has been settled against, and the payload cipher above is
+the first dependency taken under it, so an exchange is ordinary work against a reviewed implementation.
 `native/crates/orbitnet-core/Cargo.toml`'s header states what such a dependency has to clear — it ships in
 every export, so a licence, a `THIRD_PARTY.md` row and a reason the hand-written version would be worse are
 all required. **The hand-written SipHash-2-4 stays**: it is already here, already held to constant time by the
@@ -867,8 +965,10 @@ screenshot. It never saw the token.
 **What it does not close on its own**: an on-path observer, who reads the welcome and can then quote the token
 verbatim. That is the same boundary [a key with no secret folded into
 it](#two-secret-regimes-and-which-one-you-are-in) has, and it closes the same way — a **shared session
-secret**. Under one, that observer can still copy the token but cannot confirm the handshake that quotes it,
-so the claim never reaches the resume decision.
+secret**. Under one the welcome is ciphertext, so the token is no longer readable there — though a rejoining
+client still quotes it in a handshake, which is never encrypted. Either way that observer cannot confirm the
+handshake that quotes it, and the claim never reaches the resume decision. **What contains the claim is the
+confirm tag**, and it does so whether or not the token was readable.
 
 **A client stores one token, naming whichever server last issued one.** Joining a second server under the
 same identity replaces it and forfeits the resume on the first. Storing one per server would need a server

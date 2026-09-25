@@ -34,7 +34,9 @@ pub const MAGIC: [u8; 4] = *b"OBNW";
 /// deferred to a later tick instead. That is what stops a crowded fight from stalling a server.
 ///
 /// The frame header and the [`crate::auth::TRAILER_LEN`] authentication trailer both ride ABOVE this
-/// ceiling, so a full datagram is this plus both. The headroom under a 1500-byte path MTU covers it.
+/// ceiling, so a full datagram is this plus both. A session under a secret carries
+/// [`crate::auth::CIPHER_TRAILER_LEN`] instead, eight bytes more, and the payload beneath it is
+/// ciphertext of exactly the same length. The headroom under a 1500-byte path MTU covers either.
 pub const MAX_FRAME_PAYLOAD: usize = 1200;
 
 /// Something went wrong reading or validating a frame.

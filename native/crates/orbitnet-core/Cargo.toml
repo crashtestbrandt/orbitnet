@@ -11,10 +11,10 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # data, so it runs under `cargo test` in milliseconds and can be reused outside Godot. That is the boundary,
 # and it does not move.
 #
-# A vetted cryptographic dependency is allowed here. `[dependencies]` is empty today, and that emptiness
-# describes the crate. It had been read as a rule, and under that reading the only way to add a cipher or a
-# key exchange was to hand-write it. That is settled: an audited implementation is preferred to a
-# hand-written one, and the empty list vetoes nothing.
+# A vetted cryptographic dependency is allowed here. `[dependencies]` held nothing until the payload cipher
+# below, and that emptiness described the crate. It had been read as a rule, and under that reading the only
+# way to add a cipher or a key exchange was to hand-write it. That is settled: an audited implementation is
+# preferred to a hand-written one, and the list vetoes nothing.
 #
 # What that changes. An AEAD or a key exchange is ordinary work against a reviewed implementation, where it
 # used to cost several hundred lines of hand-written constant-time field arithmetic in a crate whose only
@@ -36,11 +36,33 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # That shape generalises to a stream cipher and not to an elliptic curve, which is why it was affordable
 # under the rule and why it does not need replacing now the rule is gone.
 [dependencies]
+# The **payload cipher**: ChaCha20-Poly1305 (RFC 8439), which `auth.rs` runs over every datagram of a
+# session that configured a secret. The first runtime dependency this crate has taken, against the four
+# points above:
+#
+#   * **Licence.** `Apache-2.0 OR MIT`, and so is every one of the thirteen crates it pulls. Their
+#     `THIRD_PARTY.md` rows land in the same commit.
+#   * **Why not hand-written.** An AEAD is a cipher and a universal hash wired together, and the wiring is
+#     where this design fails quietly: a Poly1305 written here would carry its own 130-bit field
+#     arithmetic and its own constant-time tag compare, and a nonce or a length-encoding mistake produces
+#     ciphertext that decrypts correctly at both ends and leaks anyway. The ChaCha20 half is close to the
+#     shape that made SipHash affordable; the Poly1305 half is not, and taking half an AEAD is not an
+#     option. This implementation has been reviewed and carries RFC 8439's own test vectors.
+#   * **The millisecond test run.** Fourteen crates in the runtime tree, no build script, no
+#     proc-macro, no `syn`. Measured cold at about 2 s of the workspace's build; `cargo test
+#     -p orbitnet-core` runs in about 1 s, which is what it ran in before the dependency.
+#   * **The engine boundary.** It names no `godot` type and no `Variant`. Keys and nonces are `[u8; N]`
+#     arrays and the API is a pure function of them.
+#
+# `default-features = false` drops `alloc` and `getrandom`. The in-place, detached-tag API needs neither:
+# the caller supplies the buffer, and every nonce here is derived rather than drawn. That keeps the
+# platform-backend crates `getrandom` would add out of the tree entirely.
+chacha20poly1305 = { version = "0.11", default-features = false }
 
-# The generator behind `tests/wire_properties.rs`, and the ONLY dependency this crate has of any
-# kind. A `[dev-dependencies]` entry is compiled for `cargo test` and for nothing else: it is absent
-# from `cargo build`, from the cdylib `orbitnet-godot` links, and from every release asset, so it changes
-# nothing about what ships. `[dependencies]` is still empty.
+# The generator behind `tests/wire_properties.rs`. A `[dev-dependencies]` entry is compiled for
+# `cargo test` and for nothing else: it is absent from `cargo build`, from the cdylib `orbitnet-godot`
+# links, and from every release asset, so it changes nothing about what ships. It therefore answers for
+# less than the runtime entry above, and `THIRD_PARTY.md` keeps the two trees in separate tables.
 #
 # Default features off. `fork` and `timeout` run each case in a subprocess to survive an abort or a
 # hang; this crate is `#![forbid(unsafe_code)]`, so a failing case panics and `std`'s own

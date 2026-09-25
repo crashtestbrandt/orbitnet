@@ -478,7 +478,10 @@ fn the_tag_compare_is_not_distinguishable_by_timing() {
     let late = wrong_tag(&datagram, TAG_LEN - 1, 0x01);
 
     let mut session = SessionAuth::new(KEY);
-    let mut shipped = |bytes: &[u8]| session.open(Direction::ToServer, bytes).is_ok();
+    // The session carries no cipher, so `open` answers with a slice of the datagram and never writes
+    // here. It is the parameter one signature costs a clear-regime caller, and nothing more.
+    let mut plain: Vec<u8> = Vec::new();
+    let mut shipped = |bytes: &[u8]| session.open(Direction::ToServer, bytes, &mut plain).is_ok();
     let mut leaky = |bytes: &[u8]| leaky_open(&KEY, Direction::ToServer, bytes).is_ok();
 
     println!();
