@@ -20,7 +20,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
-use crate::auth::{confirm_tag, derive_session_key, KEY_LEN};
+use crate::auth::{confirm_tag, derive_session_key, session_nonce, KEY_LEN};
 use crate::columnar::changed_mask;
 use crate::protocol::{protocol_major, PropSchema, PROTOCOL_VERSION};
 use crate::seats::SeatIndex;
@@ -55,9 +55,16 @@ pub enum CodecError {
         /// This peer's version.
         ours: u32,
     },
-    /// The peer's handshake carried no 16-byte session nonce, so nothing it sends afterward can be
+    /// The peer's handshake carried no 16-byte joiner nonce, so nothing it sends afterward can be
     /// authenticated. An older build, or a truncated handshake.
     MissingSessionNonce,
+    /// The peer's handshake quotes no acceptor nonce, so it is not an answer to a [`Challenge`] and
+    /// there is no session nonce to key on.
+    ///
+    /// The joiner's FIRST handshake carries none by definition — it has not been challenged yet — so
+    /// this is refused at [`Handshake::check_compatibility`] and not at [`Handshake::check_hello`],
+    /// which is the check an acceptor runs before it spends a nonce answering.
+    MissingAcceptorNonce,
     /// This peer holds a **session secret** and the remote handshake could not confirm the same one:
     /// its [`Handshake::confirm`] tag is absent, or it is a tag over some other secret.
     ///
@@ -85,6 +92,11 @@ impl fmt::Display for CodecError {
                 f,
                 "OrbitNet handshake carried no session nonce, so no datagram from this peer can be \
                  authenticated. The peer is an older build, or its handshake was truncated."
+            ),
+            CodecError::MissingAcceptorNonce => write!(
+                f,
+                "OrbitNet handshake quoted no acceptor nonce, so it is not an answer to this \
+                 session's challenge. The peer is an older build, or its handshake was truncated."
             ),
             CodecError::SecretMismatch => write!(
                 f,
@@ -121,6 +133,11 @@ pub enum FrameKind {
     Ping = 0x03,
     /// Clock probe reply, server to client. Unreliable.
     Pong = 0x04,
+    /// The acceptor's half of a join's session nonce, server to client. Reliable.
+    ///
+    /// **One of the two datagrams a session does not authenticate**, with the handshake, because the
+    /// two of them together are what establish the key. See [`Challenge`].
+    Challenge = 0x05,
     /// Join reply, server to client. Reliable — carries the tick seed the client starts from.
     Welcome = 0x06,
     /// Entity schema manifest, server to client. Reliable — lets a client validate that its
@@ -153,6 +170,7 @@ impl FrameKind {
             0x02 => Ok(FrameKind::ClientInput),
             0x03 => Ok(FrameKind::Ping),
             0x04 => Ok(FrameKind::Pong),
+            0x05 => Ok(FrameKind::Challenge),
             0x06 => Ok(FrameKind::Welcome),
             0x07 => Ok(FrameKind::EntityManifest),
             0x08 => Ok(FrameKind::EntityManifestDelta),
@@ -589,15 +607,31 @@ impl FrameHeader {
     }
 }
 
-/// The reliable frame a joining peer sends, and the reply it gets.
+/// The reliable frame a joining peer sends — twice, on either side of the acceptor's [`Challenge`].
 ///
-/// **It is the one datagram OrbitNet does not authenticate, because it is what establishes the key
-/// everything else is authenticated with.** [`crate::auth`] states exactly what that buys and what it
-/// does not.
+/// **It and the challenge are the two datagrams OrbitNet does not authenticate, because together they
+/// are what establish the key everything else is authenticated with.** [`crate::auth`] states exactly
+/// what that buys and what it does not.
 ///
-/// Its 16-byte [`Self::session_nonce`] is that key when no session secret is configured, and only a
-/// nonce when one is — in which case [`Self::confirm`] carries the proof that the sender holds the same
-/// secret. The offsets and widths are identical either way; the regime is a local decision.
+/// **A join is two round trips, and this frame is both of the joiner's legs.** Which leg it is is read
+/// off [`Self::acceptor_nonce`]:
+///
+/// | Leg | [`Self::acceptor_nonce`] | [`Self::confirm`] | What the acceptor does with it |
+/// | --- | --- | --- | --- |
+/// | the joiner's opening hello | all zeroes | `0` | [`Self::check_hello`], then answer with a [`Challenge`] |
+/// | the joiner's confirmation | the challenged half, quoted back | the tag, under a secret | [`Self::check_compatibility`], then seat the session |
+///
+/// The key is [`crate::auth::session_nonce`] of the two halves, fed to
+/// [`crate::auth::derive_session_key`] when a session secret is configured and seated verbatim when one
+/// is not. The offsets and widths are identical either way; the regime is a local decision neither end
+/// puts on the wire.
+///
+/// **The confirmation is a whole handshake rather than a smaller frame of its own**, which costs 41
+/// bytes it could have saved on a once-per-join reliable frame. What it buys is that an acceptor stores
+/// nothing about an unconfirmed connection but the two nonce halves: the session identity, the resume
+/// token and the tick rate all arrive again on the leg that actually seats them. A minimal confirm frame
+/// would make the acceptor stash those off the opening hello — per-connection state allocated for a peer
+/// that has proved nothing, which is what a replayed join would then be spending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Handshake {
     /// The sender's packed protocol version.
@@ -615,24 +649,19 @@ pub struct Handshake {
     /// it is adequate for is the thing it exists for: a player whose link dropped getting their own entity
     /// back instead of a stranger's.
     pub session_id: u64,
-    /// The 16 bytes this session's key is **taken from or derived with**, minted fresh by the joining
-    /// peer on every join and carried in the clear.
+    /// The **joiner's half** of this join's session nonce: 16 bytes minted fresh by the joining peer on
+    /// every join and carried in the clear.
     ///
-    /// It is one field with two regimes, and which one is in force is a local decision neither end
-    /// puts on the wire:
+    /// It is half of the key's input under both regimes. [`crate::auth::session_nonce`] folds it with
+    /// [`Self::acceptor_nonce`], and what comes out is the key itself with no session secret
+    /// configured, and the nonce [`crate::auth::derive_session_key`] folds the secret into with one.
     ///
-    /// | Regime | What these bytes are | What an on-path observer learns |
-    /// | --- | --- | --- |
-    /// | no session secret configured | the session key itself | everything the client knows |
-    /// | a session secret configured | a **nonce**, fed with the secret to [`crate::auth::derive_session_key`] | the nonce, and nothing else |
+    /// **A fresh draw per join** is what keeps sequence numbers from restarting under a key an observer
+    /// already has. The acceptor's half is what stops a replayed draw being enough; see [`Challenge`].
     ///
-    /// It is named for the nonce because that is the role that survives both regimes: a fresh draw per
-    /// join, which is what keeps sequence numbers from restarting under a key an observer already has.
-    ///
-    /// All zeroes is refused by [`Handshake::check_compatibility`] under either regime: it is what a
-    /// peer that sent no bytes at all decodes to, and under a secret it is also the one nonce a lazy
-    /// caller would reuse across joins.
-    pub session_nonce: [u8; KEY_LEN],
+    /// All zeroes is refused by [`Handshake::check_hello`] under either regime: it is what a peer that
+    /// sent no bytes at all decodes to, and it is also the one value a lazy caller would reuse.
+    pub joiner_nonce: [u8; KEY_LEN],
     /// The **server-minted resume token** this peer was handed the last time it presented
     /// [`Self::session_id`], quoted back to prove the identity is its own. `0` quotes none.
     ///
@@ -645,30 +674,48 @@ pub struct Handshake {
     /// kill feed, a log line, a screenshot — cannot take that player's body, because it never saw the token.
     ///
     /// **What it does not close**: an on-path observer, who reads the welcome and can then quote the token
-    /// verbatim. That is the same boundary [`Self::session_nonce`] already has under a session with no
+    /// verbatim. That is the same boundary [`Self::joiner_nonce`] already has under a session with no
     /// secret, and closing it needs a secret both ends already hold.
     ///
     /// The client persists it BESIDE the session id. A process that stored one and not the other presents a
     /// `0` here and is seated as a newcomer.
     pub resume_token: u64,
-    /// Proof the sender holds this session's **shared secret**: [`crate::auth::confirm_tag`] over
-    /// [`Self::session_nonce`] and [`Self::protocol_version`], under the key the secret derives. `0` is
-    /// the absent value and means "this peer configured no secret".
+    /// The **acceptor's half** of this join's session nonce, quoted back off the [`Challenge`] that
+    /// carried it. All zeroes means "this handshake has not been challenged yet".
     ///
-    /// **A trailing, optional field.** It is what turns the one signalable misconfiguration into a
-    /// readable rejection at the handshake instead of a session that silently drops every datagram;
-    /// [`Handshake::check_compatibility`] is where that refusal happens.
+    /// **It is what makes a recorded join unreplayable.** The joiner does not choose it, so an observer
+    /// presenting a recorded [`Self::joiner_nonce`] supplies half of a nonce whose other half the
+    /// acceptor is about to draw fresh — and the session that comes out is keyed on bytes the observer
+    /// never saw. Under protocol major 8 the nonce was the joiner's alone and that replay was admitted.
+    ///
+    /// **A trailing, optional field, and the one the acceptor reads to tell the two legs apart.** All
+    /// zeroes is the opening hello, which is answered with a challenge rather than seated; anything else
+    /// is a confirmation, and the acceptor compares it against the half it actually issued.
+    pub acceptor_nonce: [u8; KEY_LEN],
+    /// Proof the sender holds this session's **shared secret**: [`crate::auth::confirm_tag`] over this
+    /// join's folded [`crate::auth::session_nonce`] and [`Self::protocol_version`], under the key that
+    /// nonce and the secret derive. `0` is the absent value and means "this peer configured no secret".
+    ///
+    /// **A trailing, optional field, and the last one on the frame.** It is what turns the one
+    /// signalable misconfiguration into a readable rejection at the handshake instead of a session that
+    /// silently drops every datagram; [`Handshake::check_compatibility`] is where that refusal happens.
+    ///
+    /// **It cannot be produced until the challenge has landed**, because the key it is taken under
+    /// depends on both halves. That is why it rides the joiner's second leg and the opening hello
+    /// carries `0`.
     ///
     /// **It proves possession of the secret, not identity.** Everyone the game handed the secret to can
-    /// produce a valid tag over any nonce they like, and the pair `(nonce, confirm)` is in the clear, so
-    /// an on-path observer can copy it. What that observer still cannot do is derive the key — which is
-    /// the whole of what a secret buys.
+    /// produce a valid tag over any nonce they are challenged with, and the pair is in the clear, so an
+    /// on-path observer can copy it — into a join whose acceptor half is different, where it recomputes
+    /// against nothing. What that observer still cannot do is derive the key, which is the whole of what
+    /// a secret buys.
     pub confirm: u64,
 }
 
 impl Handshake {
-    /// Build a handshake for this build at `tickrate`. Carries no session identity, no nonce, no resume
-    /// token and no confirmation; see [`Handshake::with_session`], [`Handshake::with_nonce`],
+    /// Build a handshake for this build at `tickrate`. Carries no session identity, neither nonce, no
+    /// resume token and no confirmation; see [`Handshake::with_session`],
+    /// [`Handshake::with_joiner_nonce`], [`Handshake::with_acceptor_nonce`],
     /// [`Handshake::with_resume_token`] and [`Handshake::with_confirm`].
     #[must_use]
     pub fn local(tickrate: u16) -> Self {
@@ -676,8 +723,9 @@ impl Handshake {
             protocol_version: PROTOCOL_VERSION,
             tickrate,
             session_id: 0,
-            session_nonce: [0; KEY_LEN],
+            joiner_nonce: [0; KEY_LEN],
             resume_token: 0,
+            acceptor_nonce: [0; KEY_LEN],
             confirm: 0,
         }
     }
@@ -689,11 +737,20 @@ impl Handshake {
         self
     }
 
-    /// The same handshake, carrying the session nonce — which is the session key itself when no secret
-    /// is configured. See [`Self::session_nonce`] for the two regimes.
+    /// The same handshake, carrying the joiner's half of this join's session nonce.
     #[must_use]
-    pub fn with_nonce(mut self, session_nonce: [u8; KEY_LEN]) -> Self {
-        self.session_nonce = session_nonce;
+    pub fn with_joiner_nonce(mut self, joiner_nonce: [u8; KEY_LEN]) -> Self {
+        self.joiner_nonce = joiner_nonce;
+        self
+    }
+
+    /// The same handshake, quoting back the acceptor's half off the [`Challenge`] that carried it.
+    ///
+    /// This is what turns an opening hello into a confirmation, so a caller sets it and the
+    /// confirmation together or sets neither.
+    #[must_use]
+    pub fn with_acceptor_nonce(mut self, acceptor_nonce: [u8; KEY_LEN]) -> Self {
+        self.acceptor_nonce = acceptor_nonce;
         self
     }
 
@@ -706,9 +763,10 @@ impl Handshake {
 
     /// The same handshake, proving possession of the session secret. `0` proves none.
     ///
-    /// The tag is [`crate::auth::confirm_tag`] over [`Self::session_nonce`] and this handshake's own
-    /// [`Self::protocol_version`], under [`crate::auth::derive_session_key`]'s output — so a caller
-    /// builds the rest of the handshake first and tags the version it is actually sending.
+    /// The tag is [`crate::auth::confirm_tag`] over this join's folded
+    /// [`crate::auth::session_nonce`] and this handshake's own [`Self::protocol_version`], under
+    /// [`crate::auth::derive_session_key`]'s output — so a caller builds the rest of the handshake
+    /// first and tags the version it is actually sending.
     #[must_use]
     pub fn with_confirm(mut self, confirm: u64) -> Self {
         self.confirm = confirm;
@@ -718,13 +776,14 @@ impl Handshake {
     /// Encode, including the leading magic.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(MAGIC.len() + 30 + KEY_LEN);
+        let mut writer = Writer::with_capacity(MAGIC.len() + 30 + 2 * KEY_LEN);
         writer.bytes(&MAGIC);
         writer.u32(self.protocol_version);
         writer.u16(self.tickrate);
         writer.u64(self.session_id);
-        writer.bytes(&self.session_nonce);
+        writer.bytes(&self.joiner_nonce);
         writer.u64(self.resume_token);
+        writer.bytes(&self.acceptor_nonce);
         writer.u64(self.confirm);
         writer.into_inner()
     }
@@ -732,15 +791,17 @@ impl Handshake {
     /// Decode, validating the magic.
     ///
     /// **Everything after the protocol version decodes best-effort**, to a zero tick rate, no session
-    /// identity, an all-zero nonce, a `0` resume token and a `0` confirmation. That is not laxity:
+    /// identity, two all-zero nonces, a `0` resume token and a `0` confirmation. That is not laxity:
     /// `handle_hello` answers a decode error by returning, so a peer whose handshake is short — an older
     /// build, a truncated frame — would be dropped in silence with no rejection message at all. Decoding
     /// it far enough to reach [`Handshake::check_compatibility`] is what produces the operator-readable
     /// version mismatch, and the same check refuses the all-zero nonce a short handshake leaves behind.
     ///
     /// A `0` [`Self::resume_token`] is the absent value and is refused a resume, not a decode: quoting no
-    /// token is what a first-time joiner does. A `0` [`Self::confirm`] is refused nothing either, unless
-    /// the reading peer holds a secret — see [`Handshake::check_compatibility`].
+    /// token is what a first-time joiner does. An all-zero [`Self::acceptor_nonce`] is the absent value
+    /// too, and it is what an opening hello carries by definition. A `0` [`Self::confirm`] is refused
+    /// nothing either, unless the reading peer holds a secret — see
+    /// [`Handshake::check_compatibility`].
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(buf);
         if reader.bytes(MAGIC.len())? != MAGIC {
@@ -749,46 +810,79 @@ impl Handshake {
         let protocol_version = reader.u32()?;
         let tickrate = reader.u16().unwrap_or(0);
         let session_id = reader.u64().unwrap_or(0);
-        let mut session_nonce = [0u8; KEY_LEN];
+        let mut joiner_nonce = [0u8; KEY_LEN];
         if let Ok(bytes) = reader.bytes(KEY_LEN) {
-            session_nonce.copy_from_slice(bytes);
+            joiner_nonce.copy_from_slice(bytes);
         }
         let resume_token = reader.u64().unwrap_or(0);
+        let mut acceptor_nonce = [0u8; KEY_LEN];
+        if let Ok(bytes) = reader.bytes(KEY_LEN) {
+            acceptor_nonce.copy_from_slice(bytes);
+        }
         let confirm = reader.u64().unwrap_or(0);
         Ok(Self {
             protocol_version,
             tickrate,
             session_id,
-            session_nonce,
+            joiner_nonce,
             resume_token,
+            acceptor_nonce,
             confirm,
         })
     }
 
-    /// Check a remote handshake against ours, under the session secret this peer holds (`None` for a
-    /// peer that holds none).
+    /// Check a remote OPENING HELLO — everything an acceptor can decide before it has challenged the
+    /// peer, and therefore everything it decides before spending a nonce and a datagram on one.
     ///
-    /// Three rules, in the order an operator can act on them:
+    /// Two rules, in the order an operator can act on them:
     ///
     /// 1. **Protocol major must match exactly.** Reported first, because a peer one major behind by
-    ///    definition sends nothing else this build can read.
-    /// 2. **The remote must carry a non-zero [`Self::session_nonce`].** All zeroes is what a peer that sent
-    ///    none decodes to, and under a secret it is also the one nonce that would repeat across joins.
-    /// 3. **A peer holding a secret must see a [`Self::confirm`] tag over that secret.** `secret` is the
-    ///    already-folded 16 bytes from [`crate::auth::compress_secret`]; the tag is recomputed from the
-    ///    remote's own nonce and version and compared.
+    ///    definition sends nothing else this build can read. There is no negotiation and none is
+    ///    planned: a mixed-major session has no shape either end could agree on, so the answer to a
+    ///    gap is a named rejection rather than a fallback.
+    /// 2. **The remote must carry a non-zero [`Self::joiner_nonce`].** All zeroes is what a peer that
+    ///    sent none decodes to, and it is also the one value a lazy caller would reuse across joins.
     ///
     /// A differing tick rate is deliberately *not* an error — it is a policy decision for the caller,
     /// since some games legitimately let peers run at different rates. Nor is a differing session
     /// identity: every client mints its own.
     ///
-    /// **[`Handshake::resume_token`] is not checked here either.** A wrong or absent token costs the peer its
-    /// resume and nothing more: it is seated as a newcomer. Every honest first-time joiner quotes `0`, so
-    /// refusing the connection over the token would lock all of them out.
+    /// **[`Handshake::resume_token`] is not checked here or below.** A wrong or absent token costs the
+    /// peer its resume and nothing more: it is seated as a newcomer. Every honest first-time joiner
+    /// quotes `0`, so refusing the connection over the token would lock all of them out.
     ///
-    /// **The nonce and the confirmation are checked on `remote` only.** The local handshake in this call is
-    /// a version reference built by [`Handshake::local`], and the accepting side mints neither — a
-    /// session's nonce is the joiner's.
+    /// **Everything is checked on `remote` only.** The local handshake in this call is a version
+    /// reference built by [`Handshake::local`] and carries no nonce of its own.
+    pub fn check_hello(&self, remote: &Handshake) -> Result<(), CodecError> {
+        if protocol_major(remote.protocol_version) != protocol_major(self.protocol_version) {
+            return Err(CodecError::ProtocolMismatch {
+                theirs: remote.protocol_version,
+                ours: self.protocol_version,
+            });
+        }
+        if remote.joiner_nonce == [0u8; KEY_LEN] {
+            return Err(CodecError::MissingSessionNonce);
+        }
+        Ok(())
+    }
+
+    /// Check a remote CONFIRMATION against ours, under the session secret this peer holds (`None` for a
+    /// peer that holds none). This is the check in front of seating a session.
+    ///
+    /// [`Self::check_hello`]'s two rules, then two more:
+    ///
+    /// 3. **The remote must quote a non-zero [`Self::acceptor_nonce`].** All zeroes is an opening hello,
+    ///    which is answered with a [`Challenge`] rather than seated. An acceptor that tracks which half
+    ///    it issued compares against that instead, and this rule is what is left for a caller that does
+    ///    not.
+    /// 4. **A peer holding a secret must see a [`Self::confirm`] tag over that secret.** `secret` is the
+    ///    already-folded 16 bytes from [`crate::auth::compress_secret`]; the tag is recomputed from the
+    ///    [`crate::auth::session_nonce`] of the remote's two halves and its version, and compared.
+    ///
+    /// **Rule 4 reads both halves, which is what refuses a replayed join.** A confirmation captured off
+    /// a recorded join is a tag over that join's folded nonce, and the acceptor's half of this one was
+    /// drawn fresh — so it recomputes against nothing and the join is refused by name, before a session
+    /// slot is spent on it.
     ///
     /// **Only one direction of a secret misconfiguration is reportable, and this is it.** A peer holding a
     /// secret against a joiner holding none refuses the join here, with a message that says so, instead of
@@ -805,18 +899,14 @@ impl Handshake {
         remote: &Handshake,
         secret: Option<&[u8; KEY_LEN]>,
     ) -> Result<(), CodecError> {
-        if protocol_major(remote.protocol_version) != protocol_major(self.protocol_version) {
-            return Err(CodecError::ProtocolMismatch {
-                theirs: remote.protocol_version,
-                ours: self.protocol_version,
-            });
-        }
-        if remote.session_nonce == [0u8; KEY_LEN] {
-            return Err(CodecError::MissingSessionNonce);
+        self.check_hello(remote)?;
+        if remote.acceptor_nonce == [0u8; KEY_LEN] {
+            return Err(CodecError::MissingAcceptorNonce);
         }
         if let Some(secret) = secret {
-            let key = derive_session_key(secret, &remote.session_nonce);
-            let expected = confirm_tag(&key, &remote.session_nonce, remote.protocol_version);
+            let nonce = session_nonce(&remote.joiner_nonce, &remote.acceptor_nonce);
+            let key = derive_session_key(secret, &nonce);
+            let expected = confirm_tag(&key, &nonce, remote.protocol_version);
             // XOR then one test against zero, so nothing branches on the tag's CONTENTS — the same
             // property `crate::auth` folds a difference down for on the receive path. A comparison that
             // returned at the first differing byte would leak how much of a guessed tag was right.
@@ -825,6 +915,69 @@ impl Handshake {
             }
         }
         Ok(())
+    }
+}
+
+/// The acceptor's half of a join's session nonce, sent in answer to an opening [`Handshake`].
+///
+/// **It is the second of the two datagrams a session does not authenticate.** It cannot be: the key it
+/// would be sealed under is derived from the very bytes it carries, so a joiner could not open it
+/// without already holding them.
+///
+/// ```text
+/// frame kind 0x05 | joiner nonce echoed (16) | acceptor nonce (16)
+/// ```
+///
+/// **The acceptor's half is drawn per join, and that is what refuses a replayed one.** An observer
+/// presenting a recorded handshake supplies [`Handshake::joiner_nonce`] and nothing else; the acceptor
+/// answers with a half it has just drawn, and the session the pair derives is keyed on bytes the
+/// observer never saw. It cannot produce the confirmation that half demands either — see
+/// [`Handshake::check_compatibility`] — so the join is refused rather than merely useless.
+///
+/// **[`Self::joiner_nonce`] is echoed so the joiner can tell this challenge from a stale one.** A
+/// client that restarted its session on a live connection has a challenge for the PREVIOUS join
+/// possibly still in flight; adopting it would derive a key the acceptor does not hold, and the join
+/// would only converge on a retry. Sixteen bytes on a once-per-join frame buy that away.
+///
+/// **A retried hello is answered with the SAME half, not a fresh one.** The alternative deadlocks a
+/// lossy join: a re-minted half refuses the confirmation the joiner is already sending against the
+/// first, which provokes another hello, and the two ends chase each other. Re-sending what was issued
+/// costs nothing, because the half is bound to one connection and one [`Handshake::joiner_nonce`]
+/// already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Challenge {
+    /// The [`Handshake::joiner_nonce`] this challenge answers, echoed verbatim.
+    pub joiner_nonce: [u8; KEY_LEN],
+    /// The acceptor's half of the session nonce, drawn fresh for this join.
+    pub acceptor_nonce: [u8; KEY_LEN],
+}
+
+impl Challenge {
+    /// Encode, with the frame kind tag leading.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::with_capacity(1 + 2 * KEY_LEN);
+        writer.u8(FrameKind::Challenge.tag());
+        writer.bytes(&self.joiner_nonce);
+        writer.bytes(&self.acceptor_nonce);
+        writer.into_inner()
+    }
+
+    /// Decode the payload after the kind tag has been consumed.
+    ///
+    /// **Neither field decodes best-effort.** Both are required, unlike the handshake's trailing options:
+    /// reading a short challenge as all-zero bytes would have the joiner derive a key off a field that was
+    /// never sent, and then fail every tag with nothing to say why. A joiner answers the error by waiting
+    /// for its own handshake retry, which is the same recovery a lost challenge gets.
+    pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
+        let mut joiner_nonce = [0u8; KEY_LEN];
+        joiner_nonce.copy_from_slice(reader.bytes(KEY_LEN)?);
+        let mut acceptor_nonce = [0u8; KEY_LEN];
+        acceptor_nonce.copy_from_slice(reader.bytes(KEY_LEN)?);
+        Ok(Self {
+            joiner_nonce,
+            acceptor_nonce,
+        })
     }
 }
 
@@ -1902,10 +2055,17 @@ mod tests {
         );
     }
 
-    /// The 16 bytes a handshake carries. The session key itself under no secret, a nonce under one.
+    /// The joiner's half of a join's session nonce, as its handshake carries it.
     const TEST_NONCE: [u8; KEY_LEN] = [
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
         0x01,
+    ];
+
+    /// The acceptor's half, as its challenge carries it. Distinct from [`TEST_NONCE`] so a fold that
+    /// ignored one of its two arguments cannot pass anything below.
+    const TEST_ACCEPTOR: [u8; KEY_LEN] = [
+        0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+        0x39,
     ];
 
     /// A secret as a game would distribute it, already folded to the 16 bytes the derivation keys on.
@@ -1913,32 +2073,99 @@ mod tests {
         crate::auth::compress_secret(b"a secret the lobby handed both ends")
     }
 
-    /// The handshake a joiner holding `secret` sends over `nonce`: the nonce in the clear, and the
-    /// confirmation over the key it derives. The two lines every caller of this scheme writes.
-    fn hello_under(secret: &[u8; KEY_LEN], nonce: [u8; KEY_LEN]) -> Handshake {
-        let hello = Handshake::local(60).with_nonce(nonce);
+    /// A joiner's OPENING hello: its own half, no acceptor half, no confirmation.
+    fn hello(joiner: [u8; KEY_LEN]) -> Handshake {
+        Handshake::local(60).with_joiner_nonce(joiner)
+    }
+
+    /// The CONFIRMATION a joiner holding `secret` sends once it has been challenged: both halves in the
+    /// clear, and a tag over the key their fold derives. The three lines every caller of this scheme
+    /// writes.
+    fn confirmation_under(
+        secret: &[u8; KEY_LEN],
+        joiner: [u8; KEY_LEN],
+        acceptor: [u8; KEY_LEN],
+    ) -> Handshake {
+        let hello = hello(joiner).with_acceptor_nonce(acceptor);
+        let nonce = session_nonce(&joiner, &acceptor);
         let key = derive_session_key(secret, &nonce);
         hello.with_confirm(confirm_tag(&key, &nonce, hello.protocol_version))
     }
 
+    /// The same, for a joiner holding no secret: both halves and a `0` confirmation.
+    fn confirmation(joiner: [u8; KEY_LEN], acceptor: [u8; KEY_LEN]) -> Handshake {
+        hello(joiner).with_acceptor_nonce(acceptor)
+    }
+
     #[test]
     fn handshake_round_trips() {
-        let hello = Handshake::local(60).with_nonce(TEST_NONCE);
-        let decoded = Handshake::decode(&hello.encode()).unwrap();
-        assert_eq!(decoded, hello);
+        let opening = hello(TEST_NONCE);
+        let decoded = Handshake::decode(&opening.encode()).unwrap();
+        assert_eq!(decoded, opening);
         assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(decoded.session_nonce, TEST_NONCE);
+        assert_eq!(decoded.joiner_nonce, TEST_NONCE);
+        assert_eq!(
+            decoded.acceptor_nonce, [0u8; KEY_LEN],
+            "an opening hello has not been challenged yet"
+        );
         assert_eq!(decoded.confirm, 0, "a peer with no secret confirms nothing");
+    }
+
+    /// The joiner's second leg round-trips both halves. The acceptor compares the echoed half against
+    /// the one it issued, so any transformation on the way through refuses every honest joiner.
+    #[test]
+    fn a_confirming_handshake_carries_both_halves_verbatim() {
+        let confirming = confirmation(TEST_NONCE, TEST_ACCEPTOR).with_session(9);
+        let decoded = Handshake::decode(&confirming.encode()).unwrap();
+        assert_eq!(decoded, confirming);
+        assert_eq!(decoded.joiner_nonce, TEST_NONCE);
+        assert_eq!(decoded.acceptor_nonce, TEST_ACCEPTOR);
+    }
+
+    /// The challenge is the acceptor's whole contribution, and both of its fields are load-bearing:
+    /// the echo tells a joiner this challenge is for the join it is in, and the half is what the key
+    /// folds in.
+    #[test]
+    fn a_challenge_round_trips() {
+        let challenge = Challenge {
+            joiner_nonce: TEST_NONCE,
+            acceptor_nonce: TEST_ACCEPTOR,
+        };
+        let bytes = challenge.encode();
+        assert_eq!(bytes.len(), 1 + 2 * KEY_LEN, "kind byte then two halves");
+        assert_eq!(bytes[0], FrameKind::Challenge.tag());
+        assert_eq!(FrameKind::from_tag(bytes[0]), Ok(FrameKind::Challenge));
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(reader.u8(), Ok(FrameKind::Challenge.tag()));
+        assert_eq!(Challenge::decode(&mut reader), Ok(challenge));
+    }
+
+    /// NEITHER HALF DECODES BEST-EFFORT. A short challenge read as all-zero bytes would have the joiner
+    /// derive its key off a field that was never sent, and then fail every tag with nothing to say why.
+    /// The joiner answers the error by waiting for its own handshake retry.
+    #[test]
+    fn a_truncated_challenge_is_an_error_rather_than_a_zero_half() {
+        let bytes = Challenge {
+            joiner_nonce: TEST_NONCE,
+            acceptor_nonce: TEST_ACCEPTOR,
+        }
+        .encode();
+        for keep in 1..bytes.len() {
+            let mut reader = Reader::new(&bytes[1..keep]);
+            assert_eq!(
+                Challenge::decode(&mut reader),
+                Err(CodecError::UnexpectedEof),
+                "keep {keep}"
+            );
+        }
     }
 
     #[test]
     fn handshake_carries_a_session_identity_verbatim() {
-        let hello = Handshake::local(60)
-            .with_session(0xdead_beef_c0de_1234)
-            .with_nonce(TEST_NONCE);
-        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        let opening = hello(TEST_NONCE).with_session(0xdead_beef_c0de_1234);
+        let decoded = Handshake::decode(&opening.encode()).unwrap();
         assert_eq!(decoded.session_id, 0xdead_beef_c0de_1234);
-        assert_eq!(decoded, hello);
+        assert_eq!(decoded, opening);
     }
 
     /// The resume token rides the handshake verbatim, all 64 bits of it. It is compared for equality
@@ -1946,15 +2173,14 @@ mod tests {
     /// way through — a truncation to 32 bits, a sign extension — turns every honest resume into a refusal.
     #[test]
     fn handshake_carries_a_resume_token_verbatim() {
-        let hello = Handshake::local(60)
+        let opening = hello(TEST_NONCE)
             .with_session(0xdead_beef_c0de_1234)
-            .with_nonce(TEST_NONCE)
             .with_resume_token(0xfeed_face_dead_c0de);
-        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        let decoded = Handshake::decode(&opening.encode()).unwrap();
         assert_eq!(decoded.resume_token, 0xfeed_face_dead_c0de);
-        assert_eq!(decoded, hello);
+        assert_eq!(decoded, opening);
         assert_eq!(
-            Handshake::decode(&Handshake::local(60).with_nonce(TEST_NONCE).encode())
+            Handshake::decode(&hello(TEST_NONCE).encode())
                 .unwrap()
                 .resume_token,
             0,
@@ -1968,35 +2194,45 @@ mod tests {
     #[test]
     fn handshake_carries_a_confirm_tag_verbatim() {
         let secret = test_secret();
-        let hello = hello_under(&secret, TEST_NONCE).with_session(9);
-        let decoded = Handshake::decode(&hello.encode()).unwrap();
-        assert_eq!(decoded, hello);
+        let confirming = confirmation_under(&secret, TEST_NONCE, TEST_ACCEPTOR).with_session(9);
+        let decoded = Handshake::decode(&confirming.encode()).unwrap();
+        assert_eq!(decoded, confirming);
+        let nonce = session_nonce(&TEST_NONCE, &TEST_ACCEPTOR);
         assert_eq!(
             decoded.confirm,
             confirm_tag(
-                &derive_session_key(&secret, &TEST_NONCE),
-                &TEST_NONCE,
+                &derive_session_key(&secret, &nonce),
+                &nonce,
                 PROTOCOL_VERSION
             )
         );
         assert_ne!(decoded.confirm, 0, "a held secret produces a real tag");
     }
 
-    /// The 16-byte field kept its offset and its width when it became a nonce, so the frame grew by
-    /// exactly the trailing confirmation and nothing moved.
+    /// Every field at its declared width in its declared order, and the acceptor's half appended after
+    /// the resume token so the confirmation stays the last field on the frame.
     #[test]
     fn the_handshake_layout_is_the_declared_widths_in_the_declared_order() {
-        let bytes = hello_under(&test_secret(), TEST_NONCE)
+        let bytes = confirmation_under(&test_secret(), TEST_NONCE, TEST_ACCEPTOR)
             .with_session(7)
             .with_resume_token(11)
             .encode();
-        assert_eq!(bytes.len(), MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8 + 8);
+        assert_eq!(
+            bytes.len(),
+            MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8 + KEY_LEN + 8
+        );
         let nonce_at = MAGIC.len() + 4 + 2 + 8;
         assert_eq!(&bytes[nonce_at..nonce_at + KEY_LEN], &TEST_NONCE[..]);
         assert_eq!(
             &bytes[nonce_at + KEY_LEN..nonce_at + KEY_LEN + 8],
             &11u64.to_le_bytes()[..],
-            "the resume token still sits directly after the 16 bytes"
+            "the resume token still sits directly after the joiner's half"
+        );
+        let acceptor_at = nonce_at + KEY_LEN + 8;
+        assert_eq!(
+            &bytes[acceptor_at..acceptor_at + KEY_LEN],
+            &TEST_ACCEPTOR[..],
+            "and the acceptor's half directly after the token"
         );
     }
 
@@ -2005,16 +2241,16 @@ mod tests {
     /// silence instead of being seated as the newcomer a tokenless hello describes.
     #[test]
     fn a_handshake_truncated_before_its_resume_token_decodes_to_no_token() {
-        let full = Handshake::local(60)
+        let full = hello(TEST_NONCE)
             .with_session(7)
-            .with_nonce(TEST_NONCE)
             .with_resume_token(0x0123_4567_89ab_cdef);
         let bytes = full.encode();
-        for keep in (bytes.len() - 16)..(bytes.len() - 8) {
+        let token_end = MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8;
+        for keep in (token_end - 8)..token_end {
             let decoded = Handshake::decode(&bytes[..keep]).unwrap();
             assert_eq!(decoded.resume_token, 0, "keep {keep}");
             assert_eq!(
-                decoded.session_nonce, TEST_NONCE,
+                decoded.joiner_nonce, TEST_NONCE,
                 "and every field before it survives, keep {keep}"
             );
         }
@@ -2025,12 +2261,50 @@ mod tests {
         );
     }
 
+    /// The acceptor's half is a trailing field too, and a frame that stops before it decodes to all
+    /// zeroes — which is the OPENING hello an acceptor answers with a challenge. That is what the
+    /// joiner's first leg actually sends, so the absent value has to be the one the acceptor reads as
+    /// "not challenged yet" rather than a decode error.
+    #[test]
+    fn a_handshake_truncated_before_its_acceptor_nonce_decodes_to_an_opening_hello() {
+        let full = confirmation(TEST_NONCE, TEST_ACCEPTOR)
+            .with_session(7)
+            .with_resume_token(0x0123_4567_89ab_cdef);
+        let bytes = full.encode();
+        let acceptor_at = MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8;
+        for keep in acceptor_at..(acceptor_at + KEY_LEN) {
+            let decoded = Handshake::decode(&bytes[..keep]).unwrap();
+            assert_eq!(decoded.acceptor_nonce, [0u8; KEY_LEN], "keep {keep}");
+            assert_eq!(
+                decoded.resume_token, 0x0123_4567_89ab_cdef,
+                "and the field before it survives, keep {keep}"
+            );
+            assert_eq!(
+                Handshake::local(60).check_hello(&decoded),
+                Ok(()),
+                "an opening hello is answered with a challenge, keep {keep}"
+            );
+            assert_eq!(
+                Handshake::local(60)
+                    .check_compatibility(&decoded, None)
+                    .unwrap_err(),
+                CodecError::MissingAcceptorNonce,
+                "and is not seated as one, keep {keep}"
+            );
+        }
+        assert_eq!(
+            Handshake::decode(&bytes).unwrap().acceptor_nonce,
+            TEST_ACCEPTOR,
+            "the untruncated frame still carries it"
+        );
+    }
+
     /// The confirmation is the newest trailing field and decodes to `0` — "this peer configured no
     /// secret" — when it is absent. `0` is refused nothing by a peer that holds no secret either, which is
     /// what keeps a session with no secret configured on exactly the path it was on before.
     #[test]
     fn a_handshake_truncated_before_its_confirm_tag_decodes_to_no_confirmation() {
-        let full = hello_under(&test_secret(), TEST_NONCE)
+        let full = confirmation_under(&test_secret(), TEST_NONCE, TEST_ACCEPTOR)
             .with_session(7)
             .with_resume_token(0x0123_4567_89ab_cdef);
         let bytes = full.encode();
@@ -2038,7 +2312,7 @@ mod tests {
             let decoded = Handshake::decode(&bytes[..keep]).unwrap();
             assert_eq!(decoded.confirm, 0, "keep {keep}");
             assert_eq!(
-                decoded.resume_token, 0x0123_4567_89ab_cdef,
+                decoded.acceptor_nonce, TEST_ACCEPTOR,
                 "and the field before it survives, keep {keep}"
             );
             assert!(
@@ -2060,31 +2334,27 @@ mod tests {
     /// the shape an older build's handshake arrives in.
     #[test]
     fn a_truncated_handshake_decodes_far_enough_to_be_rejected_readably() {
-        let full = Handshake::local(60)
+        let full = hello(TEST_NONCE)
             .with_session(7)
-            .with_nonce(TEST_NONCE)
             .with_resume_token(0x0123_4567_89ab_cdef);
         let bytes = full.encode();
-        // The last byte of the session nonce. Everything short of this leaves an all-zero nonce behind,
-        // which is what `check_compatibility` refuses by name; past it only the trailing resume token and
-        // confirmation are lost, and those cost a resume and a secret check rather than the connection.
+        // The last byte of the joiner's half. Everything short of this leaves an all-zero half behind,
+        // which is what `check_hello` refuses by name; past it only the trailing resume token is lost,
+        // and that costs a resume rather than the connection.
         let nonce_end = MAGIC.len() + 4 + 2 + 8 + KEY_LEN;
         for keep in 8..nonce_end {
             let decoded = Handshake::decode(&bytes[..keep]).unwrap();
             assert_eq!(decoded.protocol_version, PROTOCOL_VERSION, "keep {keep}");
-            let err = Handshake::local(60)
-                .check_compatibility(&decoded, None)
-                .unwrap_err();
+            let err = Handshake::local(60).check_hello(&decoded).unwrap_err();
             assert_eq!(err, CodecError::MissingSessionNonce, "keep {keep}");
             assert!(err.to_string().contains("session nonce"), "{err}");
         }
         for keep in nonce_end..bytes.len() {
             let decoded = Handshake::decode(&bytes[..keep]).unwrap();
-            assert!(
-                Handshake::local(60)
-                    .check_compatibility(&decoded, None)
-                    .is_ok(),
-                "a hello short only of its trailing fields is compatible, keep {keep}"
+            assert_eq!(
+                Handshake::local(60).check_hello(&decoded),
+                Ok(()),
+                "a hello short only of its trailing fields is answered with a challenge, keep {keep}"
             );
             let expected_token = if keep >= nonce_end + 8 {
                 0x0123_4567_89ab_cdef
@@ -2096,9 +2366,10 @@ mod tests {
                 "each trailing field survives exactly its own bytes, keep {keep}"
             );
             assert_eq!(
-                decoded.confirm, 0,
-                "and none of these reach it, keep {keep}"
+                decoded.acceptor_nonce, [0u8; KEY_LEN],
+                "and none of these reach the acceptor half, keep {keep}"
             );
+            assert_eq!(decoded.confirm, 0, "nor the confirmation, keep {keep}");
         }
     }
 
@@ -2106,14 +2377,14 @@ mod tests {
     /// which is what lets every client mint its own.
     #[test]
     fn a_differing_session_identity_is_not_an_incompatibility() {
-        let ours = Handshake::local(60).with_session(1).with_nonce(TEST_NONCE);
-        let theirs = Handshake::local(60).with_session(2).with_nonce(TEST_NONCE);
+        let ours = hello(TEST_NONCE).with_session(1);
+        let theirs = confirmation(TEST_NONCE, TEST_ACCEPTOR).with_session(2);
         assert!(ours.check_compatibility(&theirs, None).is_ok());
     }
 
     #[test]
     fn handshake_rejects_bad_magic() {
-        let mut bytes = Handshake::local(60).with_nonce(TEST_NONCE).encode();
+        let mut bytes = hello(TEST_NONCE).encode();
         bytes[0] = b'X';
         assert_eq!(Handshake::decode(&bytes), Err(CodecError::BadMagic));
     }
@@ -2121,8 +2392,10 @@ mod tests {
     #[test]
     fn handshake_accepts_a_matching_peer() {
         let ours = Handshake::local(60);
-        let theirs = Handshake::local(60).with_nonce(TEST_NONCE);
-        assert!(ours.check_compatibility(&theirs, None).is_ok());
+        assert_eq!(ours.check_hello(&hello(TEST_NONCE)), Ok(()));
+        assert!(ours
+            .check_compatibility(&confirmation(TEST_NONCE, TEST_ACCEPTOR), None)
+            .is_ok());
     }
 
     #[test]
@@ -2130,9 +2403,47 @@ mod tests {
         let ours = Handshake::local(60);
         let theirs = Handshake {
             protocol_version: PROTOCOL_VERSION + 1, // patch bump
-            ..Handshake::local(60).with_nonce(TEST_NONCE)
+            ..confirmation(TEST_NONCE, TEST_ACCEPTOR)
         };
         assert!(ours.check_compatibility(&theirs, None).is_ok());
+    }
+
+    /// **THE COMPATIBILITY RULE IS "MAJOR MUST MATCH EXACTLY", AND THERE IS NO NEGOTIATION PATH.** Both
+    /// checks refuse a major gap in either direction, ahead of every other rule, and neither has a
+    /// branch that accepts one — so nothing has to decide which end's frame shape a mixed-major session
+    /// would run under. A peer that wants to refuse an older client pins its own `PROTOCOL_VERSION`.
+    #[test]
+    fn a_major_gap_in_either_direction_is_refused_by_both_checks() {
+        let ours = Handshake::local(60);
+        for gap in [0x0001_0000i64, -0x0001_0000] {
+            let version = (i64::from(PROTOCOL_VERSION) + gap) as u32;
+            let theirs = Handshake {
+                protocol_version: version,
+                ..confirmation_under(&test_secret(), TEST_NONCE, TEST_ACCEPTOR)
+            };
+            let expected = CodecError::ProtocolMismatch {
+                theirs: version,
+                ours: PROTOCOL_VERSION,
+            };
+            assert_eq!(
+                ours.check_hello(&theirs).unwrap_err(),
+                expected,
+                "gap {gap}"
+            );
+            assert_eq!(
+                ours.check_compatibility(&theirs, None).unwrap_err(),
+                expected,
+                "gap {gap}"
+            );
+            // Reported ahead of a correct secret as well, so an operator is told the one thing that
+            // explains every other symptom.
+            assert_eq!(
+                ours.check_compatibility(&theirs, Some(&test_secret()))
+                    .unwrap_err(),
+                expected,
+                "gap {gap}"
+            );
+        }
     }
 
     /// Version skew is reported BEFORE the missing nonce, so a peer one major behind — which by
@@ -2156,26 +2467,70 @@ mod tests {
 
     #[test]
     fn differing_tickrate_is_not_a_handshake_error() {
-        let ours = Handshake::local(60).with_nonce(TEST_NONCE);
-        let theirs = Handshake::local(30).with_nonce(TEST_NONCE);
+        let ours = hello(TEST_NONCE);
+        let theirs = Handshake::local(30)
+            .with_joiner_nonce(TEST_NONCE)
+            .with_acceptor_nonce(TEST_ACCEPTOR);
         assert!(ours.check_compatibility(&theirs, None).is_ok());
     }
 
     // --- the session secret, and the one misconfiguration that can be reported ------------------
 
-    /// The happy path: both ends folded the same secret, so the joiner's tag recomputes.
+    /// The happy path: both ends folded the same secret and the joiner answered the half it was
+    /// challenged with, so its tag recomputes.
     #[test]
     fn a_peer_holding_a_secret_accepts_a_joiner_that_confirms_the_same_one() {
         let secret = test_secret();
-        let hello = hello_under(&secret, TEST_NONCE);
+        let confirming = confirmation_under(&secret, TEST_NONCE, TEST_ACCEPTOR);
         assert!(Handshake::local(60)
-            .check_compatibility(&hello, Some(&secret))
+            .check_compatibility(&confirming, Some(&secret))
             .is_ok());
         // And across the wire, which is the only form the accepting side ever sees it in.
-        let decoded = Handshake::decode(&hello.encode()).unwrap();
+        let decoded = Handshake::decode(&confirming.encode()).unwrap();
         assert!(Handshake::local(60)
             .check_compatibility(&decoded, Some(&secret))
             .is_ok());
+    }
+
+    /// **THE REPLAYED JOIN, REFUSED.** An on-path observer records a whole join and presents it again:
+    /// the same joiner half, the same acceptor half it saw challenged, the same confirmation. The
+    /// acceptor of the new join challenged a half of its OWN, so the tag is over a nonce it never
+    /// asked for and the join is refused by name — before a session slot is spent on it.
+    ///
+    /// **This is the test that fails against protocol major 8.** There the confirmation was a tag over
+    /// the joiner's half alone, the acceptor contributed nothing, and presenting the recorded pair
+    /// derived the key that join had used.
+    #[test]
+    fn a_peer_holding_a_secret_refuses_a_replayed_join() {
+        let secret = test_secret();
+        let recorded = confirmation_under(&secret, TEST_NONCE, TEST_ACCEPTOR);
+        // The negative control: the recording itself was a valid join against the half it answered.
+        assert!(Handshake::local(60)
+            .check_compatibility(&recorded, Some(&secret))
+            .is_ok());
+        // Every half an acceptor could draw next, one bit at a time. The observer's confirmation is
+        // fixed — it cannot compute another without the secret — so each one refuses it.
+        for index in 0..KEY_LEN {
+            let mut fresh = TEST_ACCEPTOR;
+            fresh[index] ^= 0x01;
+            let replayed = Handshake {
+                acceptor_nonce: fresh,
+                ..recorded
+            };
+            assert_eq!(
+                Handshake::local(60)
+                    .check_compatibility(&replayed, Some(&secret))
+                    .unwrap_err(),
+                CodecError::SecretMismatch,
+                "acceptor byte {index}"
+            );
+        }
+        // And the key the replayed join would run under is not the one it recorded, so even an acceptor
+        // that skipped the confirmation entirely would refuse every captured datagram.
+        assert_ne!(
+            derive_session_key(&secret, &session_nonce(&TEST_NONCE, &TEST_ACCEPTOR)),
+            derive_session_key(&secret, &session_nonce(&TEST_NONCE, &[0x77u8; KEY_LEN]))
+        );
     }
 
     /// THE ONE SIGNALABLE MISCONFIGURATION. A server holding a secret against a client holding none
@@ -2187,26 +2542,31 @@ mod tests {
         let cases = [
             (
                 "a joiner that configured no secret at all",
-                Handshake::local(60).with_nonce(TEST_NONCE),
+                confirmation(TEST_NONCE, TEST_ACCEPTOR),
             ),
             (
                 "a joiner holding a different secret",
-                hello_under(
+                confirmation_under(
                     &crate::auth::compress_secret(b"some other secret"),
                     TEST_NONCE,
+                    TEST_ACCEPTOR,
                 ),
             ),
             (
-                "a tag lifted from a different nonce",
-                Handshake::local(60)
-                    .with_nonce(TEST_NONCE)
-                    .with_confirm(hello_under(&secret, [0x5au8; KEY_LEN]).confirm),
+                "a tag lifted from a different joiner half",
+                confirmation(TEST_NONCE, TEST_ACCEPTOR).with_confirm(
+                    confirmation_under(&secret, [0x5au8; KEY_LEN], TEST_ACCEPTOR).confirm,
+                ),
+            ),
+            (
+                "a tag lifted from a different acceptor half",
+                confirmation(TEST_NONCE, TEST_ACCEPTOR).with_confirm(
+                    confirmation_under(&secret, TEST_NONCE, [0x5au8; KEY_LEN]).confirm,
+                ),
             ),
             (
                 "a guessed tag",
-                Handshake::local(60)
-                    .with_nonce(TEST_NONCE)
-                    .with_confirm(0xffff_ffff_ffff_ffff),
+                confirmation(TEST_NONCE, TEST_ACCEPTOR).with_confirm(0xffff_ffff_ffff_ffff),
             ),
         ];
         for (label, hello) in cases {
@@ -2223,12 +2583,10 @@ mod tests {
     #[test]
     fn a_peer_holding_no_secret_ignores_the_confirm_tag_entirely() {
         for confirm in [0u64, 1, 0xdead_beef_c0de_1234, u64::MAX] {
-            let hello = Handshake::local(60)
-                .with_nonce(TEST_NONCE)
-                .with_confirm(confirm);
+            let confirming = confirmation(TEST_NONCE, TEST_ACCEPTOR).with_confirm(confirm);
             assert!(
                 Handshake::local(60)
-                    .check_compatibility(&hello, None)
+                    .check_compatibility(&confirming, None)
                     .is_ok(),
                 "confirm {confirm:#x}"
             );
@@ -2242,16 +2600,18 @@ mod tests {
     #[test]
     fn a_confirmation_is_checked_against_the_version_its_sender_stamped() {
         let secret = test_secret();
-        let mut hello = Handshake::local(60).with_nonce(TEST_NONCE);
-        hello.protocol_version = PROTOCOL_VERSION + 1; // patch bump
-        let key = derive_session_key(&secret, &TEST_NONCE);
-        let hello = hello.with_confirm(confirm_tag(&key, &TEST_NONCE, hello.protocol_version));
+        let mut confirming = confirmation(TEST_NONCE, TEST_ACCEPTOR);
+        confirming.protocol_version = PROTOCOL_VERSION + 1; // patch bump
+        let nonce = session_nonce(&TEST_NONCE, &TEST_ACCEPTOR);
+        let key = derive_session_key(&secret, &nonce);
+        let confirming =
+            confirming.with_confirm(confirm_tag(&key, &nonce, confirming.protocol_version));
         assert!(Handshake::local(60)
-            .check_compatibility(&hello, Some(&secret))
+            .check_compatibility(&confirming, Some(&secret))
             .is_ok());
         // And a peer whose version field was altered in flight no longer confirms, because the tag was
         // taken over the version it actually sent.
-        let mut tampered = hello;
+        let mut tampered = confirming;
         tampered.protocol_version = PROTOCOL_VERSION;
         assert_eq!(
             Handshake::local(60)
@@ -2261,18 +2621,27 @@ mod tests {
         );
     }
 
-    /// The all-zero refusal survived the field becoming a nonce, and it is checked BEFORE the
-    /// confirmation — a joiner that sent no 16 bytes is told that, not told its secret is wrong.
+    /// The all-zero refusal survived the field becoming one half of the nonce, and it is checked BEFORE
+    /// the confirmation — a joiner that sent no 16 bytes is told that, not told its secret is wrong.
+    /// Both halves have the rule, in the order their frames arrive in.
     #[test]
-    fn an_all_zero_nonce_is_refused_under_a_secret_as_well() {
+    fn an_all_zero_half_is_refused_under_a_secret_as_well() {
         let secret = test_secret();
-        let hello = hello_under(&secret, [0u8; KEY_LEN]);
+        let no_joiner_half = confirmation_under(&secret, [0u8; KEY_LEN], TEST_ACCEPTOR);
         assert_eq!(
             Handshake::local(60)
-                .check_compatibility(&hello, Some(&secret))
+                .check_compatibility(&no_joiner_half, Some(&secret))
                 .unwrap_err(),
             CodecError::MissingSessionNonce,
-            "a correctly tagged all-zero nonce is still an all-zero nonce"
+            "a correctly tagged all-zero half is still an all-zero half"
+        );
+        let no_acceptor_half = confirmation_under(&secret, TEST_NONCE, [0u8; KEY_LEN]);
+        assert_eq!(
+            Handshake::local(60)
+                .check_compatibility(&no_acceptor_half, Some(&secret))
+                .unwrap_err(),
+            CodecError::MissingAcceptorNonce,
+            "and an unchallenged handshake is not seated however well it is tagged"
         );
     }
 

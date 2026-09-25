@@ -18,26 +18,31 @@
 //! ## The MAC, and what it is and is not worth
 //!
 //! [`siphash24`] is SipHash-2-4: a keyed pseudo-random function designed for exactly this — short
-//! messages, a 64-bit tag, no table lookups. It is ~40 lines of integer arithmetic, which is what lets
-//! `orbitnet-core` stay at zero dependencies.
+//! messages, a 64-bit tag, no table lookups. It is ~40 lines of integer arithmetic, which is why it could
+//! be written here at all instead of taken as a dependency. That shape does not generalise: a stream cipher
+//! is close to it, an elliptic curve is not.
 //!
-//! **The key is minted by the client and crosses the wire in the handshake in cleartext, unless the
-//! game supplies a session secret.** With a secret the handshake carries a nonce instead and both ends
-//! derive the key, which is the section below. Under a client-minted key, what this authenticates is a
+//! **The key is folded from two nonces, one drawn by each end, and from a session secret when the game
+//! supplies one.** The joiner sends its half in the handshake, the acceptor answers with a half of its
+//! own, and both ends fold the pair into the session nonce with [`session_nonce`]. With no secret that
+//! fold is a public function of two values an observer can read, so what this authenticates is a
 //! datagram's membership in a session, not a peer's identity:
 //!
 //! - An attacker who cannot read the session's traffic cannot forge a datagram at all, whatever
 //!   sender id it puts on it. That is the case the transport does not cover.
 //! - One connected peer cannot forge another's datagrams: each session has its own key.
-//! - **An on-path observer who can read the handshake can do everything the client can.** That is the
-//!   ceiling of a client-minted key. A secret both ends already hold narrows it, with the derivation
-//!   below and no new dependency.
+//! - **An on-path observer who can read the exchange can do everything the client can.** With no
+//!   session secret both halves are in the clear — one in the handshake, one in the challenge — so the
+//!   fold is a public function of public values, and an observer that read both frames holds the key.
+//!   A secret both ends already hold narrows it, with the derivation below and no new dependency.
 //!
-//!   An X25519 exchange was considered and declined. It would demote this adversary to passive-only,
-//!   which is a real narrowing rather than none -- but unauthenticated ECDH is substituted by exactly
-//!   the on-path attacker in question, so the price is several hundred lines of hand-written
-//!   constant-time field arithmetic in a zero-dependency crate. `README.md` records the same decision
-//!   for a reader who never opens this file.
+//!   An X25519 exchange is not implemented. Unauthenticated ECDH is substituted by exactly the on-path
+//!   attacker in question, so it would demote this adversary to passive-only and buy nothing else --
+//!   that refusal stands on its own. An AUTHENTICATED exchange is open work: it was priced at several
+//!   hundred lines of hand-written constant-time field arithmetic because this crate's empty
+//!   `[dependencies]` was read as a rule, and that reading has been settled against. A vetted
+//!   implementation is preferred to a hand-written one; `Cargo.toml`'s header states what one has to
+//!   clear. `README.md` records the same for a reader who never opens this file.
 //!
 //!   **`tests/constant_time.rs` is the timing harness that decision said was missing.** It asserts
 //!   that `tags_equal`'s source, compiled on its own under each shipped profile's flags, emits no
@@ -50,34 +55,49 @@
 //! ## Deriving the key from a secret both ends already hold
 //!
 //! A game that already shares a secret with the peer — a lobby token, a matchmaker ticket, anything it
-//! authenticated before the join — does not have to mint the key on the client and send it. It can
-//! derive the key instead, with [`compress_secret`], [`derive_session_key`] and [`confirm_tag`]. The
-//! 16 bytes in the handshake stop being the key and become a **nonce**.
+//! authenticated before the join — can make that secret an input to every session key, with
+//! [`compress_secret`], [`derive_session_key`] and [`confirm_tag`]. Nothing on the wire changes shape;
+//! what changes is whether the two nonces are the whole of the key.
 //!
-//! | | Key minted by the client | Key derived from a shared secret |
+//! | | No session secret | A session secret |
 //! | --- | --- | --- |
-//! | What the handshake carries | the key itself | a nonce |
-//! | What an on-path observer learns | everything the client knows | the nonce, and nothing else |
+//! | What the key is | [`session_nonce`] of the two halves | [`derive_session_key`] over the secret and that |
+//! | What an on-path observer learns | both halves, and therefore the key | both halves, and nothing else |
 //! | What the scheme needs | nothing | a secret the game distributes out of band |
 //! | Who can join | anyone the transport accepts | anyone holding the secret |
 //!
 //! The secret is an **input** to the derivation and is never seated as the key itself;
 //! [`derive_session_key`] carries the reason, because seating it is the obvious wrong implementation.
 //!
-//! Four ceilings:
+//! Three ceilings:
 //!
 //! - **It adds no strength beyond the secret's own entropy.** A secret a lobby prints on screen, or one
 //!   short enough to guess, derives a key worth exactly that much.
-//! - **A recorded join can still be replayed.** The nonce is the joiner's choice and nothing here
-//!   refuses one that has been seen before, so an observer presenting a captured nonce has the
-//!   ACCEPTING side derive the key that join used. The observer does not learn that key -- the secret
-//!   is the other input and it holds none -- so it authors nothing new and the datagrams it captured
-//!   land nowhere. Closing the replay itself needs a value the acceptor contributes, and therefore a
-//!   round trip before a client may send anything.
 //! - **The tag is still 64 bits and the key still 128.** Deriving the key changes who can forge a
 //!   datagram. It does not change how hard forging one is for somebody who cannot read the secret.
 //! - **None of this encrypts anything.** Every payload is still on the wire in the clear. A MAC says a
 //!   datagram was not written by someone outside the session, and says nothing else.
+//!
+//! ## Both ends contribute a nonce, which is what refuses a replayed join
+//!
+//! **While the nonce was the joiner's alone, an observer could present a recorded one again.** The
+//! accepting side then derived the key that join had used, and the observer got a session in which its
+//! captured datagrams verified — without learning the key, authoring anything new, or landing those
+//! datagrams anywhere. [`session_nonce`] closes it: the acceptor draws 16 bytes of its own per join,
+//! both halves go into the fold, and a replayed half derives a key the replayer cannot compute and did
+//! not capture.
+//!
+//! **The price is that a joiner may not send until the acceptor has answered.** The key is not derivable
+//! from the joiner's own half, so the join is two round trips rather than one: handshake, the acceptor's
+//! nonce, the joiner's confirmation, the reply. `docs/protocol.md` measures that against join time.
+//!
+//! Two limits:
+//!
+//! - **With no secret configured it adds nothing.** Both halves are in the clear, so the fold is a
+//!   public function of public values and an on-path observer computes the key either way. It runs
+//!   there all the same, so one derivation and one frame sequence cover both regimes.
+//! - **It refuses a replay, not an injection.** An attacker able to answer the acceptor's nonce in the
+//!   joiner's place is authoring a fresh join, and a session secret is what refuses that.
 //!
 //! ## The direction byte
 //!
@@ -276,6 +296,12 @@ pub const SESSION_KEY_LABEL_HIGH: &[u8] = b"orbitnet-session-key-hi";
 /// Domain label prefixing [`confirm_tag`], which keeps a confirmation from being any other tag.
 pub const CONFIRM_LABEL: &[u8] = b"orbitnet-confirm";
 
+/// Domain label keying the low half of [`session_nonce`]. Exactly [`KEY_LEN`] bytes, as a SipHash key.
+pub const JOIN_LABEL_LOW: [u8; KEY_LEN] = *b"orbitnet-join-lo";
+
+/// Domain label keying the high half of [`session_nonce`]. Exactly [`KEY_LEN`] bytes, as a SipHash key.
+pub const JOIN_LABEL_HIGH: [u8; KEY_LEN] = *b"orbitnet-join-hi";
+
 /// Two 64-bit halves as one 128-bit value: little-endian, low half first.
 ///
 /// One function so that the byte order of every derived key is defined in one place.
@@ -312,12 +338,43 @@ pub fn compress_secret(secret: &[u8]) -> [u8; KEY_LEN] {
     )
 }
 
-/// The session key for one join, derived from the shared secret and the handshake nonce.
+/// The 16 bytes one join is keyed from: the joiner's half and the acceptor's, folded together.
+///
+/// **Both ends draw a half and neither half alone decides the key.** The joiner mints its 16 bytes and
+/// sends them in the handshake; the acceptor mints its own and answers with them; both then run this
+/// function and arrive at the same 16 bytes. What it closes is a REPLAYED JOIN: an observer presenting a
+/// recorded handshake supplies the joiner's half and nothing else, the acceptor's half is drawn fresh,
+/// and the session that comes out is keyed on bytes the observer never saw.
+///
+/// **It is run under both regimes.** With no session secret the output IS the key, and both halves are
+/// in the clear, so it adds nothing an on-path observer cannot compute — the reason to run it anyway is
+/// that one derivation and one frame sequence then cover a configuration decision neither end puts on
+/// the wire. With a secret it is the nonce [`derive_session_key`] folds the secret into.
+///
+/// **The order of the two arguments is part of the wire contract.** Swapping them at one end derives a
+/// different key from the same join, every datagram fails its tag, and nothing in the failure says why.
+/// Two keyed passes, under [`JOIN_LABEL_LOW`] and [`JOIN_LABEL_HIGH`], joined low half first — the same
+/// construction [`compress_secret`] uses, for the same reason: [`SipHasher`] keys on exactly [`KEY_LEN`]
+/// bytes and something has to produce those 16.
+///
+/// It cannot add entropy. Two halves of 128 bits fold to 128 bits, and the tag they protect is 64.
+#[must_use]
+pub fn session_nonce(joiner: &[u8; KEY_LEN], acceptor: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
+    let mut low = SipHasher::new(&JOIN_LABEL_LOW);
+    low.write(joiner);
+    low.write(acceptor);
+    let mut high = SipHasher::new(&JOIN_LABEL_HIGH);
+    high.write(joiner);
+    high.write(acceptor);
+    join_halves(low.finish(), high.finish())
+}
+
+/// The session key for one join, derived from the shared secret and that join's session nonce.
 ///
 /// `secret` is the 16 bytes [`compress_secret`] folded out of whatever the game distributes. `nonce` is
-/// the 16 bytes the handshake carries, which under this scheme are no longer a key: the joining side
-/// mints them fresh per join, the accepting side reads them, and both run this function to arrive at
-/// the same key. An observer reading the handshake learns the nonce and nothing else.
+/// the 16 bytes [`session_nonce`] folded out of the two halves that join exchanged, one drawn by each
+/// end. Both sides run this function over the same two inputs and arrive at the same key. An observer
+/// reading the exchange learns both halves and nothing else.
 ///
 /// **The secret is an input and is never seated as the key**, however much shorter that implementation
 /// looks. The reason is the sequence numbers:
@@ -327,7 +384,8 @@ pub fn compress_secret(secret: &[u8]) -> [u8; KEY_LEN] {
 /// - So under a key that does not change between joins, every datagram captured in one session is a
 ///   valid, unreplayed datagram in the next. The replay defense would last exactly one session.
 /// - A fresh nonce per join is what keeps the key fresh per join, and that is the only reason the
-///   nonce exists. A caller that reuses a nonce under one secret gets the constant-key failure back.
+///   nonce exists. A caller that reuses a nonce under one secret gets the constant-key failure back,
+///   which is why [`session_nonce`] draws a half at each end rather than taking the joiner's word.
 ///
 /// A peer deriving from a different secret produces a different key, so its datagrams fail the tag
 /// check at the other end. That is how a peer without the secret is refused; [`confirm_tag`] moves the
@@ -345,11 +403,16 @@ pub fn derive_session_key(secret: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN]) -> [u8;
 
 /// Proof the sender holds `secret`: a tag over the nonce and the protocol version.
 ///
-/// `key` is the output of [`derive_session_key`], so producing this tag requires the secret the key was
-/// derived from. The joining side sends it beside its nonce; the accepting side derives its own key from
-/// its own copy of the secret, recomputes the tag, and refuses the join when the two differ. Without it
-/// a peer that does not hold the secret is still refused, but only once it has sent a datagram whose tag
-/// fails — it occupies a session slot until then.
+/// `key` is the output of [`derive_session_key`] and `nonce` the [`session_nonce`] it was derived from,
+/// so producing this tag requires the secret the key was derived from AND both halves of that join's
+/// nonce. The joining side sends it once the acceptor's half has arrived; the accepting side derives its
+/// own key from its own copy of the secret, recomputes the tag, and refuses the join when the two
+/// differ. Without it a peer that does not hold the secret is still refused, but only once it has sent a
+/// datagram whose tag fails — it occupies a session slot until then.
+///
+/// **It is a tag over the JOINT nonce, which is what makes it unreplayable.** The acceptor's half is
+/// drawn per join, so a tag captured from a recorded join recomputes against nothing the acceptor will
+/// ever ask again.
 ///
 /// **The protocol version is inside the tag** so that a confirmation cannot be lifted out of a session
 /// of one protocol version and replayed into a session of another, where the fields it authorizes mean
@@ -690,6 +753,13 @@ mod tests {
         0xaf,
     ];
 
+    /// A fixed stand-in for the acceptor's half of a join's nonce, distinct from [`PIN_NONCE`] so a
+    /// fold that ignored one of its two arguments cannot pass the vectors below.
+    const PIN_ACCEPTOR: [u8; KEY_LEN] = [
+        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e,
+        0x5f,
+    ];
+
     /// A protocol version written out rather than read from the crate, so that bumping the real one
     /// does not rewrite the pinned vectors below and hide a change to the derivation.
     const PIN_VERSION: u32 = 0x0006_0000;
@@ -800,6 +870,91 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_joiner_half_derives_a_key_the_replayer_cannot_compute() {
+        // THE WHOLE POINT OF THE ACCEPTOR'S HALF, and the test that fails against a derivation keyed on
+        // the joiner's nonce alone. An observer that recorded a join presents the joiner's half again;
+        // the acceptor draws a fresh half of its own, and the session that comes out is keyed on bytes
+        // the observer never saw. Under the old scheme the two keys below were one key, and every
+        // datagram the observer had captured verified in the session it had just opened.
+        let secret = compress_secret(PIN_SECRET);
+        let recorded = derive_session_key(&secret, &session_nonce(&PIN_NONCE, &PIN_ACCEPTOR));
+        let mut replayed_acceptor = PIN_ACCEPTOR;
+        replayed_acceptor[0] ^= 0x01;
+        let replayed = derive_session_key(&secret, &session_nonce(&PIN_NONCE, &replayed_acceptor));
+        assert_ne!(
+            recorded, replayed,
+            "the same joiner half, a fresh acceptor half"
+        );
+
+        let mut captured = b"input for tick 1".to_vec();
+        SessionAuth::new(recorded)
+            .seal(Direction::ToServer, &mut captured)
+            .unwrap();
+        assert_eq!(
+            SessionAuth::new(replayed).open(Direction::ToServer, &captured),
+            Err(AuthError::BadTag),
+            "the replayed join refuses what the recorded one sealed"
+        );
+        assert!(
+            SessionAuth::new(recorded)
+                .open(Direction::ToServer, &captured)
+                .is_ok(),
+            "the negative control: it opens under the join that sealed it"
+        );
+        // And the confirmation goes the same way, which is what refuses the replay AT THE HANDSHAKE
+        // rather than after the first failed tag.
+        let joint = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let replayed_joint = session_nonce(&PIN_NONCE, &replayed_acceptor);
+        assert_ne!(
+            confirm_tag(&recorded, &joint, PIN_VERSION),
+            confirm_tag(&replayed, &replayed_joint, PIN_VERSION)
+        );
+    }
+
+    #[test]
+    fn the_session_nonce_folds_every_byte_of_both_halves() {
+        // Neither half may be ignored, and a fold that dropped one would still pass a test that only
+        // varied the other. Both sweeps, and the negative control that the same pair repeats.
+        let base = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        assert_eq!(session_nonce(&PIN_NONCE, &PIN_ACCEPTOR), base);
+        for index in 0..KEY_LEN {
+            let mut joiner = PIN_NONCE;
+            joiner[index] ^= 0x01;
+            assert_ne!(
+                session_nonce(&joiner, &PIN_ACCEPTOR),
+                base,
+                "joiner byte {index}"
+            );
+            let mut acceptor = PIN_ACCEPTOR;
+            acceptor[index] ^= 0x01;
+            assert_ne!(
+                session_nonce(&PIN_NONCE, &acceptor),
+                base,
+                "acceptor byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_session_nonce_is_order_sensitive_and_never_returns_a_half() {
+        // The argument order is part of the wire contract: an end that swapped them derives a different
+        // key from the same join and nothing it sends opens. It is checked here because the two halves
+        // have the same type, so nothing but this notices the swap.
+        assert_ne!(
+            session_nonce(&PIN_NONCE, &PIN_ACCEPTOR),
+            session_nonce(&PIN_ACCEPTOR, &PIN_NONCE)
+        );
+        // Nor is either half handed back, which is the fold's own version of the trap
+        // `derive_session_key` names: returning one argument would put the joiner back in sole charge.
+        let folded = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        assert_ne!(folded, PIN_NONCE);
+        assert_ne!(folded, PIN_ACCEPTOR);
+        // The all-zero pair folds to a value like any other. It is refused at the handshake rather than
+        // here, because this function cannot tell a drawn zero from an absent field.
+        assert_ne!(session_nonce(&[0; KEY_LEN], &[0; KEY_LEN]), [0; KEY_LEN]);
+    }
+
+    #[test]
     fn the_derivation_matches_its_pinned_byte_vectors() {
         // These bytes exist to make a refactor that changes the derivation fail here. The derivation
         // is baked into every client that has shipped: change a domain label, the byte order of the
@@ -833,6 +988,30 @@ mod tests {
         assert_eq!(
             confirm_tag(&key, &PIN_NONCE, PIN_VERSION),
             0xcb13_d7c3_763b_61c6
+        );
+        // The fold of the two halves, and the key and confirmation a whole join actually lands on. The
+        // vectors above cover the secret and the key; these cover the step in front of them, so a
+        // refactor that reordered the halves or changed a join label fails here rather than in the
+        // field.
+        let joint = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        assert_eq!(
+            joint,
+            [
+                0x27, 0xb2, 0xc9, 0x6b, 0x3b, 0x19, 0x39, 0x72, 0x48, 0x50, 0x6d, 0xc6, 0x15, 0x33,
+                0xc7, 0xbc
+            ]
+        );
+        let joined_key = derive_session_key(&secret, &joint);
+        assert_eq!(
+            joined_key,
+            [
+                0xa9, 0x1b, 0x93, 0x7c, 0xd4, 0x18, 0x03, 0xb5, 0x33, 0x62, 0x18, 0x3e, 0x70, 0x6c,
+                0x9f, 0xde
+            ]
+        );
+        assert_eq!(
+            confirm_tag(&joined_key, &joint, PIN_VERSION),
+            0x87a5_f3a0_d6d3_6f7a
         );
     }
 

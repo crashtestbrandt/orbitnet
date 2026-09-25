@@ -1,12 +1,13 @@
 name: release
 
-# Cut a release from a `v*` tag: build the extension on all three platforms, publish the binaries as
+# Cut a release from a `v*` tag: build the extension on every platform leg, publish the binaries as
 # Release assets, build the Asset Library zip, and commit a sha256 MANIFEST of what was published.
 #
 # NO BINARY IS COMMITTED, HERE OR ANYWHERE. What lands on main is `addons/orbitnet_native/binaries.json`
-# -- the size and sha256 of every published asset, plus the version this tag stamped into plugin.cfg. A
-# consumer pins the tag, downloads the assets and verifies them against a digest that lives in the commit
-# graph, which a checksum file published beside the asset cannot do: that verifies transport, not tamper.
+# -- the size and sha256 of every published asset -- plus the version this tag stamped, which is written
+# to `addons/orbitnet/plugin.cfg`, `native/Cargo.toml` and `native/Cargo.lock`. A consumer pins the tag,
+# downloads the assets and verifies them against a digest that lives in the commit graph, which a checksum
+# file published beside the asset cannot do: that verifies transport, not tamper.
 #
 # The manifest is written AFTER the assets are built, so a tag commit cannot contain its own digest; main
 # gets it one commit later. Harmless, because CI builds rather than fetches.
@@ -38,6 +39,15 @@ jobs:
           # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
           # here.
           - platform: linux
+            runner: [self-hosted, Linux, X64, legion]
+          # LINUX ARM64 CROSS-COMPILES ON THE x86_64 BOX. Same runner labels as the leg above,
+          # `aarch64-unknown-linux-gnu` as the cargo target, no arm64 hardware anywhere. `fail-fast: true`
+          # above covers it like any other leg -- the descriptor names the arm64 libraries and the publish
+          # job diffs the built set against the descriptor, so a tag that cannot produce them must not
+          # publish the other three platforms either. The box needs an aarch64 linker
+          # (`gcc-aarch64-linux-gnu`); the build refuses to start without one rather than uploading an
+          # empty artifact.
+          - platform: linux_arm64
             runner: [self-hosted, Linux, X64, legion]
           - platform: windows
             runner: [self-hosted, Windows, X64, legion-win]
@@ -121,7 +131,8 @@ jobs:
         run: tools/build-native.sh build ${{ matrix.platform }} staged-profiling profiling
 
       # macOS debug information is a .dSYM BUNDLE -- a directory. A release asset is a single file, so it
-      # is tarred here rather than at publish time, on the machine that produced it.
+      # is tarred here rather than at publish time, on the machine that produced it. One bundle per
+      # release: the dylib is universal and so is its .dSYM, which carries a UUID for each slice.
       - name: Pack the macOS debug bundle
         if: matrix.platform == 'macos'
         shell: bash
@@ -171,7 +182,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p addons/orbitnet_native/bin profiling
-          for p in linux windows macos; do
+          # EVERY PLATFORM KEY THE BUILD MATRIX CARRIES, spelled the same way. A key missing from this
+          # list leaves bin/ short of a library the descriptor names, and the next step fails the tag
+          # after every build has already succeeded.
+          for p in linux linux_arm64 windows macos; do
             cp incoming/orbitnet-$p/*            addons/orbitnet_native/bin/
             cp incoming/orbitnet-profiling-$p/*  profiling/
           done
@@ -197,8 +211,17 @@ jobs:
 
       # INPUT_VERSION THROUGH THE ENVIRONMENT, NOT `${{ }}` INTERPOLATION. Expression interpolation
       # splices the value into the script SOURCE before bash parses it, so a crafted dispatch input
-      # would run as code on a persistent self-hosted runner. Read as an env var it is data.
-      - name: Stamp the plugin version from the tag
+      # would run as code on a persistent self-hosted runner. Read as an env var it is data. The version
+      # reaches tools/version-parity.sh as an ARGUMENT, which is data for the same reason, and that
+      # script re-validates it against the same character set.
+      #
+      # BOTH VERSIONS, ONE SCRIPT. This used to stamp addons/orbitnet/plugin.cfg alone, so the cargo
+      # workspace sat at 0.1.0 for every release the project cut and anything reading `CARGO_PKG_VERSION`
+      # reported it. tools/version-parity.sh owns every site the version is written to -- plugin.cfg, the
+      # `[workspace.package]` version in native/Cargo.toml, and the member entries in native/Cargo.lock --
+      # and re-reads all of them afterwards, so a pattern that stopped matching fails the release instead
+      # of publishing the old version.
+      - name: Stamp the plugin and crate versions from the tag
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
@@ -210,8 +233,7 @@ jobs:
           case "$version" in
             ''|*[!A-Za-z0-9._-]*) echo "::error::refusing version '$version'"; exit 1 ;;
           esac
-          sed -i "s/^version=\".*\"$/version=\"${version}\"/" addons/orbitnet/plugin.cfg
-          grep '^version=' addons/orbitnet/plugin.cfg
+          tools/version-parity.sh stamp "$version"
 
       # tools/make-assetlib-zip.py RATHER THAN THE `zip` BINARY. The publish runner has neither `zip`
       # nor `unzip`: a dry run failed here with "zip: command not found" after all three cross-platform
@@ -235,10 +257,10 @@ jobs:
                 addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
 
       # EVERY published asset, including the AssetLib zip. A consumer that pins this tag can fetch the
-      # single zip -- which carries both addon directories and all six libraries -- and verify one digest,
-      # rather than fetching six files and trusting the set was complete. Written after the zip is built,
-      # so a tag commit cannot contain its own digest; main gets it one commit later. Harmless, because CI
-      # builds rather than fetches.
+      # single zip -- which carries both addon directories and every descriptor library -- and verify one
+      # digest, rather than fetching each file and trusting the set was complete. Written after the zip
+      # is built, so a tag commit cannot contain its own digest; main gets it one commit later. Harmless,
+      # because CI builds rather than fetches.
       - name: Write the asset manifest
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -285,9 +307,9 @@ jobs:
             to `main`, so a fetch is verified against the commit graph rather than against a checksum
             published beside the file it describes.
 
-            Fetch the **zip** to get both addon directories and all six libraries against one digest. The
-            loose binaries are also attached individually, for a project that wants only the files its
-            own `.gdextension` names.
+            Fetch the **zip** to get both addon directories and every library the descriptor names against
+            one digest. The loose binaries are also attached individually, for a project that wants only
+            the files its own `.gdextension` names.
 
             | Asset | What it is |
             | --- | --- |
@@ -301,12 +323,12 @@ jobs:
       # through a pull request" -- so a bot push is rejected with GH006 by construction, on every run
       # whose builds all succeeded. A step that can only pass by having nothing to push is not a guard.
       #
-      # A SEPARATE WORKTREE, because this checkout is the TAG and it is dirty by now: plugin.cfg has been
-      # stamped and binaries.json freshly written. `git checkout -B` in this tree aborts whenever either
-      # differs between the tag and main.
+      # A SEPARATE WORKTREE, because this checkout is the TAG and it is dirty by now: plugin.cfg,
+      # native/Cargo.toml and native/Cargo.lock carry the stamp and binaries.json is freshly written.
+      # `git checkout -B` in this tree aborts whenever any of the four differs between the tag and main.
       #
       # AFTER the publish, because the release is the artifact that matters. This step failing must never
-      # cost three cross-platform builds and a tag that cannot be re-run.
+      # cost a full set of cross-platform builds and a tag that cannot be re-run.
       - name: Propose the manifest to main
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -321,16 +343,34 @@ jobs:
           git worktree prune
           git fetch origin main
           git worktree add --detach "$wt" origin/main
-          # `cp`, not a shell round trip: command substitution strips trailing newlines.
+          # `cp`, not a shell round trip: command substitution strips trailing newlines. binaries.json is
+          # generated whole by this job, so copying it is the whole update.
           cp addons/orbitnet_native/binaries.json "$wt/addons/orbitnet_native/binaries.json"
-          cp addons/orbitnet/plugin.cfg           "$wt/addons/orbitnet/plugin.cfg"
-          git -C "$wt" add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
+          # THE VERSIONS ARE RE-STAMPED IN THE WORKTREE, NOT COPIED FROM THE TAG. plugin.cfg,
+          # native/Cargo.toml and native/Cargo.lock are SOURCE files that main may have moved on since the
+          # tag -- a reworded plugin description, a cargo profile added -- and copying the tag's copies
+          # over them would revert that work as a side effect of a release. Re-running the stamp writes
+          # the version fields and nothing else.
+          #
+          # THE CRATE VERSION MUST COME BACK TO MAIN, not only ride the tag. Stamped on the tag alone, the
+          # workspace version returns to its old value on the next commit and the divergence reopens
+          # immediately -- which is how it reached 0.1.0-against-0.4.0 in the first place. Carrying it here
+          # is also what lets `just version-parity` pass on main at all.
+          #
+          # RE-RUNNING AN OLDER TAG'S JOB PROPOSES A DOWNGRADE. The stamp writes this tag's version into
+          # the main worktree unconditionally, so re-running the job for an older tag after a newer one
+          # has shipped opens a pull request moving all three version files backwards. The tree it writes
+          # is internally consistent, so version-parity passes on it and does not catch it; main being
+          # protected and the pull request being reviewed is what does. Close that pull request.
+          "$wt/tools/version-parity.sh" stamp "${GITHUB_REF_NAME#v}"
+          git -C "$wt" add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg \
+                           native/Cargo.toml native/Cargo.lock
           if git -C "$wt" diff --cached --quiet; then
             echo "manifest unchanged; nothing to propose"
             git worktree remove --force "$wt"
             exit 0
           fi
-          git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
+          git -C "$wt" commit -m "release: binaries manifest and stamped versions for ${GITHUB_REF_NAME}"
           git -C "$wt" push --force origin "HEAD:refs/heads/${branch}"
           git worktree remove --force "$wt"
           # The API's answer decides this step's exit code. Piping curl into a printer exits 0 whatever

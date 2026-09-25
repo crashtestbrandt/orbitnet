@@ -15,8 +15,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 DESCRIPTOR="addons/orbitnet_native/orbitnet.gdextension"
-WORKFLOWS=".github/workflows/binaries.yml .github/workflows/release.yml"
-PLATFORMS=(linux windows macos)
+RELEASE_WF=".github/workflows/release.yml"
+WORKFLOWS=".github/workflows/binaries.yml $RELEASE_WF"
+# FOUR PLATFORM KEYS ACROSS THREE OPERATING SYSTEMS. tools/build-native.sh maps one key onto one shipped
+# filename per profile, so the two Linux architectures are two keys and both workflows carry a leg for
+# each. `linux_arm64` is spelled the same in build-native.sh, binaries.yml and release.yml; the leg grep
+# below matches `[a-z0-9_]+` only, so an underscore is the separator that works in every place the key
+# is spelled.
+PLATFORMS=(linux linux_arm64 windows macos)
 
 # Filenames the descriptor points at, deduplicated: several entries may name one file.
 # `|| true` then an explicit emptiness check: under `set -euo pipefail` a grep that matches nothing kills
@@ -53,9 +59,9 @@ fi
 # A platform tools/build-native.sh can name but no workflow leg ever runs produces nothing, which is the
 # same defect one step further back. `platform:` is the matrix key each leg passes to the script.
 #
-# BOTH WORKFLOWS, not just binaries.yml. release.yml carries its own copy of the three-leg matrix, and it
-# is the one that actually ships -- a platform missing there is caught at tag time, after three builds,
-# or not at all.
+# BOTH WORKFLOWS, not just binaries.yml. release.yml carries its own copy of the build matrix, and it is
+# the one that actually ships -- a platform missing there is caught at tag time, after every other leg
+# has already built, or not at all.
 for wf in $WORKFLOWS; do
 	legs="$(grep -oE '^[[:space:]]*-?[[:space:]]*platform:[[:space:]]*[a-z0-9_]+' "$wf" \
 		| sed 's/.*platform:[[:space:]]*//' | sort -u || true)"
@@ -67,6 +73,24 @@ for wf in $WORKFLOWS; do
 		fi
 	done
 done
+
+# THE PUBLISH JOB'S OWN LIST, which no matrix key reaches. release.yml collects the uploaded artifacts
+# with a literal `for p in <keys>` loop, and a key missing from it leaves bin/ short of a library the
+# descriptor names. The step after it catches that -- at tag time, once every leg has already built.
+# Checking the loop here makes an unlisted platform a PR failure like every other spelling of the key.
+publish="$(grep -oE '^[[:space:]]*for p in [a-z0-9_ ]+; do' "$RELEASE_WF" \
+	| sed -E 's/.*for p in //; s/; do$//' | tr ' ' '\n' | grep -v '^$' | sort -u || true)"
+if [ -z "$publish" ]; then
+	printf '::error::found no `for p in <platform keys>` loop in %s -- the publish job shape changed and this check needs updating.\n' "$RELEASE_WF"
+	status=1
+else
+	for p in "${PLATFORMS[@]}"; do
+		if ! printf '%s\n' "$publish" | grep -qx "$p"; then
+			printf '::error::%s is a platform tools/build-native.sh builds, but %s does not collect it in the publish job.\n' "$p" "$RELEASE_WF"
+			status=1
+		fi
+	done
+fi
 
 if [ "$status" -eq 0 ]; then
 	printf 'descriptor parity passed: %s library filename(s) across %s platform(s), all built and all named.\n' \

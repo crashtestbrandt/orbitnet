@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Three-process networked gate for the arena demo. This is the THIRD PR gate.
+# Three-process networked gate for the arena demo. This is the FOURTH PR gate.
 #
-# WHAT IT COVERS THAT tools/rts-probe.sh AND tools/server-shape-probe.sh CANNOT, which is why a third gating
-# probe exists at all. Every line is the INTEREST axis -- who receives what -- which neither other probe
-# reaches: the RTS probe replicates one world to every peer, and the shape probe reads one client's own seat.
+# WHAT IT COVERS THAT tools/rts-probe.sh, tools/server-shape-probe.sh AND tools/determinism-probe.sh CANNOT,
+# which is why a fourth gating probe exists at all. Every line is the INTEREST axis -- who receives what --
+# which no other probe reaches: the RTS probe replicates one world to every peer, the shape probe reads one
+# client's own seat, and the determinism probe binds no socket at all.
 #
 #   * MEMBERSHIP filtering. Three arenas replicate the same LOCAL coordinates, so no radius can separate
 #     them: a client receiving nothing from an arena it holds no seat in is membership doing it and nothing
@@ -90,7 +91,10 @@ spawn() {
 # this gate failing.
 arm_watchdog() {
 	[ -n "${WATCHPID:-}" ] && kill -9 "$WATCHPID" 2>/dev/null
-	( sleep "$WATCHDOG_S"; kill -9 $PIDS 2>/dev/null ) &
+	# Redirected because the subshell's `sleep` outlives the kill above -- it is reparented to init and would
+	# hold this script's stdout, and any consumer reading the probe through a pipe would block for the full
+	# watchdog after the verdict was printed.
+	( sleep "$WATCHDOG_S"; kill -9 $PIDS 2>/dev/null ) >/dev/null 2>&1 &
 	WATCHPID=$!
 }
 

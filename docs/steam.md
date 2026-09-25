@@ -75,10 +75,10 @@ Steam backend must not lock every player out of your server. It bites only on a 
 
 ## Where a session secret comes from
 
-`Net.set_session_secret()` derives every datagram key of a session from bytes both ends already hold, so the
-join handshake carries a nonce instead of the key and an on-path observer can no longer forge. It needs a
-secret the game distributed on a channel it **already authenticated**, and the two seams above are exactly
-that channel.
+`Net.set_session_secret()` folds a value both ends already hold into every datagram key of a session, so an
+on-path observer that reads the whole join exchange derives no key and cannot forge. It needs a secret the
+game distributed on a channel it **already authenticated**, and the two seams above are exactly that
+channel.
 
 | Source | Who sets what | What it is worth |
 |---|---|---|
@@ -88,14 +88,15 @@ that channel.
 Two rules, both about where the value is **not** allowed to come from:
 
 - **Never a build-time constant.** One secret compiled into every copy of the game is public the moment one
-  copy ships, and it degrades every session to the cleartext-key regime while looking like it did not.
+  copy ships, and it degrades every session to a key with no secret folded into it while looking like it did
+  not.
 - **Never a value a player can read and retype.** A lobby code shown on screen derives a key worth exactly
   that code's entropy. `Net.set_session_secret()` accepts any length and folds it, and the fold cannot add
   entropy that was not supplied.
 
 On ENet there is no equivalent seam and the game supplies its own — a value from whatever account service it
-already runs. A session that sets none stays on the cleartext key, which is what every session did before.
-See [protocol.md](protocol.md#datagram-authentication) for the two regimes and for what a misconfiguration
+already runs. A session that sets none runs on a key with no secret folded into it, which is the default
+regime. See [protocol.md](protocol.md#datagram-authentication) for the two regimes and for what a misconfiguration
 looks like from each side.
 
 ## What each transport authenticates and encrypts

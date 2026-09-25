@@ -7,7 +7,7 @@ it. The wire format and tick model are in [protocol.md](protocol.md).
 
 ```
 native/
-  crates/orbitnet-core/     PURE Rust, zero dependencies, no `godot` — plain `cargo test`
+  crates/orbitnet-core/     PURE Rust, no `godot` — plain `cargo test`
   crates/orbitnet-godot/    the cdylib; the only crate that knows Godot exists
 ```
 
@@ -18,6 +18,15 @@ class registration, `Variant` ↔ packed-row conversion, the entity registry, si
 
 **The rule that keeps it honest: core never sees a `Variant`.** A `godot` type in a core signature means logic
 has leaked across the boundary. `#![forbid(unsafe_code)]` throughout.
+
+**`orbitnet-core`'s dependency list is open to cryptography.** `[dependencies]` is empty today. That
+emptiness describes the crate and carries no veto: a **vetted** cipher or key exchange belongs there in
+preference to a hand-written one, and `native/crates/orbitnet-core/Cargo.toml`'s header states what such a
+dependency has to clear. The `godot` boundary above is the rule the crate actually holds.
+
+**`[dev-dependencies]` answers for less.** `proptest` is compiled for `cargo test` and is absent from
+`cargo build`, from the cdylib and from every release asset, so it changes nothing about what ships.
+`THIRD_PARTY.md` carries the dev tree and its licenses.
 
 ## One batched packet per peer per tick
 

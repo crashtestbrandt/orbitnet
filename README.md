@@ -28,7 +28,7 @@ just rts-host                    # then `just rts-join` in another terminal
 
 > **0.x.** `Net` is the surface intended to be stable, and before 1.0 that covers its shape rather than its
 > behavior. **A minor version may change what an existing `Net` call returns**, alongside the wire format and
-> the Rust internals. Pin a tag, and read [Upgrading from 0.2.x](#upgrading-from-02x) before moving one.
+> the Rust internals. Pin a tag, and read [Upgrading](#upgrading) before moving one.
 > [ROADMAP.md](ROADMAP.md) ranks what is open.
 >
 > [Versioning across releases](docs/protocol.md#versioning-across-releases) states the **policy past 0.x** —
@@ -67,7 +67,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 |---|---|
 | **Godot** | 4.4+ (built against the 4.4 API; loads in anything at or above it) |
 | **Language** | GDScript. No C# bindings. |
-| **Platforms** | Linux x86_64, Windows x86_64, macOS universal. Linux arm64, Android and iOS have no published build yet — see [ROADMAP.md](ROADMAP.md) |
+| **Platforms** | Linux x86_64, Windows x86_64, macOS universal; Linux arm64 from the next release. Android and iOS have no published build yet — see [ROADMAP.md](ROADMAP.md) |
 | **Transports** | ENet out of the box; Steam via [GodotSteam](https://godotsteam.com/), selected by export-preset feature tag |
 | **Not supported** | Web — Godot's web export cannot load a GDExtension |
 
@@ -209,24 +209,31 @@ are game decisions, and any default here would be wrong for somebody.
   reconnect immediate rather than waiting out a keepalive; `Net.set_resume_policy(ONLY_IF_DROPPED)` refuses
   that, at the cost of every genuinely fast reconnect. **Persist the token beside the session id**, or a
   restarted process cannot resume.
-- **The session key crosses the wire in the clear unless the game supplies a secret.** Every datagram but the
-  handshake carries a MAC and a replay sequence. With no secret configured, the handshake carries the key
-  those are checked with. An attacker who cannot read the session's traffic cannot forge a datagram, and one
-  connected peer cannot forge another's, but **an on-path observer who reads the handshake can do everything
-  the client can**.
+- **No session key crosses the wire, and a join is two round trips because of it.** Every datagram but the
+  handshake and the challenge carries a MAC and a replay sequence. The key is folded from **two 16-byte
+  nonce halves, one drawn by each end**: the joiner sends its half in its opening handshake, the server
+  answers with a half of its own, and the joiner confirms. A client may send nothing until the server's half
+  lands, because half of the key's input is the server's. An attacker who cannot read the session's traffic
+  cannot forge a datagram, and one connected peer cannot forge another's, but with no secret configured the
+  fold is a public function of two values that are both on the wire, so **an on-path observer who reads the
+  exchange can do everything the client can**.
 - **`Net.set_session_secret()` closes that, and the secret has to come from a channel the game already
-  authenticates** — a lobby, a matchmaker ticket. The handshake's 16 bytes become a **nonce**, the key is
-  derived from it and the secret, and an observer reading the handshake learns nothing.
-- **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes, unless the
-  transport underneath encrypts the link — see the next bullet. The ceiling is a 64-bit tag and a 128-bit key,
-  and an on-path observer can still **replay** a join it recorded, because the nonce is the client's choice
-  and presenting it again derives the same key. It authors nothing new and the captured datagrams land
-  nowhere. Closing that needs a value the acceptor contributes, and
-  therefore a second round trip before a client may send anything. An X25519 exchange was considered and
-  declined — unauthenticated ECDH is substituted by exactly the on-path attacker these bullets are about, so
-  it would demote the adversary to passive-only in exchange for several hundred lines of hand-written
-  constant-time field arithmetic in a zero-dependency crate whose only constant-time groundwork is the
-  ten-line tag compare. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+  authenticates** — a lobby, a matchmaker ticket. The halves stay what they are and every byte on the wire
+  stays where it is; the key becomes a derivation over the secret and their fold, so an observer reading the
+  whole exchange learns nothing.
+- **A recorded join can no longer be replayed.** The server draws its half fresh per connection, so an
+  observer presenting a handshake it captured is challenged on a half it has never seen: it cannot produce
+  the confirmation, and the session it would open is keyed on bytes that are not the recorded key. What this
+  does not refuse is an observer that can also **inject** — answering the server's challenge in the client's
+  place is authoring a fresh join, and a shared session secret is what refuses that.
+- **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes, unless
+  the transport underneath encrypts the link — see the next bullet. The
+  ceiling is a 64-bit tag and a 128-bit key. An X25519 exchange is not implemented. An
+  **unauthenticated** one would not close this — it is substituted by exactly the on-path attacker these
+  bullets are about, and buys only a demotion to passive-only. An **authenticated** one is open work: it was
+  priced at several hundred lines of hand-written constant-time field arithmetic because `orbitnet-core`'s
+  empty `[dependencies]` was read as a rule, and that reading has been settled against, so a vetted
+  implementation is the option. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
 - **A harness holds the tag compare to constant time.**
   `native/crates/orbitnet-core/tests/constant_time.rs` asserts that the compare's own source, compiled on its
   own under each shipped profile's flags, emits no branch, and measures whether two refused datagrams
@@ -264,11 +271,16 @@ are game decisions, and any default here would be wrong for somebody.
   inside `_rollback_tick`, on the server. The full split is in
   [docs/protocol.md](docs/protocol.md#what-the-receive-path-refuses-and-what-it-does-not).
 
-## Upgrading from 0.2.x
+## Upgrading
 
-**`PROTOCOL_VERSION` moved major 6 → 8**, so a 0.2.x peer and a current one refuse each other's handshake.
-Upgrade both ends of a session together. The three `Net` changes below raise nothing — the 0.2.1 call still
-compiles, still runs, and means something else.
+**`PROTOCOL_VERSION` moved major 6 → 9.** A 0.2.x peer and a current one refuse each other's handshake, and
+so do a **0.3.x or 0.4.x peer and a current one**: the join grew from two frames to four and the handshake
+grew a 16-byte field. A major mismatch is refused ahead of every other compatibility rule, in both
+directions, so there is no mixed-version session to diagnose — upgrade every end together.
+
+**The table below is the 0.2.x API break only.** Coming from 0.3.x or 0.4.x, the wire major is the whole of
+the upgrade and no `Net` call changed meaning. The three changes below raise nothing either — the 0.2.1 call
+still compiles, still runs, and means something else.
 
 | Change | What breaks | What to do |
 |---|---|---|

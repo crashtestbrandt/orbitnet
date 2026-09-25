@@ -28,7 +28,41 @@ Regenerate this list with `cargo tree` in `native/` after any dependency change.
 | `heck`, `proc-macro2`, `quote`, `unicode-ident`, `venial` | MIT OR Apache-2.0 (`venial`: MIT) | Proc-macro machinery used at build time by gdext's macros. Not linked into the shipped library. |
 
 `orbitnet-core` and `orbitnet-godot` are this project's own crates and carry this project's license.
-`orbitnet-core` has **zero** dependencies by design.
+`orbitnet-core` has **zero runtime dependencies** by design; the table below is its dev-only tree.
+
+## `orbitnet-core`'s dev-dependencies
+
+**Dev-only, and none of it is linked into a build.** `[dev-dependencies]` is compiled for
+`cargo test` and for nothing else, so no crate below appears in `cargo build`, in the cdylib
+`orbitnet-godot` links, or in any release asset. The zero-dependency rule in
+`native/crates/orbitnet-core/Cargo.toml` governs `[dependencies]`, which stays empty.
+
+Regenerate this list with `cargo tree -p orbitnet-core --edges normal,build,dev` in `native/`.
+
+| Crate | License | Why it is here |
+|---|---|---|
+| `proptest` | MIT OR Apache-2.0 | The generator behind `crates/orbitnet-core/tests/wire_properties.rs`: round-trip properties over the wire codec, and the arbitrary-bytes sweep of every public decoder. |
+| `bitflags`, `num-traits`, `regex-syntax`, `unarray` | MIT OR Apache-2.0 | `proptest`'s own dependencies. |
+| `rand`, `rand_core`, `rand_chacha`, `rand_xorshift`, `getrandom`, `ppv-lite86` | MIT OR Apache-2.0 | The seeded RNG `proptest` generates and shrinks cases with. |
+| `zerocopy` | BSD-2-Clause OR Apache-2.0 OR MIT | Byte-level casts inside `ppv-lite86`. |
+| `cfg-if`, `libc` | MIT OR Apache-2.0 | Platform selection under `getrandom`. `libc` is already in the tree for the crash handler. |
+| `autocfg` | Apache-2.0 OR MIT | `num-traits`' build script. |
+
+The command above prints **15 crates**, which is every row of the table.
+
+**Five more crates are locked and never built.** `native/Cargo.lock` resolves a dependency's optional
+features and every target's backends, so it pins crates no build of this workspace compiles. They are listed
+for completeness, and each one's license is compatible anyway:
+
+| Crate | License | Why it never builds |
+|---|---|---|
+| `r-efi` | MIT OR Apache-2.0 OR LGPL-2.1-or-later | `getrandom`'s UEFI backend. No platform OrbitNet builds for selects it. |
+| `wasip2`, `wit-bindgen` | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `getrandom`'s WASI backend, selected on no platform OrbitNet builds for. |
+| `zerocopy-derive` | BSD-2-Clause OR Apache-2.0 OR MIT | `zerocopy`'s optional `derive` feature, which `ppv-lite86` does not enable. |
+| `syn` | MIT OR Apache-2.0 | `zerocopy-derive`'s dependency, and reached from nowhere else. |
+
+The choice of `proptest` over `cargo-fuzz` is recorded in the header comment of
+`native/crates/orbitnet-core/tests/wire_properties.rs`.
 
 ## Why MPL-2.0 in the dependency tree is fine
 
