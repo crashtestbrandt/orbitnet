@@ -1724,6 +1724,19 @@ impl OrbitRollbackSynchronizer {
     /// `reference_tick` is the last tick this peer applied (delta base) — `None` forces full.
     /// Returns the entity tick the block describes and whether it went out as a full row, which is
     /// what the keyframe clock is measured against.
+    ///
+    /// **`scratch` comes back holding the block's changed mask whenever the answer is a delta**, and
+    /// holds whatever a previous call left there when the answer is a full row. That is the only
+    /// statement of whether the block carried a change — see `orbit_net::block_is_un_written`, which
+    /// pairs the two values.
+    ///
+    /// **A rollback block is admitted whatever that mask holds.** An empty delta decodes to the base
+    /// the peer acked, which is the authoritative row, and
+    /// [`OrbitRollbackSynchronizer::integrate_authoritative_row`] runs it against the receiver's own
+    /// predicted row for that tick. That compare is the only thing that raises a
+    /// [`StateIntegration::Mispredict`], so a client predicting against a row the server is holding
+    /// still is corrected by exactly this block. The state lane un-writes its empty deltas; this one
+    /// does not.
     pub(crate) fn encode_block(
         &mut self,
         writer: &mut Writer,
@@ -2629,6 +2642,12 @@ impl OrbitStateSynchronizer {
     }
 
     /// Encode this entity's block for one peer (state lane flag set).
+    ///
+    /// **`scratch` comes back holding the block's changed mask whenever the answer is a delta**, as
+    /// on the rollback lane — see `orbit_net::block_is_un_written`. This is the lane that acts on it:
+    /// an on-change channel that nothing touched is written here every tick it is visited, and that
+    /// block is the one the send path un-writes. A state row is applied and nothing else, so a row
+    /// identical to the base the peer holds changes nothing on the receiver.
     pub(crate) fn encode_block(
         &mut self,
         writer: &mut Writer,

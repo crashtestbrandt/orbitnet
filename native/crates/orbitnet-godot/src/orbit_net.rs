@@ -412,8 +412,12 @@ struct BandwidthMetrics {
     blocks_admitted_s: f64,
     /// Blocks that wanted to go out and did not fit the budget. **Budget pressure.**
     blocks_deferred_s: f64,
-    /// Blocks intentionally not sent — out of interest, or held back by rate tiering.
+    /// Blocks intentionally not sent — out of interest, held back by rate tiering, or written and
+    /// un-written because a state-lane delta carried no change (see [`block_is_un_written`]).
     /// **Deliberate.** Kept apart from `deferred` because conflating them hides the failure.
+    ///
+    /// The third cause dominates on a session whose bodies carry on-change channels: such a channel
+    /// is a candidate on every tick and has news on few of them.
     blocks_culled_s: f64,
     /// Blocks admitted even though they alone exceeded the whole byte budget — see the admit loop.
     /// Non-zero means one entity's full state does not fit in a datagram, so that frame went out
@@ -424,8 +428,12 @@ struct BandwidthMetrics {
     ///
     /// - Floor: about `blocks_admitted_s / FULL_STATE_INTERVAL`. Every entity owes one keyframe
     ///   per interval, so nothing lower is reachable.
-    /// - Near `blocks_admitted_s`: almost nothing is being deltaed. On a server that indicates a
-    ///   `want_full` storm; read it beside `want_full_nacks_s`.
+    /// - Near `blocks_admitted_s`: almost nothing is being deltaed. Two causes, and they are told
+    ///   apart by `want_full_nacks_s` on the server read beside `stale_blocks_s` on a client:
+    ///   - A `want_full` storm — `want_full_nacks_s` non-zero.
+    ///   - The admitted set is mostly idle on-change channels taking their keyframes, which is what
+    ///     [`block_is_un_written`] leaves of such a channel. Benign, and `want_full_nacks_s` reads
+    ///     0.00 throughout.
     blocks_full_s: f64,
     /// `WANT_FULL` NACKs received. **SERVER-SIDE ONLY** — it is incremented where a client's input
     /// frame is decoded, so a client reads a structural 0.00 here whatever its link is doing.
@@ -449,6 +457,12 @@ struct BandwidthMetrics {
     /// says nothing at all about whether a storm is happening.
     stale_blocks_s: f64,
     /// Worst age, in ticks, of any in-interest entity that had been sent at least once.
+    ///
+    /// **An idle state-lane on-change channel reads at its keyframe interval.** It is not admitted
+    /// on the ticks its delta carries no change, so its age runs up to [`FULL_STATE_INTERVAL`] and
+    /// is reset by the keyframe. A session holding such channels therefore has a floor of about that interval here,
+    /// and a reading at the floor says nothing arrived late — the age is of a row nothing changed.
+    /// A reading well above it is the starvation this column exists for.
     starve_ticks_max: f64,
     /// Worst count of in-interest entities never yet sent to a peer — the re-entry storm gauge,
     /// which `starve_ticks_max` cannot see because a never-sent entity has no age.
@@ -6087,7 +6101,9 @@ impl OrbitNet {
                 // capped at MAX_FRAME_PAYLOAD went out at 1456 bytes and drew ENet's over-MTU warning. An
                 // unreliable datagram past the path MTU fragments, and a lost fragment loses the whole frame.
                 let body_before = body.len();
-                let tick_sent = if let Some(sync) = self.rollback_entities.get(&id) {
+                // The lane the block came from travels with it. Only the state lane un-writes
+                // an empty delta -- see [`block_is_un_written`].
+                let (tick_sent, state_lane) = if let Some(sync) = self.rollback_entities.get(&id) {
                     let Some(mut sync) = live_handle(sync) else {
                         continue;
                     };
@@ -6098,7 +6114,7 @@ impl OrbitNet {
                         current,
                         reference,
                     );
-                    tick
+                    (tick, false)
                 } else if let Some(sync) = self.state_entities.get(&id) {
                     let Some(mut sync) = live_handle(sync) else {
                         continue;
@@ -6110,24 +6126,46 @@ impl OrbitNet {
                         current,
                         reference,
                     );
-                    tick
+                    (tick, true)
                 } else {
-                    None
+                    (None, false)
                 };
-                if body.len() > admit_budget {
-                    // IT DID NOT FIT. Deferring is right whenever the frame already carries something --
-                    // but if it carries NOTHING, deferring this block sends no frame at all, and that is
-                    // not a delay, it is the end of the stream. An entity that has never been sent scores
-                    // `u64::MAX` staleness, so it is first again next tick, does not fit again, and defers
-                    // again: this peer never receives another snapshot for the rest of the session, for
-                    // every entity, silently. (The first implementation had no un-write at all -- an oversized
-                    // block simply went out, which is where ENet's over-MTU warning came from.)
+                // A candidate whose delta carries no change is un-written rather than admitted,
+                // on the state lane alone. `block_is_un_written` holds the whole rule -- which lane
+                // may do it and why the other may not, what counts as no change, what an un-write
+                // does to the rota, what still bounds such a channel's staleness, and what a client
+                // may read into a block's absence. The mask it is handed is the one the encoder
+                // just left in `mask_scratch`, which only the delta branch fills, so the `full`
+                // term is required. It is the encoder's own answer, rather than an inference at
+                // this call site from having supplied a reference.
+                let un_written = tick_sent.is_some_and(|(_, was_full)| {
+                    block_is_un_written(state_lane, was_full, &self.mask_scratch)
+                });
+                // `block_admission` orders the un-write against the over-budget check below, so
+                // that the order is a rule a test can call rather than the shape this loop happens
+                // to have. The un-write leads: the oversize branch exists so a frame with nothing
+                // in it yet still carries its first block rather than ending the stream, and a
+                // block that states nothing would satisfy that branch while sending no state.
+                match block_admission(un_written, body.len() <= admit_budget, sent.is_empty()) {
+                    BlockAdmission::UnWrite => {
+                        body.truncate(body_before);
+                        self.acc_blocks_culled += 1;
+                        continue;
+                    }
+                    // IT DID NOT FIT, and the frame carries nothing yet. Deferring is right whenever the
+                    // frame already carries something -- but if it carries NOTHING, deferring this block
+                    // sends no frame at all, which ends the stream rather than delaying it. An entity that
+                    // has never been sent scores `u64::MAX` staleness, so it is first again next tick, does
+                    // not fit again, and defers again: this peer never receives another snapshot for the
+                    // rest of the session, for every entity, silently. (The first implementation had no
+                    // un-write at all -- an oversized block simply went out, which is where ENet's over-MTU
+                    // warning came from.)
                     //
                     // So the frame carries it anyway. One datagram past the path MTU fragments and a lost
                     // fragment costs that frame; a wedged peer costs the session. The condition is counted
                     // rather than swallowed, because "one entity's full state does not fit in a datagram"
                     // is a fact about the schema that somebody has to be told.
-                    if sent.is_empty() {
+                    BlockAdmission::Oversize => {
                         if let Some((tick, was_full)) = tick_sent {
                             self.acc_blocks_oversize += 1;
                             sent.push((id, tick));
@@ -6146,9 +6184,12 @@ impl OrbitNet {
                         body.truncate(body_before);
                         continue;
                     }
-                    body.truncate(body_before);
-                    self.acc_blocks_deferred += (order.len() - index) as u64;
-                    break;
+                    BlockAdmission::Defer => {
+                        body.truncate(body_before);
+                        self.acc_blocks_deferred += (order.len() - index) as u64;
+                        break;
+                    }
+                    BlockAdmission::Admit => {}
                 }
                 if let Some((tick, was_full)) = tick_sent {
                     sent.push((id, tick));
@@ -9415,6 +9456,127 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
             && current.saturating_sub(last_full) >= interval)
 }
 
+/// Whether the entity block just written is un-written again instead of admitted, because it
+/// states nothing the peer does not already hold.
+///
+/// The three arguments describe the block now sitting at the end of the frame body.
+/// [`OrbitRollbackSynchronizer::encode_block`] and [`OrbitStateSynchronizer::encode_block`] return
+/// `full` and leave `mask` in the scratch buffer they were handed whenever they wrote a delta;
+/// `state_lane` is which of the two wrote it. A free function so the rule the send path runs is the
+/// rule a test can call.
+///
+/// **Only the state lane un-writes.** A state block is applied and nothing else — the receiver
+/// writes the row into its history and its pending display — so a row identical to the base it
+/// already holds changes nothing there. A rollback block is compared first: the receiver runs the
+/// arriving authoritative row against its own predicted row for that tick, and that compare is the
+/// only thing that produces a mispredict and the resimulation that repairs it. An empty delta
+/// decodes to the base, which is the authoritative row, so it is a complete statement of what the
+/// server holds even with no mask bits set. A client whose prediction has diverged while the
+/// authoritative row stands still — a body held against a wall, a move the server rejected, a body
+/// the server parked — is corrected by exactly that block, and un-writing it would leave the client
+/// mispredicting until the next keyframe, up to [`FULL_STATE_INTERVAL`] ticks. The rollback lane
+/// therefore carries its empty deltas, and the saving here is the state lane's.
+///
+/// **Nothing to say means an empty delta mask, and nothing else.** A full block carries no mask and
+/// is never un-written. It restates the whole row, which is what repairs a delta chain the receiver
+/// cannot decode, and [`full_block_due`] is evaluated before the write with nothing here able to
+/// suppress it — so an unchanged channel still takes its keyframe every [`FULL_STATE_INTERVAL`].
+///
+/// **What it is for.** Every candidate in the send order used to be written and admitted whether or
+/// not its delta carried a change. An on-change channel — a body's health, its equipment, its
+/// sensors, the doors around it — changes on few of the ticks it is visited on, and on the rest it
+/// spent a block header and a rota visit restating a row the peer already held. Where every body
+/// carries one anchored pose channel and one unanchored on-change channel, about half of a frame's
+/// admissions went that way on a server whose per-peer budget was full, and the pose channels waited
+/// a whole rota for the bytes those admissions held.
+///
+/// **An un-written candidate loses no turn.** The send order is rebuilt every tick from
+/// `staleness x weight`, so there is no cursor to hold a place in. An un-write records no send, so
+/// `last_sent` stands and the candidate's staleness is one tick larger on the next tick than it was
+/// on this one. The first tick it has something to say it scores at least as high as it would have
+/// under the old behaviour, where an admission for an unchanged row reset that staleness to zero.
+///
+/// **Its keyframe bounds how stale it can get.** An unchanged channel is still admitted once per
+/// [`FULL_STATE_INTERVAL`] whenever the budget reaches it, and that admission moves `last_sent` like
+/// any other, so `starve_ticks_max` over a set of idle channels settles at about the keyframe
+/// interval rather than climbing without bound. That bound is why this is the lever rather than
+/// channel priority. Raising an anchored channel's declared `priority` moves the unanchored ones
+/// down every rota, which measured as a starvation of 33 ticks — over half a second at 60 Hz, on the
+/// channel a death is carried on. An un-write spends no admission on a channel that has no news, and
+/// none of the ordering on the ones that do.
+///
+/// **A client assumes nothing new from a missing state block.** A missing block already means no
+/// news in this frame. It has never meant that the row is unchanged, and no receive path reads it
+/// that way: a receiver takes exactly `entity_count` blocks and stops, a block whose slot it holds
+/// no binding for is skipped and the rest of the frame decodes, and an entity out of interest, held
+/// back by rate tiering, or deferred for budget sends nothing either. This is a fourth reason for a
+/// state block's absence and no new reading of one. The lane term above keeps a rollback block's
+/// absence meaning what it always meant.
+///
+/// **A frame whose whole admitted set was un-written is not sent.** [`snapshot_frame_is_skipped`]
+/// ends a peer's tick when no block was admitted, no interest news rides along and no interest gate
+/// is shut, so a quiet state-lane session sends its snapshots — and with them the header's
+/// `ack_tick`, `ack_token` and `margin_ticks` — at about the keyframe cadence rather than every
+/// tick. The client's clock-lead controller samples `margin_ticks` on snapshot arrival, so it
+/// corrects more slowly on such a session. Nothing is silenced by it: [`input_frame_is_owed`] keeps
+/// a peer that drives no body sending, and interest news or a shut gate sends the header on its own
+/// tick.
+///
+/// **`history_limit` must stay above the keyframe interval plus the ack round trip.** `acked_base`
+/// advances only when a frame carrying that entity is acked, and an un-written channel is carried
+/// only by its keyframe, so its base gap settles at about [`FULL_STATE_INTERVAL`] plus the round
+/// trip in ticks instead of tracking the rota. `base_span` is `history_limit` floored at 2 and
+/// clamped to [`STATE_HISTORY_DEPTH`], and [`delta_reference`] degrades to a full row once the
+/// gap reaches it. A project that sets `history_limit` below about twice the keyframe interval
+/// therefore has its idle on-change channels write full rows on every visit — a full block is
+/// never un-written — which costs more than the empty deltas this removes. The shipped
+/// projects are at 128 and 64 and both clamp to `STATE_HISTORY_DEPTH`.
+///
+/// **Counted as culled.** The block was withheld deliberately, as a rate-tiering hold-back is, so it
+/// is kept out of `blocks_deferred_s`, which exists to measure budget pressure and nothing else.
+#[must_use]
+fn block_is_un_written(state_lane: bool, full: bool, mask: &[bool]) -> bool {
+    state_lane && !full && !mask.iter().any(|&changed| changed)
+}
+
+/// What the admit loop does with the entity block it has just written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockAdmission {
+    /// Un-write it and carry on down the send order — see [`block_is_un_written`].
+    UnWrite,
+    /// It overran the budget and the frame carries nothing yet, so it goes out anyway.
+    Oversize,
+    /// It overran the budget and the frame already carries something, so it waits a tick.
+    Defer,
+    /// It fits.
+    Admit,
+}
+
+/// Which of the four the block just written gets. A free function so the **order** of the three
+/// tests is a rule a test can call, rather than the shape the admit loop happens to have.
+///
+/// **The un-write leads.** A block that states nothing satisfies the oversize branch below just as
+/// an oversized one does, and taking that branch would end the frame on a block carrying no state.
+/// Answering `UnWrite` first leaves the frame empty, so the next candidate can still take the
+/// oversize branch if it needs to.
+///
+/// `fits` is the body length against the admit budget after the write, because an entity block's
+/// encoded size is not known until it is written. `frame_is_empty` is whether anything has been
+/// admitted to this frame yet, which is what separates [`BlockAdmission::Oversize`] from
+/// [`BlockAdmission::Defer`].
+#[must_use]
+fn block_admission(un_written: bool, fits: bool, frame_is_empty: bool) -> BlockAdmission {
+    if un_written {
+        BlockAdmission::UnWrite
+    } else if fits {
+        BlockAdmission::Admit
+    } else if frame_is_empty {
+        BlockAdmission::Oversize
+    } else {
+        BlockAdmission::Defer
+    }
+}
+
 /// The stored `seat_release_policy`, reduced to a value this build knows.
 ///
 /// Total by construction: an unknown number is `HOLD`, which is the policy that releases nothing.
@@ -9463,22 +9625,22 @@ mod interest_search;
 mod tests {
     use super::{
         admit_input_blocks, adopt_whole_set, anchor_conflicts_owed, apply_interest_section,
-        band_for_row, build_interest_section, candidate_for_own_row, candidate_for_row,
-        challenge_answer, challenge_half, clamp_resume_policy, clamp_seat_release_policy,
-        clamp_unanchored_policy, classify_rx, delta_reference, encode_interest_delta,
-        filter_connection, full_block_due, hello_leg, hold_on_drop, input_frame_is_owed,
-        interest_delta_reserve, interest_table_due, interest_table_to_send, is_located,
-        manifest_owed, note_input_tick, owned_rows_into, owned_rows_of, queue_seat_release,
-        replayed_depth, resim_input_from, resolve_observer, resume_grant, retire_unnamed_interest,
-        rtt_at_ceiling_peers, seat_hello, seat_observer, seat_observers_into,
-        seat_release_policy_of, section_is_news, select_interest_path, session_directions,
-        session_is_filtering, session_key_from, snapshot_frame_is_skipped,
+        band_for_row, block_admission, block_is_un_written, build_interest_section,
+        candidate_for_own_row, candidate_for_row, challenge_answer, challenge_half,
+        clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
+        delta_reference, encode_interest_delta, filter_connection, full_block_due, hello_leg,
+        hold_on_drop, input_frame_is_owed, interest_delta_reserve, interest_table_due,
+        interest_table_to_send, is_located, manifest_owed, note_input_tick, owned_rows_into,
+        owned_rows_of, queue_seat_release, replayed_depth, resim_input_from, resolve_observer,
+        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
+        session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
         state_whole_interest_set, table_is_resolvable, unseeded_departures, veto_announces_leave,
-        AckOutcome, ChallengeAnswer, EntityRow, FrameHeader, HelloLeg, InterestPass, ManifestOwed,
-        OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
-        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
-        StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED,
-        AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
+        AckOutcome, BlockAdmission, ChallengeAnswer, EntityRow, FrameHeader, HelloLeg,
+        InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
+        ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent,
+        SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED,
+        ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
         INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
         INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
         MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
@@ -13134,6 +13296,312 @@ mod tests {
                 "tick {tick} must owe exactly one id a keyframe"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // What the admit loop does with a candidate that has no change to send.
+    // ------------------------------------------------------------------
+
+    /// One state-lane candidate's fate on one tick, as the admit loop decides it: a keyframe when
+    /// one is due, a masked delta otherwise, and no admission at all when that delta's mask carries
+    /// nothing. `Some(true)` is a full block, `Some(false)` a delta, `None` a block written and
+    /// un-written.
+    ///
+    /// The state lane, because it is the one that un-writes — the rollback lane's empty delta is
+    /// carried, which `a_rollback_delta_is_carried_even_when_it_states_no_change` pins.
+    ///
+    /// It calls the three shipping rules rather than restating them, so a change to any of them
+    /// reaches these tests. The mask is one bit because one changed property is all a block needs,
+    /// and the block always fits because a budget is not what these tests are about.
+    fn visit(id: u64, current: u64, last_full: u64, changed: bool) -> Option<bool> {
+        let full = full_block_due(false, id, current, last_full, FULL_STATE_INTERVAL);
+        match block_admission(block_is_un_written(true, full, &[changed]), true, false) {
+            BlockAdmission::UnWrite => None,
+            _ => Some(full),
+        }
+    }
+
+    #[test]
+    fn a_state_delta_carrying_no_change_is_not_admitted() {
+        assert!(
+            block_is_un_written(true, false, &[false, false, false]),
+            "every property matches the base the peer already holds, so the block states nothing"
+        );
+        assert!(
+            !block_is_un_written(true, false, &[false, true, false]),
+            "one changed property is worth the block header"
+        );
+    }
+
+    #[test]
+    fn a_rollback_delta_is_carried_even_when_it_states_no_change() {
+        // The receiver compares the arriving authoritative row against its own predicted row, and
+        // that compare is the only thing that raises a mispredict. An empty delta decodes to the
+        // base, which is the authoritative row, so it is what confirms or refutes a prediction —
+        // and a client predicting against a row the server is holding still has nothing else to
+        // read.
+        assert!(!block_is_un_written(false, false, &[false, false, false]));
+        assert!(!block_is_un_written(false, false, &[]));
+    }
+
+    #[test]
+    fn a_full_block_is_admitted_whatever_the_scratch_mask_holds() {
+        // A full row carries no mask, so the buffer still holds whichever entity was encoded before
+        // it. Deciding from the buffer alone would drop keyframes — the one block that repairs a
+        // chain the receiver cannot decode — which is why the encoder's own `full` answer leads.
+        assert!(!block_is_un_written(true, true, &[false, false, false]));
+        assert!(!block_is_un_written(true, true, &[]));
+    }
+
+    #[test]
+    fn a_state_channel_with_no_properties_has_no_delta_to_admit() {
+        // An empty mask is an empty schema: no property exists whose change could earn a block. Its
+        // keyframes still go out, so the peer keeps a row for it.
+        assert!(block_is_un_written(true, false, &[]));
+    }
+
+    #[test]
+    fn an_un_written_block_is_answered_before_the_budget_is_consulted() {
+        // The order the admit loop runs, pinned. A block that states nothing overruns the budget
+        // like any other, and the oversize branch admits whatever it is handed while the frame is
+        // still empty — so answering the budget first would end that frame on a block carrying no
+        // state, and count it as oversize rather than culled.
+        assert_eq!(
+            block_admission(true, false, true),
+            BlockAdmission::UnWrite,
+            "un-writing leads, so the frame stays empty for the next candidate"
+        );
+        assert_eq!(block_admission(true, true, false), BlockAdmission::UnWrite);
+        assert_eq!(
+            block_admission(false, false, true),
+            BlockAdmission::Oversize,
+            "a block with state in it still rides when the frame would otherwise go out empty"
+        );
+        assert_eq!(
+            block_admission(false, false, false),
+            BlockAdmission::Defer,
+            "the frame already carries something, so this one waits a tick"
+        );
+        assert_eq!(block_admission(false, true, true), BlockAdmission::Admit);
+        assert_eq!(block_admission(false, true, false), BlockAdmission::Admit);
+    }
+
+    #[test]
+    fn an_unchanged_channel_still_takes_its_keyframe_on_schedule() {
+        let id: u64 = 7;
+        let interval = FULL_STATE_INTERVAL;
+        let mut last_full = phase_tick(id, 1, interval);
+        let mut last_sent = last_full;
+        let mut keyframes: Vec<u64> = Vec::new();
+        let mut worst_age = 0u64;
+        for current in last_full + 1..=last_full + interval * 5 {
+            worst_age = worst_age.max(current - last_sent);
+            match visit(id, current, last_full, false) {
+                Some(true) => {
+                    keyframes.push(current);
+                    last_full = current;
+                    last_sent = current;
+                }
+                Some(false) => panic!("tick {current}: an unchanged row has no delta to write"),
+                None => {}
+            }
+        }
+        assert_eq!(
+            keyframes.len(),
+            5,
+            "one keyframe per interval; a skipped delta moves neither clock, so none of them slid"
+        );
+        for pair in keyframes.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                interval,
+                "the keyframes stay exactly an interval apart across a run of skips"
+            );
+        }
+        assert!(
+            worst_age <= interval,
+            "the keyframe is what bounds an idle channel's staleness, and it reached {worst_age} \
+             ticks against an interval of {interval}"
+        );
+    }
+
+    #[test]
+    fn a_channel_that_resumes_changing_is_admitted_on_that_tick() {
+        let id: u64 = 7;
+        let interval = FULL_STATE_INTERVAL;
+        let last_full = phase_tick(id, 1, interval);
+        for ahead in 1..interval {
+            let current = last_full + ahead;
+            assert_eq!(
+                visit(id, current, last_full, false),
+                None,
+                "tick {current}: nothing changed, so nothing is admitted"
+            );
+            assert_eq!(
+                visit(id, current, last_full, true),
+                Some(false),
+                "tick {current}: the same visit admits a delta the moment there is one to write"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skip_does_not_reset_the_staleness_that_orders_the_rota() {
+        // The rule this replaces admitted the unchanged block, which set `last_sent` and dropped the
+        // candidate's staleness to zero. A skip writes no `last_sent`, so the channel arrives at the
+        // tick it finally has news carrying every tick it kept quiet, and outranks a channel of the
+        // same weight that was served one tick ago.
+        let weight =
+            orbitnet_core::priority::weight_for(orbitnet_core::priority::Band::Far, 1, false);
+        let served_last_tick = orbitnet_core::priority::Candidate {
+            id: 4,
+            staleness: 1,
+            weight,
+        };
+        let resumed = orbitnet_core::priority::Candidate {
+            id: 9,
+            staleness: 12,
+            weight,
+        };
+        assert_eq!(
+            orbitnet_core::priority::cmp(&resumed, &served_last_tick),
+            core::cmp::Ordering::Less,
+            "the order is descending by score, so the staler candidate is walked first"
+        );
+        let under_the_superseded_rule = orbitnet_core::priority::Candidate {
+            id: 9,
+            staleness: 1,
+            weight,
+        };
+        assert_eq!(
+            orbitnet_core::priority::cmp(&under_the_superseded_rule, &served_last_tick),
+            core::cmp::Ordering::Greater,
+            "reset by its own unchanged admission it scored level and fell to the id tie-break, \
+             which is the penalty the skip removes"
+        );
+    }
+
+    /// One channel of the rota model below.
+    struct RotaChannel {
+        id: u64,
+        /// Whether its row differs from the base the peer holds on every tick. An anchored pose
+        /// channel does; an on-change channel — health, equipment, a door — does not.
+        changes: bool,
+        last_sent: u64,
+        last_full: u64,
+    }
+
+    /// One peer's send pass over `ticks` ticks, admitting at most `per_frame` blocks a tick, with
+    /// `skip_empty` selecting the rule under test or the one it replaces. Sixteen channels, half of
+    /// them changing every tick, all at one weight so the order is staleness alone.
+    ///
+    /// Answers the admissions that carried a change, and the worst age any quiet channel reached.
+    /// The frame is capped in blocks rather than bytes because a skipped block costs no bytes, which
+    /// is the whole of what it buys.
+    fn run_rota(skip_empty: bool, ticks: u64, per_frame: usize) -> (u64, u64) {
+        let weight =
+            orbitnet_core::priority::weight_for(orbitnet_core::priority::Band::Far, 1, false);
+        // Each channel starts from a keyframe on its own phase tick, which is the only state the
+        // send path can leave it in: `last_full` is written where a full block goes out, and a full
+        // block goes out on a phase tick. Seeding them all at one tick instead would have the first
+        // keyframe come due up to a whole interval late, which is an artifact of the seed rather
+        // than of the rule. Zero is excluded for the same reason — it means "nothing full has ever
+        // gone out", which is unconditionally due for every id.
+        let interval = FULL_STATE_INTERVAL;
+        let mut channels: Vec<RotaChannel> = (0..16u64)
+            .map(|id| {
+                let seeded = phase_tick(id, 1, interval);
+                RotaChannel {
+                    id,
+                    changes: id % 2 == 0,
+                    last_sent: seeded,
+                    last_full: seeded,
+                }
+            })
+            .collect();
+        let mut carried_a_change = 0u64;
+        let mut worst_quiet_age = 0u64;
+        // The age is read after the pass, and only once the run has been going for an interval:
+        // every channel is seeded from a keyframe, so the first interval reports the seed's age
+        // rather than the rule's.
+        let settled = interval * 2 + 1;
+        for current in interval + 1..interval + 1 + ticks {
+            let mut order: Vec<orbitnet_core::priority::Candidate> = channels
+                .iter()
+                .map(|channel| orbitnet_core::priority::Candidate {
+                    id: channel.id,
+                    staleness: current - channel.last_sent,
+                    weight,
+                })
+                .collect();
+            orbitnet_core::priority::order(&mut order);
+            let mut admitted = 0usize;
+            for candidate in &order {
+                if admitted == per_frame {
+                    break;
+                }
+                let channel = &mut channels[candidate.id as usize];
+                let full = full_block_due(
+                    false,
+                    channel.id,
+                    current,
+                    channel.last_full,
+                    FULL_STATE_INTERVAL,
+                );
+                if skip_empty
+                    && block_admission(
+                        block_is_un_written(true, full, &[channel.changes]),
+                        true,
+                        false,
+                    ) == BlockAdmission::UnWrite
+                {
+                    continue;
+                }
+                admitted += 1;
+                channel.last_sent = current;
+                if full {
+                    channel.last_full = current;
+                }
+                if channel.changes {
+                    carried_a_change += 1;
+                }
+            }
+            if current >= settled {
+                for channel in channels.iter().filter(|channel| !channel.changes) {
+                    worst_quiet_age = worst_quiet_age.max(current - channel.last_sent);
+                }
+            }
+        }
+        (carried_a_change, worst_quiet_age)
+    }
+
+    #[test]
+    fn a_frame_spends_its_admissions_on_the_channels_with_news() {
+        let ticks = FULL_STATE_INTERVAL * 8;
+        let (with_skip, quiet_age) = run_rota(true, ticks, 4);
+        let (superseded, superseded_quiet_age) = run_rota(false, ticks, 4);
+        assert!(
+            with_skip > superseded,
+            "the freed admissions go to the channels that changed: {with_skip} against \
+             {superseded} under the rule this replaces"
+        );
+        assert!(
+            with_skip * 2 >= superseded * 3,
+            "and the gain is worth the change: {with_skip} against {superseded} is under half \
+             again as many"
+        );
+        assert!(
+            quiet_age <= FULL_STATE_INTERVAL,
+            "while a quiet channel is still refreshed by its keyframe: worst age {quiet_age} \
+             against an interval of {}",
+            FULL_STATE_INTERVAL
+        );
+        assert!(
+            superseded_quiet_age < quiet_age,
+            "the rule this replaces held quiet channels fresher than they need to be, at \
+             {superseded_quiet_age} ticks against {quiet_age}, and that is what it was spending \
+             the frame on"
+        );
     }
 
     // ------------------------------------------------------------------

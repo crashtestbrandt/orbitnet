@@ -1476,8 +1476,15 @@ func _backend_has(method: StringName) -> bool:
 ##   tx_peak_peer_bytes_s           -- the busiest single peer's payload: the figure an AOI A/B has to move
 ##   blocks_admitted_s              -- entity blocks that made it into a frame
 ##   blocks_deferred_s              -- blocks that wanted to go out and did not fit. BUDGET PRESSURE.
-##   blocks_culled_s                -- blocks intentionally withheld (out of interest, or rate-tiered). DELIBERATE.
+##   blocks_culled_s                -- blocks intentionally withheld (out of interest, rate-tiered, or written and
+##                                     un-written because a state-lane delta carried no change). DELIBERATE.
 ##                                     Kept apart from deferred because conflating them hides the failure.
+##                                     The third cause dominates on a session whose bodies carry on-change channels
+##                                     -- health, equipment, the doors around a body. Such a channel is a candidate
+##                                     on every tick and has news on few of them, and restating a row the peer
+##                                     already holds costs a block header and an admission the moving bodies wanted.
+##                                     A rollback-lane block is never withheld this way: its empty delta is
+##                                     what confirms or refutes the client's prediction for that tick.
 ##   want_full_nacks_s              -- WANT_FULL NACKs received. SERVER-SIDE ONLY: it is counted where a
 ##                                     client's INPUT frame is decoded, so a client reads a structural 0.00.
 ##   unproven_acks_s                -- acks discarded because the frame token quoted was not the one this
@@ -1491,8 +1498,11 @@ func _backend_has(method: StringName) -> bool:
 ##                                     composition, and what the keyframe interval costs. Floor is about
 ##                                     blocks_admitted_s / 16, since every entity owes one keyframe per
 ##                                     interval. Near blocks_admitted_s means almost nothing is being deltaed,
-##                                     which on a server indicates a want_full storm -- read it beside
-##                                     want_full_nacks_s.
+##                                     and there are two causes. A want_full storm, which a server's
+##                                     want_full_nacks_s shows and a client's stale_blocks_s shows; or an
+##                                     admitted set that is mostly idle on-change channels taking their
+##                                     keyframes, which is all such a channel contributes and is benign.
+##                                     want_full_nacks_s reading 0.00 on the server separates the two.
 ##   blocks_oversize_s              -- blocks admitted even though one of them exceeded the WHOLE byte budget, so
 ##                                     that frame went out over the MTU and fragmented. Non-zero means one
 ##                                     entity's full state does not fit in a datagram, which is a schema fact.
@@ -1508,7 +1518,13 @@ func _backend_has(method: StringName) -> bool:
 ##   live on opposite peers -- so pairing them means pairing a CLIENT's stale_blocks_s with a SERVER's
 ##   want_full_nacks_s. Inside one net.perf they can never both be non-zero, and "want_full 0.00" read off a
 ##   client is not evidence about a storm; it is evidence that the reader was on a client.
-##   starve_ticks_max               -- worst age in ticks of an in-interest entity that HAS been sent at least once
+##   starve_ticks_max               -- worst age in ticks of an in-interest entity that HAS been sent at least once.
+##                                     An idle state-lane on-change channel reads at its keyframe interval,
+##                                     16 ticks. It is not admitted on the ticks its delta carries no change,
+##                                     and its keyframe is what resets the age. A session holding such channels therefore has a floor
+##                                     of about that interval here, and a reading at the floor says nothing arrived
+##                                     late -- the age is of a row nothing changed. Well above it is the starvation
+##                                     this column exists for.
 ##   unsent_backlog_max             -- worst count of in-interest entities never yet sent to a peer (the re-entry
 ##                                     storm gauge, which starve_ticks_max cannot see: a never-sent entity has no age)
 ##   interest_ms                    -- ms/tick in the interest pass. The cost of whichever path ran, and the
