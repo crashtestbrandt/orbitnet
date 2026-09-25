@@ -385,6 +385,55 @@ jobs:
           rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT \
                 addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
 
+      # Godot for the step below, pinned and cached under the runner's home so a release pays the download
+      # once. Extracted with python3's zipfile rather than `unzip`, which this runner does not have -- the
+      # same absence that made tools/make-assetlib-zip.py a python script.
+      - name: Provision the pinned Godot
+        env:
+          GODOT_VERSION: 4.4.1-stable
+        run: |
+          set -euo pipefail
+          dir="$HOME/.cache/orbitnet-godot/${GODOT_VERSION}"
+          bin="$dir/godot"
+          if [ ! -x "$bin" ]; then
+            mkdir -p "$dir"
+            base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}"
+            curl -fsSL -o "$dir/godot.zip" "${base}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+            python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+              "$dir/godot.zip" "$dir"
+            mv "$dir/Godot_v${GODOT_VERSION}_linux.x86_64" "$bin"
+            chmod +x "$bin"
+            rm -f "$dir/godot.zip"
+          fi
+          "$bin" --version
+          # tools/godot-quiet.sh honors GODOT_BIN, and the check below runs every Godot pass through it.
+          echo "GODOT_BIN=$bin" >> "$GITHUB_ENV"
+
+      # The zip is checked between building it and publishing it, and a failure fails the release rather
+      # than annotating it. This is also the only job in the repository where the real artifact exists --
+      # every platform's libraries, downloaded rather than built locally, with the licences copied in
+      # above.
+      #
+      # It asserts the contents -- both addon directories, every library the descriptor names, no Git LFS
+      # pointer text, the licences, nothing else -- and then unpacks the archive into a throwaway project
+      # that declares the `Net` autoload and the enabled plugin, loads the addon's GDScript, and runs
+      # tools/orbitnet-smoke.sh --skip-build against the zip's own binaries. Nothing is rebuilt: the zip
+      # supplies them.
+      #
+      # --complete is passed here and nowhere else. check.yml runs the same script on every pull request
+      # against a tree holding one platform's libraries, so only this job can require the descriptor's
+      # full named set.
+      - name: The published zip installs into a clean project and boots
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
+            version="${INPUT_VERSION#v}"
+          fi
+          tools/check-assetlib-zip.py --zip "build/orbitnet-${version}.zip" --complete
+
       # EVERY published asset, including the AssetLib zip. A consumer that pins this tag can fetch the
       # single zip -- which carries both addon directories and every descriptor library -- and verify one
       # digest, rather than fetching each file and trusting the set was complete. Written after the zip

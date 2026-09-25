@@ -117,10 +117,26 @@ rts-probe:
 arena-probe:
     GODOT="{{godot}}" tools/arena-probe.sh
 
+# The Asset Library zip is assembled by a path no other gate exercises -- tools/make-assetlib-zip.py, from a
+# tree whose bin/ was filled by downloaded artifacts, with the licences copied in. These two recipes are the
+# gate for that artifact; the script's header carries the reasoning and the full list of assertions.
+
+# The negative control: a synthetic archive per failure class -- a library removed, a Git LFS pointer, a
+# missing licence, a stray file -- each asserted to be caught. Standard library only, no Godot, no Rust.
+assetlib-selftest:
+    tools/check-assetlib-zip.py --self-test
+
+# Assemble the zip the way release.yml does, assert what it carries, unpack it into a throwaway Godot
+# project and boot it with the plugin enabled. Needs addons/orbitnet_native/bin/ populated -- `just
+# native-install`. It omits --complete, because this machine holds one platform's libraries and the
+# release runner is the only tree that holds all four platforms'.
+assetlib-check:
+    GODOT="{{godot}}" tools/check-assetlib-zip.py
+
 # Everything a PR must pass, in the order that fails fastest first. Both harness probes run before the two demo
 # probes because the harness is the addon's own project: a failure there is the addon, where a failure in a demo
 # could be either. The determinism probe leads the four because it binds no socket and costs about six seconds.
-check: addon-tracked addon-drift net-check descriptor-parity version-parity bench-check native-test lint test determinism-probe server-shape-probe rts-probe arena-probe
+check: addon-tracked addon-drift net-check descriptor-parity version-parity bench-check assetlib-selftest native-test lint test assetlib-check determinism-probe server-shape-probe rts-probe arena-probe
 
 # =====================================================================================================
 # the native backend (Rust)
@@ -361,16 +377,21 @@ export-rts-server:
 
 # Build the Asset Library payload: exactly the two addon directories, nothing else. This is what a user
 # installs through AssetLib -> Install from file, and what release.yml attaches to a tag.
+#
+# It calls tools/make-assetlib-zip.py, the same packager release.yml runs, rather than the `zip` binary this
+# recipe used to call. Two packagers produced two different archives from one tree. `zip -qr` also swept in
+# addons/orbitnet_native/binaries.json, which hashes the archive and so carries the previous tag's digests,
+# and `just assetlib-check` can only speak for an archive built the way the shipped one is.
 assetlib-zip VERSION="dev":
     #!/usr/bin/env bash
     set -euo pipefail
-    out="build/orbitnet-{{VERSION}}.zip"
     mkdir -p build
-    rm -f "$out"
+    rm -f "build/orbitnet-{{VERSION}}.zip"
     # Include the licenses: an addon installed from a zip carries no repository around with it, and a user
     # who cannot find the license terms inside the thing they installed will assume the worst.
+    # The trap is armed BEFORE the copy: a cp that copies two of the four files and then fails would
+    # otherwise exit under `set -e` with no trap installed, leaving licence files in the canonical addon
+    # directory for `just addon-drift` to report as an edited addon. `rm -f` on absent files is a no-op.
+    trap 'rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md' EXIT
     cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnet/
-    zip -qr "$out" addons/orbitnet addons/orbitnet_native
-    rm -f addons/orbitnet/LICENSE addons/orbitnet/LICENSE-MIT addons/orbitnet/LICENSE-APACHE addons/orbitnet/THIRD_PARTY.md
-    echo "wrote $out"
-    unzip -l "$out" | tail -5
+    tools/make-assetlib-zip.py "{{VERSION}}" build
