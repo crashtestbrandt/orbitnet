@@ -121,6 +121,27 @@ native-test:
     cd native && cargo clippy --workspace --all-targets -- -D warnings
     cd native && cargo test --workspace
 
+# The dudect-style timing measurement over the receive path's tag compare, under BOTH profiles Godot
+# ships -- the compare must be constant-time in `template-debug`, which every run from source loads, as
+# well as in `template_release`, which an exported game loads.
+#
+# NOT in `just check`, and deliberately `#[ignore]`d so `native-test` skips it. Its verdict is only as
+# good as the machine's noise floor. A shared GitHub-hosted runner is a noisy virtual machine with
+# neighbours, where the tolerance inflates until the test passes on anything, or the floor moves mid-run
+# and it fails on nothing. Run it on an idle machine. No job runs it today -- wiring it onto the
+# self-hosted Linux leg is a `ROADMAP.md` row. The test derives its own tolerance from a noise floor it
+# measures each run, and asserts that a deliberately leaky compare clears that tolerance by 4x, so a box
+# too noisy to resolve a known leak fails rather than passing.
+#
+# The other half of that file -- the assertion that the compare emits no branch -- is a plain unit test
+# and DOES run in `native-test` on every PR. See the header of
+# native/crates/orbitnet-core/tests/constant_time.rs.
+native-timing:
+    cd native && cargo test -p orbitnet-core --profile template-debug --test constant_time -- \
+        --ignored --nocapture --test-threads=1
+    cd native && cargo test -p orbitnet-core --release --test constant_time -- \
+        --ignored --nocapture --test-threads=1
+
 # Both descriptor profiles, into addons/orbitnet_native/bin/ under the shipped names. `template_debug` is
 # what Godot loads when a project runs from source (every dev run, every CI probe) and is the only build
 # carrying `debug-assertions`; `template_release` is what an exported game loads. Neither is the 10-50x
