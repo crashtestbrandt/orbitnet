@@ -2658,6 +2658,22 @@ impl INode for OrbitNet {
     }
 }
 
+/// What a caller handed one of the two exchange-key setters.
+///
+/// **Three outcomes, because clearing and refusing are different.** An empty array is a caller asking for
+/// no key; a wrong length is a caller who got it wrong. Folding the second into the first is how a
+/// configuration bug silently unpins a server: the setter assigns what the reader returns, so a rejected
+/// input would discard the key the previous good call installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeKeyInput {
+    /// An empty array: seat no key.
+    Clear,
+    /// Exactly [`EXCHANGE_KEY_LEN`] bytes.
+    Key([u8; EXCHANGE_KEY_LEN]),
+    /// Any other length. **The configured key is left where it is.**
+    Refused,
+}
+
 #[godot_api]
 impl OrbitNet {
     /// Emitted once per simulation tick, before input capture — the facade's `pre_tick`.
@@ -3294,7 +3310,8 @@ impl OrbitNet {
     /// have not been given the public half yet.
     #[func]
     fn set_server_static_key(&mut self, key: PackedByteArray) {
-        self.server_static = Self::read_exchange_key(&key, "set_server_static_key");
+        let input = Self::read_exchange_key(&key, "set_server_static_key");
+        Self::apply_exchange_key(&mut self.server_static, input);
     }
 
     /// SERVER: the 32-byte **public half** of [`Self::set_server_static_key`], or an empty array when no
@@ -3353,7 +3370,8 @@ impl OrbitNet {
     /// stays on whichever regime [`Self::set_session_secret`] left it in.
     #[func]
     fn set_pinned_server_key(&mut self, key: PackedByteArray) {
-        self.pinned_server_key = Self::read_exchange_key(&key, "set_pinned_server_key");
+        let input = Self::read_exchange_key(&key, "set_pinned_server_key");
+        Self::apply_exchange_key(&mut self.pinned_server_key, input);
     }
 
     /// Whether this client pinned a server key.
@@ -3366,39 +3384,51 @@ impl OrbitNet {
         self.pinned_server_key.is_some()
     }
 
-    /// A 32-byte X25519 key out of a `PackedByteArray`, or `None` for an empty array.
+    /// A 32-byte X25519 key out of a `PackedByteArray`.
     ///
     /// **A wrong length is refused rather than padded or truncated.** Either would seat a key neither
     /// end can name, and the join would fail with nothing pointing at the call that caused it.
-    fn read_exchange_key(key: &PackedByteArray, call: &str) -> Option<[u8; EXCHANGE_KEY_LEN]> {
+    fn read_exchange_key(key: &PackedByteArray, call: &str) -> ExchangeKeyInput {
         let bytes = key.as_slice();
         if bytes.is_empty() {
-            return None;
+            return ExchangeKeyInput::Clear;
         }
         if bytes.len() != EXCHANGE_KEY_LEN {
             godot_error!(
-                "OrbitNet: {call}() takes exactly {EXCHANGE_KEY_LEN} bytes and was handed {}. The \
-                 key is ignored and this session runs without one.",
+                "OrbitNet: {call}() takes exactly {EXCHANGE_KEY_LEN} bytes and was handed {}. The call \
+                 is refused and whatever key was already configured is kept. Pass an empty array to \
+                 clear one deliberately.",
                 bytes.len()
             );
-            return None;
+            return ExchangeKeyInput::Refused;
         }
         let mut out = [0u8; EXCHANGE_KEY_LEN];
         out.copy_from_slice(bytes);
-        Some(out)
+        ExchangeKeyInput::Key(out)
+    }
+
+    /// Apply one of those outcomes to a configured key. `Refused` leaves it alone, which is the whole
+    /// point of the distinction.
+    fn apply_exchange_key(slot: &mut Option<[u8; EXCHANGE_KEY_LEN]>, input: ExchangeKeyInput) {
+        match input {
+            ExchangeKeyInput::Clear => *slot = None,
+            ExchangeKeyInput::Key(key) => *slot = Some(key),
+            ExchangeKeyInput::Refused => {}
+        }
     }
 
     /// SERVER: the exchange public key to answer `hello` with, or `None` when no exchange runs.
     ///
-    /// The condition is [`offered_static_key`]; the basepoint multiply here is what costs, so it runs
-    /// only once that condition holds.
+    /// The condition is [`offered_static_key`]. The public key is read off the pending row rather than
+    /// derived here: a retried opening hello is answered as often as it is sent, and the multiply would
+    /// otherwise run once per datagram an unauthenticated peer chose to send.
     fn exchange_offer(
         &self,
         hello: &Handshake,
         pending: &PendingJoin,
     ) -> Option<[u8; EXCHANGE_KEY_LEN]> {
         offered_static_key(self.server_static.as_ref(), &hello.joiner_exchange)
-            .map(|_| exchange_public_key(&pending.acceptor_ephemeral))
+            .map(|_| pending.acceptor_public)
     }
 
     /// SERVER: what this join's exchange produced, from the pending row's cache or by deriving it.
@@ -9725,6 +9755,7 @@ fn challenge_half(
                 joiner_nonce: joiner,
                 acceptor_nonce,
                 acceptor_ephemeral,
+                acceptor_public: exchange_public_key(&acceptor_ephemeral),
                 joiner_exchange: [0u8; EXCHANGE_KEY_LEN],
                 exchange: None,
             };
@@ -9756,6 +9787,12 @@ struct PendingJoin {
     acceptor_nonce: [u8; KEY_LEN],
     /// The acceptor's ephemeral exchange secret, or all zeroes when none was drawn.
     acceptor_ephemeral: [u8; EXCHANGE_KEY_LEN],
+    /// The public half of [`Self::acceptor_ephemeral`], derived once when the row was drawn.
+    ///
+    /// **Cached for the reason [`Self::exchange`] is.** An unconfirmed opening hello is retried until the
+    /// challenge lands, and every retry is answered with a challenge carrying this value. Deriving it per
+    /// answer is a basepoint multiply an unauthenticated peer can ask for at line rate.
+    acceptor_public: [u8; EXCHANGE_KEY_LEN],
     /// The [`Handshake::joiner_exchange`] [`Self::exchange`] was derived against, all zeroes until
     /// one was.
     joiner_exchange: [u8; EXCHANGE_KEY_LEN],
@@ -10534,15 +10571,16 @@ mod tests {
         send_pass_is_due, session_auth_from, session_directions, session_is_filtering,
         session_key_from, snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
         unseeded_departures, veto_announces_leave, AckOutcome, BlockAdmission, ChallengeAnswer,
-        EntityRow, ExchangeOutcome, FrameCharge, FrameHeader, HelloLeg, InterestPass, ManifestOwed,
-        OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState, PendingJoin, ResolvedSeats,
-        ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent,
-        SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED,
-        ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, BANDWIDTH_WINDOW_SECONDS, FULL_STATE_INTERVAL,
-        INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX,
-        INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD,
-        MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE, MODE_SERVER,
-        PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+       EntityRow, ExchangeKeyInput, ExchangeOutcome, FrameCharge, FrameHeader, HelloLeg,
+        InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver,
+        PeerState, PendingJoin, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId,
+        SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots,
+        Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR,
+        BANDWIDTH_WINDOW_SECONDS, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
+        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
+        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER,
+        RESUME_ONLY_IF_DROPPED,
         RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
         SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH, UNANCHORED_CLOSED,
         UNANCHORED_OPEN, UNLOCATABLE_CENTER,
@@ -15620,12 +15658,58 @@ mod tests {
         (nonce_bytes(seed), [seed; EXCHANGE_KEY_LEN])
     }
 
+    /// A wrong-length key must not discard the key a previous good call installed.
+    ///
+    /// **The failure this pins is fail-open on the value the pin exists to provide.** The setters assign
+    /// what the reader returns, so a reader that answered "no key" for a malformed input would unpin the
+    /// server on a caller's length mistake, and the client would then join with no exchange at all rather
+    /// than refusing or keeping the last good pin.
+    #[test]
+    fn a_refused_key_keeps_the_one_already_configured() {
+        let good = [7u8; EXCHANGE_KEY_LEN];
+        let mut slot = None;
+
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Key(good));
+        assert_eq!(slot, Some(good), "a well-formed key is seated");
+
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Refused);
+        assert_eq!(
+            slot,
+            Some(good),
+            "a refused call leaves the configured key alone"
+        );
+    }
+
+    /// Clearing stays available, and is what an empty array asks for. Without this the refusal above
+    /// would have taken the deliberate clear with it.
+    #[test]
+    fn an_empty_key_clears_and_a_refusal_does_not() {
+        let mut slot = Some([9u8; EXCHANGE_KEY_LEN]);
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Refused);
+        assert!(slot.is_some(), "refused leaves it");
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Clear);
+        assert_eq!(slot, None, "an empty array clears it");
+    }
+
+    /// The acceptor's public key is derived when the row is drawn, so answering a retried hello reads it
+    /// back rather than running a basepoint multiply per datagram an unauthenticated peer sends.
+    #[test]
+    fn the_rows_public_key_is_the_one_its_secret_derives() {
+        let row = pending([1u8; KEY_LEN], 5);
+        assert_eq!(
+            row.acceptor_public,
+            exchange_public_key(&row.acceptor_ephemeral),
+            "the cached public half matches the secret it was drawn from"
+        );
+    }
+
     /// The row `drawn(seed)` produces against `joiner`.
     fn pending(joiner: [u8; KEY_LEN], seed: u8) -> PendingJoin {
         PendingJoin {
             joiner_nonce: joiner,
             acceptor_nonce: nonce_bytes(seed),
             acceptor_ephemeral: [seed; EXCHANGE_KEY_LEN],
+            acceptor_public: exchange_public_key(&[seed; EXCHANGE_KEY_LEN]),
             joiner_exchange: [0u8; EXCHANGE_KEY_LEN],
             exchange: None,
         }

@@ -802,7 +802,8 @@ refused. A pinned client against a server holding no static key is the one misco
 reports itself, and it reports itself on the client.
 
 **What it costs.** Four X25519 operations per join per end — two basepoint multiplies and two
-Diffie-Hellman — plus 64 bytes on the wire per join, 32 on each of the first two legs. Nothing at rest, and
+Diffie-Hellman — plus 96 bytes on the wire per join, 32 on each of the three legs. The confirmation
+repeats the hello's shape, so it carries the joiner's public key a second time. Nothing at rest, and
 nothing at all for a session that configures no pin. `x25519-dalek` is the implementation; it is
 `orbitnet-core`'s only runtime dependency, its constant-time claims are that crate's own rather than
 anything this repository measures, and `native/crates/orbitnet-core/Cargo.toml`'s header states what it had
