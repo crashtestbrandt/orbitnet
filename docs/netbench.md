@@ -129,7 +129,7 @@ per window.
 | `blocks_admitted_s` / `blocks_deferred_s` / `blocks_culled_s` / `blocks_oversize_s` / `blocks_full_s` | what the admit loop did with each block |
 | `starve_ticks_max` / `unsent_backlog_max` | worst in-interest staleness, and the re-entry backlog it cannot see |
 | `interest_ms` / `interest_grid` / `interest_entities` | the interest pass's cost, which path ran, and the mean set size |
-| `interarrival_near` / `_mid` / `_far` / `_all` | mean ticks between admissions, per distance band |
+| `interarrival_near` / `_mid` / `_far` / `_all` | mean ticks between admissions, per distance band. The candidacy count is weighted by the ticks each frame advanced, so the unit stays ticks whatever the authority's frame rate. |
 | `blocks_s` | entity blocks admitted per second, from the debug counter. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
 | `rx_applied_s` / `rx_rejected_s` / `rx_skipped_s` | inbound rows applied, refused, and unplaceable |
 | `peers` / `ents_rollback` / `ents_state` | what the session held that window |
@@ -138,6 +138,25 @@ per window.
 `BandwidthMetrics::fields` is the one list both the log line and the Godot dictionary are built from, and
 `server.csv` takes its send-path columns from whatever that line names — so a counter added there appears in
 the CSV with no parser change.
+
+**Every `*_s` column is a rate per wall second**, and the window is charged the wall time of every frame
+whether or not that frame advanced a tick. The figures therefore do not move with how fast the authority
+renders.
+
+**An artifact captured before the window was put on one time base under-reports every per-second column.**
+The window used to be charged simulated time on a frame that ticked and wall time on a frame that did not,
+so an idle frame's seconds were charged twice and the one-second window closed early. The deflation is
+`1 / (1 + idle_frame_wall_fraction)`, which is a function of the authority's frame rate against its net tick
+rate — measured at x0.63 on a ~145 fps authority against a 60 Hz net tick, x0.67 at 120 fps and x1.00 at 60
+and 30. `compare.py` against such a baseline reads `tx_bytes_s`, `blocks_deferred_s`, `want_full_nacks_s` and
+every other per-second column as having risen. Re-capture the baseline rather than judging across that
+boundary.
+
+**`net_ms` covers every snapshot datagram the frame sent.** A frame that advanced two net ticks sends up to
+two per peer, so on an authority rendering below its net tick rate the column carries the admit-and-encode
+cost more than once. The interest pass and the send ordering run once per frame whatever the tick count, so
+`interest_ms` does not move with it. `net_ms` is a per-frame figure and the tick rate fixes the per-second
+cost.
 
 **`want_full_nacks_s` is reported at the end of a run and not gated.** Its own doc calls near-zero the
 acceptance bar for interest management being on, and `compare.py` already judges it as a fault counter — but

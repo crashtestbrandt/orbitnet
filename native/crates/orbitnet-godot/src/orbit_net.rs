@@ -120,7 +120,11 @@ const ANCHOR_SOURCE_INFERRED: i64 = 1;
 const ANCHOR_SOURCE_FIXED: i64 = 2;
 const ANCHOR_SOURCE_ENTITY: i64 = 3;
 
-/// Seconds between clock probes.
+/// Wall seconds between clock probes.
+///
+/// **Wall, because a round trip is a wall-clock quantity.** It shares its time base with the
+/// bandwidth window, so a client rendering above its tick rate probes at this interval rather than
+/// faster — see [`frame_charge`].
 const PING_INTERVAL: f64 = 0.25;
 /// Ticks between forced full-state blocks per entity (phase-offset by entity id).
 const FULL_STATE_INTERVAL: u64 = 16;
@@ -165,6 +169,10 @@ const AOI_EXIT_FACTOR: f32 = 1.25;
 const WIRE_OVERHEAD_BYTES: u64 = 28 + 12 + 1;
 
 /// Seconds per accounting window — the period the per-second bandwidth figures are averaged over.
+///
+/// **Wall seconds.** The window is charged the wall time of every frame, ticking or not, so every
+/// published `*_s` figure is a rate on the wire rather than one that moves with the frame rate. See
+/// [`frame_charge`].
 const BANDWIDTH_WINDOW_SECONDS: f64 = 1.0;
 
 /// One replicated entity as the send path sees it, gathered once per tick before any peer is
@@ -1029,7 +1037,14 @@ impl ResumeTable {
     }
 }
 
-/// How many unacked snapshot frames a peer's sent log retains before the oldest expire.
+/// How many **ticks** of unacked snapshot sends a peer's sent log retains before the oldest expire.
+///
+/// **Denominated in ticks rather than in datagrams.** A frame that advanced several ticks sends several
+/// snapshot datagrams at one tick value, and [`PeerState::note_sent_frame`] folds them into one
+/// entry so this depth keeps meaning the same span of ticks at any frame rate.
+///
+/// Twice the 32-tick window [`PeerState::consume_ack`] can confirm over — an `ack_tick` plus the 32
+/// frames its `ack_bits` name — which is the margin an ack arriving a round trip late needs.
 const SENT_LOG_DEPTH: usize = 64;
 
 /// How many entries of each half of a peer's pending interest delta ride one frame.
@@ -1073,9 +1088,9 @@ const INTEREST_DELTA_PENDING_HARD_MAX: usize = INTEREST_DELTA_PENDING_MAX * 4;
 
 /// How many ticks a prefix rides unacknowledged before it is given up on.
 ///
-/// **The same depth as [`SENT_LOG_DEPTH`]**, and for the same reason: past 64 frames an ack can no
-/// longer confirm the frame anyway, so holding the prefix past that reserves budget on every tick
-/// for a section nothing will ever retire. What is dropped is the prefix — those events are never
+/// **The same depth as [`SENT_LOG_DEPTH`]**, and for the same reason: past 64 ticks the sent log no
+/// longer holds the frame the prefix rode in, so no ack can retire it, and holding the prefix past
+/// that reserves budget on every tick for a section nothing will ever retire. What is dropped is the prefix — those events are never
 /// announced to that peer, so the drop owes that connection a whole set
 /// ([`OrbitNet::send_interest_tables`]) rather than leaving its mirror wrong. The rest of the pending
 /// delta is unaffected and takes the next frame.
@@ -1486,6 +1501,31 @@ impl PeerState {
         self.acked_base.clear();
     }
 
+    /// File one snapshot datagram's entity ticks under the tick it carried.
+    ///
+    /// **One entry per tick, whatever the frame's datagram count.** A frame that advanced several
+    /// ticks sends several snapshot datagrams at one tick value, and [`SENT_LOG_DEPTH`] is
+    /// denominated in ticks: an entry per datagram would let the log's reach shrink toward
+    /// `64 / max_ticks_per_frame` frames on an authority running behind its tick rate, while the
+    /// ticks each of those frames spans grows by the same factor.
+    ///
+    /// **The fold holds that denomination rather than making an ack work.**
+    /// [`PeerState::consume_ack`] retains by predicate, so it already confirms every entry filed
+    /// under the acked tick and would promote both halves of a split frame.
+    fn note_sent_frame(&mut self, tick: u64, mut sent: Vec<(u64, u64)>) {
+        let same_tick = matches!(self.sent_log.back(), Some((frame, _)) if *frame == tick);
+        if same_tick {
+            if let Some((_, entities)) = self.sent_log.back_mut() {
+                entities.append(&mut sent);
+            }
+        } else {
+            self.sent_log.push_back((tick, sent));
+        }
+        while self.sent_log.len() > SENT_LOG_DEPTH {
+            self.sent_log.pop_front();
+        }
+    }
+
     /// Consume one arriving acknowledgment whole: check its proof, raise `newest_ack`, take a
     /// round-trip sample, and promote to `acked_base` every entity tick the frames it confirms carried.
     ///
@@ -1883,6 +1923,15 @@ pub struct OrbitNet {
     /// wall delta instead; its own cap/retention/discard bounds are exactly the catch-up policy
     /// the engine clamp was standing in for, applied where the clock can see it.
     last_process_wall_us: u64,
+    /// Wall-clock stamp of the previous coupled `physics_process` call, in usec (0 = none yet).
+    ///
+    /// The coupled loop simulates on the engine's fixed physics step — that is what coupled mode
+    /// is — but the windowed timers [`OrbitNet::run_net_upkeep`] drives are wall quantities, and the
+    /// fixed step is not one: under sustained `max_physics_steps_per_frame` clamping the engine runs
+    /// fewer steps than the wall asked for and charges each the nominal length. Measuring the charge
+    /// here keeps every published `*_s` figure a rate on the wire in coupled mode, which is the
+    /// shipped default, as well as in decoupled mode.
+    last_physics_wall_us: u64,
 
     planner: ResimPlanner,
     rollback_entities: BTreeMap<u64, Gd<OrbitRollbackSynchronizer>>,
@@ -2372,6 +2421,7 @@ impl INode for OrbitNet {
             hello_timer: 0.0,
             stretch_now: 1.0,
             last_process_wall_us: 0,
+            last_physics_wall_us: 0,
             planner: ResimPlanner::new(),
             rollback_entities: BTreeMap::new(),
             state_entities: BTreeMap::new(),
@@ -2498,10 +2548,31 @@ impl INode for OrbitNet {
     fn physics_process(&mut self, delta: f64) {
         self.drain_pending();
         if self.running && self.sync_to_physics {
-            self.step_coupled();
+            // The engine's `delta` here is the **nominal physics step** rather than elapsed wall
+            // time. Godot hands `_physics_process` a fixed `1 / physics_ticks_per_second`, and under sustained
+            // clamping (`max_physics_steps_per_frame`) it runs fewer steps than the wall asked for
+            // and still charges each of them the nominal length. Charging that to the windowed
+            // timers would divide counters accumulated over more wall seconds by a short window and
+            // inflate every published `*_s` figure — the same class of frame-rate artifact the one
+            // time base exists to remove. So the charge is measured from the monotonic clock, as
+            // the decoupled loop measures its own.
+            //
+            // The **simulation** still runs on the fixed step, which is what coupled mode is for. The
+            // tick length is the physics step and no wall measurement moves it.
+            let now_us = Time::singleton().get_ticks_usec();
+            let wall = if self.last_physics_wall_us == 0 {
+                delta
+            } else {
+                now_us.saturating_sub(self.last_physics_wall_us) as f64 / 1_000_000.0
+            };
+            self.last_physics_wall_us = now_us;
+            self.step_coupled(wall);
+        } else {
+            // Not driving the coupled loop this frame: a stale stamp would charge the whole idle
+            // span to the first window after it resumes.
+            self.last_physics_wall_us = 0;
         }
         self.publish_tick_state();
-        let _ = delta;
     }
 
     fn process(&mut self, delta: f64) {
@@ -4491,7 +4562,7 @@ impl OrbitNet {
         }
     }
 
-    fn step_coupled(&mut self) {
+    fn step_coupled(&mut self, wall_delta: f64) {
         // Coupled mode pins stretch to exactly 1.0 — a stretched clock slides tick boundaries
         // across physics frames and renders as judder. Clock error is absorbed by slewing whole
         // ticks, rarely, under hysteresis + cooldown.
@@ -4510,7 +4581,7 @@ impl OrbitNet {
         // Exactly `ticks` whole tick-lengths: no fractional remainder can exist in coupled mode.
         let first = self.accumulator.tick();
         let step = self.accumulator.advance(dt * f64::from(ticks));
-        self.run_frame(first, step.ticks, dt);
+        self.run_frame(first, step.ticks, dt, wall_delta);
     }
 
     fn step_decoupled(&mut self, delta: f64) {
@@ -4539,16 +4610,21 @@ impl OrbitNet {
             // then the hard resync (which this stall has all but guaranteed) fires once, aimed.
             self.clock.clear();
         }
-        if step.ticks > 0 {
-            self.run_frame(first, step.ticks, rate.dt());
-        } else {
-            self.run_net_upkeep(delta);
-        }
+        // One entry point whether or not the frame released a tick. `run_frame` charges the net
+        // upkeep the same wall seconds either way; the split that used to live here is what
+        // charged an idle frame's seconds twice. See `frame_charge`.
+        self.run_frame(first, step.ticks, rate.dt(), delta);
     }
 
-    fn run_frame(&mut self, first_tick: u64, ticks: u32, dt: f64) {
+    /// Run one frame of the loop — the tick batch, the resimulation it owes, and the send passes.
+    ///
+    /// `wall_delta` is the wall time the frame took, and [`frame_charge`] turns it and `ticks` into
+    /// the two per-frame quantities that are neither simulation nor state — what the windowed
+    /// timers are charged, and how many send passes run.
+    fn run_frame(&mut self, first_tick: u64, ticks: u32, dt: f64, wall_delta: f64) {
+        let charge = frame_charge(wall_delta, ticks);
         if ticks == 0 {
-            self.run_net_upkeep(dt);
+            self.run_net_upkeep(charge);
             return;
         }
 
@@ -4587,8 +4663,8 @@ impl OrbitNet {
         let current = first_tick + u64::from(ticks);
         self.run_rollback(first_tick, current, dt);
         self.capture_state_lane(current);
-        self.run_net_upkeep(dt * f64::from(ticks));
-        self.flush_network(current);
+        self.run_net_upkeep(charge);
+        self.flush_network(current, charge.passes);
 
         // AFTER the send, so a server announces the same tick's interest pass rather than the
         // previous one's, and on a tick boundary, so a client announces what its packet handlers
@@ -5246,65 +5322,77 @@ impl OrbitNet {
         }
     }
 
-    fn run_net_upkeep(&mut self, delta: f64) {
+    /// The per-frame work that is neither simulation nor send — expiring held sessions, the
+    /// client's ping interval, the bandwidth window, and the debug line.
+    ///
+    /// **It takes a [`FrameCharge`] rather than a bare `f64`, so the only seconds that can reach
+    /// these timers are the ones [`frame_charge`] decided.** All three are wall-clock quantities —
+    /// [`PING_INTERVAL`] is how often a client measures a round trip, and
+    /// [`BANDWIDTH_WINDOW_SECONDS`] is the denominator under every published `*_s` figure, which is
+    /// a rate on the wire. Charging simulated time here is the mistake this replaced, and passing
+    /// it now needs a `FrameCharge` that nothing constructs.
+    ///
+    /// **Every window discards its overshoot**, so a timer reset here starts from zero rather than
+    /// from the remainder. What that costs differs per timer:
+    ///
+    /// | timer | residual |
+    /// | --- | --- |
+    /// | `bw_timer` | none in the published rate — [`Self::publish_bandwidth`] divides by the window's **measured** length, so `tx_bytes_s` is exact whatever the overshoot was |
+    /// | `ping_timer` | fires up to one frame late per interval, so the period is `PING_INTERVAL` rounded up to a frame — 0.267 s against a stated 0.25 s on a 30 fps client, 6.7% slow |
+    /// | `dbg_timer` | the same one frame per interval, on a line nothing measures |
+    fn run_net_upkeep(&mut self, charge: FrameCharge) {
+        let seconds = charge.seconds;
         self.expire_held_sessions();
-        if self.mode == MODE_CLIENT && self.running {
-            self.ping_timer += delta;
-            if self.ping_timer >= PING_INTERVAL {
-                self.ping_timer = 0.0;
-                self.send_ping();
-            }
+        if self.mode == MODE_CLIENT
+            && self.running
+            && charge_window(&mut self.ping_timer, seconds, PING_INTERVAL).is_some()
+        {
+            self.send_ping();
         }
         // `metrics()` is `&self`, so the raw counters are windowed here — the one place that
         // already owns a one-second timer — rather than divided on every read.
-        self.bw_timer += delta;
-        if self.bw_timer >= BANDWIDTH_WINDOW_SECONDS {
-            let window = self.bw_timer;
-            self.bw_timer = 0.0;
+        if let Some(window) = charge_window(&mut self.bw_timer, seconds, BANDWIDTH_WINDOW_SECONDS) {
             self.publish_bandwidth(window);
         }
-        if self.debug_wire {
-            self.dbg_timer += delta;
-            if self.dbg_timer >= 1.0 {
-                self.dbg_timer = 0.0;
-                godot_print!(
-                    "[orbitnet] tick={} mode={} peers={} ents={}r/{}s sent={} blk {} B rx applied={} rejected={} skipped={} kinds={:?}",
-                    self.accumulator.tick(),
-                    self.mode,
-                    self.peers.len(),
-                    self.rollback_entities.len(),
-                    self.state_entities.len(),
-                    self.dbg_sent,
-                    self.dbg_sent_bytes,
-                    self.dbg_rx_applied,
-                    self.dbg_rx_rejected,
-                    self.dbg_rx_skipped,
-                    self.dbg_rx_kinds
-                );
-                if self.dbg_rx_unauth > 0 {
-                    godot_print!("[orbitnet]   rx_unauthenticated={}", self.dbg_rx_unauth);
-                }
-                godot_print!(
-                    "[orbitnet]   input_novel={} input_nonfinite={} resim_spans={} resim_ticks={} fresh={}",
-                    self.dbg_input_novel,
-                    self.dbg_input_nonfinite,
-                    self.dbg_resim_spans,
-                    self.dbg_resim_ticks_total,
-                    self.dbg_fresh
-                );
-                self.dbg_input_novel = 0;
-                self.dbg_input_nonfinite = 0;
-                self.dbg_resim_spans = 0;
-                self.dbg_resim_ticks_total = 0;
-                self.dbg_fresh = 0;
-                self.dbg_rx_kinds = [0; 10];
-                self.dbg_sent = 0;
-                self.dbg_sent_bytes = 0;
-                self.dbg_rx_applied = 0;
-                self.dbg_rx_rejected = 0;
-                self.dbg_rx_skipped = 0;
-                self.dbg_rx_unauth = 0;
+        // `debug_wire` first, so an ordinary session does not advance a timer nothing reads.
+        if self.debug_wire && charge_window(&mut self.dbg_timer, seconds, 1.0).is_some() {
+            godot_print!(
+                "[orbitnet] tick={} mode={} peers={} ents={}r/{}s sent={} blk {} B rx applied={} rejected={} skipped={} kinds={:?}",
+                self.accumulator.tick(),
+                self.mode,
+                self.peers.len(),
+                self.rollback_entities.len(),
+                self.state_entities.len(),
+                self.dbg_sent,
+                self.dbg_sent_bytes,
+                self.dbg_rx_applied,
+                self.dbg_rx_rejected,
+                self.dbg_rx_skipped,
+                self.dbg_rx_kinds
+            );
+            if self.dbg_rx_unauth > 0 {
+                godot_print!("[orbitnet]   rx_unauthenticated={}", self.dbg_rx_unauth);
             }
+            godot_print!(
+                "[orbitnet]   input_novel={} input_nonfinite={} resim_spans={} resim_ticks={} fresh={}",
+                self.dbg_input_novel,
+                self.dbg_input_nonfinite,
+                self.dbg_resim_spans,
+                self.dbg_resim_ticks_total,
+                self.dbg_fresh
+            );
+            self.dbg_input_novel = 0;
+            self.dbg_input_nonfinite = 0;
+            self.dbg_resim_spans = 0;
+            self.dbg_resim_ticks_total = 0;
+            self.dbg_fresh = 0;
+            self.dbg_rx_kinds = [0; 10];
+            self.dbg_sent = 0;
+            self.dbg_sent_bytes = 0;
+            self.dbg_rx_applied = 0;
+            self.dbg_rx_rejected = 0;
+            self.dbg_rx_skipped = 0;
+            self.dbg_rx_unauth = 0;
         }
     }
 
@@ -5440,7 +5528,66 @@ impl OrbitNet {
     // Send path
     // ------------------------------------------------------------------
 
-    fn flush_network(&mut self, current: u64) {
+    /// Run this frame's send, spending `passes` snapshot datagrams per peer — one per simulation
+    /// tick the frame advanced.
+    ///
+    /// **The send rate follows the net tick rate rather than the frame rate.** One datagram per
+    /// rendered frame made snapshot datagrams per second `min(frame_rate, tick_hz)`, so an
+    /// authority rendering below its net tick rate served proportionally less of each peer's send
+    /// rota and every remote body on it was updated proportionally less often. A rendering host is
+    /// where that happens most often, and a loaded dedicated server whose loop falls below its tick
+    /// rate is the same case. Measured against a 60 Hz net tick with the authority capped at 30 fps,
+    /// the far band's mean gap between updates went from 7.72 to 14.36 ticks.
+    ///
+    /// **The extra datagrams buy rota coverage rather than fresher state.** The state lane is
+    /// captured once per frame, so every datagram a frame sends carries the same tick and the
+    /// authority's frame period is still the floor under the gap between one body's distinct poses.
+    /// What changes is how much of the ordered set reaches the peer inside that period.
+    ///
+    /// **A later datagram in one frame carries the next slice of the rota, never a repeat.**
+    /// [`Self::send_snapshots`] holds a cursor into the ordered set that only moves forward, so an
+    /// entity admitted by an earlier datagram is not reconsidered until the next frame. Re-admitting
+    /// it would re-encode identical bytes at a tick the peer already holds, which the receiver
+    /// discards as stale and counts in `stale_blocks_s`.
+    ///
+    /// **A peer whose whole rota fits in one datagram gets one datagram.** The cursor reaches the
+    /// end of the ordered set and [`send_pass_is_due`] stops the frame there, so a small session and
+    /// a catch-up frame both send exactly what they have to say.
+    ///
+    /// **The byte budget is spent per datagram and clamps to [`MAX_FRAME_PAYLOAD`].** One datagram
+    /// of K times the budget would sit past the path MTU, which fragments, and a lost fragment costs
+    /// the whole frame. The burst is bounded by the tick accumulator's `max_ticks_per_frame`, which
+    /// is already the session's declared catch-up limit.
+    ///
+    /// **The interest pass, the interest section and the ordering run once per frame**, and the
+    /// extra datagrams spend the order that pass produced. Interest is a function of the captured
+    /// poses, so running it again inside one frame would compute the same set at the same cost;
+    /// `interest_ms` is therefore the cost of one pass per frame at any tick count, and what moves
+    /// with the tick count is the admit-and-encode half, reported inside `net_ms`.
+    ///
+    /// **A frame that advanced no tick sends nothing.** That is the other half of the same rule, and
+    /// it is what keeps an authority rendering above its tick rate from sending more than `tick_hz`
+    /// datagrams per second.
+    ///
+    /// **The client's input frame goes out once per frame that ticks.** One input block carries the
+    /// last [`INPUT_REDUNDANCY`] ticks of that body's input, so it already names every tick the
+    /// frame ran and a second copy inside one frame duplicates bytes that are already in flight.
+    /// What that costs is the input rota — a body [`admit_input_blocks`] defers waits a whole frame
+    /// rather than a tick, and the redundancy window covers a frame of up to four ticks.
+    ///
+    /// **The slot reconcile and the entity manifest run once per frame.** The reconcile returns
+    /// immediately on a table that already agrees with the registries, and the manifest is reliable,
+    /// ordered and generation-stamped, so a second copy inside one frame is a duplicate on a channel
+    /// that cannot drop the first.
+    ///
+    /// **An ack names a tick, and a tick may now carry several datagrams.** A peer that received one
+    /// of them and not another still acks the tick, so the server promotes `acked_base` for the
+    /// entities both carried and the next masked delta for an entity whose datagram was lost
+    /// references a base that peer does not hold. The peer cannot decode it, NACKs, and takes a full
+    /// block, which is the repair a broken delta chain already has, one round trip deep. Telling the
+    /// datagrams apart would need a per-datagram sequence in the frame header, which is a wire break,
+    /// and the case needs a multi-tick frame and a loss inside it together.
+    fn flush_network(&mut self, current: u64, passes: u32) {
         if self.mode == MODE_OFFLINE || !self.has_live_peer() {
             return;
         }
@@ -5451,10 +5598,11 @@ impl OrbitNet {
                 // Before the manifest, because the manifest is what publishes the table.
                 self.reconcile_slots(current);
                 self.send_manifest_if_dirty();
-                self.send_snapshots(current);
+                self.send_snapshots(current, passes);
             }
             _ => {}
         }
+        // The whole frame's send cost, every datagram included, which is what the frame spent.
         self.m_net_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
 
@@ -5767,8 +5915,11 @@ impl OrbitNet {
     /// 3. The send order is built from the **surviving** set — so it is `O(peers · K log K)` in the
     ///    interest size rather than `O(peers · N log N)` over the whole registry, which is where the
     ///    real per-peer cost lived. Ordering ahead of the cull bought bandwidth and no CPU.
-    /// 4. Admission spends the byte budget down the ordered list.
-    fn send_snapshots(&mut self, current: u64) {
+    /// 4. Admission spends the byte budget down the ordered list, `passes` datagrams' worth of it
+    ///    — one per simulation tick the frame advanced, each picking the list up where the last one
+    ///    stopped. See [`Self::flush_network`] for why the count is the tick count and
+    ///    [`send_pass_is_due`] for what stops a frame that has run out of rota.
+    fn send_snapshots(&mut self, current: u64, passes: u32) {
         let budget = self.effective_send_budget();
         let peer_ids: Vec<i32> = self
             .peers
@@ -5971,8 +6122,14 @@ impl OrbitNet {
                         age
                     };
                     let weight = priority::weight_for(band, row.priority, row.owner == peer_id);
-                    self.acc_band_members[band.index()] += 1;
-                    peer_members += 1;
+                    // **Weighted by the frame's tick count, because the figure it feeds is
+                    // denominated in ticks.** `interarrival_*` is `members / sends`, read as the
+                    // mean ticks between admissions, and a frame that advanced K ticks offered this
+                    // candidate K ticks of candidacy while the order was built once. Counting it
+                    // once would report the gap in frames and under-state the view lag the
+                    // lag-compensation rewind charges on an authority running below its tick rate.
+                    self.acc_band_members[band.index()] += u64::from(passes);
+                    peer_members += u64::from(passes);
                     order.push((
                         priority::Candidate {
                             id,
@@ -5999,9 +6156,11 @@ impl OrbitNet {
 
             // --- the trailing interest-delta section, decided BEFORE the admit loop ---
             //
-            // Its bytes come off the budget the loop is about to spend, because a section appended
-            // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. The
-            // ack that retires it is the ordinary one every frame already carries and proves.
+            // Built once per frame and ridden by the frame's **first** datagram. The section states this
+            // tick's relevancy transitions, so a copy on each datagram of a multi-tick frame would
+            // repeat a set the peer already applied — `apply_interest_section` is idempotent and
+            // announces nothing the second time, so the copies cost only bytes. The ack that retires
+            // it is the ordinary one every frame already carries and proves.
             let (carries_delta, interest_generation, gate_shut) = {
                 let Some(peer) = self.peers.get_mut(&peer_id) else {
                     continue;
@@ -6024,11 +6183,20 @@ impl OrbitNet {
                     shut,
                 )
             };
-            let admit_budget = budget.saturating_sub(interest_delta_reserve(
+            // The reserve comes off the **first** datagram's budget alone, because a section appended
+            // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. Later
+            // datagrams of the same frame carry no section and spend the whole budget on blocks.
+            let first_admit_budget = budget.saturating_sub(interest_delta_reserve(
                 delta_left.len() + delta_entered.len(),
             ));
 
-            // --- admit ---
+            // --- admit, once per datagram this frame owes ---
+            //
+            // `next` is this peer's cursor into the ordered set, and it only ever moves forward.
+            // That is what makes the second datagram of a multi-tick frame the next slice of the
+            // rota rather than a second copy of the first: every datagram of the frame encodes the
+            // same `current`, so re-admitting an entity would put identical bytes on the wire at a
+            // tick the peer already holds, and the receiver would discard them as stale.
             //
             // THE BUDGET BOUNDS THE BODY, AND THE DATAGRAM IS THE BODY PLUS THE FRAME HEADER. `send_budget`
             // clamps to `MAX_FRAME_PAYLOAD` (1200) and every check below is against `body.len()`, so a full
@@ -6036,245 +6204,297 @@ impl OrbitNet {
             // than an oversight, but it is not what the constant's name says: the real wire figure is header +
             // body + 12 (ENet) + 28 (IPv4/UDP), which stays comfortably inside a 1500 B path MTU. Do not read
             // `MAX_FRAME_PAYLOAD` as "the datagram size"; read it as "the entity payload one frame may carry".
-            let mut writer = Writer::with_capacity(budget + 256);
-            let mut body = Writer::with_capacity(budget);
-            let mut sent: Vec<(u64, u64)> = Vec::new();
-            // The subset of `sent` that went out full, so the keyframe clock is measured against
-            // what repairs a chain. Kept beside `sent` rather than widening it, because `sent` is
-            // moved into the ack log verbatim.
-            let mut sent_full: Vec<(u64, u64)> = Vec::new();
-
-            for index in 0..order.len() {
-                let (candidate, band) = order[index];
-                if body.len() >= admit_budget {
-                    // Everything left wanted to go out and did not fit: budget pressure, which is
-                    // a different fact from a cull and is counted as one.
-                    self.acc_blocks_deferred += (order.len() - index) as u64;
-                    break;
-                }
-                let id = candidate.id;
-                // The wire name for this entity. Missing only while `reconcile_slots` is holding
-                // the entity back — a slot still inside its predecessor's reuse quarantine — which
-                // is a delay this entity's next tick resolves, so it counts as deferred.
-                let Some(slot) = self.slots.slot_of(id) else {
-                    self.acc_blocks_deferred += 1;
-                    continue;
-                };
-                // Rate tiering is a deliberate hold-back, so it counts as culled, not deferred.
-                // **It phases on the 64-bit id, not the wire slot**, and so does `full_block_due`
-                // below. Either value spreads a set of entities across an interval — dense
-                // sequential slots spread more evenly than hashes do, which
-                // `send_phase_spreads_dense_sequential_indices` pins — but only the id is STABLE.
-                // A slot is released and reissued, so an entity that took a different slot would
-                // jump its tier phase and its keyframe phase with it, restarting the interval it
-                // was part-way through.
-                if tiering
-                    && !orbitnet_core::interest::send_phase(id, current, band.tiered_interval())
-                {
-                    self.acc_blocks_culled += 1;
-                    continue;
-                }
-                let last_full = self
-                    .peers
-                    .get(&peer_id)
-                    .and_then(|p| p.last_full.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                let full_due =
-                    full_block_due(want_full, id, current, last_full, FULL_STATE_INTERVAL);
-                // Masked deltas reference only CLIENT-ACKED ticks: the peer provably applied
-                // that base, so loss can no longer leave it reconstructing against its own
-                // prediction. No acked base yet (or an evicted row) degrades to a full block.
-                let reference = if full_due {
-                    None
+            let mut next = 0usize;
+            let mut pass = 0u32;
+            while send_pass_is_due(pass, passes, order.len() - next) {
+                let this_pass = pass;
+                pass += 1;
+                let admit_budget = if this_pass == 0 {
+                    first_admit_budget
                 } else {
-                    self.peers
-                        .get(&peer_id)
-                        .and_then(|p| p.acked_base.get(&id))
-                        .copied()
-                        .and_then(|base| delta_reference(base, current, base_span))
+                    budget
                 };
+                let mut writer = Writer::with_capacity(budget + 256);
+                let mut body = Writer::with_capacity(budget);
+                let mut sent: Vec<(u64, u64)> = Vec::new();
+                // The subset of `sent` that went out full, so the keyframe clock is measured against
+                // what repairs a chain. Kept beside `sent` rather than widening it, because `sent` is
+                // moved into the ack log verbatim.
+                let mut sent_full: Vec<(u64, u64)> = Vec::new();
 
-                // An entity block's encoded size is not known until it is written, so the budget can only
-                // be enforced by writing and un-writing. The pre-check above admits an entity whenever the
-                // body is at `budget - 1`, and the block that follows can be any size -- which is how a frame
-                // capped at MAX_FRAME_PAYLOAD went out at 1456 bytes and drew ENet's over-MTU warning. An
-                // unreliable datagram past the path MTU fragments, and a lost fragment loses the whole frame.
-                let body_before = body.len();
-                // The lane the block came from travels with it. Only the state lane un-writes
-                // an empty delta -- see [`block_is_un_written`].
-                let (tick_sent, state_lane) = if let Some(sync) = self.rollback_entities.get(&id) {
-                    let Some(mut sync) = live_handle(sync) else {
-                        continue;
-                    };
-                    let tick = sync.bind_mut().encode_block(
-                        &mut body,
-                        &mut self.mask_scratch,
-                        slot,
-                        current,
-                        reference,
-                    );
-                    (tick, false)
-                } else if let Some(sync) = self.state_entities.get(&id) {
-                    let Some(mut sync) = live_handle(sync) else {
-                        continue;
-                    };
-                    let tick = sync.bind_mut().encode_block(
-                        &mut body,
-                        &mut self.mask_scratch,
-                        slot,
-                        current,
-                        reference,
-                    );
-                    (tick, true)
-                } else {
-                    (None, false)
-                };
-                // A candidate whose delta carries no change is un-written rather than admitted,
-                // on the state lane alone. `block_is_un_written` holds the whole rule -- which lane
-                // may do it and why the other may not, what counts as no change, what an un-write
-                // does to the rota, what still bounds such a channel's staleness, and what a client
-                // may read into a block's absence. The mask it is handed is the one the encoder
-                // just left in `mask_scratch`, which only the delta branch fills, so the `full`
-                // term is required. It is the encoder's own answer, rather than an inference at
-                // this call site from having supplied a reference.
-                let un_written = tick_sent.is_some_and(|(_, was_full)| {
-                    block_is_un_written(state_lane, was_full, &self.mask_scratch)
-                });
-                // `block_admission` orders the un-write against the over-budget check below, so
-                // that the order is a rule a test can call rather than the shape this loop happens
-                // to have. The un-write leads: the oversize branch exists so a frame with nothing
-                // in it yet still carries its first block rather than ending the stream, and a
-                // block that states nothing would satisfy that branch while sending no state.
-                match block_admission(un_written, body.len() <= admit_budget, sent.is_empty()) {
-                    BlockAdmission::UnWrite => {
-                        body.truncate(body_before);
-                        self.acc_blocks_culled += 1;
-                        continue;
-                    }
-                    // IT DID NOT FIT, and the frame carries nothing yet. Deferring is right whenever the
-                    // frame already carries something -- but if it carries NOTHING, deferring this block
-                    // sends no frame at all, which ends the stream rather than delaying it. An entity that
-                    // has never been sent scores `u64::MAX` staleness, so it is first again next tick, does
-                    // not fit again, and defers again: this peer never receives another snapshot for the
-                    // rest of the session, for every entity, silently. (The first implementation had no
-                    // un-write at all -- an oversized block simply went out, which is where ENet's over-MTU
-                    // warning came from.)
-                    //
-                    // So the frame carries it anyway. One datagram past the path MTU fragments and a lost
-                    // fragment costs that frame; a wedged peer costs the session. The condition is counted
-                    // rather than swallowed, because "one entity's full state does not fit in a datagram"
-                    // is a fact about the schema that somebody has to be told.
-                    BlockAdmission::Oversize => {
-                        if let Some((tick, was_full)) = tick_sent {
-                            self.acc_blocks_oversize += 1;
-                            sent.push((id, tick));
-                            if was_full {
-                                sent_full.push((id, tick));
-                            }
-                            self.acc_band_sends[band.index()] += 1;
-                            peer_sends += 1;
-                            self.acc_blocks_deferred += (order.len() - index - 1) as u64;
-                            break;
-                        }
-                        // No tick came back, so there is no row to admit. Nothing was written either
-                        // (an entity in neither map writes no bytes), so this is unreachable in
-                        // practice -- but if it happens, drop it and let the rest of the order run
-                        // rather than ending the frame on an entity that contributed nothing.
-                        body.truncate(body_before);
-                        continue;
-                    }
-                    BlockAdmission::Defer => {
-                        body.truncate(body_before);
-                        self.acc_blocks_deferred += (order.len() - index) as u64;
+                let mut index = next;
+                while index < order.len() {
+                    let (candidate, band) = order[index];
+                    if body.len() >= admit_budget {
+                        // Everything left wanted to go out and did not fit. Whether that is a defer
+                        // or the next datagram's opening slice is not known until the frame's last
+                        // datagram has run, so the count is charged once, below the pass loop.
                         break;
                     }
-                    BlockAdmission::Admit => {}
-                }
-                if let Some((tick, was_full)) = tick_sent {
-                    sent.push((id, tick));
-                    if was_full {
-                        sent_full.push((id, tick));
+                    let id = candidate.id;
+                    // The wire name for this entity. Missing only while `reconcile_slots` is holding
+                    // the entity back — a slot still inside its predecessor's reuse quarantine — which
+                    // is a delay this entity's next tick resolves, so it counts as deferred.
+                    let Some(slot) = self.slots.slot_of(id) else {
+                        self.acc_blocks_deferred += 1;
+                        index += 1;
+                        continue;
+                    };
+                    // Rate tiering is a deliberate hold-back, so it counts as culled, not deferred.
+                    // **It phases on the 64-bit id, not the wire slot**, and so does `full_block_due`
+                    // below. Either value spreads a set of entities across an interval — dense
+                    // sequential slots spread more evenly than hashes do, which
+                    // `send_phase_spreads_dense_sequential_indices` pins — but only the id is STABLE.
+                    // A slot is released and reissued, so an entity that took a different slot would
+                    // jump its tier phase and its keyframe phase with it, restarting the interval it
+                    // was part-way through.
+                    if tiering
+                        && !orbitnet_core::interest::send_phase(id, current, band.tiered_interval())
+                    {
+                        self.acc_blocks_culled += 1;
+                        index += 1;
+                        continue;
                     }
-                    self.acc_band_sends[band.index()] += 1;
-                    peer_sends += 1;
+                    let last_full = self
+                        .peers
+                        .get(&peer_id)
+                        .and_then(|p| p.last_full.get(&id))
+                        .copied()
+                        .unwrap_or(0);
+                    let full_due =
+                        full_block_due(want_full, id, current, last_full, FULL_STATE_INTERVAL);
+                    // Masked deltas reference only CLIENT-ACKED ticks: the peer provably applied
+                    // that base, so loss can no longer leave it reconstructing against its own
+                    // prediction. No acked base yet (or an evicted row) degrades to a full block.
+                    let reference = if full_due {
+                        None
+                    } else {
+                        self.peers
+                            .get(&peer_id)
+                            .and_then(|p| p.acked_base.get(&id))
+                            .copied()
+                            .and_then(|base| delta_reference(base, current, base_span))
+                    };
+
+                    // An entity block's encoded size is not known until it is written, so the budget can only
+                    // be enforced by writing and un-writing. The pre-check above admits an entity whenever the
+                    // body is at `budget - 1`, and the block that follows can be any size -- which is how a frame
+                    // capped at MAX_FRAME_PAYLOAD went out at 1456 bytes and drew ENet's over-MTU warning. An
+                    // unreliable datagram past the path MTU fragments, and a lost fragment loses the whole frame.
+                    let body_before = body.len();
+                    // The lane the block came from travels with it. Only the state lane un-writes
+                    // an empty delta -- see [`block_is_un_written`].
+                    let (tick_sent, state_lane) =
+                        if let Some(sync) = self.rollback_entities.get(&id) {
+                            let Some(mut sync) = live_handle(sync) else {
+                                index += 1;
+                                continue;
+                            };
+                            let tick = sync.bind_mut().encode_block(
+                                &mut body,
+                                &mut self.mask_scratch,
+                                slot,
+                                current,
+                                reference,
+                            );
+                            (tick, false)
+                        } else if let Some(sync) = self.state_entities.get(&id) {
+                            let Some(mut sync) = live_handle(sync) else {
+                                index += 1;
+                                continue;
+                            };
+                            let tick = sync.bind_mut().encode_block(
+                                &mut body,
+                                &mut self.mask_scratch,
+                                slot,
+                                current,
+                                reference,
+                            );
+                            (tick, true)
+                        } else {
+                            (None, false)
+                        };
+                    // A candidate whose delta carries no change is un-written rather than admitted,
+                    // on the state lane alone. `block_is_un_written` holds the whole rule -- which lane
+                    // may do it and why the other may not, what counts as no change, what an un-write
+                    // does to the rota, what still bounds such a channel's staleness, and what a client
+                    // may read into a block's absence. The mask it is handed is the one the encoder
+                    // just left in `mask_scratch`, which only the delta branch fills, so the `full`
+                    // term is required. It is the encoder's own answer, rather than an inference at
+                    // this call site from having supplied a reference.
+                    let un_written = tick_sent.is_some_and(|(_, was_full)| {
+                        block_is_un_written(state_lane, was_full, &self.mask_scratch)
+                    });
+                    // `block_admission` orders the un-write against the over-budget check below, so
+                    // that the order is a rule a test can call rather than the shape this loop happens
+                    // to have. The un-write leads: the oversize branch exists so a datagram with
+                    // nothing in it yet still carries its first block rather than ending the stream,
+                    // and a block that states nothing would satisfy that branch while sending no state.
+                    //
+                    // **The cursor moves for every decision but `Defer`**, and
+                    // [`admission_advances_cursor`] is that rule. It runs before the arms so no arm can
+                    // forget it: leaving the cursor standing offers this candidate again, which spins
+                    // inside one datagram on an un-write and encodes a block twice on an admit.
+                    let admission =
+                        block_admission(un_written, body.len() <= admit_budget, sent.is_empty());
+                    if admission_advances_cursor(admission) {
+                        index += 1;
+                    }
+                    match admission {
+                        BlockAdmission::UnWrite => {
+                            body.truncate(body_before);
+                            self.acc_blocks_culled += 1;
+                            continue;
+                        }
+                        // IT DID NOT FIT, and the datagram carries nothing yet. Deferring is right whenever
+                        // the datagram already carries something -- but if it carries NOTHING, deferring this
+                        // block sends no datagram at all, which ends the stream rather than delaying it. An
+                        // entity that has never been sent scores `u64::MAX` staleness, so it is first again next tick,
+                        // does not fit again, and defers again: this peer never receives another snapshot for
+                        // the rest of the session, for every entity, silently. (The first implementation had no
+                        // un-write at all -- an oversized block simply went out, which is where ENet's over-MTU
+                        // warning came from.)
+                        //
+                        // So the datagram carries it anyway. One datagram past the path MTU fragments and a lost
+                        // fragment costs that frame; a wedged peer costs the session. The condition is counted
+                        // rather than swallowed, because "one entity's full state does not fit in a datagram"
+                        // is a fact about the schema that somebody has to be told.
+                        BlockAdmission::Oversize => {
+                            if let Some((tick, was_full)) = tick_sent {
+                                self.acc_blocks_oversize += 1;
+                                sent.push((id, tick));
+                                if was_full {
+                                    sent_full.push((id, tick));
+                                }
+                                self.acc_band_sends[band.index()] += 1;
+                                peer_sends += 1;
+                                break;
+                            }
+                            // No tick came back, so there is no row to admit. Nothing was written either
+                            // (an entity in neither map writes no bytes), so this is unreachable in
+                            // practice -- but if it happens, drop it and let the rest of the order run
+                            // rather than ending the datagram on an entity that contributed nothing.
+                            body.truncate(body_before);
+                            continue;
+                        }
+                        // The cursor stays on this candidate, so the frame's next datagram opens on it
+                        // against a whole budget. The count is charged once below the pass loop, where
+                        // what the frame's LAST datagram left behind is known.
+                        BlockAdmission::Defer => {
+                            body.truncate(body_before);
+                            break;
+                        }
+                        BlockAdmission::Admit => {}
+                    }
+                    if let Some((tick, was_full)) = tick_sent {
+                        sent.push((id, tick));
+                        if was_full {
+                            sent_full.push((id, tick));
+                        }
+                        self.acc_band_sends[band.index()] += 1;
+                        peer_sends += 1;
+                    }
+                    index += 1;
+                }
+                next = index;
+
+                // A LEAVE-ONLY TICK STILL SENDS. The gate is "did this frame carry anything", and a
+                // relevancy event is something: skipping the frame because no entity block was admitted
+                // is exactly the tick on which a peer needs to be told that an entity stopped being sent
+                // to it.
+                //
+                // AND A TICK WITH A SHUT INTEREST GATE STILL SENDS, carrying nothing but its header. The
+                // client's generation echo rides an input frame, a connection driving no body sends one
+                // only when a snapshot has arrived, and the echo is discharged when the frame is handed
+                // to an UNRELIABLE transport — so a single lost datagram leaves the client believing it
+                // has told the server something the server never heard. The client cannot detect that;
+                // nothing tells it whether its echo landed. The server can, because it holds both
+                // generations, so the server is what breaks the silence. One header per tick, only while
+                // a gate is shut, which is about a round trip.
+                //
+                // Both are facts about the **tick**, and the frame's first datagram discharges them.
+                // A later datagram of the same frame goes out only when it admitted an entity block
+                // of its own; a second header at the same tick, with the same ack fields and the
+                // same section, tells the peer nothing the first did not.
+                let carries = carries_delta && this_pass == 0;
+                let skipped = if this_pass == 0 {
+                    snapshot_frame_is_skipped(!sent.is_empty(), carries, gate_shut)
+                } else {
+                    sent.is_empty()
+                };
+                if skipped {
+                    continue;
+                }
+                let header = FrameHeader {
+                    kind: FrameKind::ServerSnapshot,
+                    tick: u32::try_from(current).unwrap_or(u32::MAX),
+                    ack_tick,
+                    ack_bits: 0,
+                    ack_token,
+                    margin_ticks: margin,
+                    flags: if carries {
+                        FrameHeader::FLAG_INTEREST_DELTA
+                    } else {
+                        0
+                    },
+                    entity_count: sent.len() as u32,
+                };
+                header.encode(&mut writer);
+                writer.bytes(body.as_slice());
+                // AFTER the blocks, which is what makes it invisible to a peer that does not know about
+                // it: a receiver reads exactly `entity_count` blocks and stops.
+                if carries {
+                    encode_interest_delta(
+                        interest_generation,
+                        &delta_left,
+                        &delta_entered,
+                        &mut writer,
+                    );
+                }
+                self.acc_blocks_admitted += sent.len() as u64;
+                self.acc_blocks_full += sent_full.len() as u64;
+                self.dbg_sent += sent.len() as u64;
+                self.dbg_sent_bytes += writer.len() as u64;
+                self.send_to(peer_id, writer.as_slice(), TransferMode::UNRELIABLE);
+
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.want_full = false;
+                    // The stamp is set by the FIRST frame to carry this prefix and does not move on a
+                    // re-send: what an ack has to reach is the frame whose arrival proves the client
+                    // applied these entries.
+                    if carries && peer.interest_delta_tick.is_none() {
+                        peer.interest_delta_tick = Some(current);
+                    }
+                    for &(id, tick) in &sent {
+                        peer.last_sent.insert(id, tick);
+                    }
+                    for &(id, tick) in &sent_full {
+                        peer.last_full.insert(id, tick);
+                    }
+                    peer.note_sent_frame(current, sent);
                 }
             }
 
-            // Folded in before the empty-frame `continue` below. A tick that offered this peer
-            // candidates and admitted none of them is part of that peer's cadence, and dropping it
-            // would bias the figure toward the peers that got served.
+            // Everything the frame's last datagram left behind wanted to go out and did not fit:
+            // budget pressure, which is a different fact from a cull and is counted as one. Charged
+            // once for the frame rather than once per datagram, so a multi-tick frame does not
+            // report the same waiting entity several times.
+            //
+            // **It is the per-datagram charge generalized, not a second policy.** On a frame of one
+            // datagram this bills exactly what charging `order.len() - index` at each break did: the
+            // cursor ends on the candidate that broke the loop, one past it where an oversized block
+            // was admitted. Every candidate the loop stepped over deliberately — a tiering
+            // hold-back, an un-written state delta, an entity whose slot is still in quarantine — is
+            // behind the cursor and already counted under its own name, so none of them reach this.
+            self.acc_blocks_deferred += (order.len() - next) as u64;
+
+            // Folded in after the pass loop, and ungated by whether a frame actually went out. A
+            // tick that offered this peer candidates and admitted none of them is part of that
+            // peer's cadence, and dropping it would bias the figure toward the peers that got
+            // served.
             let acc = self.acc_peer_band.entry(peer_id).or_insert((0, 0));
             acc.0 += peer_sends;
             acc.1 += peer_members;
-
-            // A LEAVE-ONLY TICK STILL SENDS. The gate is "did this frame carry anything", and a
-            // relevancy event is something: skipping the frame because no entity block was admitted
-            // is exactly the tick on which a peer needs to be told that an entity stopped being sent
-            // to it.
-            //
-            // AND A TICK WITH A SHUT INTEREST GATE STILL SENDS, carrying nothing but its header. The
-            // client's generation echo rides an input frame, a connection driving no body sends one
-            // only when a snapshot has arrived, and the echo is discharged when the frame is handed
-            // to an UNRELIABLE transport — so a single lost datagram leaves the client believing it
-            // has told the server something the server never heard. The client cannot detect that;
-            // nothing tells it whether its echo landed. The server can, because it holds both
-            // generations, so the server is what breaks the silence. One header per tick, only while
-            // a gate is shut, which is about a round trip.
-            if snapshot_frame_is_skipped(!sent.is_empty(), carries_delta, gate_shut) {
-                continue;
-            }
-            let header = FrameHeader {
-                kind: FrameKind::ServerSnapshot,
-                tick: u32::try_from(current).unwrap_or(u32::MAX),
-                ack_tick,
-                ack_bits: 0,
-                ack_token,
-                margin_ticks: margin,
-                flags: if carries_delta {
-                    FrameHeader::FLAG_INTEREST_DELTA
-                } else {
-                    0
-                },
-                entity_count: sent.len() as u32,
-            };
-            header.encode(&mut writer);
-            writer.bytes(body.as_slice());
-            // AFTER the blocks, which is what makes it invisible to a peer that does not know about
-            // it: a receiver reads exactly `entity_count` blocks and stops.
-            if carries_delta {
-                encode_interest_delta(
-                    interest_generation,
-                    &delta_left,
-                    &delta_entered,
-                    &mut writer,
-                );
-            }
-            self.acc_blocks_admitted += sent.len() as u64;
-            self.acc_blocks_full += sent_full.len() as u64;
-            self.dbg_sent += sent.len() as u64;
-            self.dbg_sent_bytes += writer.len() as u64;
-            self.send_to(peer_id, writer.as_slice(), TransferMode::UNRELIABLE);
-
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
-                peer.want_full = false;
-                // The stamp is set by the FIRST frame to carry this prefix and does not move on a
-                // re-send: what an ack has to reach is the frame whose arrival proves the client
-                // applied these entries.
-                if carries_delta && peer.interest_delta_tick.is_none() {
-                    peer.interest_delta_tick = Some(current);
-                }
-                for &(id, tick) in &sent {
-                    peer.last_sent.insert(id, tick);
-                }
-                for &(id, tick) in &sent_full {
-                    peer.last_full.insert(id, tick);
-                }
-                peer.sent_log.push_back((current, sent));
-                while peer.sent_log.len() > SENT_LOG_DEPTH {
-                    peer.sent_log.pop_front();
-                }
-            }
         }
 
         self.aoi_rows = rows;
@@ -9459,7 +9679,7 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 /// Whether the entity block just written is un-written again instead of admitted, because it
 /// states nothing the peer does not already hold.
 ///
-/// The three arguments describe the block now sitting at the end of the frame body.
+/// The three arguments describe the block now sitting at the end of the datagram body.
 /// [`OrbitRollbackSynchronizer::encode_block`] and [`OrbitStateSynchronizer::encode_block`] return
 /// `full` and leave `mask` in the scratch buffer they were handed whenever they wrote a delta;
 /// `state_lane` is which of the two wrote it. A free function so the rule the send path runs is the
@@ -9491,10 +9711,16 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 /// a whole rota for the bytes those admissions held.
 ///
 /// **An un-written candidate loses no turn.** The send order is rebuilt every tick from
-/// `staleness x weight`, so there is no cursor to hold a place in. An un-write records no send, so
-/// `last_sent` stands and the candidate's staleness is one tick larger on the next tick than it was
-/// on this one. The first tick it has something to say it scores at least as high as it would have
-/// under the old behaviour, where an admission for an unchanged row reset that staleness to zero.
+/// `staleness x weight`, and the rota cursor a frame's datagrams share is rebuilt with it, so
+/// nothing carries a place across ticks. An un-write records no send, so `last_sent` stands and the
+/// candidate's staleness is one tick larger on the next tick than it was on this one. The first tick
+/// it has something to say it scores at least as high as it would have under the old behaviour,
+/// where an admission for an unchanged row reset that staleness to zero.
+///
+/// **Within one frame it does lose its place, and must.** The admit loop advances that cursor past
+/// an un-written candidate, so the frame's later datagrams open on the candidates behind it. Leaving
+/// the cursor standing would offer the same candidate to the same datagram again, which is a spin
+/// rather than a re-try: nothing between the two visits can change the mask.
 ///
 /// **Its keyframe bounds how stale it can get.** An unchanged channel is still admitted once per
 /// [`FULL_STATE_INTERVAL`] whenever the budget reaches it, and that admission moves `last_sent` like
@@ -9513,14 +9739,10 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 /// state block's absence and no new reading of one. The lane term above keeps a rollback block's
 /// absence meaning what it always meant.
 ///
-/// **A frame whose whole admitted set was un-written is not sent.** [`snapshot_frame_is_skipped`]
-/// ends a peer's tick when no block was admitted, no interest news rides along and no interest gate
-/// is shut, so a quiet state-lane session sends its snapshots — and with them the header's
-/// `ack_tick`, `ack_token` and `margin_ticks` — at about the keyframe cadence rather than every
-/// tick. The client's clock-lead controller samples `margin_ticks` on snapshot arrival, so it
-/// corrects more slowly on such a session. Nothing is silenced by it: [`input_frame_is_owed`] keeps
-/// a peer that drives no body sending, and interest news or a shut gate sends the header on its own
-/// tick.
+/// **A frame whose whole admitted set was un-written is not sent.** [`snapshot_frame_is_skipped`] answers
+/// the frame's FIRST datagram; a later one is skipped when it admitted nothing. Either way a rota that
+/// un-writes end to end leaves the cursor at `order.len()`, so [`send_pass_is_due`] stops the frame rather
+/// than spending another datagram on it.
 ///
 /// **`history_limit` must stay above the keyframe interval plus the ack round trip.** `acked_base`
 /// advances only when a frame carrying that entity is acked, and an un-written channel is carried
@@ -9544,9 +9766,10 @@ fn block_is_un_written(state_lane: bool, full: bool, mask: &[bool]) -> bool {
 enum BlockAdmission {
     /// Un-write it and carry on down the send order — see [`block_is_un_written`].
     UnWrite,
-    /// It overran the budget and the frame carries nothing yet, so it goes out anyway.
+    /// It overran the budget and the datagram carries nothing yet, so it goes out anyway.
     Oversize,
-    /// It overran the budget and the frame already carries something, so it waits a tick.
+    /// It overran the budget and the datagram already carries something, so it waits — for this
+    /// frame's next datagram if it owes one, and otherwise for the next tick.
     Defer,
     /// It fits.
     Admit,
@@ -9556,14 +9779,16 @@ enum BlockAdmission {
 /// tests is a rule a test can call, rather than the shape the admit loop happens to have.
 ///
 /// **The un-write leads.** A block that states nothing satisfies the oversize branch below just as
-/// an oversized one does, and taking that branch would end the frame on a block carrying no state.
-/// Answering `UnWrite` first leaves the frame empty, so the next candidate can still take the
-/// oversize branch if it needs to.
+/// an oversized one does, and taking that branch would end the datagram on a block carrying no
+/// state. Answering `UnWrite` first leaves the datagram empty, so the next candidate can still take
+/// the oversize branch if it needs to.
 ///
 /// `fits` is the body length against the admit budget after the write, because an entity block's
 /// encoded size is not known until it is written. `frame_is_empty` is whether anything has been
-/// admitted to this frame yet, which is what separates [`BlockAdmission::Oversize`] from
-/// [`BlockAdmission::Defer`].
+/// admitted to the datagram being built, which is what separates [`BlockAdmission::Oversize`] from
+/// [`BlockAdmission::Defer`]. A frame may spend several datagrams (see [`send_pass_is_due`]), and
+/// each of them asks this question for itself: the wedge the oversize branch exists to prevent is a
+/// datagram going out empty, not a frame.
 #[must_use]
 fn block_admission(un_written: bool, fits: bool, frame_is_empty: bool) -> BlockAdmission {
     if un_written {
@@ -9575,6 +9800,20 @@ fn block_admission(un_written: bool, fits: bool, frame_is_empty: bool) -> BlockA
     } else {
         BlockAdmission::Defer
     }
+}
+
+/// Whether an admission moves the rota cursor off this candidate.
+///
+/// **Every decision but [`BlockAdmission::Defer`] does.** The cursor is what the frame's next datagram
+/// resumes from, so a decision that leaves it standing offers the same candidate again: an un-written
+/// block would spin on it inside one datagram, and an admitted one would be encoded twice at a single
+/// tick. `Defer` leaves it standing deliberately — that candidate was written and un-written rather than
+/// sent, and the next datagram opens on it against a whole budget.
+///
+/// Stated here rather than left implicit in the admit loop's arms because the loop cannot be driven from
+/// a test: it needs live `Gd<Node>` handles. This is the half of the rule that can be.
+fn admission_advances_cursor(admission: BlockAdmission) -> bool {
+    !matches!(admission, BlockAdmission::Defer)
 }
 
 /// The stored `seat_release_policy`, reduced to a value this build knows.
@@ -9615,6 +9854,93 @@ fn queue_seat_release(pending: &mut Vec<i32>, peer: i32) {
     }
 }
 
+/// What one frame of the loop owes the parts that are neither simulation nor state — the seconds it
+/// charges the windowed timers, and the number of send passes it runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameCharge {
+    /// Seconds charged to the ping interval, the bandwidth window and the debug line.
+    seconds: f64,
+    /// Send passes the frame runs, one per simulation tick it advanced.
+    passes: u32,
+}
+
+/// Decide both halves of [`FrameCharge`] from the wall seconds a frame took and the simulation ticks
+/// it advanced.
+///
+/// Both rules are stated here, in one pure function of the pair, so a unit test can drive a sequence
+/// of ticking and non-ticking frames through them with no scene, no node and no socket.
+///
+/// **The upkeep charge is wall seconds, on every frame, whether or not it ticked.** Everything the
+/// charge drives is a wall-clock quantity: [`PING_INTERVAL`] is how often a client measures a round
+/// trip, and [`BANDWIDTH_WINDOW_SECONDS`] is the denominator under every published `*_s` figure,
+/// which is a rate on the wire.
+///
+/// **The two-base charge this replaced cost a whole factor on every windowed figure.** A frame that
+/// ticked used to charge simulated time (`dt` times the ticks) and a frame that did not used to
+/// charge wall time, so the seconds an idle frame charged were charged again inside the next tick's
+/// simulated span. The one-second window therefore closed on less than a second of wall time, and
+/// every `*_s` column came out deflated by `1 / (1 + idle_frame_wall_fraction)`.
+///
+/// | authority frame rate against a 60 Hz net tick | deflation |
+/// | --- | --- |
+/// | ~145 fps | x0.63 |
+/// | 120 fps | x0.67 |
+/// | 60 fps | x1.00 |
+/// | 30 fps | x1.00 |
+///
+/// A peer taking 73 kB/s on a ~145 fps authority was published as 46 kB/s, and `blocks_deferred_s`,
+/// `starve_ticks_max`'s neighbours and every other windowed counter were understated by the same
+/// factor. Any threshold or run history read off those columns was reading a frame-rate artifact.
+///
+/// **A frame spends one snapshot datagram per tick it advanced**, and no more than the send rota
+/// has left. See [`OrbitNet::flush_network`] for what a datagram costs and [`send_pass_is_due`] for
+/// what stops a frame short of its tick count.
+///
+/// **A wall delta that is negative or not a number charges nothing.** The decoupled loop measures
+/// its own delta from a monotonic stamp and a step of the process clock can read backwards; a `NaN`
+/// would propagate into every windowed figure and stay there for the rest of the session.
+fn frame_charge(wall_delta: f64, ticks: u32) -> FrameCharge {
+    FrameCharge {
+        // `f64::max` answers the other operand for a `NaN`, so this catches both cases.
+        seconds: wall_delta.max(0.0),
+        passes: ticks,
+    }
+}
+
+/// Whether a frame owes another snapshot datagram, given the datagrams it has already spent and
+/// what is left of this peer's ordered send set.
+///
+/// **The first datagram of a frame that advanced a tick always runs**, with an empty ordered set
+/// included: a leave-only tick and a shut interest gate both send a header and nothing else, and
+/// those are the tick's own news rather than the rota's.
+///
+/// **A later datagram runs only while the rota has something left.** Every datagram of one frame
+/// encodes the same tick, so a second pass over an exhausted set would re-encode blocks the peer
+/// already holds; the receiver reads them as stale, counts them in `stale_blocks_s` and throws the
+/// datagram away. A small session, a harness scene and every catch-up frame whose set fits inside
+/// one budget therefore send exactly one datagram however many ticks the frame advanced.
+///
+/// **A frame that advanced no tick sends nothing at all**, which is `passes` of zero.
+fn send_pass_is_due(pass: u32, passes: u32, rota_left: usize) -> bool {
+    pass < passes && (pass == 0 || rota_left > 0)
+}
+
+/// Charge `seconds` to a windowed timer, and report the window's measured length when it closed.
+///
+/// **The overshoot is discarded rather than carried**, which is what the three timers this replaced
+/// each did. A window therefore closes on the first frame at or past its length, so it runs up to
+/// one frame long — the measured length is returned, and a caller that divides by it (the bandwidth
+/// window) has no residual at all while one that does not (the ping interval) runs that one frame
+/// slow. See [`OrbitNet::run_net_upkeep`] for the per-timer figures.
+fn charge_window(timer: &mut f64, seconds: f64, window: f64) -> Option<f64> {
+    *timer += seconds;
+    if *timer >= window {
+        Some(std::mem::replace(timer, 0.0))
+    } else {
+        None
+    }
+}
+
 // The adversarial state search over the interest lane. A child module so it can reach the rules
 // directly: they are the point, and a search that restated them would find nothing.
 #[cfg(test)]
@@ -9624,29 +9950,31 @@ mod interest_search;
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_input_blocks, adopt_whole_set, anchor_conflicts_owed, apply_interest_section,
-        band_for_row, block_admission, block_is_un_written, build_interest_section,
-        candidate_for_own_row, candidate_for_row, challenge_answer, challenge_half,
-        clamp_resume_policy, clamp_seat_release_policy, clamp_unanchored_policy, classify_rx,
-        delta_reference, encode_interest_delta, filter_connection, full_block_due, hello_leg,
-        hold_on_drop, input_frame_is_owed, interest_delta_reserve, interest_table_due,
-        interest_table_to_send, is_located, manifest_owed, note_input_tick, owned_rows_into,
-        owned_rows_of, queue_seat_release, replayed_depth, resim_input_from, resolve_observer,
-        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        admission_advances_cursor, admit_input_blocks, adopt_whole_set, anchor_conflicts_owed,
+        apply_interest_section, band_for_row, block_admission, block_is_un_written,
+        build_interest_section, candidate_for_own_row, candidate_for_row, challenge_answer,
+        challenge_half, charge_window, clamp_resume_policy, clamp_seat_release_policy,
+        clamp_unanchored_policy, classify_rx, delta_reference, encode_interest_delta,
+        filter_connection, frame_charge, full_block_due, hello_leg, hold_on_drop,
+        input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
+        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
+        queue_seat_release, replayed_depth, resim_input_from, resolve_observer, resume_grant,
+        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
-        session_directions, session_is_filtering, session_key_from, snapshot_frame_is_skipped,
-        state_whole_interest_set, table_is_resolvable, unseeded_departures, veto_announces_leave,
-        AckOutcome, BlockAdmission, ChallengeAnswer, EntityRow, FrameHeader, HelloLeg,
-        InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
-        ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent,
-        SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED,
-        ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
+        send_pass_is_due, session_directions, session_is_filtering, session_key_from,
+        snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
+        unseeded_departures, veto_announces_leave, AckOutcome, BlockAdmission, ChallengeAnswer,
+        EntityRow, FrameCharge, FrameHeader, HelloLeg, InterestPass, ManifestOwed, OrbitNet,
+        PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
+        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED,
+        AOI_EXIT_FACTOR, BANDWIDTH_WINDOW_SECONDS, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
         INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
         INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
-        MODE_HOST, MODE_OFFLINE, MODE_SERVER, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
-        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
-        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, UNANCHORED_CLOSED, UNANCHORED_OPEN,
-        UNLOCATABLE_CENTER,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER,
+        RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
+        SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH,
+        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
     use orbitnet_core::codec::{Challenge, Handshake, InterestDeltaSection};
     use std::collections::HashMap;
@@ -13360,6 +13688,44 @@ mod tests {
         assert!(block_is_un_written(true, false, &[]));
     }
 
+    /// The cursor moves off a candidate for every decision but `Defer`.
+    ///
+    /// **The failure this pins is a hang, not a wrong frame.** The admit loop runs
+    /// `while index < order.len()`, so a decision that neither advances the cursor nor leaves the loop
+    /// offers the same candidate again forever. `UnWrite` is the one that would: it `continue`s, where
+    /// the oversize drop and `Defer` both break out. Before this rule was stated in one place, the
+    /// increment lived in each arm and omitting it from that arm was invisible to every test here.
+    #[test]
+    fn every_admission_but_a_defer_moves_the_cursor_on() {
+        assert!(
+            admission_advances_cursor(BlockAdmission::UnWrite),
+            "an un-written candidate is done with; leaving the cursor on it spins this datagram"
+        );
+        assert!(admission_advances_cursor(BlockAdmission::Admit));
+        assert!(admission_advances_cursor(BlockAdmission::Oversize));
+        assert!(
+            !admission_advances_cursor(BlockAdmission::Defer),
+            "a deferred candidate was written and un-written rather than sent, so the frame's next \
+             datagram opens on it against a whole budget"
+        );
+    }
+
+    /// The rule holds for what the admit loop actually decides, rather than for the four variants in
+    /// the abstract: a state-lane delta carrying no change un-writes, and that must move the cursor.
+    #[test]
+    fn a_state_delta_with_nothing_to_say_still_moves_the_cursor_on() {
+        let admission = block_admission(
+            block_is_un_written(true, false, &[false, false]),
+            true,
+            false,
+        );
+        assert_eq!(admission, BlockAdmission::UnWrite);
+        assert!(
+            admission_advances_cursor(admission),
+            "the candidate the send path culls most often is the one a standing cursor would spin on"
+        );
+    }
+
     #[test]
     fn an_un_written_block_is_answered_before_the_budget_is_consulted() {
         // The order the admit loop runs, pinned. A block that states nothing overruns the budget
@@ -15166,5 +15532,299 @@ mod tests {
         assert_eq!(replayed_depth(97, 100), 3);
         // A plan that begins inside the batch (an entity registered mid-frame) replays nothing.
         assert_eq!(replayed_depth(102, 100), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // One time base per frame: what every windowed figure is divided by, and how many send passes
+    // a frame runs. Both come out of `frame_charge`, so both are driven here without a scene.
+    // ------------------------------------------------------------------
+
+    /// `seconds` seconds of frames at `fps`, each carrying the ticks an `hz` accumulator releases on
+    /// it.
+    ///
+    /// The tick a frame boundary lands on is computed from integer-valued arithmetic rather than
+    /// from an accumulated remainder, so a long run cannot drift a tick.
+    fn frames(fps: u32, hz: u32, seconds: u32) -> Vec<(f64, u32)> {
+        let wall = 1.0 / f64::from(fps);
+        let mut released = 0u32;
+        let mut out = Vec::new();
+        for frame in 1..=(fps * seconds) {
+            let due = (f64::from(frame) * f64::from(hz) / f64::from(fps)).floor() as u32;
+            out.push((wall, due - released));
+            released = due;
+        }
+        out
+    }
+
+    /// What a frame used to charge — simulated seconds when it ticked, wall seconds when it did not.
+    fn two_base_charge(wall: f64, ticks: u32, hz: u32) -> f64 {
+        if ticks > 0 {
+            f64::from(ticks) / f64::from(hz)
+        } else {
+            wall
+        }
+    }
+
+    /// The wall seconds elapsed when the first bandwidth window closes under `charge`.
+    fn window_closes_at(frames: &[(f64, u32)], fps: u32, charge: impl Fn(f64, u32) -> f64) -> f64 {
+        let mut timer = 0.0;
+        for (index, &(wall, ticks)) in frames.iter().enumerate() {
+            if charge_window(&mut timer, charge(wall, ticks), BANDWIDTH_WINDOW_SECONDS).is_some() {
+                return (index + 1) as f64 / f64::from(fps);
+            }
+        }
+        panic!("the window never closed");
+    }
+
+    /// The bandwidth window closes on one second of wall time at every frame rate, which is what
+    /// makes `tx_bytes_s` and every other `*_s` column a rate on the wire rather than a figure that
+    /// moves with how fast the authority happens to render.
+    #[test]
+    fn the_bandwidth_window_closes_on_one_second_of_wall_time_at_every_frame_rate() {
+        for &fps in &[30u32, 60, 120, 145] {
+            let sequence = frames(fps, 60, 2);
+            let at = window_closes_at(&sequence, fps, |wall, ticks| {
+                frame_charge(wall, ticks).seconds
+            });
+            // A window can only close on a frame boundary, so one frame is the resolution of the
+            // answer at every rate.
+            let tolerance = 1.5 / f64::from(fps);
+            assert!(
+                (at - 1.0).abs() < tolerance,
+                "at {fps} fps the window closed after {at:.3} s of wall time"
+            );
+        }
+    }
+
+    /// The two-base charge this replaced closed the window early on every frame rate above the tick
+    /// rate, and each windowed counter was divided by that short window. The factors asserted here
+    /// are the ones measured on a running authority, and they are what an idle frame's seconds
+    /// being charged twice predicts.
+    #[test]
+    fn the_two_base_charge_closed_the_window_early_and_deflated_every_windowed_figure() {
+        for &(fps, deflation) in &[(30u32, 1.00), (60, 1.00), (120, 0.67), (145, 0.63)] {
+            let sequence = frames(fps, 60, 2);
+            let at = window_closes_at(&sequence, fps, |wall, ticks| {
+                two_base_charge(wall, ticks, 60)
+            });
+            let tolerance = 1.5 / f64::from(fps);
+            assert!(
+                (at - deflation).abs() < tolerance,
+                "at {fps} fps the old charge closed the window after {at:.3} s of wall time, \
+                 against a predicted {deflation:.2}"
+            );
+        }
+    }
+
+    /// Snapshot datagrams one frame sequence spends for a peer that always has `rota_left` entities
+    /// still waiting after each datagram. Drives the shipping predicate rather than restating it.
+    fn datagrams(sequence: &[(f64, u32)], rota_left: usize) -> u32 {
+        let mut sent = 0u32;
+        for &(wall, ticks) in sequence {
+            let passes = frame_charge(wall, ticks).passes;
+            let mut pass = 0u32;
+            while send_pass_is_due(pass, passes, rota_left) {
+                sent += 1;
+                pass += 1;
+            }
+        }
+        sent
+    }
+
+    /// A peer under budget pressure receives one snapshot datagram per net tick at every frame
+    /// rate. The rates either side of the tick rate are the two halves of one rule — an authority
+    /// rendering faster sends no more than the tick rate, and one rendering slower sends no fewer.
+    #[test]
+    fn a_saturated_rota_spends_one_datagram_per_net_tick_at_every_frame_rate() {
+        for &fps in &[30u32, 60, 120, 145] {
+            let sequence = frames(fps, 60, 1);
+            assert_eq!(datagrams(&sequence, 1_000), 60, "at {fps} fps");
+            // One datagram per frame that ticked is what ran before, which is `min(fps, hz)`.
+            let ticking = sequence.iter().filter(|&&(_, ticks)| ticks > 0).count() as u32;
+            assert_eq!(ticking, fps.min(60), "at {fps} fps");
+        }
+    }
+
+    /// A peer whose whole ordered set fits inside one budget receives **one** datagram per frame,
+    /// however many ticks that frame advanced.
+    ///
+    /// Every datagram of one frame encodes the same tick, because the state lane is captured once
+    /// per frame. A second datagram over an exhausted rota would therefore be byte-identical to the
+    /// first, and the receiver counts it in `stale_blocks_s` and throws it away — up to eight copies
+    /// of 1200 B per peer on exactly the catch-up frame that is already late.
+    #[test]
+    fn a_rota_that_fits_one_datagram_sends_one_whatever_the_frame_advanced() {
+        // At 30 fps against a 60 Hz net tick every frame advances two ticks.
+        let sequence = frames(30, 60, 1);
+        assert_eq!(sequence.iter().filter(|&&(_, t)| t == 2).count(), 30);
+        assert_eq!(
+            datagrams(&sequence, 0),
+            30,
+            "one datagram per frame, not one per tick"
+        );
+    }
+
+    /// The rule either side of the tick count: the first datagram of a ticking frame always runs,
+    /// a later one runs only while the rota has something left, and a frame that advanced no tick
+    /// runs none.
+    #[test]
+    fn a_later_datagram_in_one_frame_runs_only_while_the_rota_has_something_left() {
+        assert!(
+            send_pass_is_due(0, 8, 0),
+            "a leave-only tick and a shut interest gate both send a header with no blocks"
+        );
+        assert!(
+            !send_pass_is_due(1, 8, 0),
+            "nothing left that is not a repeat"
+        );
+        assert!(send_pass_is_due(1, 8, 1), "one entity still waiting");
+        assert!(
+            !send_pass_is_due(8, 8, 40),
+            "the frame's tick count is the ceiling"
+        );
+        assert!(
+            !send_pass_is_due(0, 0, 40),
+            "a frame that advanced no tick sends nothing"
+        );
+    }
+
+    /// A frame that advanced no tick charges no datagram; one that advanced several may spend
+    /// several. The tick accumulator's catch-up cap is what bounds the burst, and the charge adds
+    /// no second cap.
+    #[test]
+    fn a_frame_charges_one_datagram_per_tick_and_none_when_it_ran_none() {
+        assert_eq!(frame_charge(1.0 / 145.0, 0).passes, 0);
+        assert_eq!(frame_charge(1.0 / 60.0, 1).passes, 1);
+        assert_eq!(frame_charge(1.0 / 30.0, 2).passes, 2);
+        assert_eq!(
+            frame_charge(0.2, orbitnet_core::tick::DEFAULT_MAX_TICKS_PER_FRAME).passes,
+            orbitnet_core::tick::DEFAULT_MAX_TICKS_PER_FRAME
+        );
+    }
+
+    /// Several datagrams at one tick file one sent-log entry, and the entry holds every entity all
+    /// of them carried.
+    #[test]
+    fn several_datagrams_at_one_tick_file_one_sent_log_entry() {
+        let mut peer = PeerState::default();
+        peer.note_sent_frame(10, vec![(1, 10), (2, 10)]);
+        peer.note_sent_frame(10, vec![(3, 10)]);
+        assert_eq!(peer.sent_log.len(), 1);
+        let (tick, entities) = peer.sent_log.back().unwrap();
+        assert_eq!(*tick, 10);
+        assert_eq!(entities.as_slice(), &[(1, 10), (2, 10), (3, 10)]);
+        peer.note_sent_frame(12, vec![(4, 12)]);
+        assert_eq!(peer.sent_log.len(), 2, "a new tick opens a new entry");
+    }
+
+    /// The log's reach stays [`SENT_LOG_DEPTH`] TICKS on a catch-up frame that spends a datagram
+    /// per tick. An entry per datagram would hold the same 64 entries across eight times fewer
+    /// frames, so the span the oldest entry reaches back to would collapse by the same factor.
+    #[test]
+    fn the_sent_log_reaches_back_sent_log_depth_ticks_whatever_the_datagram_count() {
+        let per_frame = u64::from(orbitnet_core::tick::DEFAULT_MAX_TICKS_PER_FRAME);
+        let mut peer = PeerState::default();
+        for frame in 1..=(SENT_LOG_DEPTH as u64 * 2) {
+            let tick = frame * per_frame;
+            for _ in 0..per_frame {
+                peer.note_sent_frame(tick, vec![(1, tick)]);
+            }
+        }
+        assert_eq!(peer.sent_log.len(), SENT_LOG_DEPTH);
+        let oldest = peer.sent_log.front().unwrap().0;
+        let newest = peer.sent_log.back().unwrap().0;
+        assert_eq!(
+            newest - oldest,
+            (SENT_LOG_DEPTH as u64 - 1) * per_frame,
+            "an entry per datagram would reach back {} ticks instead",
+            SENT_LOG_DEPTH as u64 - per_frame
+        );
+    }
+
+    /// One ack confirms every entity a multi-datagram tick carried, which is what leaves the fold a
+    /// question of denomination rather than of correctness.
+    #[test]
+    fn one_ack_confirms_every_entity_a_multi_datagram_tick_carried() {
+        let mut peer = peer_with_salt(0x55);
+        peer.note_sent_frame(10, vec![(1, 10)]);
+        peer.note_sent_frame(10, vec![(2, 10)]);
+        let token = peer.frame_token(10).unwrap();
+        assert_eq!(
+            peer.consume_ack(10, token, 0, 12, TICK_MS),
+            AckOutcome::Consumed
+        );
+        assert_eq!(peer.acked_base.get(&1), Some(&10));
+        assert_eq!(peer.acked_base.get(&2), Some(&10));
+        assert!(peer.sent_log.is_empty(), "the tick was confirmed whole");
+    }
+
+    /// The same wall delta charges the same seconds whatever the frame ticked, and a delta that is
+    /// negative or not a number charges nothing.
+    #[test]
+    fn a_frame_charges_its_wall_seconds_and_nothing_else() {
+        let wall = 1.0 / 145.0;
+        assert_eq!(frame_charge(wall, 0).seconds, wall);
+        assert_eq!(frame_charge(wall, 3).seconds, wall);
+        assert_eq!(
+            frame_charge(-1.0, 1),
+            FrameCharge {
+                seconds: 0.0,
+                passes: 1
+            },
+            "a backwards wall delta"
+        );
+        assert_eq!(
+            frame_charge(f64::NAN, 1),
+            FrameCharge {
+                seconds: 0.0,
+                passes: 1
+            },
+            "a NaN would stay in every windowed figure for the rest of the session"
+        );
+    }
+
+    /// A client rendering above its tick rate pings on the interval the constant states. The old
+    /// charge ran its ping timer fast by the same factor the bandwidth window closed early by.
+    #[test]
+    fn a_client_above_its_tick_rate_pings_on_the_stated_interval_rather_than_faster() {
+        let sequence = frames(145, 60, 2);
+        let mut timer = 0.0;
+        let now = sequence
+            .iter()
+            .filter(|&&(wall, ticks)| {
+                charge_window(&mut timer, frame_charge(wall, ticks).seconds, PING_INTERVAL)
+                    .is_some()
+            })
+            .count();
+        let mut old_timer = 0.0;
+        let before = sequence
+            .iter()
+            .filter(|&&(wall, ticks)| {
+                charge_window(
+                    &mut old_timer,
+                    two_base_charge(wall, ticks, 60),
+                    PING_INTERVAL,
+                )
+                .is_some()
+            })
+            .count();
+        // Two wall seconds hold eight whole intervals, and the discarded overshoot costs the last
+        // one: a frame is 1/145 s and an interval closes on the first frame at or past 0.25 s.
+        assert_eq!(now, 7, "pings in two seconds of wall time");
+        assert_eq!(before, 12, "what the same two seconds used to send");
+    }
+
+    /// The window reports the length it measured and starts the next one from zero.
+    #[test]
+    fn a_closed_window_reports_what_it_measured_and_discards_the_overshoot() {
+        let mut timer = 0.0;
+        assert_eq!(charge_window(&mut timer, 0.4, 1.0), None);
+        assert_eq!(charge_window(&mut timer, 0.4, 1.0), None);
+        let closed = charge_window(&mut timer, 0.4, 1.0).expect("1.2 s closes a 1 s window");
+        assert!(
+            (closed - 1.2).abs() < 1.0e-9,
+            "the measured length, not 1.0"
+        );
+        assert_eq!(timer, 0.0, "the overshoot is discarded rather than carried");
     }
 }

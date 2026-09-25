@@ -1469,6 +1469,11 @@ func _backend_has(method: StringName) -> bool:
 ## shape bench_metrics.gd and the perf probe read -- widening a dictionary two harnesses index into is how a
 ## measurement change becomes a gate failure.
 ##
+## Every *_s figure is a rate per wall second. The window is charged the wall time of every frame, whether or
+## not that frame advanced a net tick, so no figure here moves with how fast the authority renders. A capture
+## taken before the window ran on one time base reads low on all of them, by a factor set by how far the
+## authority's frame rate ran above its net tick rate.
+##
 ##   tx_bytes_s / rx_bytes_s        -- OrbitNet PAYLOAD, in and out. Not what the link carries.
 ##   tx_datagrams_s / rx_datagrams_s -- datagram counts, published so the wire figure can be CHECKED not trusted
 ##   tx_wire_bytes_s                -- payload + 41 B/datagram (28 IPv4+UDP, 12 ENet, 1 Godot RAW tag). On a full

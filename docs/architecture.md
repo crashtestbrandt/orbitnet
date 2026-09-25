@@ -51,6 +51,24 @@ also Godot's own RPC default, so netcode traffic does share a stream with a game
 The scaling law is `O(peers)` **engine crossings** plus `O(entities × peers)` **bytes in native memory**, not
 `O(entities × peers)` crossings. Acks piggyback on the frame header, so there is no separate ack RPC.
 
+**One snapshot datagram per net tick, and a frame spends as many as it advanced ticks.** A frame that
+advanced two ticks sends up to two datagrams per peer; each spends its own per-peer byte budget and each picks
+that peer's send rota up where the last one stopped. A frame that advanced no tick sends nothing, and a peer
+whose whole rota fits inside one budget gets one datagram whatever the frame advanced — every datagram of one
+frame carries the same tick, so a second pass over an exhausted rota would repeat bytes the peer already holds.
+The burst a catch-up frame emits is bounded by the tick accumulator's own `max_ticks_per_frame`.
+
+**The extra datagrams buy rota coverage rather than fresher state.** The state lane is captured once per
+frame, so the authority's frame period is the floor under the gap between one body's **distinct** poses: a
+30 fps listen host produces 30 distinct snapshot ticks a second against a 60 fps dedicated server's 60. What
+falls is the **mean** gap between a given body's updates, because more of the ordered set reaches the peer
+inside each frame — which is what `interarrival_far` and `starve_ticks_max` measure.
+
+**A tick may carry several datagrams, and an ack names only the tick.** A peer that received one of them and
+not another still acks the tick, so the server promotes a delta base the peer does not hold; the peer cannot
+decode the next masked delta against it, NACKs, and takes a full block. That repair already exists for a
+broken delta chain, and the case needs a multi-tick frame and a loss inside it together.
+
 ## Snapshot capture and history
 
 **Native code cannot make a GDScript getter cheap.** Reading a scripted property costs a lookup, a call and
