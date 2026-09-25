@@ -64,6 +64,15 @@ jobs:
       - name: Bench comparator self-test
         run: python3 tools/netbench/compare.py --self-test
 
+      # The negative control for the Asset Library zip check. It synthesizes an archive per failure class
+      # -- a library the descriptor names removed, a library replaced by Git LFS pointer text, a missing
+      # licence, the EditorPlugin script plugin.cfg names missing, a stray file, a nested addon copy --
+      # and asserts each one is caught. Standard library
+      # only, no Godot and no Rust, which is why it belongs in this job; the archive itself is assembled
+      # and booted in the `godot` job below, where a library exists to package.
+      - name: Asset Library zip check self-test
+        run: tools/check-assetlib-zip.py --self-test
+
   native:
     runs-on: ubuntu-latest
     steps:
@@ -176,6 +185,18 @@ jobs:
       # rather than compiling a second copy.
       - name: Extension load smoke (throwaway project)
         run: tools/orbitnet-smoke.sh --skip-build
+
+      # The artifact a consumer installs, rather than the working tree every other step here loads. It is
+      # assembled with tools/make-assetlib-zip.py the way release.yml assembles it, its contents are
+      # asserted, and it is unpacked into a throwaway project that boots with the plugin enabled and the
+      # `Net` autoload declared.
+      #
+      # Without --complete, because a pull request holds only the Linux libraries this job just built,
+      # where the release runner holds every platform's. The half a pull request can actually break is the
+      # packaging script, the descriptor and the addon layout, and this covers those; release.yml runs the
+      # same script with --complete on the real zip before publishing it.
+      - name: Asset Library zip installs into a clean project
+        run: tools/check-assetlib-zip.py
 
       # First of the four probes. It binds no socket and costs about six seconds, and like the shape probe it
       # runs in the harness project, which contains no game: a failure there is the addon, where a failure in

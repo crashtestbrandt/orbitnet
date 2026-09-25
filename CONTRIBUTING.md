@@ -8,8 +8,9 @@ just check           # everything a PR must pass
 ```
 
 `check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → `descriptor-parity` →
-`version-parity` → `bench-check` → cargo gates → lint → unit suites → the determinism probe → the
-server-shape probe → the two-peer RTS probe → the arena probe.
+`version-parity` → `bench-check` → `assetlib-selftest` → cargo gates → lint → unit suites →
+`assetlib-check` → the determinism probe → the server-shape probe → the two-peer RTS probe → the arena
+probe.
 
 **One version, three files.** `addons/orbitnet/plugin.cfg`, the `[workspace.package]` version in
 `native/Cargo.toml` and the member entries in `native/Cargo.lock` must agree. `tools/version-parity.sh` is

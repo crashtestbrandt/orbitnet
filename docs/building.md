@@ -114,6 +114,34 @@ So main is always *proven* to build on every platform, and history carries diges
 **Two builds per platform, and they are not the same bytes.** `template_debug` and `template_release` differ
 by their checks, which is the whole reason the descriptor names both.
 
+### The zip is gated before it is published
+
+Every gate above loads a library it built itself, out of the working tree. The zip a consumer installs is
+assembled by a path none of them touch — `tools/make-assetlib-zip.py`, from a tree whose `bin/` was filled
+by downloaded build artifacts, with the licence files copied in. **`tools/check-assetlib-zip.py` is the gate
+for that artifact.**
+
+| Assertion | What it catches |
+|---|---|
+| Both addon directories present, nothing outside them | a packaging walk that picked up the repository root or a synced mirror copy |
+| Every file under `bin/` is one the zip's own descriptor names | a renamed profile, a library nothing loads |
+| Each library non-empty and not Git LFS pointer text | the failure class above, reaching a user as a few hundred bytes of text |
+| The licence files `release.yml` copies in are present | an addon installed from a zip carries no repository with it |
+| `binaries.json` stays out | it hashes the archive, so the copy in the tree carries the previous tag's digests |
+| `plugin.cfg` and the EditorPlugin script it names are present and non-empty | a plugin that installs and then fails the moment the user enables it |
+| The archive unpacks into a throwaway project that boots | the addon's GDScript compiles, `Net` instantiates, and the zip's own binaries register their classes |
+
+Where it runs:
+
+- **`just assetlib-check`** — assemble from this tree, assert, boot. In `just check`.
+- **`check.yml`** — `--self-test` in the gates job (the negative control: one synthetic archive per failure
+  class, each asserted to be caught), and the full run in the Godot job. A pull request holds one platform's
+  libraries, so it cannot produce the real artifact; what it can break is the packaging script, the
+  descriptor and the addon layout.
+- **`release.yml`** — `--complete` on the real zip, between building it and publishing it. The only tree
+  that holds every platform's libraries, so the only place the descriptor's full named set can be required.
+  A failure there fails the release.
+
 ## Platform keys
 
 **A platform key names one shipped filename per profile.** It is finer-grained than an operating system:
