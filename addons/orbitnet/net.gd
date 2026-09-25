@@ -275,6 +275,12 @@ func _on_backend_entity_left_interest(peer: int, entity_id: int) -> void:
 ## Install the NATIVE crash handler, appending reports to `<dir>/crash-native.log`. Returns false if it was
 ## already installed (or the path did not fit). `dir` must be an absolute, already-created directory.
 ##
+## **On Android this returns true and installs nothing**, and no `crash-native.log` is ever written. Bionic
+## has no `<execinfo.h>` for the POSIX branch to link against, and `debuggerd` already writes a symbolized
+## tombstone for every fatal signal in release builds as well as debug. The return value reports that the
+## slot was claimed; it does not report that a handler exists. A caller that shows the player a "native
+## crash reports enabled" line off it has to exclude Android. See docs/crash-capture.md.
+##
 ## Not netcode -- it lives on this facade because for many games the backend cdylib is the only NATIVE binary
 ## a release export template loads, and Godot's own crash handler is DEBUG_ENABLED-only (so is
 ## NOTIFICATION_CRASH). A shipped build otherwise dies with nothing but a truncated log. See the crash module

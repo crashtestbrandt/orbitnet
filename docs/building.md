@@ -117,10 +117,10 @@ by their checks, which is the whole reason the descriptor names both.
 ## Platform keys
 
 **A platform key names one shipped filename per profile.** It is finer-grained than an operating system:
-the two Linux architectures are two keys, because they are two files and two descriptor entries, while
-macOS is one key, because its two architectures end up in one file. `tools/build-native.sh` takes the key,
-both workflows pass it as `matrix.platform`, and `PLATFORMS` in `tools/check-descriptor-parity.sh` is the
-list all three are checked against.
+the two Linux architectures are two keys, and the three Android ABIs three more, because each is its own
+file and its own descriptor entry, while macOS is one key because its two architectures end up in one
+file. `tools/build-native.sh` takes the key, both workflows pass it as `matrix.platform`, and `PLATFORMS`
+in `tools/check-descriptor-parity.sh` is the list all three are checked against.
 
 | Key | Cargo target(s) | Shipped as | Built on |
 |---|---|---|---|
@@ -128,6 +128,14 @@ list all three are checked against.
 | `linux_arm64` | `aarch64-unknown-linux-gnu` | `liborbitnet.linux.<profile>.arm64.so` | the same x86_64 Linux runner, cross-compiled |
 | `windows` | `x86_64-pc-windows-msvc` | `orbitnet.windows.<profile>.x86_64.dll` | the Windows runner |
 | `macos` | `x86_64-apple-darwin` + `aarch64-apple-darwin` | `liborbitnet.macos.<profile>.universal.dylib` | the arm64 macOS runner |
+| `android_arm64` | `aarch64-linux-android` | `liborbitnet.android.<profile>.arm64.so` | the same x86_64 Linux runner, cross-compiled |
+| `android_arm32` | `armv7-linux-androideabi` | `liborbitnet.android.<profile>.arm32.so` | the same x86_64 Linux runner, cross-compiled |
+| `android_x86_64` | `x86_64-linux-android` | `liborbitnet.android.<profile>.x86_64.so` | the same x86_64 Linux runner, cross-compiled |
+
+**Use Godot's architecture names in a shipped name.** The `[libraries]` key in the `.gdextension` is
+`<platform>.<debug|release>.<arch>`, and Godot spells the two arm ABIs `arm64` and `arm32` — never the
+NDK's `arm64-v8a` and `armeabi-v7a`, and never a Rust target triple. A wrong name there fails at `dlopen`
+on that ABI and nowhere else, which is the failure `just descriptor-parity` exists to catch.
 
 **macOS is built universal, `profiling` included.** Every profile builds both `x86_64-apple-darwin` and
 `aarch64-apple-darwin` and `lipo`s them together, including a local `just native-install`. A single-arch
@@ -179,6 +187,102 @@ machine.
 On an arm64 Linux host none of this applies. `tools/build-native.sh host` reports `linux_arm64` there, and
 `just native-install` builds and stages the library that host's Godot will load.
 
+### Android is three keys, one per ABI
+
+Android has no universal container. Each ABI ships its own `.so`, which needs its own descriptor entry,
+which needs its own platform key. All three cross-compile on the x86_64 Linux runner.
+
+| ABI | Key | Why it ships |
+|---|---|---|
+| `arm64` | `android_arm64` | every phone and tablet shipping today |
+| `arm32` | `android_arm32` | still an export-preset checkbox; a project that ticks it otherwise exports an app whose extension is absent on those devices |
+| `x86_64` | `android_x86_64` | the Android emulator and ChromeOS, which is where the extension is loaded while a game is developed on a desktop |
+
+**There is no `x86_32` key.** No Android device ships that ABI and the emulator system images for it are
+gone. A project that needs one adds it the way any platform is added — see
+[Adding a platform](#adding-a-platform).
+
+**Each android leg needs the NDK on its box.** `rustup target add` supplies the Rust std libraries;
+rustc still shells out to a C linker for the cdylib, and for an android ABI that linker is the NDK's clang
+wrapper, carrying Bionic's libc and crt objects. Nothing else from the NDK is needed — the workspace has
+no `cc` or `bindgen` in its dependency graph, so no C is compiled.
+
+```sh
+sdkmanager --install "ndk;26.3.11579264"   # the command-line tools
+# or Android Studio: SDK Manager -> SDK Tools -> NDK (Side by side)
+sudo apt-get install -y google-android-ndk-installer   # Debian/Ubuntu
+sudo pacman -S android-ndk                             # Arch
+```
+
+`tools/build-native.sh ndk-root` prints the NDK the build will use, and is the only search in the
+repository — both workflows call it rather than carrying a copy. It reads, and the first hit wins:
+
+1. `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK`, `NDK_HOME`, `ANDROID_NDK_LATEST_HOME`.
+2. `ndk/<version>` under `ANDROID_SDK_ROOT`, `ANDROID_HOME`, `$HOME/Android/Sdk`,
+   `$HOME/Library/Android/sdk`, `/usr/lib/android-sdk`, `/opt/android-sdk` — in that order, and the
+   newest version within whichever root matches first.
+3. `/usr/lib/android-ndk` and `/opt/android-ndk*`, the distribution packages that are an NDK root
+   themselves.
+
+**Root order decides which NDK wins**, and version comparison happens only within one root. A box
+carrying the pinned NDK under `ANDROID_SDK_ROOT` and a stale one under `$HOME` uses the pinned one.
+Point `ANDROID_NDK_HOME` at a particular install to override the search, or set the target's own
+`CARGO_TARGET_<TRIPLE>_LINKER` to bypass it entirely. **With no NDK the build refuses to start** and
+prints the lines above, for the same reason the aarch64 leg does: a leg that produced nothing would
+upload an empty artifact and fail the tag after every other platform had already built.
+
+**The CI legs resolve it themselves.** `binaries.yml` and `release.yml` each carry a
+`Locate the Android NDK` step ahead of the build, guarded to the android legs. It calls
+`tools/build-native.sh ndk-root`, so CI and the build agree on what counts as an NDK and on which one
+wins; it installs the pinned version through `sdkmanager` when the box has one and the search came up
+empty, and otherwise fails naming what to install. `ANDROID_NDK_VERSION` in that step is the only place
+the installed version is spelled. An NDK is a licensed SDK component rather than a distribution package,
+so a runner carrying no command-line tools cannot be provisioned from CI and has to be set up by hand.
+
+**API 21 is the floor.** `tools/build-native.sh` builds against API 21 by default and falls back to the
+lowest level the installed NDK ships. A library built against 21 loads on every device at or above it, so
+the lowest available level is the one that excludes the fewest devices; Godot's export template sets the
+minimum SDK the app itself declares. `ORBITNET_ANDROID_API` overrides the default.
+
+**The 64-bit ABIs are linked with 16 KB page alignment.** Android devices with 16 KB memory pages reject a
+library whose segments are aligned to 4 KB, and Play requires that alignment of apps targeting recent API
+levels. NDK r27 and newer link that way already and the flag is then a no-op; an older NDK does not, and
+the failure is a `dlopen` on a 16 KB device and nowhere else. `arm32` is unaffected.
+
+**The android libraries are published untested.** Every push to `main` touching `native/**` compiles all
+three and every tag publishes them, so a change that breaks an android build fails a gate. Loading one
+needs a device or an emulator and no runner in this fleet has either, so nothing here proves the classes
+register or a tick advances on Android. Two things remain unmeasured, and both are runtime questions
+rather than build ones: the rollback loop's per-tick budget on a thermally throttled phone, and what the
+reconciliation path costs on a mobile radio.
+
+**The extension installs no native crash handler on Android.** Bionic has no `<execinfo.h>` for the POSIX
+branch to link against, and `debuggerd` already writes a symbolized tombstone for every fatal signal in
+release builds. `Net.install_native_crash_handler()` still returns `true` there and writes no
+`crash-native.log` — see [crash-capture.md](crash-capture.md).
+
+### iOS is not a key yet
+
+`tools/build-native.sh` stages **one file per platform per profile**, the descriptor names that file and
+the release publishes it as its own asset. iOS does not fit that shape, and the mismatch is structural
+rather than a missing toolchain:
+
+- **The artifact is a directory.** An iOS GDExtension is packaged as an `.xcframework` holding a device
+  slice and a simulator slice. They cannot be merged into one file with `lipo`, because both are `arm64`
+  — an `.xcframework` exists precisely for the case `lipo` cannot cover.
+- **It needs Xcode on a macOS box**, not just the command line tools, for `xcodebuild -create-xcframework`.
+  The macOS runner has the command line tools, which is what `dsymutil` and `lipo` need and all the
+  current legs ask of it.
+
+**The static library itself is not an obstacle.** An iOS GDExtension links statically, and `cargo rustc
+--crate-type staticlib` sets that for one invocation without touching
+`native/crates/orbitnet-godot/Cargo.toml` or any other platform's build — `tools/build-native.sh` already
+uses `cargo rustc` for per-platform overrides.
+
+Closing it means teaching the build path to stage a bundle and the release path to publish one, which is
+a larger change than another key. ENet over UDP needs no protocol change either way — this is a
+build-matrix question rather than a netcode one.
+
 ### Windows and macOS test where they build
 
 `check.yml` runs all of its jobs on `ubuntu-latest` and cannot speak for the other two platforms. A bad
@@ -204,6 +308,9 @@ test it:
   already runs both on Linux for every pull request. **`linux_arm64` cannot run them at all**: it is
   cross-built on the x86_64 box, so the runner that produced the artifact cannot load it. The steps name the
   two legs that do run rather than excluding the ones that do not, so a future cross-built leg has to opt in.
+- **The three android legs cannot run them either**, for a stronger version of the same reason: their
+  artifacts target another operating system as well as another ABI, and loading one needs a device or an
+  emulator. The allowlist is what kept them out with no change to these steps.
 
 ## The version
 
@@ -262,5 +369,10 @@ tag. Use the same spelling everywhere — the parity check matches a leg by `pla
 list by `for p in <keys>`, and accepts `[a-z0-9_]` only, so an underscore is the separator that works in
 every place the key is spelled.
 
+**A key that needs a toolchain the runner lacks needs a fifth edit**: a preflight in
+`tools/build-native.sh` that refuses to start and names the install, and a step in both workflows that
+provisions it. Without the preflight a leg with no linker can exit 0 having produced nothing, and the tag
+then fails in the publish job after every other platform has already built.
+
 The Rust itself is architecture-agnostic. There are no web entries because Godot's web export cannot load a
-GDExtension at all, and no android/ios entries yet.
+GDExtension at all, and no ios entries for the reasons above.

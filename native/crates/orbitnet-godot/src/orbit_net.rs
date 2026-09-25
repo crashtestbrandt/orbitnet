@@ -3808,6 +3808,11 @@ impl OrbitNet {
     /// build otherwise dies with no backtrace and no `NOTIFICATION_CRASH`. `dir` is resolved and
     /// created by the caller, which already owns its own log directory, so nothing in the signal
     /// path has to touch Godot. Idempotent; returns false if already installed.
+    ///
+    /// On Android this claims the slot, registers nothing and still returns `true`, the same as any
+    /// target with no handler branch: Bionic has no `<execinfo.h>` to link against, and `debuggerd`
+    /// already writes a symbolized tombstone for every fatal signal in release builds. A caller that
+    /// treats the return value as "a handler exists" has to exclude Android. See `crash.rs`'s header.
     #[func]
     fn install_crash_handler(&self, dir: GString) -> bool {
         crate::crash::install(&dir.to_string())

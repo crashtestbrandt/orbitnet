@@ -62,10 +62,36 @@ windows.debug.x86_64 = "res://addons/orbitnet_native/bin/orbitnet.windows.templa
 windows.release.x86_64 = "res://addons/orbitnet_native/bin/orbitnet.windows.template_release.x86_64.dll"
 macos.debug = "res://addons/orbitnet_native/bin/liborbitnet.macos.template_debug.universal.dylib"
 macos.release = "res://addons/orbitnet_native/bin/liborbitnet.macos.template_release.universal.dylib"
+android.debug.arm64 = "res://addons/orbitnet_native/bin/liborbitnet.android.template_debug.arm64.so"
+android.release.arm64 = "res://addons/orbitnet_native/bin/liborbitnet.android.template_release.arm64.so"
+android.debug.arm32 = "res://addons/orbitnet_native/bin/liborbitnet.android.template_debug.arm32.so"
+android.release.arm32 = "res://addons/orbitnet_native/bin/liborbitnet.android.template_release.arm32.so"
+android.debug.x86_64 = "res://addons/orbitnet_native/bin/liborbitnet.android.template_debug.x86_64.so"
+android.release.x86_64 = "res://addons/orbitnet_native/bin/liborbitnet.android.template_release.x86_64.so"
 
 ; The linux arm64 entries are CROSS-BUILT on the x86_64 Linux runner, under the `linux_arm64` platform
 ; key: one more matrix leg on the box that already builds the x86_64 libraries, with no arm64 hardware
 ; anywhere in the release path.
+;
+; The android entries are cross-built on that same x86_64 Linux runner, one platform key per ABI, linked
+; with the NDK's clang wrappers. Android has no universal container, so each ABI ships its own `.so` and
+; needs its own entry here. Three of the four architectures Godot's export preset offers are here:
+;   arm64    every phone and tablet shipping today.
+;   arm32    still an export-preset checkbox, and a project that ticks it exports an app whose extension
+;            is simply absent on those devices without this entry.
+;   x86_64   the Android emulator and ChromeOS, which is where the extension gets loaded while a game is
+;            developed on a desktop.
+; There is no x86_32 entry: no Android device ships that ABI and the emulator system images for it are
+; gone. A project that needs one adds the key the way any platform is added -- see docs/building.md.
+;
+; There are no ios entries. An iOS GDExtension is a static library packaged as an `.xcframework`, a
+; directory holding a device slice and a simulator slice that cannot be merged into one file because both
+; are arm64. The build path here stages one file per platform per profile and the release publishes each
+; as its own asset, so ios needs an artifact shape this repository does not have yet. The static linkage
+; is not the obstacle -- `cargo rustc --crate-type staticlib` covers that for one invocation. ENet over
+; UDP needs no protocol change either way -- this is a build-matrix question rather than a netcode one.
 ; No web entries: Godot's web export cannot load a GDExtension at all.
-; No android/ios entries yet; mobile lands with the export-preset pass (ENet over UDP needs no protocol
-; change, so this is a build-matrix question, not a netcode one).
+;
+; Every entry above is built by binaries.yml and published by release.yml. Only linux, windows and macos
+; are also loaded and exercised by the workflow that builds them; the android libraries are cross-compiled
+; and no runner in this repository can execute one. See docs/building.md.
