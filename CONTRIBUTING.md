@@ -8,8 +8,15 @@ just check           # everything a PR must pass
 ```
 
 `check` runs fastest-failing first: `addon-tracked` → `addon-drift` → `net-check` → `descriptor-parity` →
-`bench-check` → cargo gates → lint → unit suites → the server-shape probe → the two-peer RTS probe → the
-arena probe.
+`version-parity` → `bench-check` → cargo gates → lint → unit suites → the server-shape probe → the two-peer
+RTS probe → the arena probe.
+
+**One version, three files.** `addons/orbitnet/plugin.cfg`, the `[workspace.package]` version in
+`native/Cargo.toml` and the member entries in `native/Cargo.lock` must agree. `tools/version-parity.sh` is
+the only thing that writes them — `just version-stamp <version>` locally, and `release.yml` from the tag.
+`just version-parity` fails a tree that moves one without the others. It runs inside `just check` and
+inside `release.yml`; it is **not a `check.yml` step yet**, so a pull request that diverges the three is
+green until the next tag.
 
 ## Layout, and where to edit
 

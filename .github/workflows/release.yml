@@ -4,9 +4,10 @@ name: release
 # Release assets, build the Asset Library zip, and commit a sha256 MANIFEST of what was published.
 #
 # NO BINARY IS COMMITTED, HERE OR ANYWHERE. What lands on main is `addons/orbitnet_native/binaries.json`
-# -- the size and sha256 of every published asset, plus the version this tag stamped into plugin.cfg. A
-# consumer pins the tag, downloads the assets and verifies them against a digest that lives in the commit
-# graph, which a checksum file published beside the asset cannot do: that verifies transport, not tamper.
+# -- the size and sha256 of every published asset -- plus the version this tag stamped, which is written
+# to `addons/orbitnet/plugin.cfg`, `native/Cargo.toml` and `native/Cargo.lock`. A consumer pins the tag,
+# downloads the assets and verifies them against a digest that lives in the commit graph, which a checksum
+# file published beside the asset cannot do: that verifies transport, not tamper.
 #
 # The manifest is written AFTER the assets are built, so a tag commit cannot contain its own digest; main
 # gets it one commit later. Harmless, because CI builds rather than fetches.
@@ -210,8 +211,17 @@ jobs:
 
       # INPUT_VERSION THROUGH THE ENVIRONMENT, NOT `${{ }}` INTERPOLATION. Expression interpolation
       # splices the value into the script SOURCE before bash parses it, so a crafted dispatch input
-      # would run as code on a persistent self-hosted runner. Read as an env var it is data.
-      - name: Stamp the plugin version from the tag
+      # would run as code on a persistent self-hosted runner. Read as an env var it is data. The version
+      # reaches tools/version-parity.sh as an ARGUMENT, which is data for the same reason, and that
+      # script re-validates it against the same character set.
+      #
+      # BOTH VERSIONS, ONE SCRIPT. This used to stamp addons/orbitnet/plugin.cfg alone, so the cargo
+      # workspace sat at 0.1.0 for every release the project cut and anything reading `CARGO_PKG_VERSION`
+      # reported it. tools/version-parity.sh owns every site the version is written to -- plugin.cfg, the
+      # `[workspace.package]` version in native/Cargo.toml, and the member entries in native/Cargo.lock --
+      # and re-reads all of them afterwards, so a pattern that stopped matching fails the release instead
+      # of publishing the old version.
+      - name: Stamp the plugin and crate versions from the tag
         env:
           INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
@@ -223,8 +233,7 @@ jobs:
           case "$version" in
             ''|*[!A-Za-z0-9._-]*) echo "::error::refusing version '$version'"; exit 1 ;;
           esac
-          sed -i "s/^version=\".*\"$/version=\"${version}\"/" addons/orbitnet/plugin.cfg
-          grep '^version=' addons/orbitnet/plugin.cfg
+          tools/version-parity.sh stamp "$version"
 
       # tools/make-assetlib-zip.py RATHER THAN THE `zip` BINARY. The publish runner has neither `zip`
       # nor `unzip`: a dry run failed here with "zip: command not found" after all three cross-platform
@@ -314,9 +323,9 @@ jobs:
       # through a pull request" -- so a bot push is rejected with GH006 by construction, on every run
       # whose builds all succeeded. A step that can only pass by having nothing to push is not a guard.
       #
-      # A SEPARATE WORKTREE, because this checkout is the TAG and it is dirty by now: plugin.cfg has been
-      # stamped and binaries.json freshly written. `git checkout -B` in this tree aborts whenever either
-      # differs between the tag and main.
+      # A SEPARATE WORKTREE, because this checkout is the TAG and it is dirty by now: plugin.cfg,
+      # native/Cargo.toml and native/Cargo.lock carry the stamp and binaries.json is freshly written.
+      # `git checkout -B` in this tree aborts whenever any of the four differs between the tag and main.
       #
       # AFTER the publish, because the release is the artifact that matters. This step failing must never
       # cost a full set of cross-platform builds and a tag that cannot be re-run.
@@ -334,16 +343,34 @@ jobs:
           git worktree prune
           git fetch origin main
           git worktree add --detach "$wt" origin/main
-          # `cp`, not a shell round trip: command substitution strips trailing newlines.
+          # `cp`, not a shell round trip: command substitution strips trailing newlines. binaries.json is
+          # generated whole by this job, so copying it is the whole update.
           cp addons/orbitnet_native/binaries.json "$wt/addons/orbitnet_native/binaries.json"
-          cp addons/orbitnet/plugin.cfg           "$wt/addons/orbitnet/plugin.cfg"
-          git -C "$wt" add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg
+          # THE VERSIONS ARE RE-STAMPED IN THE WORKTREE, NOT COPIED FROM THE TAG. plugin.cfg,
+          # native/Cargo.toml and native/Cargo.lock are SOURCE files that main may have moved on since the
+          # tag -- a reworded plugin description, a cargo profile added -- and copying the tag's copies
+          # over them would revert that work as a side effect of a release. Re-running the stamp writes
+          # the version fields and nothing else.
+          #
+          # THE CRATE VERSION MUST COME BACK TO MAIN, not only ride the tag. Stamped on the tag alone, the
+          # workspace version returns to its old value on the next commit and the divergence reopens
+          # immediately -- which is how it reached 0.1.0-against-0.4.0 in the first place. Carrying it here
+          # is also what lets `just version-parity` pass on main at all.
+          #
+          # RE-RUNNING AN OLDER TAG'S JOB PROPOSES A DOWNGRADE. The stamp writes this tag's version into
+          # the main worktree unconditionally, so re-running the job for an older tag after a newer one
+          # has shipped opens a pull request moving all three version files backwards. The tree it writes
+          # is internally consistent, so version-parity passes on it and does not catch it; main being
+          # protected and the pull request being reviewed is what does. Close that pull request.
+          "$wt/tools/version-parity.sh" stamp "${GITHUB_REF_NAME#v}"
+          git -C "$wt" add addons/orbitnet_native/binaries.json addons/orbitnet/plugin.cfg \
+                           native/Cargo.toml native/Cargo.lock
           if git -C "$wt" diff --cached --quiet; then
             echo "manifest unchanged; nothing to propose"
             git worktree remove --force "$wt"
             exit 0
           fi
-          git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
+          git -C "$wt" commit -m "release: binaries manifest and stamped versions for ${GITHUB_REF_NAME}"
           git -C "$wt" push --force origin "HEAD:refs/heads/${branch}"
           git worktree remove --force "$wt"
           # The API's answer decides this step's exit code. Piping curl into a printer exits 0 whatever

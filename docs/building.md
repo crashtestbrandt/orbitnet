@@ -107,7 +107,7 @@ reasons:
 |---|---|---|
 | `check.yml` | every PR and push | Builds both descriptor profiles for Linux, confirms each is a real ELF object, and runs every gate against them. |
 | `binaries.yml` | push to main touching `native/**` | Builds both descriptor profiles on every platform leg, uploads them as **artifacts**. The Windows and macOS legs then run the load smoke and the four unit suites against what they just built. |
-| `release.yml` | a `v*` tag | Builds all three profiles on every platform leg, publishes the binaries and the AssetLib zip as Release assets, and commits the manifest. |
+| `release.yml` | a `v*` tag | Builds all three profiles on every platform leg, publishes the binaries and the AssetLib zip as Release assets, stamps the version, and commits the manifest. |
 
 So main is always *proven* to build on every platform, and history carries digests rather than bytes.
 
@@ -195,6 +195,36 @@ test it:
   already runs both on Linux for every pull request. **`linux_arm64` cannot run them at all**: it is
   cross-built on the x86_64 box, so the runner that produced the artifact cannot load it. The steps name the
   two legs that do run rather than excluding the ones that do not, so a future cross-built leg has to opt in.
+
+## The version
+
+**One version, written to three files.** A release tag `vX.Y.Z` is stamped into all of them by
+`tools/version-parity.sh`, which is the only thing that writes any of them.
+
+| File | Field | Who reads it |
+|---|---|---|
+| `addons/orbitnet/plugin.cfg` | `version=` | Godot's plugin list, and the AssetLib entry |
+| `native/Cargo.toml` | `[workspace.package] version` | `CARGO_PKG_VERSION`, a crash report, a cargo consumer of `orbitnet-core` |
+| `native/Cargo.lock` | one entry per workspace member | `cargo build --locked`, and any vendoring consumer |
+
+Both crates inherit the workspace version with `version.workspace = true`, so the member manifests carry no
+version of their own.
+
+**Where the check runs.** `just version-parity` fails a tree whose three files disagree.
+
+| Where | When |
+|---|---|
+| `just check` | locally, before a pull request |
+| `release.yml` | at tag time, immediately after stamping — the only place a stamp can be proved, because a rewrite whose pattern stops matching exits 0 and would otherwise publish the old version |
+
+It is **not a `check.yml` step yet**, so a pull request that moves one file without the others passes CI
+and the divergence lands on main until the next tag re-stamps it.
+
+**The stamp returns to `main`.** The manifest pull request carries `plugin.cfg`, `native/Cargo.toml` and
+`native/Cargo.lock` alongside `binaries.json`. Stamped on the tag alone, the crate version would revert on
+the next commit and the divergence would reopen at once.
+
+To bump locally before tagging: `just version-stamp 0.5.0`.
 
 ## CI runs on GitHub-hosted runners
 
