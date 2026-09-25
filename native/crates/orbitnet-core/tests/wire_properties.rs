@@ -105,8 +105,8 @@
 //! regression test.
 
 use orbitnet_core::auth::{
-    compress_secret, siphash24, AuthError, Direction, ReplayWindow, SessionAuth, SipHasher,
-    KEY_LEN, TRAILER_LEN,
+    compress_secret, derive_cipher_key, siphash24, AuthError, Direction, ReplayWindow, SessionAuth,
+    SipHasher, CIPHER_TRAILER_LEN, KEY_LEN, SEQ_LEN, TRAILER_LEN,
 };
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
@@ -859,9 +859,10 @@ fn drive_every_decoder(bytes: &[u8], schema: &SchemaBuilder) -> Result<(), TestC
     // key for a whole session and judges every datagram against it, and a generated key only
     // changes which tag is the one in 2^64 that verifies.
     let key = [0x5au8; KEY_LEN];
+    let mut plain: Vec<u8> = Vec::new();
     let mut session = SessionAuth::new(key);
     for direction in [Direction::ToServer, Direction::ToClient] {
-        match session.open(direction, bytes) {
+        match session.open(direction, bytes, &mut plain) {
             // Reached only by a buffer that happens to carry a tag this key produces, which is
             // what the sealed corpus below supplies. A payload that opened is the datagram with
             // the trailer stripped, so its length is fixed by the datagram's.
@@ -878,17 +879,20 @@ fn drive_every_decoder(bytes: &[u8], schema: &SchemaBuilder) -> Result<(), TestC
     let mut sender = SessionAuth::new(key);
     if sender.seal(Direction::ToServer, &mut sealed).is_some() {
         let mut receiver = SessionAuth::new(key);
-        prop_assert_eq!(receiver.open(Direction::ToServer, &sealed), Ok(bytes));
+        prop_assert_eq!(
+            receiver.open(Direction::ToServer, &sealed, &mut plain),
+            Ok(bytes)
+        );
         // The same datagram a second time is the replay the window refuses.
         prop_assert_eq!(
-            receiver.open(Direction::ToServer, &sealed),
+            receiver.open(Direction::ToServer, &sealed, &mut plain),
             Err(AuthError::Replayed)
         );
         // The other direction is a different tag over the same bytes, which is what stops a peer's
         // own datagram from being reflected back at it.
         let mut reflected = SessionAuth::new(key);
         prop_assert_eq!(
-            reflected.open(Direction::ToClient, &sealed),
+            reflected.open(Direction::ToClient, &sealed, &mut plain),
             Err(AuthError::BadTag)
         );
         // Every truncation of a datagram that would otherwise have verified. The cut is clamped
@@ -897,8 +901,94 @@ fn drive_every_decoder(bytes: &[u8], schema: &SchemaBuilder) -> Result<(), TestC
         for cut in [0, 1, TRAILER_LEN - 1, TRAILER_LEN, sealed.len() / 2, last] {
             let mut truncated = SessionAuth::new(key);
             prop_assert!(truncated
-                .open(Direction::ToServer, &sealed[..cut.min(last)])
+                .open(Direction::ToServer, &sealed[..cut.min(last)], &mut plain)
                 .is_err());
+        }
+    }
+
+    // --- The same sweep under a session secret, where the payload is ciphertext and the tag is
+    // Poly1305. The decoder past it is the same one, so what this adds is the cipher's own refusals:
+    // arbitrary bytes presented as a ciphertext, and every truncation of one that would have opened.
+    let cipher_key = derive_cipher_key(&compress_secret(b"wire-properties"), &[0x5au8; KEY_LEN]);
+    let mut encrypting = SessionAuth::encrypted(key, cipher_key);
+    for direction in [Direction::ToServer, Direction::ToClient] {
+        match encrypting.open(direction, bytes, &mut plain) {
+            // Unreachable in practice — it needs a Poly1305 tag over bytes nobody encrypted — and
+            // asserted rather than assumed, because a decryption that answered on a failed tag would
+            // land here with unauthenticated plaintext.
+            Ok(payload) => {
+                prop_assert_eq!(payload.len(), bytes.len() - CIPHER_TRAILER_LEN);
+            }
+            Err(error) => prop_assert!(matches!(
+                error,
+                AuthError::Truncated | AuthError::BadTag | AuthError::Replayed
+            )),
+        }
+    }
+    let mut encrypted = bytes.to_vec();
+    let mut cipher_sender = SessionAuth::encrypted(key, cipher_key);
+    if cipher_sender
+        .seal(Direction::ToServer, &mut encrypted)
+        .is_some()
+    {
+        // The ciphertext is exactly as long as the plaintext, and the trailer is what a receiver
+        // needs to reconstruct the nonce. A datagram of the length below carries neither more nor
+        // less than that.
+        prop_assert_eq!(encrypted.len(), bytes.len() + CIPHER_TRAILER_LEN);
+        let mut receiver = SessionAuth::encrypted(key, cipher_key);
+        prop_assert_eq!(
+            receiver.open(Direction::ToServer, &encrypted, &mut plain),
+            Ok(bytes)
+        );
+        prop_assert_eq!(
+            receiver.open(Direction::ToServer, &encrypted, &mut plain),
+            Err(AuthError::Replayed)
+        );
+        let mut reflected = SessionAuth::encrypted(key, cipher_key);
+        prop_assert_eq!(
+            reflected.open(Direction::ToClient, &encrypted, &mut plain),
+            Err(AuthError::BadTag)
+        );
+        let last = encrypted.len() - 1;
+        for cut in [
+            0,
+            1,
+            CIPHER_TRAILER_LEN - 1,
+            CIPHER_TRAILER_LEN,
+            encrypted.len() / 2,
+            last,
+        ] {
+            let mut truncated = SessionAuth::encrypted(key, cipher_key);
+            prop_assert!(truncated
+                .open(Direction::ToServer, &encrypted[..cut.min(last)], &mut plain)
+                .is_err());
+        }
+        // One alteration in each region of the datagram rather than at every index. The ciphertext,
+        // the sequence number and the tag are all covered by Poly1305, so each has to be refused and
+        // has to leave the scratch empty rather than holding plaintext nobody authenticated.
+        // Sweeping every byte of every generated datagram costs this suite ten times its run.
+        // `auth.rs`'s own `an_altered_sequence_number_is_refused_rather_than_decrypted` sweeps a
+        // fixed datagram once, which is where that finer-grained coverage belongs.
+        let split = encrypted.len() - CIPHER_TRAILER_LEN;
+        let positions = [
+            0, // the first ciphertext byte, or the sequence number of an empty one
+            split.saturating_sub(1),
+            split, // the low byte of the sequence number
+            split + SEQ_LEN - 1,
+            split + SEQ_LEN, // the first tag byte
+            last,
+        ];
+        for index in positions {
+            let mut altered = encrypted.clone();
+            altered[index] ^= 0x01;
+            let mut receiver = SessionAuth::encrypted(key, cipher_key);
+            prop_assert_eq!(
+                receiver.open(Direction::ToServer, &altered, &mut plain),
+                Err(AuthError::BadTag),
+                "byte {} of an encrypted datagram",
+                index
+            );
+            prop_assert!(plain.is_empty());
         }
     }
     // A sequence number is a `u32` the sender chose, including one far past the window, which is

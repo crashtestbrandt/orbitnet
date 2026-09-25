@@ -31,8 +31,8 @@ use godot::classes::{
 use godot::prelude::*;
 
 use orbitnet_core::auth::{
-    compress_secret, confirm_tag, derive_session_key, session_nonce, siphash24,
-    MAX_INPUT_BLOCKS_PER_TICK, REPLAY_WINDOW, TRAILER_LEN,
+    compress_secret, confirm_tag, derive_cipher_key, derive_session_key, session_nonce, siphash24,
+    MAX_INPUT_BLOCKS_PER_TICK, REPLAY_WINDOW,
 };
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
@@ -2374,6 +2374,16 @@ pub struct OrbitNet {
     dbg_resim_spans: u64,
     dbg_resim_ticks_total: u64,
     dbg_fresh: u64,
+    /// Scratch the receive path decrypts into, held here so it is allocated once per session rather
+    /// than once per datagram.
+    ///
+    /// **It is taken out of `self` for the length of one datagram** — see [`OrbitNet::handle_packet`] —
+    /// because the frame handlers it is handed to take `&mut self` and the payload they read borrows
+    /// this buffer. The interest pass moves its own scratch the same way, for the same reason.
+    ///
+    /// Empty and untouched in a session with no secret: there the payload is already plaintext and
+    /// [`SessionAuth::open`] answers with a slice of the datagram itself.
+    rx_plain: Vec<u8>,
 }
 
 #[godot_api]
@@ -2529,6 +2539,7 @@ impl INode for OrbitNet {
             dbg_rx_kinds: [0; 10],
             dbg_rx_unauth: 0,
             auth_warned: false,
+            rx_plain: Vec::new(),
             dbg_input_novel: 0,
             dbg_input_nonfinite: 0,
             dbg_resim_spans: 0,
@@ -3147,7 +3158,9 @@ impl OrbitNet {
     /// | | No secret | A secret |
     /// | --- | --- | --- |
     /// | The key | the two exchanged nonce halves, folded | the secret and that fold, derived |
-    /// | An on-path observer | can do everything the client can | can read the traffic and forge nothing |
+    /// | The payload | on the wire in the clear | encrypted with ChaCha20-Poly1305 |
+    /// | The tag | 64-bit SipHash over the payload | 128-bit Poly1305 over the ciphertext |
+    /// | An on-path observer | can do everything the client can | reads no payload and forges nothing |
     ///
     /// **It does not change the frame sequence.** The join is two round trips under both regimes — the
     /// acceptor contributes half of the nonce either way, which is what refuses a replayed join. See
@@ -3156,9 +3169,20 @@ impl OrbitNet {
     /// **THE SECRET IS A DERIVATION INPUT AND IS NEVER THE SESSION KEY.** See [`session_key_from`] for why
     /// seating it is the obvious wrong implementation and what it re-opens.
     ///
-    /// Three ceilings, all unchanged by this: the tag is still 64 bits, the key still 128, and the derived
-    /// key is worth exactly the entropy of the secret. **None of it encrypts anything** — every payload is
-    /// still on the wire in the clear.
+    /// **Every payload is encrypted under a secret.** [`SessionAuth`] runs ChaCha20-Poly1305 over each
+    /// datagram it seals and each one it opens, under a cipher key [`derive_cipher_key`] draws from the
+    /// same secret and fold under labels of its own. With no secret nothing is encrypted, and encrypting
+    /// there would hide nothing, because both halves of the nonce cross the wire and whoever reads a
+    /// payload can compute the key that hid it. See [`session_auth_from`].
+    ///
+    /// **What the cipher costs.** Eight bytes per datagram — a 16-byte Poly1305 tag in place of the
+    /// 8-byte SipHash one — and about 1.2 µs per full-size frame at each end, which is under 0.1% of a
+    /// 60 Hz frame on a server with eight peers. Zero for a session that sets no secret.
+    ///
+    /// **What it does not hide.** How many datagrams a peer sends, when, or how long each one is — the
+    /// ciphertext is exactly as long as the plaintext. The handshake and the challenge stay in the clear
+    /// because they are what establish the key. Two ceilings stand under both regimes — the key is 128
+    /// bits, and a derived key is worth exactly the entropy of the secret supplied.
     ///
     /// **A misconfiguration looks the same to the player either way** — the two ends derive different keys,
     /// nothing either sends opens at the other, and the join never completes while the handshake retries.
@@ -4068,14 +4092,17 @@ impl OrbitNet {
     /// [`OrbitNet::send_raw`]. There is no key to seal either of them under: each carries one half of
     /// the pair the key is folded from.
     ///
-    /// The sealed datagram is [`TRAILER_LEN`] bytes longer than the payload. That rides above
+    /// The sealed datagram is [`orbitnet_core::auth::TRAILER_LEN`] bytes longer than the payload, or
+    /// [`orbitnet_core::auth::CIPHER_TRAILER_LEN`] under a session secret. That rides above
     /// `MAX_FRAME_PAYLOAD` the same way the frame header does.
+    ///
+    /// **Under a secret this is also where the payload is encrypted**, in the same pass that tags it —
+    /// [`SessionAuth::seal`] runs ChaCha20-Poly1305 over `sealed` in place. Nothing here decides the
+    /// regime: the session was seated with a cipher key or without one when the join completed.
     fn send_to(&mut self, peer: i32, bytes: &[u8], mode: TransferMode) {
         let Some((direction, _)) = session_directions(self.mode) else {
             return;
         };
-        let mut sealed = Vec::with_capacity(bytes.len() + TRAILER_LEN);
-        sealed.extend_from_slice(bytes);
         let auth = match direction {
             Direction::ToServer => self.session_auth.as_mut(),
             Direction::ToClient => self
@@ -4088,6 +4115,8 @@ impl OrbitNet {
         let Some(auth) = auth else {
             return;
         };
+        let mut sealed = Vec::with_capacity(bytes.len() + auth.trailer_len());
+        sealed.extend_from_slice(bytes);
         if auth.seal(direction, &mut sealed).is_none() {
             return;
         }
@@ -4214,11 +4243,11 @@ impl OrbitNet {
             }
             ChallengeAnswer::Adopt => {
                 self.acceptor_nonce = Some(challenge.acceptor_nonce);
-                self.session_auth = Some(SessionAuth::new(session_key_from(
+                self.session_auth = Some(session_auth_from(
                     self.session_secret.as_ref(),
                     challenge.joiner_nonce,
                     challenge.acceptor_nonce,
-                )));
+                ));
                 // Confirm immediately rather than waiting out the retry timer, which is what keeps the
                 // second round trip to one round trip of added join time.
                 self.hello_timer = 0.0;
@@ -6202,7 +6231,8 @@ impl OrbitNet {
             // clamps to `MAX_FRAME_PAYLOAD` (1200) and every check below is against `body.len()`, so a full
             // frame leaves here at 1200 plus the header's own bytes -- not at 1200. That is deliberate rather
             // than an oversight, but it is not what the constant's name says: the real wire figure is header +
-            // body + 12 (ENet) + 28 (IPv4/UDP), which stays comfortably inside a 1500 B path MTU. Do not read
+            // body + the authentication trailer (12 bytes, or 20 under a session secret) + 12 (ENet) + 28
+            // (IPv4/UDP), which stays comfortably inside a 1500 B path MTU. Do not read
             // `MAX_FRAME_PAYLOAD` as "the datagram size"; read it as "the entity payload one frame may carry".
             let mut next = 0usize;
             let mut pass = 0u32;
@@ -6982,9 +7012,25 @@ impl OrbitNet {
             self.handle_challenge(bytes);
             return;
         }
-        let Some(payload) = self.open_datagram(sender, bytes) else {
-            return;
-        };
+        // **The decryption scratch is moved out of `self` and put back.** Under a session secret the
+        // payload the handlers below read lives in this buffer, and those handlers take `&mut self`;
+        // borrowing it out of a field would hold `self` for the length of the frame. The interest pass
+        // moves its own scratch the same way. Moving it keeps its capacity, so a session allocates here
+        // once rather than once per datagram.
+        let mut plain = std::mem::take(&mut self.rx_plain);
+        if let Some(payload) = self.open_datagram(sender, bytes, &mut plain) {
+            self.dispatch_frame(sender, payload);
+        }
+        self.rx_plain = plain;
+    }
+
+    /// Route one authenticated payload to the handler for its frame kind.
+    ///
+    /// Split from [`Self::handle_packet`] so the payload can borrow either the datagram or the
+    /// decryption scratch while every handler here takes `&mut self`. **Nothing reaches this function
+    /// until [`Self::open_datagram`] has returned `Ok`**, so every byte it reads is one this session's
+    /// peer authenticated.
+    fn dispatch_frame(&mut self, sender: i32, payload: &[u8]) {
         if payload.is_empty() {
             return;
         }
@@ -7249,9 +7295,20 @@ impl OrbitNet {
     /// **Nothing below this line decodes a byte a peer chose until this returns.** `None` means the
     /// datagram was forged, replayed, or sent by a peer with no handshake — including the ping a
     /// server used to answer for any connected sender, which is now refused with the rest.
-    fn open_datagram<'a>(&mut self, sender: i32, bytes: &'a [u8]) -> Option<&'a [u8]> {
+    ///
+    /// **Under a session secret this is also where the payload is decrypted**, and the answer is a
+    /// slice of `plain` rather than of `bytes`. The tag is Poly1305 over the ciphertext, so it is
+    /// checked before anything is deciphered and a refused datagram leaves `plain` empty; with no
+    /// secret `plain` is untouched. The order — authenticate, then the replay window, then decode — is
+    /// the same under both regimes and is [`SessionAuth::open`]'s whole contract.
+    fn open_datagram<'a>(
+        &mut self,
+        sender: i32,
+        bytes: &'a [u8],
+        plain: &'a mut Vec<u8>,
+    ) -> Option<&'a [u8]> {
         // A peer authenticates with the direction it EXPECTS TO RECEIVE. That is what makes a
-        // reflected datagram fail: the direction is mixed into the MAC and never sent.
+        // reflected datagram fail: the direction is mixed into the tag and never sent.
         let (_, direction) = session_directions(self.mode)?;
         let auth = match direction {
             Direction::ToClient => self.session_auth.as_mut(),
@@ -7260,7 +7317,7 @@ impl OrbitNet {
                 .get_mut(&sender)
                 .and_then(|state| state.auth.as_mut()),
         };
-        let opened = auth.map(|auth| auth.open(direction, bytes));
+        let opened = auth.map(|auth| auth.open(direction, bytes, plain));
         match opened {
             Some(Ok(payload)) => Some(payload),
             Some(Err(AuthError::Truncated | AuthError::BadTag | AuthError::Replayed)) | None => {
@@ -7413,7 +7470,11 @@ impl OrbitNet {
         // changes the key: one comparison covers both.
         let rekeyed = peer.auth.is_some_and(|auth| auth.key() != session_key);
         if peer.auth.is_none_or(|auth| auth.key() != session_key) {
-            peer.auth = Some(SessionAuth::new(session_key));
+            peer.auth = Some(session_auth_from(
+                self.session_secret.as_ref(),
+                hello.joiner_nonce,
+                acceptor,
+            ));
             peer.budget = ReceiveBudget::new();
             // A REKEY IS A CLIENT THAT RESTARTED ITS SESSION ON A LIVE CONNECTION, so its entity
             // manifest went with it. Zeroed in the same block that replaces the auth, because these
@@ -9417,9 +9478,10 @@ fn challenge_answer(
 /// on-path observer computes the key either way; running it regardless is what keeps one derivation and
 /// one frame sequence over a configuration decision neither end puts on the wire.
 ///
-/// **It changes who can forge, not how hard forging is.** The tag is still 64 bits and the key still 128,
-/// and a derived key is worth exactly the entropy of the secret it came from. Nothing here encrypts
-/// anything.
+/// **What a secret changes here is who can forge.** The key is 128 bits under both regimes, and a
+/// derived key is worth exactly the entropy of the secret it came from. This function produces the MAC
+/// key alone — whether the payload is also encrypted, and what tags it, is decided one level up in
+/// [`session_auth_from`].
 #[must_use]
 fn session_key_from(
     secret: Option<&[u8; KEY_LEN]>,
@@ -9430,6 +9492,43 @@ fn session_key_from(
     match secret {
         Some(secret) => derive_session_key(secret, &nonce),
         None => nonce,
+    }
+}
+
+/// The whole session state one join seats: the key above, and the **payload cipher** when a secret is
+/// configured.
+///
+/// A free function beside [`session_key_from`] for the same reason — both ends run this one line, the
+/// client in [`OrbitNet::handle_challenge`] and the server in `handle_hello` — and it is what decides
+/// the regime, once, at the seat.
+///
+/// | `secret` | What the session does |
+/// | --- | --- |
+/// | `None` | tags every datagram with SipHash-2-4 and sends the payload in the clear |
+/// | `Some` | encrypts every payload with ChaCha20-Poly1305 and tags it with Poly1305 |
+///
+/// **With no secret the cipher is absent rather than keyed on the nonce.** Both halves of that nonce
+/// cross the wire, so a cipher keyed on it hides a payload from nobody who read the join, and a wire
+/// that looked encrypted would say otherwise. The regime is neither transmitted nor negotiated: a peer
+/// whose configuration differs from the other end's derives a different key and is refused, which is the
+/// behaviour a mismatched secret already had.
+///
+/// **The cipher key is derived from the secret, not from the session key.** [`derive_cipher_key`] runs
+/// over the same folded nonce under labels of its own, so the key that hides a payload and the key that
+/// authenticated it are separate values neither of which computes the other.
+#[must_use]
+fn session_auth_from(
+    secret: Option<&[u8; KEY_LEN]>,
+    joiner: [u8; KEY_LEN],
+    acceptor: [u8; KEY_LEN],
+) -> SessionAuth {
+    let key = session_key_from(secret, joiner, acceptor);
+    match secret {
+        Some(secret) => SessionAuth::encrypted(
+            key,
+            derive_cipher_key(secret, &session_nonce(&joiner, &acceptor)),
+        ),
+        None => SessionAuth::new(key),
     }
 }
 
@@ -9961,8 +10060,8 @@ mod tests {
         queue_seat_release, replayed_depth, resim_input_from, resolve_observer, resume_grant,
         retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
-        send_pass_is_due, session_directions, session_is_filtering, session_key_from,
-        snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
+        send_pass_is_due, session_auth_from, session_directions, session_is_filtering,
+        session_key_from, snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
         unseeded_departures, veto_announces_leave, AckOutcome, BlockAdmission, ChallengeAnswer,
         EntityRow, FrameCharge, FrameHeader, HelloLeg, InterestPass, ManifestOwed, OrbitNet,
         PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
@@ -9976,6 +10075,7 @@ mod tests {
         SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH,
         UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
+    use orbitnet_core::auth::{CIPHER_TRAILER_LEN, TRAILER_LEN};
     use orbitnet_core::codec::{Challenge, Handshake, InterestDeltaSection};
     use std::collections::HashMap;
 
@@ -14862,6 +14962,7 @@ mod tests {
 
     #[test]
     fn two_sessions_under_one_secret_derive_different_keys() {
+        let mut plain: Vec<u8> = Vec::new();
         // THE CROSS-SESSION REPLAY PROPERTY, and the reason the secret is a derivation input rather
         // than the key. `SessionAuth` restarts its sequence counter at 1 on every join and the replay
         // window only ever knows the session in front of it, so two joins landing on one key would make
@@ -14882,13 +14983,13 @@ mod tests {
             .seal(Direction::ToServer, &mut captured)
             .unwrap();
         assert_eq!(
-            SessionAuth::new(second).open(Direction::ToServer, &captured),
+            SessionAuth::new(second).open(Direction::ToServer, &captured, &mut plain),
             Err(AuthError::BadTag),
             "the next session refuses what the last one sealed"
         );
         assert!(
             SessionAuth::new(first)
-                .open(Direction::ToServer, &captured)
+                .open(Direction::ToServer, &captured, &mut plain)
                 .is_ok(),
             "the negative control: it opens under the session that sealed it"
         );
@@ -14912,6 +15013,7 @@ mod tests {
 
     #[test]
     fn a_peer_with_a_different_secret_derives_a_key_that_opens_nothing() {
+        let mut plain: Vec<u8> = Vec::new();
         // What refuses a peer that does not hold the secret, once it is past the handshake: its key is
         // not the session's, so nothing it sends verifies and nothing sent to it does either.
         let joiner = nonce_bytes(3);
@@ -14932,8 +15034,102 @@ mod tests {
             .seal(Direction::ToServer, &mut datagram)
             .unwrap();
         assert_eq!(
-            SessionAuth::new(ours).open(Direction::ToServer, &datagram),
+            SessionAuth::new(ours).open(Direction::ToServer, &datagram, &mut plain),
             Err(AuthError::BadTag)
+        );
+    }
+
+    #[test]
+    fn a_session_secret_seats_the_payload_cipher_and_no_secret_seats_none() {
+        // The regime is decided once, at the seat, and both ends run this one function. Neither end
+        // transmits which one it chose: a mismatch shows up as a key that opens nothing.
+        let joiner = nonce_bytes(11);
+        let acceptor = nonce_bytes(111);
+
+        let clear = session_auth_from(None, joiner, acceptor);
+        assert!(!clear.encrypts(), "no secret, no cipher");
+        assert_eq!(clear.trailer_len(), TRAILER_LEN);
+
+        let secret = compress_secret(b"a secret the lobby handed both ends");
+        let sealed = session_auth_from(Some(&secret), joiner, acceptor);
+        assert!(sealed.encrypts());
+        assert_eq!(sealed.trailer_len(), CIPHER_TRAILER_LEN);
+        // The MAC key is what a repeated handshake is compared against, and seating a cipher must not
+        // have moved it — the comparison in `handle_hello` is derived-key against derived-key.
+        assert_eq!(
+            sealed.key(),
+            session_key_from(Some(&secret), joiner, acceptor)
+        );
+    }
+
+    #[test]
+    fn under_a_secret_the_two_ends_of_one_join_encrypt_and_decrypt_for_each_other() {
+        // The round trip the join actually produces: the server seats its half in `handle_hello`, the
+        // client its own in `handle_challenge`, and each runs `session_auth_from` over the same pair.
+        let joiner = nonce_bytes(13);
+        let acceptor = nonce_bytes(113);
+        let secret = compress_secret(b"a secret the lobby handed both ends");
+        let mut server = session_auth_from(Some(&secret), joiner, acceptor);
+        let mut client = session_auth_from(Some(&secret), joiner, acceptor);
+
+        let mut plain: Vec<u8> = Vec::new();
+        let mut snapshot = b"net_pos 4.0 0.0 1.5".to_vec();
+        server
+            .seal(Direction::ToClient, &mut snapshot)
+            .expect("the server seals its snapshot");
+        assert!(
+            !snapshot.windows(7).any(|w| w == b"net_pos"),
+            "the payload is not on the wire"
+        );
+        assert_eq!(
+            client.open(Direction::ToClient, &snapshot, &mut plain),
+            Ok(&b"net_pos 4.0 0.0 1.5"[..])
+        );
+
+        let mut input = b"nin_move 1 0".to_vec();
+        client
+            .seal(Direction::ToServer, &mut input)
+            .expect("and the client its input");
+        assert_eq!(
+            server.open(Direction::ToServer, &input, &mut plain),
+            Ok(&b"nin_move 1 0"[..])
+        );
+    }
+
+    #[test]
+    fn one_end_configuring_a_secret_and_the_other_not_opens_nothing_either_way() {
+        // The misconfiguration `has_session_secret()` exists to diagnose, now that the two regimes
+        // differ in the cipher as well as the key. Neither direction produces a readable payload.
+        let joiner = nonce_bytes(17);
+        let acceptor = nonce_bytes(117);
+        let secret = compress_secret(b"only one end holds this");
+        let mut with = session_auth_from(Some(&secret), joiner, acceptor);
+        let mut without = session_auth_from(None, joiner, acceptor);
+
+        let mut plain: Vec<u8> = Vec::new();
+        let mut sealed = b"a payload long enough to reach both refusals".to_vec();
+        with.seal(Direction::ToServer, &mut sealed).unwrap();
+        assert_eq!(
+            without.open(Direction::ToServer, &sealed, &mut plain),
+            Err(AuthError::BadTag)
+        );
+        let mut clear = b"a payload long enough to reach both refusals".to_vec();
+        without.seal(Direction::ToServer, &mut clear).unwrap();
+        assert_eq!(
+            with.open(Direction::ToServer, &clear, &mut plain),
+            Err(AuthError::BadTag)
+        );
+        assert!(plain.is_empty());
+        // A short clear datagram reaches the other refusal instead, because the cipher's trailer is 8
+        // bytes wider than the one that produced it. Both are the same outcome for the session: the
+        // join never completes, and `has_session_secret()` is what says which end is wrong.
+        let mut short = b"in".to_vec();
+        SessionAuth::new(without.key())
+            .seal(Direction::ToServer, &mut short)
+            .unwrap();
+        assert_eq!(
+            with.open(Direction::ToServer, &short, &mut plain),
+            Err(AuthError::Truncated)
         );
     }
 
@@ -15111,6 +15307,7 @@ mod tests {
 
     #[test]
     fn a_replayed_join_derives_a_key_the_replayer_never_saw() {
+        let mut plain: Vec<u8> = Vec::new();
         // **THE REPLAYED JOIN, AT THE KEY.** An on-path observer records a whole join and presents the
         // joiner's half again. The acceptor draws its own half per join, so the session that comes out
         // is keyed on bytes the observer never saw, and every datagram it captured under the recorded
@@ -15130,13 +15327,13 @@ mod tests {
             .seal(Direction::ToServer, &mut captured)
             .unwrap();
         assert_eq!(
-            SessionAuth::new(replayed).open(Direction::ToServer, &captured),
+            SessionAuth::new(replayed).open(Direction::ToServer, &captured, &mut plain),
             Err(AuthError::BadTag),
             "the replayed join refuses what the recorded one sealed"
         );
         assert!(
             SessionAuth::new(recorded)
-                .open(Direction::ToServer, &captured)
+                .open(Direction::ToServer, &captured, &mut plain)
                 .is_ok(),
             "the negative control: it opens under the join that sealed it"
         );
@@ -15151,6 +15348,7 @@ mod tests {
 
     #[test]
     fn a_retried_hello_derives_the_same_key_and_keeps_its_replay_window() {
+        let mut plain: Vec<u8> = Vec::new();
         // A hello is retried until the welcome lands, so `handle_hello` runs again for a peer already
         // seated. It compares DERIVED KEY against derived key, and a retry that repeats BOTH halves —
         // its own, and the one this server re-issues rather than re-mints — derives the same one, which
@@ -15178,9 +15376,9 @@ mod tests {
         SessionAuth::new(seated)
             .seal(Direction::ToServer, &mut first)
             .unwrap();
-        assert!(window.open(Direction::ToServer, &first).is_ok());
+        assert!(window.open(Direction::ToServer, &first, &mut plain).is_ok());
         assert_eq!(
-            window.open(Direction::ToServer, &first),
+            window.open(Direction::ToServer, &first, &mut plain),
             Err(AuthError::Replayed),
             "the window that survived the retry still refuses the repeat"
         );

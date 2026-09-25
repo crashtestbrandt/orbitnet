@@ -19,8 +19,8 @@ class registration, `Variant` ↔ packed-row conversion, the entity registry, si
 **The rule that keeps it honest: core never sees a `Variant`.** A `godot` type in a core signature means logic
 has leaked across the boundary. `#![forbid(unsafe_code)]` throughout.
 
-**`orbitnet-core`'s dependency list is open to cryptography.** `[dependencies]` is empty today. That
-emptiness describes the crate and carries no veto: a **vetted** cipher or key exchange belongs there in
+**`orbitnet-core`'s dependency list is open to cryptography**, and holds one entry: `chacha20poly1305`,
+the payload cipher a session under a shared secret runs. A **vetted** cipher or key exchange belongs there in
 preference to a hand-written one, and `native/crates/orbitnet-core/Cargo.toml`'s header states what such a
 dependency has to clear. The `godot` boundary above is the rule the crate actually holds.
 

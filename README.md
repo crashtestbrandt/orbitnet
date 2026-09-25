@@ -205,7 +205,8 @@ are game decisions, and any default here would be wrong for somebody.
 - **A session identity is client-asserted, and the token narrows what asserting one buys.** The server mints a
   **resume token** per identity, sends it in the welcome, and a rejoiner must quote it back — so a peer that
   merely *observed* somebody's session id, off a roster broadcast or a log line, can no longer take that
-  player's body. **An on-path observer still can**, because it reads the welcome the token traveled in. Under
+  player's body. **An on-path observer still can**, because it reads the welcome the token traveled in — unless
+  a session secret is configured, which is what stops it confirming a handshake that quotes one. Under
   the default policy a valid claim still beats a live connection, which is what makes a relaunched client's
   reconnect immediate rather than waiting out a keepalive; `Net.set_resume_policy(ONLY_IF_DROPPED)` refuses
   that, at the cost of every genuinely fast reconnect. **Persist the token beside the session id**, or a
@@ -219,33 +220,41 @@ are game decisions, and any default here would be wrong for somebody.
   fold is a public function of two values that are both on the wire, so **an on-path observer who reads the
   exchange can do everything the client can**.
 - **`Net.set_session_secret()` closes that, and the secret has to come from a channel the game already
-  authenticates** — a lobby, a matchmaker ticket. The halves stay what they are and every byte on the wire
-  stays where it is; the key becomes a derivation over the secret and their fold, so an observer reading the
-  whole exchange learns nothing.
+  authenticates** — a lobby, a matchmaker ticket. The halves stay what they are; the key becomes a derivation
+  over the secret and their fold, so an observer reading the whole exchange learns nothing.
 - **A recorded join can no longer be replayed.** The server draws its half fresh per connection, so an
   observer presenting a handshake it captured is challenged on a half it has never seen: it cannot produce
   the confirmation, and the session it would open is keyed on bytes that are not the recorded key. What this
   does not refuse is an observer that can also **inject** — answering the server's challenge in the client's
   place is authoring a fresh join, and a shared session secret is what refuses that.
-- **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes, unless
-  the transport underneath encrypts the link — see the next bullet. The
-  ceiling is a 64-bit tag and a 128-bit key. An X25519 exchange is not implemented. An
-  **unauthenticated** one would not close this — it is substituted by exactly the on-path attacker these
-  bullets are about, and buys only a demotion to passive-only. An **authenticated** one is open work: it was
-  priced at several hundred lines of hand-written constant-time field arithmetic because `orbitnet-core`'s
-  empty `[dependencies]` was read as a rule, and that reading has been settled against, so a vetted
-  implementation is the option. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+- **A session secret also encrypts every payload; without one, nothing is encrypted.** Under a secret each
+  datagram is ChaCha20-Poly1305 over a cipher key derived from that secret and the join's folded nonce, so a
+  passive observer on the path reads no position, no input and no state value. Without one every payload is
+  on the wire in the clear, unless the transport underneath encrypts the link — see the bullet below.
+  Encrypting with no secret would buy nothing: both nonce halves cross the wire, so whoever can read the
+  payload can compute the key that hid it. **The cost is 8 bytes and about 1.2 µs per full-size datagram**,
+  and it is zero for a session that configures no secret;
+  [docs/protocol.md](docs/protocol.md#what-a-session-secret-encrypts) measures it and states what a secret
+  still does not hide — how many datagrams go out, when, and how long each one is.
+- **A key exchange is still not implemented.** An X25519 exchange would remove the out-of-band secret. An
+  **unauthenticated** one would not close the on-path forgery above — it is substituted by exactly that
+  attacker, and buys only a demotion to passive-only. An **authenticated** one is open work: it was priced at
+  several hundred lines of hand-written constant-time field arithmetic because `orbitnet-core`'s empty
+  `[dependencies]` was read as a rule, and that reading has been settled against, so a vetted implementation
+  is the option — which is what the payload cipher above already is.
+  [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
 - **A harness holds the tag compare to constant time.**
   `native/crates/orbitnet-core/tests/constant_time.rs` asserts that the compare's own source, compiled on its
   own under each shipped profile's flags, emits no branch, and measures whether two refused datagrams
   differing in which tag byte is wrong are separable by timing. The branch assertion runs on every pull
   request. The measurement is `just native-timing`, and it gates no pull request, because a shared CI
   runner's noise floor is too high for its verdict to mean anything — a nightly job runs it on the
-  self-hosted box instead. **It covers that ten-line compare and nothing else** — not the
-  field arithmetic an exchange would need.
-- **Encryption comes from the transport, and OrbitNet supplies none of it.** An ENet session carries every
-  payload in the clear. A Steam session's packets are encrypted and its peer identity authenticated by
-  SteamNetworkingSockets. A game inherits that from the `custom_features="steam"` export-preset tag, not from
+  self-hosted box instead. **It covers that ten-line compare and nothing else** — not the field arithmetic
+  an exchange would need, and not the payload cipher, whose own tag compare is the dependency's.
+- **Transport encryption is a second, independent layer, and a session may have either or both.** An ENet
+  session carries every payload in the clear unless a session secret is configured. A Steam session's packets
+  are encrypted and its peer identity authenticated by SteamNetworkingSockets, whatever OrbitNet does on top.
+  A game inherits that from the `custom_features="steam"` export-preset tag, not from
   anything visible at a call site, and loses it when the same code exports without the tag. The per-transport
   table of what is authenticated, what is encrypted, by whom, and what of it this repository cannot verify is
   in [docs/steam.md](docs/steam.md#what-each-transport-authenticates-and-encrypts).

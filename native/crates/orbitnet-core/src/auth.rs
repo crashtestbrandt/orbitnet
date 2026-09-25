@@ -1,13 +1,16 @@
-//! What the receive path refuses: datagram authenticity, replay, and per-peer volume.
+//! What the receive path refuses: datagram authenticity, replay, and per-peer volume — and, under a
+//! session secret, what the send path encrypts.
 //!
 //! Before this module the transport's sender id was the whole of a datagram's identity. Anything that
 //! could put a packet on the socket under a connected peer's id could write that peer's input, and a
 //! captured datagram could be sent again unchanged for as long as its tick stayed inside the history
 //! ring. Three checks close that, in the order a datagram meets them:
 //!
-//! 1. **A MAC over every byte.** Each session has a 16-byte key, and every datagram but the handshake
-//!    carries an 8-byte [`TAG_LEN`] tag over its payload, its sequence number and a direction byte.
-//!    A tag that does not verify is dropped before a single field is decoded.
+//! 1. **A tag over every byte.** Each session has a 16-byte key, and every datagram but the handshake
+//!    and the challenge carries a tag over its payload, its sequence number and a direction byte. A tag
+//!    that does not verify is dropped before a single field is decoded. With no session secret the tag
+//!    is [`TAG_LEN`] bytes of SipHash-2-4; under one it is [`CIPHER_TAG_LEN`] bytes of Poly1305 and the
+//!    payload beneath it is ciphertext.
 //! 2. **A replay window.** Each datagram carries a 32-bit sequence number. [`ReplayWindow`] accepts a
 //!    sequence once and refuses a repeat, and refuses one more than [`REPLAY_WINDOW`] behind the
 //!    newest accepted — the same sliding bitmap IPsec uses, sized to tolerate normal reordering.
@@ -62,7 +65,9 @@
 //! | | No session secret | A session secret |
 //! | --- | --- | --- |
 //! | What the key is | [`session_nonce`] of the two halves | [`derive_session_key`] over the secret and that |
-//! | What an on-path observer learns | both halves, and therefore the key | both halves, and nothing else |
+//! | What an on-path observer learns | both halves, the key, and every payload | both halves, and nothing else |
+//! | What authenticates a datagram | [`siphash24`], a 64-bit tag | Poly1305, a 128-bit tag |
+//! | What the payload is | plaintext | ChaCha20 ciphertext under [`derive_cipher_key`] |
 //! | What the scheme needs | nothing | a secret the game distributes out of band |
 //! | Who can join | anyone the transport accepts | anyone holding the secret |
 //!
@@ -72,11 +77,36 @@
 //! Three ceilings:
 //!
 //! - **It adds no strength beyond the secret's own entropy.** A secret a lobby prints on screen, or one
-//!   short enough to guess, derives a key worth exactly that much.
-//! - **The tag is still 64 bits and the key still 128.** Deriving the key changes who can forge a
-//!   datagram. It does not change how hard forging one is for somebody who cannot read the secret.
-//! - **None of this encrypts anything.** Every payload is still on the wire in the clear. A MAC says a
-//!   datagram was not written by someone outside the session, and says nothing else.
+//!   short enough to guess, derives a key worth exactly that much — the MAC key, the cipher key and
+//!   every confirmation alike.
+//! - **The key is still 128 bits.** [`derive_cipher_key`] expands to the 32 bytes ChaCha20 takes and
+//!   cannot expand the entropy that went in.
+//! - **It hides the payload from an observer and not from a peer.** Everyone the game handed the secret
+//!   to derives the same key from the same join, so this is confidentiality against somebody outside
+//!   the session, not between the peers inside it.
+//!
+//! ## What a session secret encrypts, and what it leaves readable
+//!
+//! Under a secret every datagram [`SessionAuth::seal`] produces is **ChaCha20-Poly1305** over the
+//! payload: a reviewed AEAD rather than a cipher and a MAC wired together here. Two consequences are
+//! worth stating separately from the table above.
+//!
+//! - **The Poly1305 tag replaces the SipHash one rather than joining it.** One pass over the datagram
+//!   instead of two, and the authenticated payload gains 8 bytes rather than 16. It also retires the
+//!   64-bit tag ceiling for a session that configured a secret; a session that did not still has it.
+//! - **The sequence number stays in the clear**, because the receiver needs it before it holds a
+//!   plaintext: it is half of the nonce the decryption runs under. It is named as associated data, so
+//!   altering it fails the tag rather than decrypting against a different nonce.
+//!
+//! What a session secret does **not** hide: how many datagrams a peer sends, when it sends them, and
+//! how long each one is. A snapshot frame is as long as the entities it carries, so an observer counting
+//! bytes still sees a session's shape. Length hiding would cost padding on every frame, and it is not
+//! done.
+//!
+//! **With no secret configured, nothing here runs and nothing changes.** [`SessionAuth::new`] carries no
+//! cipher key, and the wire is the SipHash tag and the plaintext payload it has always been. Encrypting
+//! there would buy nothing: both halves of the nonce the key is folded from cross the wire, so an
+//! observer that read the join computes the key that hid the payload.
 //!
 //! ## Both ends contribute a nonce, which is what refuses a replayed join
 //!
@@ -103,14 +133,27 @@
 //!
 //! The two directions of a session share one key, so without domain separation an attacker could
 //! reflect a client's datagram back at the client and have it verify. The direction — [`Direction`] —
-//! is mixed into the MAC and is **not transmitted**: each side authenticates with the direction it
+//! is mixed into the tag and is **not transmitted**: each side authenticates with the direction it
 //! expects to receive, so a reflected datagram fails the tag check.
+//!
+//! **Under a secret it is also the first byte of the AEAD nonce**, where it does more than refuse a
+//! reflection. One key covers both directions, so without it the client's datagram 5 and the server's
+//! would encrypt under one nonce, and an observer holding both would hold the exclusive-or of the two
+//! payloads. See [`datagram_nonce`].
 //!
 //! ## Sequence numbers are refused rather than wrapped
 //!
 //! 32 bits at 60 Hz is 2.2 years of one session. Past it [`SessionAuth::seal`] returns `None` and the
 //! datagram is not sent, because a wrapped sequence would re-open the replay window on every datagram
 //! the attacker captured in the first pass.
+//!
+//! **That refusal is now load-bearing twice.** Under a secret the sequence number is also the varying
+//! half of the AEAD nonce, and a repeated nonce under one ChaCha20 key gives an observer the
+//! exclusive-or of the two payloads and forges the Poly1305 key outright. Widening the counter instead
+//! of refusing it would break both properties at once.
+
+use chacha20poly1305::aead::inout::InOutBuf;
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit};
 
 /// Bytes of session key. 128 bits, the SipHash key width.
 pub const KEY_LEN: usize = 16;
@@ -123,6 +166,21 @@ pub const SEQ_LEN: usize = 4;
 
 /// Bytes every authenticated datagram carries past its payload: sequence number then tag.
 pub const TRAILER_LEN: usize = SEQ_LEN + TAG_LEN;
+
+/// Bytes of ChaCha20-Poly1305 key. 256 bits, the only width the cipher takes.
+pub const CIPHER_KEY_LEN: usize = 32;
+
+/// Bytes of Poly1305 tag an encrypted datagram carries.
+pub const CIPHER_TAG_LEN: usize = 16;
+
+/// Bytes an encrypted datagram carries past its ciphertext: sequence number then Poly1305 tag.
+///
+/// Eight more than [`TRAILER_LEN`]. The Poly1305 tag replaces the SipHash one rather than joining it,
+/// so the whole of the cost is the wider tag.
+pub const CIPHER_TRAILER_LEN: usize = SEQ_LEN + CIPHER_TAG_LEN;
+
+/// Bytes of ChaCha20-Poly1305 nonce, fixed at 96 bits by RFC 8439.
+pub const CIPHER_NONCE_LEN: usize = 12;
 
 /// How far behind the newest accepted sequence a datagram may still be accepted.
 ///
@@ -146,6 +204,9 @@ pub enum AuthError {
     /// The datagram is shorter than its own trailer, so it carries no tag to check.
     Truncated,
     /// The tag does not match: forged, corrupted, or authenticated for the other direction.
+    ///
+    /// Under a session secret this is the Poly1305 verification failing, which covers the same three
+    /// causes and one more — a ciphertext altered in flight. No plaintext is produced either way.
     BadTag,
     /// The sequence number was accepted before, or is further behind than [`REPLAY_WINDOW`].
     Replayed,
@@ -296,6 +357,18 @@ pub const SESSION_KEY_LABEL_HIGH: &[u8] = b"orbitnet-session-key-hi";
 /// Domain label prefixing [`confirm_tag`], which keeps a confirmation from being any other tag.
 pub const CONFIRM_LABEL: &[u8] = b"orbitnet-confirm";
 
+/// Domain labels prefixing the four 64-bit words of [`derive_cipher_key`], low word first.
+///
+/// Four rather than two because ChaCha20-Poly1305 keys on [`CIPHER_KEY_LEN`] bytes where SipHash keys
+/// on [`KEY_LEN`], and each pass produces eight. A label per word is what keeps the four from being
+/// four copies of one value.
+pub const CIPHER_KEY_LABELS: [&[u8]; 4] = [
+    b"orbitnet-cipher-key-0",
+    b"orbitnet-cipher-key-1",
+    b"orbitnet-cipher-key-2",
+    b"orbitnet-cipher-key-3",
+];
+
 /// Domain label keying the low half of [`session_nonce`]. Exactly [`KEY_LEN`] bytes, as a SipHash key.
 pub const JOIN_LABEL_LOW: [u8; KEY_LEN] = *b"orbitnet-join-lo";
 
@@ -328,8 +401,9 @@ fn join_halves(low: u64, high: u64) -> [u8; KEY_LEN] {
 ///   passed 16 bytes through and hashed everything else would make the boundary at 16 bytes a
 ///   behavior change nobody can see.
 ///
-/// The fold cannot add entropy, and takes essentially none away: it is a pseudo-random function of the
-/// whole secret, and the tag it eventually protects is 64 bits.
+/// The fold cannot add entropy, and takes essentially none away. It is a pseudo-random function of the
+/// whole secret, and the 16 bytes it produces are the ceiling every key derived from it inherits — the
+/// MAC key, the cipher key and every confirmation alike.
 #[must_use]
 pub fn compress_secret(secret: &[u8]) -> [u8; KEY_LEN] {
     join_halves(
@@ -357,7 +431,8 @@ pub fn compress_secret(secret: &[u8]) -> [u8; KEY_LEN] {
 /// construction [`compress_secret`] uses, for the same reason: [`SipHasher`] keys on exactly [`KEY_LEN`]
 /// bytes and something has to produce those 16.
 ///
-/// It cannot add entropy. Two halves of 128 bits fold to 128 bits, and the tag they protect is 64.
+/// It cannot add entropy. Two halves of 128 bits fold to 128 bits, and no key derived from the result
+/// is worth more than that.
 #[must_use]
 pub fn session_nonce(joiner: &[u8; KEY_LEN], acceptor: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
     let mut low = SipHasher::new(&JOIN_LABEL_LOW);
@@ -399,6 +474,71 @@ pub fn derive_session_key(secret: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN]) -> [u8;
     high.write(SESSION_KEY_LABEL_HIGH);
     high.write(nonce);
     join_halves(low.finish(), high.finish())
+}
+
+/// The key one session's payloads are **encrypted** under, from the shared secret and that join's
+/// session nonce.
+///
+/// The twin of [`derive_session_key`] over the same two inputs, under labels of its own, and it exists
+/// only where a secret does: with no secret there is nothing to derive from that an observer of the
+/// join does not already hold, so [`SessionAuth`] carries no cipher and every payload stays in the
+/// clear. [`SessionAuth::seal`] and [`SessionAuth::open`] are what run it.
+///
+/// **Separate labels rather than a second use of the MAC key.** Reusing one key across a MAC and a
+/// cipher is the mistake this construction is shaped to refuse, and deriving both from the secret under
+/// distinct labels costs four more SipHash passes per join — one per word of [`CIPHER_KEY_LABELS`] —
+/// and nothing per datagram.
+///
+/// **It expands to 32 bytes and cannot expand the entropy.** The inputs are 16 bytes of compressed
+/// secret and 16 of folded nonce, so the cipher key is worth the 128 bits of the weaker of them —
+/// which is the secret's own entropy, the same ceiling [`derive_session_key`] has. ChaCha20 takes no
+/// shorter key, so something has to produce the 32 bytes, and this is it.
+#[must_use]
+pub fn derive_cipher_key(secret: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN]) -> [u8; CIPHER_KEY_LEN] {
+    let mut key = [0u8; CIPHER_KEY_LEN];
+    for (word, label) in CIPHER_KEY_LABELS.iter().enumerate() {
+        let mut hasher = SipHasher::new(secret);
+        hasher.write(label);
+        hasher.write(nonce);
+        key[word * 8..word * 8 + 8].copy_from_slice(&hasher.finish().to_le_bytes());
+    }
+    key
+}
+
+/// The ChaCha20-Poly1305 nonce for one datagram: the direction byte, then the sequence number.
+///
+/// **An AEAD nonce must never repeat under one key, and what makes this one unique is not new.** The
+/// two properties it rests on are both already here and both already tested:
+///
+/// - [`SessionAuth::seal`] issues each sequence number once and **refuses to wrap** — see the module
+///   header. That refusal was written for the replay window; it is now also what keeps a nonce from
+///   coming round again.
+/// - The two directions of a session share one key, so [`Direction`] separates them. Without it the
+///   client's datagram 5 and the server's would encrypt under one nonce, and an observer would hold
+///   the exclusive-or of the two payloads.
+///
+/// The remaining seven bytes are zero and reserved. They are not a counter: a session that needs more
+/// than [`u32::MAX`] datagrams in one direction is refused rather than widened, because widening here
+/// would silently re-open the replay window the same refusal protects.
+fn datagram_nonce(direction: Direction, seq: u32) -> [u8; CIPHER_NONCE_LEN] {
+    let mut nonce = [0u8; CIPHER_NONCE_LEN];
+    nonce[0] = direction as u8;
+    nonce[1..1 + SEQ_LEN].copy_from_slice(&seq.to_le_bytes());
+    nonce
+}
+
+/// The associated data Poly1305 covers beside the ciphertext: the sequence number, then the direction.
+///
+/// **The sequence number is on the wire in the clear because the receiver needs it before it has a
+/// plaintext** — it is half of the nonce the decryption runs under. Naming it here as well is what
+/// makes altering it a tag failure rather than a decryption against the wrong nonce, and it keeps the
+/// authenticated input the same shape [`tag_over`] signs under the clear regime: payload, sequence,
+/// direction.
+fn datagram_aad(direction: Direction, seq: u32) -> [u8; SEQ_LEN + 1] {
+    let mut aad = [0u8; SEQ_LEN + 1];
+    aad[..SEQ_LEN].copy_from_slice(&seq.to_le_bytes());
+    aad[SEQ_LEN] = direction as u8;
+    aad
 }
 
 /// Proof the sender holds `secret`: a tag over the nonce and the protocol version.
@@ -513,24 +653,52 @@ impl ReplayWindow {
     }
 }
 
-/// One session's authentication state: the shared key, this side's send counter, and the window that
-/// refuses a repeat from the other side.
+/// One session's authentication state: the shared key, this side's send counter, the window that
+/// refuses a repeat from the other side, and the payload cipher when the game configured a secret.
 ///
 /// Both directions of a session use one key and one [`Direction`] tells them apart, so a peer holds
 /// exactly one of these per session — a client one for the server, a server one per connected peer.
+///
+/// **The cipher key is an `Option` of 32 plain bytes rather than a constructed cipher**, so this stays
+/// [`Copy`] and a peer table keeps holding it by value. The cipher is built per datagram from those
+/// bytes; ChaCha20's key schedule is the key itself, so there is nothing to amortize.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionAuth {
     key: [u8; KEY_LEN],
+    cipher_key: Option<[u8; CIPHER_KEY_LEN]>,
     next_seq: u32,
     window: ReplayWindow,
 }
 
 impl SessionAuth {
-    /// A session under `key`, having sent and received nothing.
+    /// A session under `key`, having sent and received nothing, whose payloads are **in the clear**.
+    ///
+    /// This is the no-secret regime and it is byte-for-byte what it has always been: the SipHash tag,
+    /// the 32-bit sequence number, and a payload an observer reads. Encrypting here would buy nothing —
+    /// both halves of the nonce the key is folded from are on the wire, so anyone who can read the
+    /// payload can compute the key that hid it.
     #[must_use]
     pub fn new(key: [u8; KEY_LEN]) -> Self {
         Self {
             key,
+            cipher_key: None,
+            next_seq: 1,
+            window: ReplayWindow::new(),
+        }
+    }
+
+    /// A session whose payloads are **encrypted** under `cipher_key`, and whose datagrams are
+    /// authenticated by that cipher's own tag rather than by `key`.
+    ///
+    /// Both keys come from the session secret: [`derive_session_key`] and [`derive_cipher_key`] over
+    /// the same folded nonce, under labels of their own. `key` is kept because it is what the two ends
+    /// compare a repeated handshake against — see [`Self::key`] — and it is what [`confirm_tag`] was
+    /// taken under.
+    #[must_use]
+    pub fn encrypted(key: [u8; KEY_LEN], cipher_key: [u8; CIPHER_KEY_LEN]) -> Self {
+        Self {
+            key,
+            cipher_key: Some(cipher_key),
             next_seq: 1,
             window: ReplayWindow::new(),
         }
@@ -542,52 +710,130 @@ impl SessionAuth {
         self.key
     }
 
+    /// Whether this session's payloads are encrypted, which is exactly whether a secret is configured.
+    #[must_use]
+    pub fn encrypts(&self) -> bool {
+        self.cipher_key.is_some()
+    }
+
+    /// Bytes [`Self::seal`] appends past the payload, which the two regimes disagree about.
+    #[must_use]
+    pub fn trailer_len(&self) -> usize {
+        if self.encrypts() {
+            CIPHER_TRAILER_LEN
+        } else {
+            TRAILER_LEN
+        }
+    }
+
     /// Whether this session's send counter is spent. A spent session can still receive.
     #[must_use]
     pub fn exhausted(&self) -> bool {
         self.next_seq == 0
     }
 
-    /// Append the sequence number and tag to `payload`, consuming one sequence number.
+    /// Turn `payload` into a datagram, consuming one sequence number.
+    ///
+    /// | Regime | What `payload` becomes |
+    /// | --- | --- |
+    /// | no secret | payload ‖ sequence ‖ 8-byte SipHash tag |
+    /// | a secret | ciphertext ‖ sequence ‖ 16-byte Poly1305 tag |
     ///
     /// `None` means the counter is spent (see the module header) and the datagram must not be sent —
-    /// wrapping it would re-open the replay window on everything captured in the first pass.
+    /// wrapping it would re-open the replay window on everything captured in the first pass, and under
+    /// a secret it would repeat an AEAD nonce, which is worse. `payload` may have been rewritten by the
+    /// time `None` comes back, so a refused datagram is dropped rather than retried.
     pub fn seal(&mut self, direction: Direction, payload: &mut Vec<u8>) -> Option<()> {
         if self.next_seq == 0 {
             return None;
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        let Some(cipher_key) = self.cipher_key else {
+            payload.extend_from_slice(&seq.to_le_bytes());
+            let tag = tag_over(&self.key, payload, direction);
+            payload.extend_from_slice(&tag.to_le_bytes());
+            return Some(());
+        };
+        let cipher = ChaCha20Poly1305::new(&cipher_key.into());
+        let tag = cipher
+            .encrypt_inout_detached(
+                &datagram_nonce(direction, seq).into(),
+                &datagram_aad(direction, seq),
+                InOutBuf::from(payload.as_mut_slice()),
+            )
+            .ok()?;
         payload.extend_from_slice(&seq.to_le_bytes());
-        let tag = tag_over(&self.key, payload, direction);
-        payload.extend_from_slice(&tag.to_le_bytes());
+        payload.extend_from_slice(&tag);
         Some(())
     }
 
     /// Verify `datagram` as arriving in `direction`, answering the payload with the trailer stripped.
     ///
-    /// The replay window is advanced **only** on a datagram whose tag verified, so an attacker cannot
-    /// burn sequence numbers the real peer has yet to send.
+    /// **The three checks run in one order under both regimes: authenticate, then replay, then decode.**
+    /// Getting that order wrong is the failure this design is known for.
+    ///
+    /// - **Nothing is decrypted or returned before the tag verifies.** Under a secret the Poly1305 tag
+    ///   is taken over the ciphertext, so it is checked before a byte is deciphered, and a datagram that
+    ///   fails it leaves `plain` empty rather than holding unauthenticated plaintext for a later caller
+    ///   to find.
+    /// - **The replay window is advanced only on a datagram that authenticated**, so an attacker cannot
+    ///   burn sequence numbers the real peer has yet to send. Under a secret the sequence number the
+    ///   window is handed is one Poly1305 covered as associated data, so it is the sender's own.
+    /// - **The caller decodes nothing until this returns `Ok`.**
+    ///
+    /// `plain` is scratch the caller owns and reuses. With no secret it is untouched and the answer
+    /// borrows `datagram` directly; under a secret the plaintext is written there and the answer
+    /// borrows that. One signature covers both so that no call site can pick the wrong one.
     pub fn open<'a>(
         &mut self,
         direction: Direction,
         datagram: &'a [u8],
+        plain: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], AuthError> {
-        if datagram.len() < TRAILER_LEN {
+        let Some(cipher_key) = self.cipher_key else {
+            if datagram.len() < TRAILER_LEN {
+                return Err(AuthError::Truncated);
+            }
+            let split = datagram.len() - TAG_LEN;
+            let (signed, tag_bytes) = datagram.split_at(split);
+            let tag = u64::from_le_bytes(tag_bytes.try_into().unwrap_or([0; TAG_LEN]));
+            if !tags_equal(tag, tag_over(&self.key, signed, direction)) {
+                return Err(AuthError::BadTag);
+            }
+            let payload_len = signed.len() - SEQ_LEN;
+            let seq = u32::from_le_bytes(signed[payload_len..].try_into().unwrap_or([0; SEQ_LEN]));
+            if !self.window.accept(seq) {
+                return Err(AuthError::Replayed);
+            }
+            return Ok(&signed[..payload_len]);
+        };
+        if datagram.len() < CIPHER_TRAILER_LEN {
             return Err(AuthError::Truncated);
         }
-        let split = datagram.len() - TAG_LEN;
-        let (signed, tag_bytes) = datagram.split_at(split);
-        let tag = u64::from_le_bytes(tag_bytes.try_into().unwrap_or([0; TAG_LEN]));
-        if !tags_equal(tag, tag_over(&self.key, signed, direction)) {
+        let split = datagram.len() - CIPHER_TRAILER_LEN;
+        let (ciphertext, trailer) = datagram.split_at(split);
+        let seq = u32::from_le_bytes(trailer[..SEQ_LEN].try_into().unwrap_or([0; SEQ_LEN]));
+        let mut tag = [0u8; CIPHER_TAG_LEN];
+        tag.copy_from_slice(&trailer[SEQ_LEN..]);
+        plain.clear();
+        plain.extend_from_slice(ciphertext);
+        let cipher = ChaCha20Poly1305::new(&cipher_key.into());
+        let verified = cipher.decrypt_inout_detached(
+            &datagram_nonce(direction, seq).into(),
+            &datagram_aad(direction, seq),
+            InOutBuf::from(plain.as_mut_slice()),
+            (&tag).into(),
+        );
+        if verified.is_err() {
+            plain.clear();
             return Err(AuthError::BadTag);
         }
-        let payload_len = signed.len() - SEQ_LEN;
-        let seq = u32::from_le_bytes(signed[payload_len..].try_into().unwrap_or([0; SEQ_LEN]));
         if !self.window.accept(seq) {
+            plain.clear();
             return Err(AuthError::Replayed);
         }
-        Ok(&signed[..payload_len])
+        Ok(plain.as_slice())
     }
 }
 
@@ -887,17 +1133,18 @@ mod tests {
         );
 
         let mut captured = b"input for tick 1".to_vec();
+        let mut plain: Vec<u8> = Vec::new();
         SessionAuth::new(recorded)
             .seal(Direction::ToServer, &mut captured)
             .unwrap();
         assert_eq!(
-            SessionAuth::new(replayed).open(Direction::ToServer, &captured),
+            SessionAuth::new(replayed).open(Direction::ToServer, &captured, &mut plain),
             Err(AuthError::BadTag),
             "the replayed join refuses what the recorded one sealed"
         );
         assert!(
             SessionAuth::new(recorded)
-                .open(Direction::ToServer, &captured)
+                .open(Direction::ToServer, &captured, &mut plain)
                 .is_ok(),
             "the negative control: it opens under the join that sealed it"
         );
@@ -1017,17 +1264,21 @@ mod tests {
 
     #[test]
     fn a_session_under_a_derived_key_carries_both_directions_and_no_other_derivation() {
+        let mut plain: Vec<u8> = Vec::new();
         let secret = compress_secret(PIN_SECRET);
         let key = derive_session_key(&secret, &PIN_NONCE);
         let mut client = SessionAuth::new(key);
         let mut server = SessionAuth::new(key);
         let mut up = b"input".to_vec();
         client.seal(Direction::ToServer, &mut up).unwrap();
-        assert_eq!(server.open(Direction::ToServer, &up), Ok(&b"input"[..]));
+        assert_eq!(
+            server.open(Direction::ToServer, &up, &mut plain),
+            Ok(&b"input"[..])
+        );
         let mut down = b"snapshot".to_vec();
         server.seal(Direction::ToClient, &mut down).unwrap();
         assert_eq!(
-            client.open(Direction::ToClient, &down),
+            client.open(Direction::ToClient, &down, &mut plain),
             Ok(&b"snapshot"[..])
         );
         // The next join under the same secret takes a fresh nonce, and the previous join's datagrams
@@ -1036,15 +1287,368 @@ mod tests {
         next_nonce[0] ^= 0x01;
         let mut next_join = SessionAuth::new(derive_session_key(&secret, &next_nonce));
         assert_eq!(
-            next_join.open(Direction::ToServer, &up),
+            next_join.open(Direction::ToServer, &up, &mut plain),
             Err(AuthError::BadTag)
         );
         // Nor does a peer deriving from a different secret over the same nonce open them.
         let stranger_key = derive_session_key(&compress_secret(b"another secret"), &PIN_NONCE);
         let mut stranger = SessionAuth::new(stranger_key);
         assert_eq!(
-            stranger.open(Direction::ToServer, &up),
+            stranger.open(Direction::ToServer, &up, &mut plain),
             Err(AuthError::BadTag)
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The payload cipher. Everything below needs a session secret; with none configured the suites
+    // above are the whole of the behavior, which is what
+    // `with_no_session_secret_the_wire_is_byte_for_byte_what_it_was` pins.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The cipher key one pinned join derives, written out so that a change to the derivation has to
+    /// change this array. A peer on the old bytes decrypts nothing a peer on the new ones sent, and
+    /// the failure says only `BadTag`.
+    #[test]
+    fn derive_cipher_key_is_pinned_and_separate_from_the_mac_key() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let cipher_key = derive_cipher_key(&secret, &nonce);
+        assert_eq!(
+            cipher_key,
+            [
+                0xae, 0xba, 0x99, 0x8f, 0x40, 0x3b, 0xd3, 0x77, 0xe3, 0xda, 0xff, 0x61, 0x7d, 0x1a,
+                0x54, 0x48, 0x36, 0x21, 0x1f, 0xa6, 0x7f, 0xeb, 0x0b, 0x72, 0x3b, 0x55, 0x61, 0x14,
+                0xb2, 0x7c, 0x04, 0xb0
+            ]
+        );
+        // The key that hides a payload and the key that authenticated it are separate values. Both
+        // halves are checked, because a derivation that reused the MAC key for the low 16 bytes would
+        // pass a test that only looked at the high ones.
+        let mac_key = derive_session_key(&secret, &nonce);
+        assert_ne!(cipher_key[..KEY_LEN], mac_key[..]);
+        assert_ne!(cipher_key[KEY_LEN..], mac_key[..]);
+        // And the four words are four different passes rather than one repeated.
+        for word in 1..4 {
+            assert_ne!(
+                cipher_key[..8],
+                cipher_key[word * 8..word * 8 + 8],
+                "word 0 against word {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_different_secret_or_a_different_join_derives_a_different_cipher_key() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let base = derive_cipher_key(&secret, &nonce);
+        assert_ne!(
+            base,
+            derive_cipher_key(&compress_secret(b"another secret"), &nonce)
+        );
+        let mut other_acceptor = PIN_ACCEPTOR;
+        other_acceptor[0] ^= 0x01;
+        assert_ne!(
+            base,
+            derive_cipher_key(&secret, &session_nonce(&PIN_NONCE, &other_acceptor))
+        );
+    }
+
+    /// The whole point of the feature: a payload an observer could read is one it cannot.
+    #[test]
+    fn a_session_secret_puts_the_payload_on_the_wire_as_ciphertext() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let plaintext = b"net_pos 12.5 0.0 -3.25, net_orient ...";
+        let mut datagram = plaintext.to_vec();
+        let mut tx = SessionAuth::encrypted(
+            derive_session_key(&secret, &nonce),
+            derive_cipher_key(&secret, &nonce),
+        );
+        assert!(tx.encrypts());
+        assert_eq!(tx.trailer_len(), CIPHER_TRAILER_LEN);
+        tx.seal(Direction::ToServer, &mut datagram).unwrap();
+
+        assert_eq!(datagram.len(), plaintext.len() + CIPHER_TRAILER_LEN);
+        assert_ne!(&datagram[..plaintext.len()], &plaintext[..]);
+        assert!(
+            !datagram.windows(7).any(|w| w == b"net_pos"),
+            "no run of the plaintext survives on the wire"
+        );
+
+        let mut plain: Vec<u8> = Vec::new();
+        let mut rx = SessionAuth::encrypted(
+            derive_session_key(&secret, &nonce),
+            derive_cipher_key(&secret, &nonce),
+        );
+        assert_eq!(
+            rx.open(Direction::ToServer, &datagram, &mut plain),
+            Ok(&plaintext[..])
+        );
+    }
+
+    /// The pinned datagram, so that a port of this protocol has bytes to reproduce and a change to
+    /// the nonce layout, the associated data or the trailer order fails here rather than in a session.
+    #[test]
+    fn an_encrypted_datagram_is_pinned_to_its_bytes() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let mut datagram = b"input".to_vec();
+        SessionAuth::encrypted(
+            derive_session_key(&secret, &nonce),
+            derive_cipher_key(&secret, &nonce),
+        )
+        .seal(Direction::ToServer, &mut datagram)
+        .unwrap();
+        assert_eq!(
+            datagram,
+            vec![
+                0xe1, 0x71, 0x1d, 0x5c, 0x3f, 0x01, 0x00, 0x00, 0x00, 0xcc, 0x55, 0xf2, 0x29, 0x8c,
+                0x35, 0xbc, 0x61, 0x70, 0xb1, 0x99, 0x21, 0x00, 0xbb, 0xff, 0x2d
+            ]
+        );
+        // The sequence number is the fifth through eighth bytes and is readable: a receiver needs it
+        // before it holds a plaintext, because it is half of the nonce.
+        assert_eq!(&datagram[5..9], &1u32.to_le_bytes());
+    }
+
+    /// **With no secret the wire is what it was**, which is the claim this change rests on. Sealing a
+    /// payload under [`SessionAuth::new`] produces exactly the bytes, the sequence number and the
+    /// SipHash tag it always did, and the payload is still readable in the datagram.
+    #[test]
+    fn with_no_session_secret_the_wire_is_byte_for_byte_what_it_was() {
+        let mut tx = SessionAuth::new(REF_KEY);
+        assert!(!tx.encrypts());
+        assert_eq!(tx.trailer_len(), TRAILER_LEN);
+        let mut datagram = b"input".to_vec();
+        tx.seal(Direction::ToServer, &mut datagram).unwrap();
+
+        let mut expected = b"input".to_vec();
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        let tag = siphash24(
+            &REF_KEY,
+            &[b"input".as_slice(), &1u32.to_le_bytes(), &[0x01]].concat(),
+        );
+        expected.extend_from_slice(&tag.to_le_bytes());
+        assert_eq!(datagram, expected);
+        assert_eq!(&datagram[..5], b"input", "and the payload is in the clear");
+    }
+
+    /// One key covers both directions, so the direction byte has to reach the nonce as well as the
+    /// tag. Without it the two flows encrypt under one keystream and an observer holding both
+    /// datagrams holds the exclusive-or of their payloads.
+    #[test]
+    fn the_two_directions_never_share_a_nonce() {
+        assert_ne!(
+            datagram_nonce(Direction::ToServer, 7),
+            datagram_nonce(Direction::ToClient, 7)
+        );
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let key = derive_session_key(&secret, &nonce);
+        let cipher_key = derive_cipher_key(&secret, &nonce);
+
+        let mut up = b"the same payload".to_vec();
+        SessionAuth::encrypted(key, cipher_key)
+            .seal(Direction::ToServer, &mut up)
+            .unwrap();
+        let mut down = b"the same payload".to_vec();
+        SessionAuth::encrypted(key, cipher_key)
+            .seal(Direction::ToClient, &mut down)
+            .unwrap();
+        // Both are sequence 1 under one key. The ciphertexts must differ, or the keystream repeated.
+        assert_eq!(&up[16..20], &down[16..20], "the same sequence number");
+        assert_ne!(&up[..16], &down[..16]);
+    }
+
+    #[test]
+    fn each_datagram_of_one_direction_takes_its_own_nonce() {
+        assert_ne!(
+            datagram_nonce(Direction::ToServer, 1),
+            datagram_nonce(Direction::ToServer, 2)
+        );
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let mut tx = SessionAuth::encrypted(
+            derive_session_key(&secret, &nonce),
+            derive_cipher_key(&secret, &nonce),
+        );
+        let mut first = b"the same payload".to_vec();
+        tx.seal(Direction::ToServer, &mut first).unwrap();
+        let mut second = b"the same payload".to_vec();
+        tx.seal(Direction::ToServer, &mut second).unwrap();
+        assert_ne!(&first[..16], &second[..16]);
+    }
+
+    /// The sequence number rides in the clear, so it is the field an attacker can reach. Poly1305
+    /// covers it as associated data, which is what makes altering it a refusal rather than a
+    /// decryption under a nonce nobody sealed with.
+    #[test]
+    fn an_altered_sequence_number_is_refused_rather_than_decrypted() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let key = derive_session_key(&secret, &nonce);
+        let cipher_key = derive_cipher_key(&secret, &nonce);
+        let mut datagram = b"input".to_vec();
+        SessionAuth::encrypted(key, cipher_key)
+            .seal(Direction::ToServer, &mut datagram)
+            .unwrap();
+
+        let mut plain: Vec<u8> = Vec::new();
+        for index in 5..5 + SEQ_LEN {
+            let mut altered = datagram.clone();
+            altered[index] ^= 0x01;
+            let mut rx = SessionAuth::encrypted(key, cipher_key);
+            assert_eq!(
+                rx.open(Direction::ToServer, &altered, &mut plain),
+                Err(AuthError::BadTag),
+                "sequence byte {index}"
+            );
+        }
+        // And every other byte of the datagram goes the same way: ciphertext and tag alike.
+        for index in 0..datagram.len() {
+            let mut altered = datagram.clone();
+            altered[index] ^= 0x01;
+            let mut rx = SessionAuth::encrypted(key, cipher_key);
+            assert_eq!(
+                rx.open(Direction::ToServer, &altered, &mut plain),
+                Err(AuthError::BadTag),
+                "byte {index}"
+            );
+            assert!(plain.is_empty(), "no plaintext survives a refusal");
+        }
+    }
+
+    /// The ordering this design is known for getting wrong. Refusing after decoding, or advancing the
+    /// window before the tag verifies, are both reachable from here.
+    #[test]
+    fn a_forged_ciphertext_burns_no_sequence_number_and_leaves_no_plaintext() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let key = derive_session_key(&secret, &nonce);
+        let cipher_key = derive_cipher_key(&secret, &nonce);
+        let mut genuine = b"one".to_vec();
+        SessionAuth::encrypted(key, cipher_key)
+            .seal(Direction::ToServer, &mut genuine)
+            .unwrap();
+
+        let mut forged = genuine.clone();
+        forged[0] ^= 0xff;
+        let mut plain: Vec<u8> = Vec::new();
+        let mut rx = SessionAuth::encrypted(key, cipher_key);
+        assert_eq!(
+            rx.open(Direction::ToServer, &forged, &mut plain),
+            Err(AuthError::BadTag)
+        );
+        assert!(plain.is_empty());
+        // Sequence 1 was never accepted, so the datagram that genuinely carries it still opens.
+        assert_eq!(
+            rx.open(Direction::ToServer, &genuine, &mut plain),
+            Ok(&b"one"[..])
+        );
+        // And the replay window still refuses the second copy.
+        assert_eq!(
+            rx.open(Direction::ToServer, &genuine, &mut plain),
+            Err(AuthError::Replayed)
+        );
+        assert!(plain.is_empty(), "a refused replay releases nothing either");
+    }
+
+    #[test]
+    fn a_peer_on_a_different_secret_decrypts_nothing() {
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let ours = compress_secret(PIN_SECRET);
+        let theirs = compress_secret(b"another secret");
+        let mut datagram = b"input".to_vec();
+        SessionAuth::encrypted(
+            derive_session_key(&ours, &nonce),
+            derive_cipher_key(&ours, &nonce),
+        )
+        .seal(Direction::ToServer, &mut datagram)
+        .unwrap();
+
+        let mut plain: Vec<u8> = Vec::new();
+        assert_eq!(
+            SessionAuth::encrypted(
+                derive_session_key(&theirs, &nonce),
+                derive_cipher_key(&theirs, &nonce),
+            )
+            .open(Direction::ToServer, &datagram, &mut plain),
+            Err(AuthError::BadTag)
+        );
+        // A peer holding the secret but not this join's nonce is refused the same way: the cipher key
+        // is per join, which is what keeps one session's capture out of the next.
+        let mut other_acceptor = PIN_ACCEPTOR;
+        other_acceptor[0] ^= 0x01;
+        let next = session_nonce(&PIN_NONCE, &other_acceptor);
+        assert_eq!(
+            SessionAuth::encrypted(
+                derive_session_key(&ours, &next),
+                derive_cipher_key(&ours, &next),
+            )
+            .open(Direction::ToServer, &datagram, &mut plain),
+            Err(AuthError::BadTag)
+        );
+    }
+
+    #[test]
+    fn an_encrypted_datagram_shorter_than_its_trailer_is_truncated() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let mut plain: Vec<u8> = Vec::new();
+        let mut rx = SessionAuth::encrypted(
+            derive_session_key(&secret, &nonce),
+            derive_cipher_key(&secret, &nonce),
+        );
+        for len in 0..CIPHER_TRAILER_LEN {
+            assert_eq!(
+                rx.open(Direction::ToServer, &vec![0u8; len], &mut plain),
+                Err(AuthError::Truncated),
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_payload_still_encrypts_and_opens() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let key = derive_session_key(&secret, &nonce);
+        let cipher_key = derive_cipher_key(&secret, &nonce);
+        let mut datagram: Vec<u8> = Vec::new();
+        SessionAuth::encrypted(key, cipher_key)
+            .seal(Direction::ToClient, &mut datagram)
+            .unwrap();
+        assert_eq!(datagram.len(), CIPHER_TRAILER_LEN);
+        let mut plain: Vec<u8> = Vec::new();
+        assert_eq!(
+            SessionAuth::encrypted(key, cipher_key).open(
+                Direction::ToClient,
+                &datagram,
+                &mut plain
+            ),
+            Ok(&[][..])
+        );
+    }
+
+    /// The associated data is the sequence number then the direction, which is the order
+    /// [`tag_over`] signs under the clear regime. Stated as a value rather than left implicit,
+    /// because a port that reverses the two produces tags that verify nowhere.
+    #[test]
+    fn the_associated_data_names_the_sequence_then_the_direction() {
+        assert_eq!(datagram_aad(Direction::ToServer, 1), [1, 0, 0, 0, 0x01]);
+        assert_eq!(
+            datagram_aad(Direction::ToClient, 0x0201),
+            [0x01, 0x02, 0, 0, 0x02]
+        );
+        assert_eq!(
+            datagram_nonce(Direction::ToServer, 1)[..5],
+            [0x01, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            datagram_nonce(Direction::ToServer, 1)[5..],
+            [0; CIPHER_NONCE_LEN - 5],
+            "the remaining bytes are reserved and zero"
         );
     }
 
@@ -1059,25 +1663,31 @@ mod tests {
 
     #[test]
     fn a_sealed_datagram_opens_to_its_payload() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut tx = SessionAuth::new(REF_KEY);
         let mut rx = SessionAuth::new(REF_KEY);
         let mut buf = b"hello".to_vec();
         assert!(tx.seal(Direction::ToServer, &mut buf).is_some());
         assert_eq!(buf.len(), 5 + TRAILER_LEN);
-        assert_eq!(rx.open(Direction::ToServer, &buf), Ok(&b"hello"[..]));
+        assert_eq!(
+            rx.open(Direction::ToServer, &buf, &mut plain),
+            Ok(&b"hello"[..])
+        );
     }
 
     #[test]
     fn an_empty_payload_still_seals_and_opens() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut tx = SessionAuth::new(REF_KEY);
         let mut rx = SessionAuth::new(REF_KEY);
         let mut buf: Vec<u8> = Vec::new();
         tx.seal(Direction::ToClient, &mut buf).unwrap();
-        assert_eq!(rx.open(Direction::ToClient, &buf), Ok(&[][..]));
+        assert_eq!(rx.open(Direction::ToClient, &buf, &mut plain), Ok(&[][..]));
     }
 
     #[test]
     fn a_tampered_byte_fails_the_tag() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut tx = SessionAuth::new(REF_KEY);
         let mut rx = SessionAuth::new(REF_KEY);
         let mut buf = b"hello".to_vec();
@@ -1087,42 +1697,51 @@ mod tests {
             forged[index] ^= 0x01;
             let mut fresh = SessionAuth::new(REF_KEY);
             assert_eq!(
-                fresh.open(Direction::ToServer, &forged),
+                fresh.open(Direction::ToServer, &forged, &mut plain),
                 Err(AuthError::BadTag),
                 "byte {index}"
             );
         }
         // The untouched original still opens, so the loop above rejected forgeries and not the scheme.
-        assert!(rx.open(Direction::ToServer, &buf).is_ok());
+        assert!(rx.open(Direction::ToServer, &buf, &mut plain).is_ok());
     }
 
     #[test]
     fn a_wrong_key_fails_the_tag() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut tx = SessionAuth::new(REF_KEY);
         let mut other = REF_KEY;
         other[15] ^= 0x80;
         let mut rx = SessionAuth::new(other);
         let mut buf = b"hello".to_vec();
         tx.seal(Direction::ToServer, &mut buf).unwrap();
-        assert_eq!(rx.open(Direction::ToServer, &buf), Err(AuthError::BadTag));
+        assert_eq!(
+            rx.open(Direction::ToServer, &buf, &mut plain),
+            Err(AuthError::BadTag)
+        );
     }
 
     #[test]
     fn a_reflected_datagram_fails_the_tag() {
+        let mut plain: Vec<u8> = Vec::new();
         // The whole point of the direction byte: the same key, the same bytes, the other direction.
         let mut tx = SessionAuth::new(REF_KEY);
         let mut rx = SessionAuth::new(REF_KEY);
         let mut buf = b"input".to_vec();
         tx.seal(Direction::ToServer, &mut buf).unwrap();
-        assert_eq!(rx.open(Direction::ToClient, &buf), Err(AuthError::BadTag));
+        assert_eq!(
+            rx.open(Direction::ToClient, &buf, &mut plain),
+            Err(AuthError::BadTag)
+        );
     }
 
     #[test]
     fn a_datagram_shorter_than_its_trailer_is_truncated() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut rx = SessionAuth::new(REF_KEY);
         for len in 0..TRAILER_LEN {
             assert_eq!(
-                rx.open(Direction::ToServer, &vec![0u8; len]),
+                rx.open(Direction::ToServer, &vec![0u8; len], &mut plain),
                 Err(AuthError::Truncated),
                 "len {len}"
             );
@@ -1131,16 +1750,21 @@ mod tests {
 
     #[test]
     fn a_replayed_datagram_is_refused_once_it_has_been_accepted() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut tx = SessionAuth::new(REF_KEY);
         let mut rx = SessionAuth::new(REF_KEY);
         let mut buf = b"input".to_vec();
         tx.seal(Direction::ToServer, &mut buf).unwrap();
-        assert!(rx.open(Direction::ToServer, &buf).is_ok());
-        assert_eq!(rx.open(Direction::ToServer, &buf), Err(AuthError::Replayed));
+        assert!(rx.open(Direction::ToServer, &buf, &mut plain).is_ok());
+        assert_eq!(
+            rx.open(Direction::ToServer, &buf, &mut plain),
+            Err(AuthError::Replayed)
+        );
     }
 
     #[test]
     fn a_forged_datagram_does_not_burn_a_sequence_number() {
+        let mut plain: Vec<u8> = Vec::new();
         let mut tx = SessionAuth::new(REF_KEY);
         let mut rx = SessionAuth::new(REF_KEY);
         let mut first = b"one".to_vec();
@@ -1148,11 +1772,11 @@ mod tests {
         let mut forged = first.clone();
         forged[0] ^= 0xff;
         assert_eq!(
-            rx.open(Direction::ToServer, &forged),
+            rx.open(Direction::ToServer, &forged, &mut plain),
             Err(AuthError::BadTag)
         );
         // Sequence 1 was never accepted, so the genuine datagram carrying it still is.
-        assert!(rx.open(Direction::ToServer, &first).is_ok());
+        assert!(rx.open(Direction::ToServer, &first, &mut plain).is_ok());
     }
 
     #[test]
@@ -1160,6 +1784,7 @@ mod tests {
         // Parked on the last sequence number rather than sealing four billion datagrams to reach it.
         let mut spent = SessionAuth {
             key: REF_KEY,
+            cipher_key: None,
             next_seq: u32::MAX,
             window: ReplayWindow::new(),
         };
@@ -1169,6 +1794,31 @@ mod tests {
         let mut buf = Vec::new();
         assert!(spent.seal(Direction::ToServer, &mut buf).is_none());
         assert!(buf.is_empty());
+    }
+
+    /// The same refusal under a secret, where it is the property the whole construction rests on: the
+    /// nonce is the direction byte and this counter, so a counter that wrapped would seal a second
+    /// datagram under a nonce already used and hand an observer the exclusive-or of two payloads. The
+    /// clear regime's failure is a replayed tag; this one is silent, so it gets its own test rather
+    /// than trusting the shared code path.
+    #[test]
+    fn seal_refuses_once_the_counter_is_spent_under_a_secret() {
+        let secret = compress_secret(PIN_SECRET);
+        let nonce = session_nonce(&PIN_NONCE, &PIN_ACCEPTOR);
+        let mut spent = SessionAuth {
+            key: derive_session_key(&secret, &nonce),
+            cipher_key: Some(derive_cipher_key(&secret, &nonce)),
+            next_seq: u32::MAX,
+            window: ReplayWindow::new(),
+        };
+        let mut buf = b"input".to_vec();
+        assert!(spent.seal(Direction::ToServer, &mut buf).is_some());
+        assert_eq!(buf.len(), b"input".len() + CIPHER_TRAILER_LEN);
+        assert!(spent.exhausted());
+        // The counter is spent rather than wrapped, and the refusal produces no datagram at all.
+        let mut buf = b"input".to_vec();
+        assert!(spent.seal(Direction::ToServer, &mut buf).is_none());
+        assert_eq!(buf, b"input");
     }
 
     #[test]

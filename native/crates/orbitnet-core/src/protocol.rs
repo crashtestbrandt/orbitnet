@@ -30,7 +30,7 @@
 /// | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster ([`crate::seats`]) to clients. |
 /// | 7 | A snapshot frame may carry a trailing **interest-delta section** ([`crate::codec::InterestDeltaSection`]), announced by `FrameHeader::FLAG_INTEREST_DELTA`, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token** ([`crate::codec::Handshake::resume_token`]), which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce** ([`crate::codec::Handshake::joiner_nonce`]) and the handshake gains a trailing **confirm tag** ([`crate::codec::Handshake::confirm`]); with a session secret configured the key is derived from `(secret, nonce)` by [`crate::auth::derive_session_key`] rather than read off the wire. The field keeps its offset and its width, so nothing about its shape refuses a peer predating the rename -- the major does, and without it that peer would seat the nonce as the key and fail every MAC. [`crate::codec::Handshake::check_compatibility`] refuses an all-zero nonce under EITHER regime — it is what a peer that sent no bytes at all decodes to — and a peer holding a secret additionally refuses a confirm tag that does not recompute. The entity manifest carries a leading **generation** and states a **change** rather than the whole table ([`crate::codec::ManifestDelta`], frame kind `0x08`); a client that cannot apply one asks for the whole table with `FrameHeader::FLAG_WANT_MANIFEST`. |
 /// | 8 | The interest-delta section carries a leading **generation** ([`crate::codec::InterestDeltaSection::generation`]), and one peer's whole interest set has a frame kind of its own ([`crate::codec::FrameKind::InterestTable`], `0x09`) that a client asks for with `FrameHeader::FLAG_WANT_INTEREST`. Before it, a delta naming a slot the receiver could not resolve was dropped in silence and then retired on the frame's ack, so the two ends disagreed about that entity for as long as the session ran. A client input frame carries, before its blocks, the interest generation that client holds ([`crate::codec::FrameKind::ClientInput`]), so the server builds a section only for a peer that provably holds the baseline it is diffed against. The generation shifts the offsets of the section's own counts and the echo shifts every input block's, which is what makes this a major rather than a trailing addition. |
-/// | 9 | The join is **two round trips** and both ends contribute to the key. The handshake's 16 bytes are the **joiner's half** of the session nonce ([`crate::codec::Handshake::joiner_nonce`]); the acceptor answers with a [`crate::codec::Challenge`] frame (kind `0x05`) carrying a half of its own, and the joiner repeats its handshake quoting that half back in a new [`crate::codec::Handshake::acceptor_nonce`] field. The key is [`crate::auth::derive_session_key`] over [`crate::auth::session_nonce`] of the pair, and the confirm tag is taken over the folded nonce. What this closes is a REPLAYED JOIN: under major 8 the nonce was the joiner's alone, so an observer presenting a recorded handshake had the accepting side derive the key that join had used. A peer predating this seats the joiner's half as the key, derives a different one, and fails every MAC — the major is what refuses it, and the new field would otherwise decode as an absent trailing value rather than a mismatch. |
+/// | 9 | The join is **two round trips** and both ends contribute to the key. The handshake's 16 bytes are the **joiner's half** of the session nonce ([`crate::codec::Handshake::joiner_nonce`]); the acceptor answers with a [`crate::codec::Challenge`] frame (kind `0x05`) carrying a half of its own, and the joiner repeats its handshake quoting that half back in a new [`crate::codec::Handshake::acceptor_nonce`] field. The key is [`crate::auth::derive_session_key`] over [`crate::auth::session_nonce`] of the pair, and the confirm tag is taken over the folded nonce. What this closes is a REPLAYED JOIN: under major 8 the nonce was the joiner's alone, so an observer presenting a recorded handshake had the accepting side derive the key that join had used. A peer predating this seats the joiner's half as the key, derives a different one, and fails every MAC — the major is what refuses it, and the new field would otherwise decode as an absent trailing value rather than a mismatch. **Also at this major: with a session secret configured, every datagram's payload is ChaCha20-Poly1305 ciphertext** under [`crate::auth::derive_cipher_key`], and its trailer is the sequence number plus a 16-byte Poly1305 tag ([`crate::auth::CIPHER_TRAILER_LEN`]) in place of the 8-byte SipHash one. A session that configures no secret is unchanged, byte for byte. The trailer is 8 bytes wider and the payload is unreadable, so a peer predating it decodes a snapshot out of ciphertext; the major is what refuses that. |
 ///
 /// **Minor is not checked, and records a change no peer can misread.** The only kind that qualifies is an
 /// OPTIONAL TRAILING field on a control frame: an older peer stops decoding before it and gets the
@@ -39,7 +39,9 @@
 ///
 /// **A row above records every wire change that landed at that major**, including one a minor bump alone
 /// could have carried. Major 7's confirm tag is an optional trailing field on the handshake and rode a bump
-/// the other changes had already forced.
+/// the other changes had already forced. The payload cipher joined major 9 the same way: it forces a major
+/// of its own, major 9 was pending and unreleased, and the batching rule below is what put it in that row
+/// rather than opening a tenth.
 ///
 /// **Pending majors ship in one release.** A change bumps this constant as it lands, so no build is ever
 /// wrong about its own frame layout, but the release carrying it waits for the other pending majors — one
@@ -342,6 +344,17 @@ mod tests {
     fn protocol_major_is_extracted() {
         assert_eq!(protocol_major(PROTOCOL_VERSION), 9);
         assert_eq!(protocol_major(0x0007_0201), 7);
+    }
+
+    /// The payload cipher folded into major 9 rather than opening a tenth, because 9 was pending and
+    /// unreleased. Pinned so that a later wire break has to decide deliberately whether it joins a
+    /// pending major or opens the next one — see "Pending wire breaks ship together".
+    #[test]
+    fn the_payload_cipher_rides_the_major_that_was_already_pending() {
+        assert_eq!(
+            PROTOCOL_VERSION, 0x0009_0000,
+            "a wire change that lands while a major is pending joins it"
+        );
     }
 
     #[test]

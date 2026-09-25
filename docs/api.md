@@ -81,7 +81,7 @@ evasion. Those need an authenticated layer above it, and `set_session_id()` is w
 | `set_resume_token(token: int) -> void` | Quote a stored token. **Before the join handshake**, like the identity. |
 | `peer_resume_token(peer: int) -> int` | Server-side, diagnostics. |
 | `resume_policy()` / `set_resume_policy(p)` | `Net.ResumePolicy.ALWAYS` (the default), `ONLY_IF_DROPPED`, or `NEVER`. |
-| `set_session_secret(secret: PackedByteArray)` / `has_session_secret() -> bool` | Derive the per-datagram key from a secret both ends already share. **Before `set_mode()`**, on both ends. An empty array clears it. There is no getter for the bytes. |
+| `set_session_secret(secret: PackedByteArray)` / `has_session_secret() -> bool` | Derive the per-datagram key from a secret both ends already share, **and encrypt every payload** under it. **Before `set_mode()`**, on both ends. An empty array clears it. There is no getter for the bytes. See [protocol.md](protocol.md#what-a-session-secret-encrypts). |
 | `peer_session_id(peer: int) -> int` | Server-side: the identity `peer` presented. **Key your roster on this.** 0 for an unknown peer and one that claimed none. |
 | `is_session_held(session_id: int) -> bool` | Server-side: whether a dropped session is still reclaimable. |
 | `reconnect_grace() -> float` / `set_reconnect_grace(s: float) -> void` | Seconds a dropped peer's session is held open. Wall-clock, server-side, 30 s by default. 0 disables resume — a drop is forgotten in the same frame and `peer_dropped` reports `held = false`. |
@@ -90,7 +90,8 @@ evasion. Those need an authenticated layer above it, and `set_session_id()` is w
 welcome; a rejoiner must quote it back. Without it, anyone who *saw* a session id — off a roster broadcast, a
 kill feed, a log line, a screenshot — could present it and take that player's body. **It does not stop an
 on-path observer**, who reads the welcome the token traveled in; that boundary is the same one the session key
-has, and `set_session_secret()` is what moves it.
+has, and `set_session_secret()` is what moves it — under a secret the observer cannot confirm the handshake
+that quotes a token, whether or not it read one.
 
 #### Releasing a dropped connection's seats
 

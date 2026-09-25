@@ -28,16 +28,44 @@ Regenerate this list with `cargo tree` in `native/` after any dependency change.
 | `heck`, `proc-macro2`, `quote`, `unicode-ident`, `venial` | MIT OR Apache-2.0 (`venial`: MIT) | Proc-macro machinery used at build time by gdext's macros. Not linked into the shipped library. |
 
 `orbitnet-core` and `orbitnet-godot` are this project's own crates and carry this project's license.
-`orbitnet-core` has **zero runtime dependencies** by design; the table below is its dev-only tree.
+
+## `orbitnet-core`'s runtime dependencies
+
+**These ship inside every export**, which is what makes them answer for more than the dev-only tree below.
+The whole of it is one crate and its transitive closure: `chacha20poly1305`, the **payload cipher** a session
+that configures `Net.set_session_secret()` runs over every datagram. `orbitnet-core` had none before it, and
+`native/crates/orbitnet-core/Cargo.toml`'s header carries what one has to clear and why this one was taken
+rather than hand-written.
+
+Regenerate this list with `cargo tree -p orbitnet-core --edges normal` in `native/`.
+
+| Crate | License | Why it is here |
+|---|---|---|
+| `chacha20poly1305` | Apache-2.0 OR MIT | RustCrypto's ChaCha20-Poly1305 (RFC 8439), the AEAD `auth.rs` seals and opens a datagram with under a session secret. |
+| `chacha20`, `poly1305` | MIT OR Apache-2.0 (`poly1305`: Apache-2.0 OR MIT) | The two halves of that construction: the stream cipher and the one-time authenticator. |
+| `aead`, `cipher`, `universal-hash`, `crypto-common`, `inout`, `block-buffer` | MIT OR Apache-2.0 | RustCrypto's trait and buffer plumbing the three crates above are written against. |
+| `hybrid-array`, `typenum` | MIT OR Apache-2.0 | Fixed-length array types, which is how key, nonce and tag widths are checked at compile time. |
+| `ctutils`, `cmov` | Apache-2.0 OR MIT | The constant-time conditional move Poly1305's tag comparison is built on. |
+| `cfg-if` | MIT OR Apache-2.0 | Platform selection between ChaCha20's SIMD backends. |
+| `cpufeatures` | MIT OR Apache-2.0 | Runtime CPU feature detection for Poly1305's x86 backend. **x86 and x86-64 only**; it is absent from an aarch64 build's tree. |
+
+The command above prints **14 crates** on an aarch64 host, and 15 on x86-64 with `cpufeatures`. No crate in
+that tree has a build script or a proc-macro, which is why `cargo test -p orbitnet-core` still runs in
+under a second. `libc` is `cpufeatures`' own dependency and is already in the tree for the crash handler.
+
+**Default features are off.** `chacha20poly1305`'s `alloc` and `getrandom` features are not enabled: the
+in-place, detached-tag API needs neither, and switching `getrandom` off keeps its platform-backend crates out
+of the runtime tree entirely.
 
 ## `orbitnet-core`'s dev-dependencies
 
 **Dev-only, and none of it is linked into a build.** `[dev-dependencies]` is compiled for
 `cargo test` and for nothing else, so no crate below appears in `cargo build`, in the cdylib
-`orbitnet-godot` links, or in any release asset. The zero-dependency rule in
-`native/crates/orbitnet-core/Cargo.toml` governs `[dependencies]`, which stays empty.
+`orbitnet-godot` links, or in any release asset. That is what makes a dev entry answer for less than a
+runtime one, and it is why the two trees are tabled separately.
 
-Regenerate this list with `cargo tree -p orbitnet-core --edges normal,build,dev` in `native/`.
+Regenerate this list with `cargo tree -p orbitnet-core --edges normal,build,dev` in `native/`, and read
+the rows the runtime table above already covers out of it.
 
 | Crate | License | Why it is here |
 |---|---|---|
@@ -45,10 +73,11 @@ Regenerate this list with `cargo tree -p orbitnet-core --edges normal,build,dev`
 | `bitflags`, `num-traits`, `regex-syntax`, `unarray` | MIT OR Apache-2.0 | `proptest`'s own dependencies. |
 | `rand`, `rand_core`, `rand_chacha`, `rand_xorshift`, `getrandom`, `ppv-lite86` | MIT OR Apache-2.0 | The seeded RNG `proptest` generates and shrinks cases with. |
 | `zerocopy` | BSD-2-Clause OR Apache-2.0 OR MIT | Byte-level casts inside `ppv-lite86`. |
-| `cfg-if`, `libc` | MIT OR Apache-2.0 | Platform selection under `getrandom`. `libc` is already in the tree for the crash handler. |
+| `libc` | MIT OR Apache-2.0 | Platform selection under `getrandom`, and already in the tree for the crash handler. `cfg-if` sits here too and is in the runtime table above. |
 | `autocfg` | Apache-2.0 OR MIT | `num-traits`' build script. |
 
-The command above prints **15 crates**, which is every row of the table.
+The command above prints the runtime table's rows and these together — **28 crates** on an aarch64 host, 14
+of them the runtime table's.
 
 **Five more crates are locked and never built.** `native/Cargo.lock` resolves a dependency's optional
 features and every target's backends, so it pins crates no build of this workspace compiles. They are listed

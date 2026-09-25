@@ -643,39 +643,51 @@ func peer_resume_token(peer: int) -> int:
 	return _orbit.peer_resume_token(peer)
 
 # --- the shared session secret -----------------------------------------------------------------------
-## Set the SHARED SESSION SECRET this session's per-datagram keys are derived from. An empty array clears it.
+## Set the [b]shared session secret[/b] this session's per-datagram keys are derived from, and encrypt every
+## payload under it. An empty array clears it.
 ##
-## BOTH ENDS MUST SET THE SAME ONE, AND SET IT BEFORE [method set_mode]. The client folds it into the key it
-## seals with, the server folds it into the key it opens with, and a session where the two disagree
+## [b]Both ends must set the same one, and set it before [method set_mode].[/b] The client folds it into the
+## key it seals with, the server folds it into the key it opens with, and a session where the two disagree
 ## authenticates nothing.
 ##
-## SOURCE IT FROM A CHANNEL THE GAME ALREADY AUTHENTICATED -- a lobby's metadata, a matchmaking ticket, a
-## session record fetched over TLS. Any length works: it is folded to 16 bytes internally, so a token, a
-## ticket or a passphrase can be passed as they are.
+## [b]Source it from a channel the game already authenticated[/b] -- a lobby's metadata, a matchmaking
+## ticket, a session record fetched over TLS. Any length works: it is folded to 16 bytes internally, so a
+## token, a ticket or a passphrase can be passed as they are.
 ##
-## WHAT IT CHANGES. The join exchanges two 16-byte NONCE HALVES under both regimes -- the client sends its
-## half in the handshake, the server answers with one of its own -- and the per-datagram key is folded from
-## the pair. Without a secret that fold is all the key is, and both halves are in the clear, so an ON-PATH
-## OBSERVER who reads the exchange can forge anything the client can. With one, the secret is folded in as
-## well, and that observer learns both halves and nothing else.
+## [b]What it changes.[/b] Two things.
 ##
-## WHAT IT DOES NOT CHANGE. The frame sequence: the join is two round trips either way, and a client may not
-## send until the server has answered. The tag is still 64 bits and the key still 128. The derived key is
-## worth exactly the entropy of the secret you supply -- one a lobby prints on screen buys what it looks like
-## it buys. And NONE OF THIS ENCRYPTS ANYTHING: every payload is still on the wire in the clear.
+## - [b]The key.[/b] The join exchanges two 16-byte nonce halves under both regimes -- the client sends its
+##   half in the handshake, the server answers with one of its own -- and the per-datagram key is folded from
+##   the pair. Without a secret that fold is all the key is, and both halves are in the clear, so an
+##   [b]on-path observer[/b] who reads the exchange can forge anything the client can. With one, the secret
+##   is folded in as well, and that observer learns both halves and nothing else.
+## - [b]The payload.[/b] With a secret, every datagram is encrypted with ChaCha20-Poly1305 under a cipher key
+##   derived from the same secret and fold. An observer on the path reads no position, no input and no state
+##   value. [b]Without a secret nothing is encrypted[/b], and encrypting there would buy nothing -- both
+##   halves cross the wire, so whoever can read a payload can compute the key that hid it.
 ##
-## A MISCONFIGURATION LOOKS THE SAME TO THE PLAYER EITHER WAY: the two ends derive different keys, nothing
-## either sends opens at the other, and the join never completes while the handshake retries. What differs is
-## whether anything says why.
+## [b]What it costs.[/b] Eight bytes per datagram and roughly a microsecond per full-size frame at each end,
+## which is under 0.1% of a 60 Hz frame on a server with eight peers. Zero for a session that sets no secret.
 ##
-## - SERVER WITH A SECRET, CLIENT WITHOUT is refused at the handshake, with one readable rejection in the
-##   server's log naming the secret. That is what the confirm tag on the handshake exists for.
-## - CLIENT WITH A SECRET, SERVER WITHOUT cannot be reported at all. The server's reply is sealed under a key
-##   the client will not derive, so it never reads a byte of it -- a rejection included -- and the server sees
-##   a hello it has no reason to refuse.
+## [b]What it does not change.[/b] The frame sequence -- the join is two round trips either way, and a client
+## may not send until the server has answered. The key is still 128 bits, and the derived key is worth
+## exactly the entropy of the secret you supply; one a lobby prints on screen buys what it looks like it
+## buys. Nor does it hide [b]how many[/b] datagrams a peer sends, [b]when[/b], or [b]how long[/b] each one
+## is, and it leaves the handshake and the challenge in the clear, because those two are what establish the
+## key.
 ##
-## COMPARE [method has_session_secret] ON BOTH ENDS WHEN A JOIN HANGS. It is the only thing that separates
-## this from a dead link.
+## [b]A misconfiguration looks the same to the player either way[/b] -- the two ends derive different keys,
+## nothing either sends opens at the other, and the join never completes while the handshake retries. What
+## differs is whether anything says why.
+##
+## - [b]Server with a secret, client without[/b] is refused at the handshake, with one readable rejection in
+##   the server's log naming the secret. That is what the confirm tag on the handshake exists for.
+## - [b]Client with a secret, server without[/b] cannot be reported at all. The server's reply is sealed
+##   under a key the client will not derive, so it never reads a byte of it -- a rejection included -- and
+##   the server sees a hello it has no reason to refuse.
+##
+## [b]Compare [method has_session_secret] on both ends when a join hangs.[/b] It is the only thing that
+## separates this from a dead link.
 ##
 ## A no-op against a backend that predates the call, which leaves that session on the cleartext key.
 func set_session_secret(secret: PackedByteArray) -> void:
@@ -683,8 +695,9 @@ func set_session_secret(secret: PackedByteArray) -> void:
 		return
 	_orbit.set_session_secret(secret)
 
-## Whether a session secret is set. THERE IS NO GETTER FOR THE BYTES, deliberately -- the only questions a
-## game has are "did my configuration take" and "am I about to join in the clear", and both are this one.
+## Whether a session secret is set, which is also whether this session's payloads are encrypted.
+## [b]There is no getter for the bytes[/b], deliberately -- the only questions a game has are "did my
+## configuration take" and "am I about to join in the clear", and both are this one.
 ##
 ## false against a backend that predates the call, which is the honest answer: that backend derives nothing.
 func has_session_secret() -> bool:
