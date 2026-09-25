@@ -647,14 +647,16 @@ func peer_resume_token(peer: int) -> int:
 ## session record fetched over TLS. Any length works: it is folded to 16 bytes internally, so a token, a
 ## ticket or a passphrase can be passed as they are.
 ##
-## WHAT IT CHANGES. Without a secret the per-datagram key is minted by the client and carried in the join
-## handshake in the clear, so an ON-PATH OBSERVER who reads that handshake can forge anything the client can.
-## With one, the handshake carries only a NONCE, both ends derive the key from `(secret, nonce)`, and that
-## observer learns the nonce and nothing else.
+## WHAT IT CHANGES. The join exchanges two 16-byte NONCE HALVES under both regimes -- the client sends its
+## half in the handshake, the server answers with one of its own -- and the per-datagram key is folded from
+## the pair. Without a secret that fold is all the key is, and both halves are in the clear, so an ON-PATH
+## OBSERVER who reads the exchange can forge anything the client can. With one, the secret is folded in as
+## well, and that observer learns both halves and nothing else.
 ##
-## WHAT IT DOES NOT CHANGE. The tag is still 64 bits and the key still 128. The derived key is worth exactly
-## the entropy of the secret you supply -- one a lobby prints on screen buys what it looks like it buys. And
-## NONE OF THIS ENCRYPTS ANYTHING: every payload is still on the wire in the clear.
+## WHAT IT DOES NOT CHANGE. The frame sequence: the join is two round trips either way, and a client may not
+## send until the server has answered. The tag is still 64 bits and the key still 128. The derived key is
+## worth exactly the entropy of the secret you supply -- one a lobby prints on screen buys what it looks like
+## it buys. And NONE OF THIS ENCRYPTS ANYTHING: every payload is still on the wire in the clear.
 ##
 ## A MISCONFIGURATION LOOKS THE SAME TO THE PLAYER EITHER WAY: the two ends derive different keys, nothing
 ## either sends opens at the other, and the join never completes while the handshake retries. What differs is

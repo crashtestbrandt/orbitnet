@@ -46,11 +46,11 @@ pub mod slots;
 pub mod tick;
 
 pub use auth::{
-    compress_secret, confirm_tag, derive_session_key, AuthError, Direction, ReceiveBudget,
-    ReplayWindow, SessionAuth, KEY_LEN,
+    compress_secret, confirm_tag, derive_session_key, session_nonce, AuthError, Direction,
+    ReceiveBudget, ReplayWindow, SessionAuth, KEY_LEN,
 };
 pub use clock::ClockEstimator;
-pub use codec::{CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
+pub use codec::{Challenge, CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
 pub use columnar::ColumnarHistory;
 pub use freshness::{Confidence, FreshnessLedger, MemoRing};
 pub use history::{plan_cost, BodyId, BodyResim, DirtyWindow, ResimPlanner, ResimRange, TickRing};
