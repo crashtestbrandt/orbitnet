@@ -189,5 +189,9 @@ Apache-2.0 / BSD / MPL-2.0 needs a conversation first.
 - If the change forces a **protocol major**, say so in the description. Pending majors ship together in one
   release, and that batching needs the pending set visible at release time — see
   [protocol.md](docs/protocol.md#pending-wire-breaks-ship-together).
+- A change that forces a **protocol major**, or that changes what an existing `Net` call means, also adds its
+  bullet to `Unreleased` in [CHANGELOG.md](CHANGELOG.md), in the same pull request. Everything else is
+  assembled there at release time from the generated notes — see
+  [CHANGELOG.md](CHANGELOG.md#format-and-how-an-entry-is-added).
 - CI runs on GitHub-hosted runners with `pull_request`, so a fork PR gets no secrets and needs no approval to
   run.
