@@ -140,13 +140,25 @@ into `server.csv`.
 just native-check    # fmt + clippy -D warnings + tests + build + the load smoke
 ```
 
-One rule: **`orbitnet-core` never sees a `Variant`.** Zero runtime dependencies, no `godot`, which is why
-its tests run in milliseconds. A `godot` type in a core signature means logic has leaked across the boundary.
+One rule: **`orbitnet-core` never sees a `Variant`**, and never depends on `godot`. Everything there is a pure
+function of plain data, which is why its tests run in milliseconds. A `godot` type in a core signature means
+logic has leaked across the boundary.
 
-**`[dependencies]` stays empty; `[dev-dependencies]` does not have to.** A generator or test-only crate is
-compiled for `cargo test` and is linked into no build, so it does not weaken the rule above. `proptest` is
-the one such entry today, behind `crates/orbitnet-core/tests/wire_properties.rs`. Add one only together with
-its license row in `THIRD_PARTY.md`, in the same change.
+**That crate may take a vetted dependency.** Its `[dependencies]` is empty today. Keeping it empty had been
+read as a rule, and under that reading the only way to add cryptography was to hand-write it — which is how a
+key exchange came to be priced at several hundred lines of constant-time field arithmetic and declined. The
+emptiness describes the crate and carries no veto.
+
+Such a dependency is a **runtime** dependency and ships inside every export, so it has to clear more than a
+dev-dependency does: a licence from the set below with its `THIRD_PARTY.md` row in the same commit, and a
+reason the hand-written version would be worse. `native/crates/orbitnet-core/Cargo.toml`'s header carries the
+full list and the reasoning. **Hand-written SipHash-2-4 stays** — it is already there, already held to
+constant time by a test, and its shape is what made it affordable.
+
+**A `[dev-dependencies]` entry answers for less.** It is compiled for `cargo test` and linked into no build,
+so it reaches no export and no release asset. `proptest` is the one such entry today, behind
+`crates/orbitnet-core/tests/wire_properties.rs`. Add one only together with its license row in
+`THIRD_PARTY.md`, in the same change.
 
 **Do not commit binaries.** `addons/orbitnet_native/bin/` is gitignored and no workflow ever adds to it.
 `binaries.yml` proves every platform builds on every `native/**` push; `release.yml` publishes the bytes as

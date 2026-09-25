@@ -228,11 +228,12 @@ are game decisions, and any default here would be wrong for somebody.
   place is authoring a fresh join, and a shared session secret is what refuses that.
 - **None of this encrypts anything.** Every payload is on the wire in the clear under both regimes, unless
   the transport underneath encrypts the link — see the next bullet. The
-  ceiling is a 64-bit tag and a 128-bit key. An X25519 exchange was considered and declined —
-  unauthenticated ECDH is substituted by exactly the on-path attacker these bullets are about, so
-  it would demote the adversary to passive-only in exchange for several hundred lines of hand-written
-  constant-time field arithmetic in a zero-dependency crate whose only constant-time groundwork is the
-  ten-line tag compare. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+  ceiling is a 64-bit tag and a 128-bit key. An X25519 exchange is not implemented. An
+  **unauthenticated** one would not close this — it is substituted by exactly the on-path attacker these
+  bullets are about, and buys only a demotion to passive-only. An **authenticated** one is open work: it was
+  priced at several hundred lines of hand-written constant-time field arithmetic because `orbitnet-core`'s
+  empty `[dependencies]` was read as a rule, and that reading has been settled against, so a vetted
+  implementation is the option. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
 - **A harness holds the tag compare to constant time.**
   `native/crates/orbitnet-core/tests/constant_time.rs` asserts that the compare's own source, compiled on its
   own under each shipped profile's flags, emits no branch, and measures whether two refused datagrams
