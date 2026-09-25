@@ -705,6 +705,108 @@ func has_session_secret() -> bool:
 		return false
 	return _orbit.has_session_secret()
 
+# --- the authenticated key exchange ------------------------------------------------------------------
+## SERVER: set the [b]static key[/b] whose public half clients pin. 32 bytes; an empty array clears it, any other
+## length is refused with an error and leaves the server without one.
+##
+## [b]Set it before[/b] [method set_mode], the way the session secret is set. It is what makes this server
+## authenticable: a client that pinned [method server_public_key] runs an X25519 exchange only the holder of
+## these bytes can complete, and the session key then depends on a value an on-path observer cannot compute.
+##
+## [b]Draw one with[/b] [method generate_server_static_key], store it, and reuse it. It has to outlive the process
+## that drew it -- a key re-drawn per launch gives every run a different identity and makes every pin already
+## distributed worthless. Rotating it is a deliberate act with that cost.
+##
+## [b]Publish the public half.[/b] [method server_public_key] returns it, and it goes to clients over any channel
+## with integrity: inside the game build, on a website, in a server-browser row. It needs no confidentiality,
+## because a peer holding it can verify this server and cannot impersonate it.
+##
+## [b]What it authenticates[/b]: this server, to a client that pinned it. Not the client -- anyone who can reach
+## this server completes the exchange. Refusing a client is what [method set_session_secret], the resume
+## token and the transport are for.
+##
+## [b]It costs a client that pinned nothing nothing.[/b] A handshake offering no exchange is answered without one,
+## so a server can hold a static key while some of its clients have not been given the public half yet.
+##
+## A no-op against a backend that predates the call, which leaves that session without an exchange.
+func set_server_static_key(key: PackedByteArray) -> void:
+	if not _backend_has(&"set_server_static_key"):
+		return
+	_orbit.set_server_static_key(key)
+
+## SERVER: the 32-byte [b]public half[/b] of [method set_server_static_key], or an empty array when none is set.
+##
+## This is the value a game publishes and hands to clients for [method set_pinned_server_key]. It is public
+## by construction and safe to print, log or ship inside a build.
+func server_public_key() -> PackedByteArray:
+	if not _backend_has(&"server_public_key"):
+		return PackedByteArray()
+	var key: PackedByteArray = _orbit.server_public_key()
+	return key
+
+## Whether a server static key is set. [b]There is no getter for the secret bytes[/b], for the reason
+## [method has_session_secret] has none.
+##
+## false against a backend that predates the call, which is the honest answer: that backend runs no exchange.
+func has_server_static_key() -> bool:
+	if not _backend_has(&"has_server_static_key"):
+		return false
+	return _orbit.has_server_static_key()
+
+## 32 fresh bytes from the platform CSPRNG, usable as a server static key. An empty array against a backend
+## that predates the call.
+##
+## [b]Call it once, store the result, and call it again only to rotate.[/b] It returns bytes rather than installing
+## them precisely so a game has to decide where they are kept.
+func generate_server_static_key() -> PackedByteArray:
+	if not _backend_has(&"generate_server_static_key"):
+		return PackedByteArray()
+	var key: PackedByteArray = _orbit.generate_server_static_key()
+	return key
+
+## CLIENT: [b]pin[/b] the 32-byte server public key this client authenticates. An empty array clears the pin; any
+## other length is refused with an error.
+##
+## [b]Set it before[/b] [method set_mode]. The join then runs an X25519 exchange against it, and the session key
+## depends on a value an on-path observer cannot compute -- which is what closes the on-path forgery the
+## default configuration leaves open, and what [method set_session_secret] closes the other way.
+##
+## [b]How it differs from a session secret.[/b] Both reach this client out of band. A secret has to travel a channel
+## with integrity AND confidentiality, every holder of it can impersonate the server, and it cannot ship in a
+## build because every player would hold it. A pin is a [b]public[/b] key: it needs integrity only, a holder can
+## verify the server and cannot impersonate it, and it may ship in the build. That is why a game with no
+## account service can use this and cannot use a secret. Configuring both is at least as strong as either.
+##
+## [b]A pinned client refuses a join the server answered without an exchange[/b], with one readable error. It does
+## not fall back -- falling back would let anything on the path strip the exchange and leave this client
+## reporting a security property it does not have.
+##
+## [b]What it does not change.[/b] The frame sequence: the join is two round trips either way. The tag is still 64
+## bits and the key still 128. And [b]none of this encrypts anything[/b]: every payload is still on the wire in the
+## clear.
+##
+## [b]A server whose key changes every session cannot be pinned.[/b] A listen server a player hosts, reached through
+## a direct-connect address box, has no value to distribute in advance; that session stays on whichever
+## regime [method set_session_secret] left it in.
+##
+## A no-op against a backend that predates the call, which leaves that session without an exchange.
+func set_pinned_server_key(key: PackedByteArray) -> void:
+	if not _backend_has(&"set_pinned_server_key"):
+		return
+	_orbit.set_pinned_server_key(key)
+
+## Whether this client pinned a server key.
+##
+## [b]Compare it against[/b] [method has_server_static_key] on the server when a join is refused: a pinned client
+## against a server holding no static key is the one misconfiguration of the pair that reports itself, and it
+## reports itself on the client.
+##
+## false against a backend that predates the call.
+func has_pinned_server_key() -> bool:
+	if not _backend_has(&"has_pinned_server_key"):
+		return false
+	return _orbit.has_pinned_server_key()
+
 ## Which claims on a session identity this server grants. See [method set_resume_policy]. ALWAYS is the default
 ## and stays the default.
 enum ResumePolicy {

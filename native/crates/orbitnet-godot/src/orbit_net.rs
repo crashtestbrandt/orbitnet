@@ -31,8 +31,9 @@ use godot::classes::{
 use godot::prelude::*;
 
 use orbitnet_core::auth::{
-    compress_secret, confirm_tag, derive_cipher_key, derive_session_key, session_nonce, siphash24,
-    MAX_INPUT_BLOCKS_PER_TICK, REPLAY_WINDOW,
+    acceptor_exchange_secret, compress_secret, confirm_tag, derive_cipher_key, derive_session_key,
+    exchange_public_key, fold_secrets, joiner_exchange_secret, session_nonce, siphash24,
+    EXCHANGE_KEY_LEN, MAX_INPUT_BLOCKS_PER_TICK, REPLAY_WINDOW,
 };
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
@@ -1960,7 +1961,11 @@ pub struct OrbitNet {
     /// **The row survives the confirmation that seats the session**, because a confirmation is retried
     /// until the welcome lands and every retry has to be answered with the half already issued. It is
     /// dropped where the peer entry is: `_on_peer_disconnected` and [`Self::stop`].
-    challenges: HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])>,
+    ///
+    /// It also carries this connection's **ephemeral exchange secret** when the server runs a key
+    /// exchange, for the same mint-once reason: the joiner confirms against the public half it was
+    /// challenged with, so re-drawing one would refuse the confirmation already in flight.
+    challenges: HashMap<i32, PendingJoin>,
     /// This peer's own session identity, sent in its handshake. `0` claims none.
     session_id: u64,
     /// Client: the **resume token** a server issued for [`Self::session_id`], quoted back in every later
@@ -2028,6 +2033,33 @@ pub struct OrbitNet {
     ///
     /// It is never read back out: there is [`OrbitNet::has_session_secret`] and no getter for the bytes.
     session_secret: Option<[u8; KEY_LEN]>,
+    /// Server: the **static X25519 secret** whose public half joining clients pin, or `None` for a
+    /// server that runs no key exchange.
+    ///
+    /// It is long-lived by design: a game publishes the matching public key once, in whatever channel
+    /// carries integrity — the build, a website, a server-browser row — and every join against this
+    /// server authenticates it against that one value. Rotating it invalidates every pin already
+    /// distributed, which is the reason it is not re-drawn per session.
+    ///
+    /// Never read back out. [`OrbitNet::server_public_key`] answers with the public half, which is the
+    /// only one a game has any use for.
+    server_static: Option<[u8; EXCHANGE_KEY_LEN]>,
+    /// Client: the server **static public key this client pinned**, or `None` for a client that
+    /// authenticates no server and runs no exchange.
+    ///
+    /// **It is the whole of the exchange's trust anchor.** A client that set one refuses any join the
+    /// server answered without an exchange, because falling back would let an attacker strip 32 bytes
+    /// and take the authentication away.
+    pinned_server_key: Option<[u8; EXCHANGE_KEY_LEN]>,
+    /// Client: this join's **ephemeral exchange secret**, drawn once beside [`Self::joiner_nonce`] and
+    /// discarded with it. `None` when no key is pinned, because an unpinned client offers no exchange.
+    joiner_ephemeral: Option<[u8; EXCHANGE_KEY_LEN]>,
+    /// The 16 bytes this join's key exchange produced, or `None` when no exchange ran.
+    ///
+    /// It is the second of the two secrets [`fold_secrets`] combines, and it is per join: the client
+    /// computes it in [`OrbitNet::handle_challenge`] and the server recomputes it on every leg of a
+    /// hello, so neither end stores it against anything longer-lived than the join.
+    exchange_secret: Option<[u8; KEY_LEN]>,
     /// Server: the sessions of dropped peers, held open until their grace window closes.
     resume: ResumeTable,
     /// Server: peer ids whose seats a `RELEASE_ON_DROP` policy owes a release, queued by
@@ -2366,6 +2398,15 @@ pub struct OrbitNet {
     /// Whether this session has already warned that it is refusing datagrams. One warning per
     /// session: under an actual flood the log is the second thing to fall over.
     auth_warned: bool,
+    /// CLIENT: whether this session has already reported refusing a join over the key exchange. One
+    /// report per session, for the reason [`Self::auth_warned`] is one: the hello is retried twice a
+    /// second until it succeeds, and a server that will never answer with an exchange would otherwise
+    /// fill the log at that rate.
+    ///
+    /// **A flag of its own rather than [`Self::auth_warned`]**, which counts refused datagrams. The two
+    /// describe different failures and a session can only reach one of them: a join refused here never
+    /// seats a key, so there is nothing to refuse a datagram under.
+    exchange_refused: bool,
     dbg_input_novel: u64,
     /// Input rows refused for carrying a non-finite float, counted per row rather than per block —
     /// a redundancy window re-sends the same poisoned tick, and the row count is what says how much
@@ -2443,6 +2484,10 @@ impl INode for OrbitNet {
             joiner_nonce: None,
             acceptor_nonce: None,
             session_secret: None,
+            server_static: None,
+            pinned_server_key: None,
+            joiner_ephemeral: None,
+            exchange_secret: None,
             resume: ResumeTable::default(),
             pending_seat_releases: Vec::new(),
             live_peers: std::collections::HashSet::new(),
@@ -2540,6 +2585,7 @@ impl INode for OrbitNet {
             dbg_rx_unauth: 0,
             auth_warned: false,
             rx_plain: Vec::new(),
+            exchange_refused: false,
             dbg_input_novel: 0,
             dbg_input_nonfinite: 0,
             dbg_resim_spans: 0,
@@ -2610,6 +2656,22 @@ impl INode for OrbitNet {
         }
         self.publish_tick_state();
     }
+}
+
+/// What a caller handed one of the two exchange-key setters.
+///
+/// **Three outcomes, because clearing and refusing are different.** An empty array is a caller asking for
+/// no key; a wrong length is a caller who got it wrong. Folding the second into the first is how a
+/// configuration bug silently unpins a server: the setter assigns what the reader returns, so a rejected
+/// input would discard the key the previous good call installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeKeyInput {
+    /// An empty array: seat no key.
+    Clear,
+    /// Exactly [`EXCHANGE_KEY_LEN`] bytes.
+    Key([u8; EXCHANGE_KEY_LEN]),
+    /// Any other length. **The configured key is left where it is.**
+    Refused,
 }
 
 #[godot_api]
@@ -2814,6 +2876,7 @@ impl OrbitNet {
         self.ping_timer = 0.0;
 
         self.auth_warned = false;
+        self.exchange_refused = false;
         if self.mode == MODE_CLIENT {
             self.synced = false;
             self.running = false;
@@ -2821,6 +2884,11 @@ impl OrbitNet {
             // a key an observer already saw would make every datagram captured from the last session
             // replayable into this one, under both regimes.
             self.joiner_nonce = Some(Self::mint_session_key());
+            // The exchange's half of the same rule, and drawn only when a key is pinned: an unpinned
+            // client runs no exchange, so drawing an ephemeral for it would cost a CSPRNG read and a
+            // basepoint multiply per join for a value nothing reads.
+            self.joiner_ephemeral = self.pinned_server_key.map(|_| Self::mint_exchange_secret());
+            self.exchange_secret = None;
             // **AND NO KEY YET.** Half of the key's input is the acceptor's, so there is nothing to
             // seat until its challenge lands — see `handle_challenge`. `send_to` refuses to send
             // anything while this is `None`, which is what makes "a client may not send until the
@@ -2854,7 +2922,13 @@ impl OrbitNet {
         self.session_auth = None;
         self.joiner_nonce = None;
         self.acceptor_nonce = None;
+        // The ephemeral and what it derived describe one join. The STATIC key and the PIN are not
+        // cleared, for the reason the secret is not: both describe a standing arrangement between the
+        // game and its server, and a game that set one expects the next join to use it.
+        self.joiner_ephemeral = None;
+        self.exchange_secret = None;
         self.auth_warned = false;
+        self.exchange_refused = false;
         // A held session describes a player who can come back to THIS session. There is no session to come
         // back to now, and carrying the table into the next one would resume a stranger.
         self.resume.clear();
@@ -3213,6 +3287,193 @@ impl OrbitNet {
     #[func]
     fn has_session_secret(&self) -> bool {
         self.session_secret.is_some()
+    }
+
+    /// SERVER: the **static X25519 secret** whose public half clients pin. 32 bytes; an empty array
+    /// clears it, and any other length is refused with an error.
+    ///
+    /// Set it before [`Self::set_mode`], the way the session secret is. It is what makes this server
+    /// authenticable: a client that pinned [`Self::server_public_key`] derives its session key through
+    /// an exchange only the holder of these bytes can complete.
+    ///
+    /// **It is long-lived, and that is the point.** Draw one with
+    /// [`Self::generate_server_static_key`], store it where the server's own configuration lives, and
+    /// publish the public half. Re-drawing it invalidates every pin already distributed, so every client
+    /// holding the old one refuses the join by name until it is updated.
+    ///
+    /// **It authenticates the server to the client and nobody to anybody else.** Any client that can
+    /// reach this server completes the exchange; refusing a client is what
+    /// [`Self::set_session_secret`], the resume token and the transport are for.
+    ///
+    /// **Configuring it costs a client that pinned nothing nothing at all.** A hello offering no
+    /// exchange is answered without one, so a server can hold a static key while some of its clients
+    /// have not been given the public half yet.
+    #[func]
+    fn set_server_static_key(&mut self, key: PackedByteArray) {
+        let input = Self::read_exchange_key(&key, "set_server_static_key");
+        Self::apply_exchange_key(&mut self.server_static, input);
+    }
+
+    /// SERVER: the 32-byte **public half** of [`Self::set_server_static_key`], or an empty array when no
+    /// static key is set.
+    ///
+    /// This is the value a game publishes — in the build, on a website, in a server-browser row — and
+    /// hands to clients for [`Self::set_pinned_server_key`]. It is public by construction: a peer holding
+    /// it can verify this server and cannot impersonate it, which is the whole difference between it and
+    /// a session secret.
+    #[func]
+    fn server_public_key(&self) -> PackedByteArray {
+        match self.server_static {
+            Some(secret) => PackedByteArray::from(&exchange_public_key(&secret)[..]),
+            None => PackedByteArray::new(),
+        }
+    }
+
+    /// Whether a server static key is set.
+    ///
+    /// **No getter for the secret bytes**, for the reason [`Self::has_session_secret`] has none: handing
+    /// key material back out puts it in every debug print that walks the node.
+    #[func]
+    fn has_server_static_key(&self) -> bool {
+        self.server_static.is_some()
+    }
+
+    /// 32 fresh bytes from the platform CSPRNG, usable as a server static key.
+    ///
+    /// **A game calls this ONCE, stores the result, and calls it again only to rotate.** Drawing one per
+    /// launch gives every run a different identity and makes a pinned key worthless — the value has to
+    /// outlive the process that drew it, which is why this returns bytes rather than installing them.
+    ///
+    /// It draws through the same path [`Self::mint_exchange_secret`] uses, with the same CSPRNG caveat.
+    #[func]
+    fn generate_server_static_key(&self) -> PackedByteArray {
+        PackedByteArray::from(&Self::mint_exchange_secret()[..])
+    }
+
+    /// CLIENT: **pin** the 32-byte server public key this client will authenticate. An empty array
+    /// clears the pin; any other length is refused with an error.
+    ///
+    /// Set it before [`Self::set_mode`]. The join then runs an X25519 exchange against it, and the
+    /// session key depends on a value an on-path observer cannot compute — which is what closes the
+    /// on-path forgery the default configuration leaves open.
+    ///
+    /// **A pinned client refuses a join the server answered without an exchange**, with one readable
+    /// error. Downgrading would let anything on the path strip the exchange and leave the client
+    /// reporting a security property it does not have.
+    ///
+    /// **The pin has to reach this client over a channel with integrity.** It needs no confidentiality:
+    /// the key is public, it may ship inside the build, and a player who reads it out of the binary
+    /// gains nothing. A session secret cannot be distributed that way, which is why this exists.
+    ///
+    /// **A server whose key changes every session cannot be pinned.** A listen server a player hosts,
+    /// reached through a direct-connect address box, has no value to distribute in advance; that session
+    /// stays on whichever regime [`Self::set_session_secret`] left it in.
+    #[func]
+    fn set_pinned_server_key(&mut self, key: PackedByteArray) {
+        let input = Self::read_exchange_key(&key, "set_pinned_server_key");
+        Self::apply_exchange_key(&mut self.pinned_server_key, input);
+    }
+
+    /// Whether this client pinned a server key.
+    ///
+    /// The client-side twin of [`Self::has_server_static_key`], and the pair to compare across both ends
+    /// when a join is refused: a pinned client against a server holding no static key is the one
+    /// misconfiguration that reports itself.
+    #[func]
+    fn has_pinned_server_key(&self) -> bool {
+        self.pinned_server_key.is_some()
+    }
+
+    /// A 32-byte X25519 key out of a `PackedByteArray`.
+    ///
+    /// **A wrong length is refused rather than padded or truncated.** Either would seat a key neither
+    /// end can name, and the join would fail with nothing pointing at the call that caused it.
+    fn read_exchange_key(key: &PackedByteArray, call: &str) -> ExchangeKeyInput {
+        let bytes = key.as_slice();
+        if bytes.is_empty() {
+            return ExchangeKeyInput::Clear;
+        }
+        if bytes.len() != EXCHANGE_KEY_LEN {
+            godot_error!(
+                "OrbitNet: {call}() takes exactly {EXCHANGE_KEY_LEN} bytes and was handed {}. The call \
+                 is refused and whatever key was already configured is kept. Pass an empty array to \
+                 clear one deliberately.",
+                bytes.len()
+            );
+            return ExchangeKeyInput::Refused;
+        }
+        let mut out = [0u8; EXCHANGE_KEY_LEN];
+        out.copy_from_slice(bytes);
+        ExchangeKeyInput::Key(out)
+    }
+
+    /// Apply one of those outcomes to a configured key. `Refused` leaves it alone, which is the whole
+    /// point of the distinction.
+    fn apply_exchange_key(slot: &mut Option<[u8; EXCHANGE_KEY_LEN]>, input: ExchangeKeyInput) {
+        match input {
+            ExchangeKeyInput::Clear => *slot = None,
+            ExchangeKeyInput::Key(key) => *slot = Some(key),
+            ExchangeKeyInput::Refused => {}
+        }
+    }
+
+    /// SERVER: the exchange public key to answer `hello` with, or `None` when no exchange runs.
+    ///
+    /// The condition is [`offered_static_key`]. The public key is read off the pending row rather than
+    /// derived here: a retried opening hello is answered as often as it is sent, and the multiply would
+    /// otherwise run once per datagram an unauthenticated peer chose to send.
+    fn exchange_offer(
+        &self,
+        hello: &Handshake,
+        pending: &PendingJoin,
+    ) -> Option<[u8; EXCHANGE_KEY_LEN]> {
+        offered_static_key(self.server_static.as_ref(), &hello.joiner_exchange)
+            .map(|_| pending.acceptor_public)
+    }
+
+    /// SERVER: what this join's exchange produced, from the pending row's cache or by deriving it.
+    ///
+    /// The decision itself is [`acceptor_exchange`], a free function so the rule a join is refused by
+    /// can be stated and tested without a `SceneTree`. This wrapper adds the cache and nothing else.
+    ///
+    /// **The result is cached on the pending row, because a confirmation is retried until the welcome
+    /// lands.** Deriving it costs five scalar multiplications on an unauthenticated datagram, and a peer
+    /// that has been challenged once can resend its confirmation at line rate. The row is already keyed
+    /// on the connection and the joiner's nonce half, and the derivation is a pure function of the row's
+    /// ephemeral and the hello's exchange half, so a repeat costs one comparison.
+    ///
+    /// **The cached value is valid only for the [`Handshake::joiner_exchange`] it was derived against.**
+    /// A hello may repeat its nonce half and carry a different exchange half; that is a different
+    /// transcript, and it derives again rather than answering from the cache.
+    fn exchange_with(
+        &mut self,
+        peer: i32,
+        hello: &Handshake,
+        pending: &PendingJoin,
+    ) -> ExchangeOutcome {
+        if offered_static_key(self.server_static.as_ref(), &hello.joiner_exchange).is_none() {
+            return ExchangeOutcome::NotOffered;
+        }
+        if let Some(row) = self.challenges.get(&peer) {
+            if row.joiner_exchange == hello.joiner_exchange {
+                if let Some(cached) = row.exchange {
+                    return cached;
+                }
+            }
+        }
+        let outcome = acceptor_exchange(
+            self.server_static.as_ref(),
+            &pending.acceptor_ephemeral,
+            &hello.joiner_exchange,
+        );
+        // The row `hello_leg` just handed back, which nothing has touched since.
+        if let Some(row) = self.challenges.get_mut(&peer) {
+            if row.acceptor_ephemeral == pending.acceptor_ephemeral {
+                row.joiner_exchange = hello.joiner_exchange;
+                row.exchange = Some(outcome);
+            }
+        }
+        outcome
     }
 
     /// The resume token this server issued to `peer`, or `0` for an unknown peer and one holding no
@@ -4179,10 +4440,22 @@ impl OrbitNet {
         }
         // `start()` draws the half; `get_or_insert_with` covers the transport connecting first.
         let joiner = *self.joiner_nonce.get_or_insert_with(Self::mint_session_key);
+        // The exchange is offered only by a client that pinned a server key. Offering one without a pin
+        // would be an exchange with nothing to authenticate it, which is substituted by exactly the
+        // on-path attacker it would be run against — see `orbitnet_core::auth`.
+        let joiner_exchange = if self.pinned_server_key.is_some() {
+            exchange_public_key(
+                self.joiner_ephemeral
+                    .get_or_insert_with(Self::mint_exchange_secret),
+            )
+        } else {
+            [0u8; EXCHANGE_KEY_LEN]
+        };
         let hello = Handshake::local(self.tickrate.clamp(1, 240) as u16)
             .with_session(self.session_id)
             .with_joiner_nonce(joiner)
-            .with_resume_token(self.resume_token);
+            .with_resume_token(self.resume_token)
+            .with_joiner_exchange(joiner_exchange);
         let hello = match self.acceptor_nonce {
             // The CONFIRMATION. The acceptor's half is quoted back so the server can match this frame
             // to the challenge it issued, and the tag — only under a secret — is taken over the FOLD of
@@ -4191,7 +4464,10 @@ impl OrbitNet {
             // recomputes it against the version it reads: major must match, minor and patch may differ.
             Some(acceptor) => {
                 let hello = hello.with_acceptor_nonce(acceptor);
-                match self.session_secret {
+                // Under either secret. A tag over an exchanged secret is what moves "this client
+                // pinned some other server's key" from a join that hangs to one readable rejection in
+                // the server's log, exactly as the tag over a supplied secret already does.
+                match fold_secrets(self.session_secret.as_ref(), self.exchange_secret.as_ref()) {
                     Some(secret) => {
                         let nonce = session_nonce(&joiner, &acceptor);
                         let key = derive_session_key(&secret, &nonce);
@@ -4229,8 +4505,29 @@ impl OrbitNet {
         let Ok(challenge) = Challenge::decode(&mut reader) else {
             return;
         };
-        match challenge_answer(self.joiner_nonce, self.acceptor_nonce, &challenge) {
+        match challenge_answer(
+            self.joiner_nonce,
+            self.acceptor_nonce,
+            self.pinned_server_key.is_some(),
+            &challenge,
+        ) {
             ChallengeAnswer::Ignore => {}
+            // A pinned client fails the join rather than falling back. Accepting a challenge with no
+            // exchange in it would let anything on the path strip 32 bytes and take the whole
+            // authentication away, and the client would then report a security property it does not
+            // have. The join stops here; the retry re-sends the hello, and the server either starts
+            // answering with a key or it never does.
+            ChallengeAnswer::Unauthenticated => {
+                if !self.exchange_refused {
+                    self.exchange_refused = true;
+                    godot_error!(
+                        "OrbitNet: refusing to join — this client pinned a server key with \
+                         Net.set_pinned_server_key(), and the server answered the handshake with no \
+                         key exchange. Either the server set no static key, or something on the path \
+                         removed it. The join is refused rather than downgraded to the cleartext key."
+                    );
+                }
+            }
             // A re-sent challenge, which a retried hello provokes. The key is already seated and its
             // send counter has been spent on nothing; re-seating would be a no-op that reset it.
             //
@@ -4242,9 +4539,33 @@ impl OrbitNet {
                 self.send_hello();
             }
             ChallengeAnswer::Adopt => {
+                // The exchange, BEFORE the key is seated, because its output is an input to that key.
+                // `None` back from it is a non-contributory Diffie-Hellman — a low-order public key,
+                // which is an attacker forcing a shared value both ends would agree on and neither
+                // chose — and it refuses the join rather than keying on it.
+                if let (Some(pinned), Some(ephemeral)) =
+                    (self.pinned_server_key, self.joiner_ephemeral)
+                {
+                    let Some(exchanged) =
+                        joiner_exchange_secret(&ephemeral, &pinned, &challenge.acceptor_exchange)
+                    else {
+                        if !self.exchange_refused {
+                            self.exchange_refused = true;
+                            godot_error!(
+                                "OrbitNet: refusing to join — the server's key exchange produced no \
+                                 usable secret. Its exchange key is one of the few values that force \
+                                 a shared result whatever this client's own secret was, which is an \
+                                 attacker on the path rather than a misconfiguration."
+                            );
+                        }
+                        return;
+                    };
+                    self.exchange_secret = Some(exchanged);
+                }
                 self.acceptor_nonce = Some(challenge.acceptor_nonce);
                 self.session_auth = Some(session_auth_from(
-                    self.session_secret.as_ref(),
+                    fold_secrets(self.session_secret.as_ref(), self.exchange_secret.as_ref())
+                        .as_ref(),
                     challenge.joiner_nonce,
                     challenge.acceptor_nonce,
                 ));
@@ -4261,7 +4582,8 @@ impl OrbitNet {
     /// **Four unrelated values come from here and each one is its own draw**: the joiner's half of a
     /// session nonce, the acceptor's half, a connection's ack-token salt, and the high bits of a resume
     /// token. Sharing the draw would let a peer that learns one compute another, and both halves are
-    /// transmitted by definition.
+    /// transmitted by definition. [`Self::mint_exchange_secret`] draws the two X25519 ephemerals under
+    /// the same rule and at a different width.
     ///
     /// `Crypto` is Godot's platform CSPRNG. `RandomNumberGenerator` is the fallback for a build
     /// without the mbedtls module, and it is **not** cryptographic: an attacker who can predict its
@@ -4274,6 +4596,37 @@ impl OrbitNet {
         let bytes = random.as_slice();
         if bytes.len() >= KEY_LEN {
             key.copy_from_slice(&bytes[..KEY_LEN]);
+            return key;
+        }
+        let mut rng = RandomNumberGenerator::new_gd();
+        rng.randomize();
+        for chunk in key.chunks_mut(4) {
+            chunk.copy_from_slice(&rng.randi().to_le_bytes());
+        }
+        key
+    }
+
+    /// 32 unpredictable bytes: one X25519 secret, drawn fresh.
+    ///
+    /// **Its own draw, like every other value in this file that reaches the wire.** Two come from here
+    /// — a joiner's per-join ephemeral and an acceptor's per-join ephemeral — and each one's public
+    /// half is transmitted by definition, so deriving one from another value the session uses would
+    /// hand an observer material it should not have.
+    ///
+    /// **Any 32 bytes are a valid secret.** X25519 clamps the scalar rather than refusing one, so there
+    /// is no value here to reject and no retry loop to write. The CSPRNG caveat on
+    /// [`Self::mint_session_key`] applies unchanged: under the non-cryptographic fallback an attacker
+    /// who can predict the stream predicts this key, and the exchange then authenticates nothing.
+    ///
+    /// A server's LONG-LIVED static secret does not come from here. It is supplied by the game through
+    /// [`Self::set_server_static_key`], because it has to outlive the process that first drew it;
+    /// [`Self::generate_server_static_key`] is the draw a game calls once to obtain one.
+    fn mint_exchange_secret() -> [u8; EXCHANGE_KEY_LEN] {
+        let mut key = [0u8; EXCHANGE_KEY_LEN];
+        let random = Crypto::new_gd().generate_random_bytes(EXCHANGE_KEY_LEN as i32);
+        let bytes = random.as_slice();
+        if bytes.len() >= EXCHANGE_KEY_LEN {
+            key.copy_from_slice(&bytes[..EXCHANGE_KEY_LEN]);
             return key;
         }
         let mut rng = RandomNumberGenerator::new_gd();
@@ -7340,9 +7693,10 @@ impl OrbitNet {
         self.auth_warned = true;
         godot_warn!(
             "OrbitNet: refusing an unauthenticated datagram from peer {sender} — forged, replayed, \
-             sent before the handshake, or sealed under a key derived from a different session \
-             secret. Compare has_session_secret() on both ends if a join never completes. Further \
-             refusals this session are silent; run with ORBITNET_DEBUG to count them."
+             sent before the handshake, or sealed under a key the two ends derived differently. \
+             Compare has_session_secret(), and has_server_static_key() against \
+             has_pinned_server_key(), on both ends if a join never completes. Further refusals this \
+             session are silent; run with ORBITNET_DEBUG to count them."
         );
     }
 
@@ -7412,22 +7766,63 @@ impl OrbitNet {
         // answered with the challenge rather than a rejection, and neither seats anything — no key, no
         // identity, no [`PeerState`]. The decision is [`hello_leg`], which is where the reason and the
         // tests for it are.
-        let acceptor = match hello_leg(&mut self.challenges, sender, &hello, Self::mint_session_key)
-        {
-            HelloLeg::Challenge(acceptor) => {
+        //
+        // **The exchange ephemeral is drawn in the same row**, and only by a server that holds a static
+        // key: without one there is nothing for a joiner to authenticate the exchange against, so the
+        // draw and the 32 bytes on the challenge would both be spent on nothing.
+        let offers_exchange = self.server_static.is_some();
+        let pending = match hello_leg(&mut self.challenges, sender, &hello, || {
+            (
+                Self::mint_session_key(),
+                if offers_exchange {
+                    Self::mint_exchange_secret()
+                } else {
+                    [0u8; EXCHANGE_KEY_LEN]
+                },
+            )
+        }) {
+            HelloLeg::Challenge(pending) => {
                 let challenge = Challenge {
                     joiner_nonce: hello.joiner_nonce,
-                    acceptor_nonce: acceptor,
+                    acceptor_nonce: pending.acceptor_nonce,
+                    // All zeroes unless both ends offered one. A joiner with no pin runs no exchange,
+                    // so answering it with a key would cost a basepoint multiply per join and change
+                    // nothing it does.
+                    acceptor_exchange: self
+                        .exchange_offer(&hello, &pending)
+                        .unwrap_or([0u8; EXCHANGE_KEY_LEN]),
                 };
                 self.send_raw(sender, &challenge.encode(), TransferMode::RELIABLE);
                 return;
             }
-            HelloLeg::Confirm(acceptor) => acceptor,
+            HelloLeg::Confirm(pending) => pending,
+        };
+        let acceptor = pending.acceptor_nonce;
+        // The exchange. [`OrbitNet::exchange_with`] separates the three outcomes, because two of them
+        // are ordinary and the third is an attack.
+        //
+        // **A non-contributory result refuses the hello here, by name.** Folding it to "no exchange"
+        // would seat this connection on the key derived from the two wire nonce halves alone, which an
+        // on-path observer also holds — and it is exactly an on-path attacker that produces one, by
+        // rewriting `joiner_exchange` to a low-order point on both hello legs. Refusing with an error
+        // keeps the misconfiguration table's promise that a failed join says which end failed it.
+        let exchanged = match self.exchange_with(sender, &hello, &pending) {
+            ExchangeOutcome::NotOffered => None,
+            ExchangeOutcome::Derived(secret) => Some(secret),
+            ExchangeOutcome::NonContributory => {
+                godot_error!(
+                    "OrbitNet: rejecting peer {sender}: its key exchange half is a low-order point, \
+                     so the exchange produces a value this server did not contribute to. The join is \
+                     refused rather than downgraded to the unexchanged key."
+                );
+                return;
+            }
         };
         // The confirmation, which is where a peer that does not hold this session's secret is refused —
         // and where a REPLAYED one is, because the tag is over the fold of both halves and the
         // acceptor's was drawn here.
-        if let Err(err) = ours.check_compatibility(&hello, self.session_secret.as_ref()) {
+        let secret = fold_secrets(self.session_secret.as_ref(), exchanged.as_ref());
+        if let Err(err) = ours.check_compatibility(&hello, secret.as_ref()) {
             godot_error!("OrbitNet: rejecting peer {sender}: {err}");
             return;
         }
@@ -7435,8 +7830,7 @@ impl OrbitNet {
         // derived-key against derived-key. Comparing the wire halves instead and re-deriving on every
         // hello would reset the replay window on each RETRY of one join, which is exactly the property
         // that comparison exists to preserve.
-        let session_key =
-            session_key_from(self.session_secret.as_ref(), hello.joiner_nonce, acceptor);
+        let session_key = session_key_from(secret.as_ref(), hello.joiner_nonce, acceptor);
         // The whole resume decision, and the two mutations it implies — stripping a superseded incumbent's
         // identity, and spending the held window. It is a free function over the two plain tables so the
         // rule this defect lived in is one thing a test can call with no `SceneTree`; see [`seat_hello`].
@@ -9348,28 +9742,124 @@ fn session_directions(mode: i64) -> Option<(Direction, Direction)> {
 /// makes the key change — which is what `handle_hello`'s rekey comparison detects, and what stops the
 /// restarted session inheriting the replay window of the one before it.
 fn challenge_half(
-    challenges: &mut HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])>,
+    challenges: &mut HashMap<i32, PendingJoin>,
     peer: i32,
     joiner: [u8; KEY_LEN],
-    draw: impl FnOnce() -> [u8; KEY_LEN],
-) -> [u8; KEY_LEN] {
+    draw: impl FnOnce() -> ([u8; KEY_LEN], [u8; EXCHANGE_KEY_LEN]),
+) -> PendingJoin {
     match challenges.get(&peer) {
-        Some(&(held, half)) if held == joiner => half,
+        Some(&pending) if pending.joiner_nonce == joiner => pending,
         _ => {
-            let half = draw();
-            challenges.insert(peer, (joiner, half));
-            half
+            let (acceptor_nonce, acceptor_ephemeral) = draw();
+            let pending = PendingJoin {
+                joiner_nonce: joiner,
+                acceptor_nonce,
+                acceptor_ephemeral,
+                acceptor_public: exchange_public_key(&acceptor_ephemeral),
+                joiner_exchange: [0u8; EXCHANGE_KEY_LEN],
+                exchange: None,
+            };
+            challenges.insert(peer, pending);
+            pending
         }
+    }
+}
+
+/// SERVER: everything one unconfirmed connection is challenged on.
+///
+/// **The two drawn values are drawn together and replaced together**, which is the mint-once rule
+/// [`challenge_half`] states: a joiner confirms against the acceptor half AND the exchange key it was
+/// challenged with, so re-drawing either alone would refuse a confirmation already in flight.
+///
+/// [`Self::acceptor_ephemeral`] is all zeroes on a server that runs no key exchange, and holds secret
+/// material where [`Self::joiner_nonce`] and [`Self::acceptor_nonce`] are values the wire carries. Its
+/// public half is what the [`Challenge`] holds.
+///
+/// **The last two fields are a cache.** They hold what [`OrbitNet::exchange_with`] derived and the
+/// joiner half it derived it against, so a retried confirmation costs a comparison rather than five
+/// scalar multiplications. They change no answer, and they expose nothing the row did not already
+/// hold: the cached value is a pure function of [`Self::acceptor_ephemeral`] and two public keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingJoin {
+    /// The [`Handshake::joiner_nonce`] this row was drawn against.
+    joiner_nonce: [u8; KEY_LEN],
+    /// The acceptor's half of the session nonce.
+    acceptor_nonce: [u8; KEY_LEN],
+    /// The acceptor's ephemeral exchange secret, or all zeroes when none was drawn.
+    acceptor_ephemeral: [u8; EXCHANGE_KEY_LEN],
+    /// The public half of [`Self::acceptor_ephemeral`], derived once when the row was drawn.
+    ///
+    /// **Cached for the reason [`Self::exchange`] is.** An unconfirmed opening hello is retried until the
+    /// challenge lands, and every retry is answered with a challenge carrying this value. Deriving it per
+    /// answer is a basepoint multiply an unauthenticated peer can ask for at line rate.
+    acceptor_public: [u8; EXCHANGE_KEY_LEN],
+    /// The [`Handshake::joiner_exchange`] [`Self::exchange`] was derived against, all zeroes until
+    /// one was.
+    joiner_exchange: [u8; EXCHANGE_KEY_LEN],
+    /// This join's exchange result, or `None` until a leg has derived one.
+    exchange: Option<ExchangeOutcome>,
+}
+
+/// SERVER: the static secret to run this join's exchange with, or `None` when no exchange runs.
+///
+/// Both ends have to have offered one. The acceptor needs a static key for a joiner to authenticate
+/// it against, and the joiner signals its pin by carrying a non-zero [`Handshake::joiner_exchange`].
+/// Either one missing means no exchange runs, and the session stays on whatever regime
+/// [`OrbitNet::set_session_secret`] left it in.
+fn offered_static_key<'a>(
+    static_secret: Option<&'a [u8; EXCHANGE_KEY_LEN]>,
+    joiner_exchange: &[u8; EXCHANGE_KEY_LEN],
+) -> Option<&'a [u8; EXCHANGE_KEY_LEN]> {
+    static_secret.filter(|_| *joiner_exchange != [0u8; EXCHANGE_KEY_LEN])
+}
+
+/// SERVER: what one join's key exchange produced.
+///
+/// **The non-contributory case is its own variant because it is an attack**, where the other two are
+/// ordinary configurations. Collapsing it into [`Self::NotOffered`] would seat the connection on the key
+/// [`session_key_from`] derives from the two wire nonce halves alone — the key an on-path observer
+/// also holds — on a server that had a static key configured and a joiner that had pinned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeOutcome {
+    /// No exchange ran: this acceptor holds no static key, or the joiner offered no half.
+    NotOffered,
+    /// Both ends offered, and the fold produced this join's exchange contribution.
+    Derived([u8; KEY_LEN]),
+    /// Both ends offered and the Diffie-Hellman was non-contributory, so the hello is refused.
+    NonContributory,
+}
+
+/// SERVER: decide one join's exchange from the three values it turns on.
+///
+/// A free function beside [`hello_leg`], for the reason that one is: the rule a join is refused by
+/// needs no `SceneTree` to state or to test. [`OrbitNet::exchange_with`] is the only caller, and the
+/// cache it puts in front of this changes no answer here.
+///
+/// **A non-contributory result refuses the hello rather than falling back.** The low-order points
+/// force a shared value whatever this acceptor's secret was, so a peer that folded one in would be
+/// keying on a value only the attacker chose; treating that as "no exchange" would hand an on-path
+/// attacker a downgrade by rewriting 32 bytes on both hello legs.
+fn acceptor_exchange(
+    static_secret: Option<&[u8; EXCHANGE_KEY_LEN]>,
+    ephemeral: &[u8; EXCHANGE_KEY_LEN],
+    joiner_exchange: &[u8; EXCHANGE_KEY_LEN],
+) -> ExchangeOutcome {
+    let Some(static_secret) = offered_static_key(static_secret, joiner_exchange) else {
+        return ExchangeOutcome::NotOffered;
+    };
+    match acceptor_exchange_secret(static_secret, ephemeral, joiner_exchange) {
+        Some(secret) => ExchangeOutcome::Derived(secret),
+        None => ExchangeOutcome::NonContributory,
     }
 }
 
 /// SERVER: which leg of the join an arriving [`Handshake`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelloLeg {
-    /// Answer with a [`Challenge`] carrying this half, and seat nothing.
-    Challenge([u8; KEY_LEN]),
+    /// Answer with a [`Challenge`] carrying this row's values, and seat nothing.
+    Challenge(PendingJoin),
     /// A confirmation quoting the half this acceptor issued. Check it and seat the session.
-    Confirm([u8; KEY_LEN]),
+    Confirm(PendingJoin),
 }
 
 /// SERVER: read the leg off the handshake, minting or re-sending this connection's acceptor half.
@@ -9393,16 +9883,16 @@ enum HelloLeg {
 /// re-challenged — is handed the current one and converges, where a refusal would leave it retrying
 /// against a half nobody holds.
 fn hello_leg(
-    challenges: &mut HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])>,
+    challenges: &mut HashMap<i32, PendingJoin>,
     peer: i32,
     hello: &Handshake,
-    draw: impl FnOnce() -> [u8; KEY_LEN],
+    draw: impl FnOnce() -> ([u8; KEY_LEN], [u8; EXCHANGE_KEY_LEN]),
 ) -> HelloLeg {
-    let acceptor = challenge_half(challenges, peer, hello.joiner_nonce, draw);
-    if hello.acceptor_nonce == acceptor {
-        HelloLeg::Confirm(acceptor)
+    let pending = challenge_half(challenges, peer, hello.joiner_nonce, draw);
+    if hello.acceptor_nonce == pending.acceptor_nonce {
+        HelloLeg::Confirm(pending)
     } else {
-        HelloLeg::Challenge(acceptor)
+        HelloLeg::Challenge(pending)
     }
 }
 
@@ -9411,6 +9901,9 @@ fn hello_leg(
 enum ChallengeAnswer {
     /// Not for this join, or carrying no half. Wait for the handshake retry.
     Ignore,
+    /// This client pinned a server key and the challenge offers no key exchange. Refuse the join and
+    /// say so; seating it would be a silent downgrade to the key an on-path observer can compute.
+    Unauthenticated,
     /// The half already held, re-sent. Confirm again without disturbing the key.
     Confirm,
     /// A new half. Seat the key from it and confirm.
@@ -9434,13 +9927,25 @@ enum ChallengeAnswer {
 /// acceptor that no longer holds this connection's pending half issues a new one, and a client that
 /// refused it would retry against a half nobody holds for ever. Re-seating the key is safe only because
 /// the caller gates this on the session not yet being synced.
+///
+/// **A challenge offering no exchange is refused when this client pinned a key**, and that refusal is
+/// what makes the pin binding: accepting it would let anything on the path strip the exchange key and
+/// leave the client joining on the key an on-path observer can compute, while reporting a security
+/// property it does not have. It is checked before the re-send case, so a client that has seated
+/// nothing is not told it holds a key. A client that pinned nothing takes the same frame, which is
+/// what keeps an acceptor holding a static key usable by joiners that have not been given the public
+/// half yet.
 fn challenge_answer(
     joiner: Option<[u8; KEY_LEN]>,
     acceptor: Option<[u8; KEY_LEN]>,
+    pinned: bool,
     challenge: &Challenge,
 ) -> ChallengeAnswer {
     if joiner != Some(challenge.joiner_nonce) || challenge.acceptor_nonce == [0u8; KEY_LEN] {
         return ChallengeAnswer::Ignore;
+    }
+    if pinned && challenge.acceptor_exchange == [0u8; EXCHANGE_KEY_LEN] {
+        return ChallengeAnswer::Unauthenticated;
     }
     if acceptor == Some(challenge.acceptor_nonce) {
         return ChallengeAnswer::Confirm;
@@ -9460,6 +9965,9 @@ fn challenge_answer(
 /// | --- | --- |
 /// | `None` | [`session_nonce`] of the two halves |
 /// | `Some` | [`derive_session_key`] over the secret and that |
+///
+/// `secret` is [`fold_secrets`]'s output, so `Some` covers a session holding a game-supplied secret, one
+/// that ran a key exchange, and one that did both. This function does not know which.
 ///
 /// **BOTH HALVES ARE INPUTS, AND THE ACCEPTOR'S IS WHAT REFUSES A REPLAYED JOIN.** Keying on `joiner`
 /// alone is the shorter implementation and is what protocol major 8 did: an observer presenting a
@@ -10049,31 +10557,36 @@ mod interest_search;
 #[cfg(test)]
 mod tests {
     use super::{
-        admission_advances_cursor, admit_input_blocks, adopt_whole_set, anchor_conflicts_owed,
-        apply_interest_section, band_for_row, block_admission, block_is_un_written,
-        build_interest_section, candidate_for_own_row, candidate_for_row, challenge_answer,
-        challenge_half, charge_window, clamp_resume_policy, clamp_seat_release_policy,
-        clamp_unanchored_policy, classify_rx, delta_reference, encode_interest_delta,
-        filter_connection, frame_charge, full_block_due, hello_leg, hold_on_drop,
-        input_frame_is_owed, interest_delta_reserve, interest_table_due, interest_table_to_send,
-        is_located, manifest_owed, note_input_tick, owned_rows_into, owned_rows_of,
-        queue_seat_release, replayed_depth, resim_input_from, resolve_observer, resume_grant,
-        retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
+        acceptor_exchange, admission_advances_cursor, admit_input_blocks, adopt_whole_set,
+        anchor_conflicts_owed, apply_interest_section, band_for_row, block_admission,
+        block_is_un_written, build_interest_section, candidate_for_own_row, candidate_for_row,
+        challenge_answer, challenge_half, charge_window, clamp_resume_policy,
+        clamp_seat_release_policy, clamp_unanchored_policy, classify_rx, delta_reference,
+        encode_interest_delta, filter_connection, frame_charge, full_block_due, hello_leg,
+        hold_on_drop, input_frame_is_owed, interest_delta_reserve, interest_table_due,
+        interest_table_to_send, is_located, manifest_owed, note_input_tick, owned_rows_into,
+        owned_rows_of, queue_seat_release, replayed_depth, resim_input_from, resolve_observer,
+        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
         seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
         send_pass_is_due, session_auth_from, session_directions, session_is_filtering,
         session_key_from, snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
         unseeded_departures, veto_announces_leave, AckOutcome, BlockAdmission, ChallengeAnswer,
-        EntityRow, FrameCharge, FrameHeader, HelloLeg, InterestPass, ManifestOwed, OrbitNet,
-        PeerAnchor, PeerDeclaration, PeerObserver, PeerState, ResolvedSeats, ResumeGrant,
-        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
-        StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED,
-        AOI_EXIT_FACTOR, BANDWIDTH_WINDOW_SECONDS, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
-        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
-        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
-        MODE_HOST, MODE_OFFLINE, MODE_SERVER, PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER,
-        RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
-        SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH,
-        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        EntityRow, ExchangeKeyInput, ExchangeOutcome, FrameCharge, FrameHeader, HelloLeg,
+        InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
+        PendingJoin, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex,
+        SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots, Writer,
+        ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, BANDWIDTH_WINDOW_SECONDS,
+        FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX,
+        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
+        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
+        MODE_SERVER, PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
+        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
+        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH, UNANCHORED_CLOSED,
+        UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+    };
+    use orbitnet_core::auth::{
+        acceptor_exchange_secret, exchange_public_key, fold_secrets, joiner_exchange_secret,
+        EXCHANGE_KEY_LEN,
     };
     use orbitnet_core::auth::{CIPHER_TRAILER_LEN, TRAILER_LEN};
     use orbitnet_core::codec::{Challenge, Handshake, InterestDeltaSection};
@@ -15138,12 +15651,119 @@ mod tests {
     // `SceneTree`; both are what a replayed join, a retried hello and a restarted session meet.
     // ------------------------------------------------------------------
 
+    /// One pending row's draw, as the server builds it: the acceptor half and the exchange ephemeral
+    /// together, because both are minted once per `(connection, joiner half)`.
+    fn drawn(seed: u8) -> ([u8; KEY_LEN], [u8; EXCHANGE_KEY_LEN]) {
+        (nonce_bytes(seed), [seed; EXCHANGE_KEY_LEN])
+    }
+
+    /// A wrong-length key must not discard the key a previous good call installed.
+    ///
+    /// **The failure this pins is fail-open on the value the pin exists to provide.** The setters assign
+    /// what the reader returns, so a reader that answered "no key" for a malformed input would unpin the
+    /// server on a caller's length mistake, and the client would then join with no exchange at all rather
+    /// than refusing or keeping the last good pin.
+    #[test]
+    fn a_refused_key_keeps_the_one_already_configured() {
+        let good = [7u8; EXCHANGE_KEY_LEN];
+        let mut slot = None;
+
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Key(good));
+        assert_eq!(slot, Some(good), "a well-formed key is seated");
+
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Refused);
+        assert_eq!(
+            slot,
+            Some(good),
+            "a refused call leaves the configured key alone"
+        );
+    }
+
+    /// Clearing stays available, and is what an empty array asks for. Without this the refusal above
+    /// would have taken the deliberate clear with it.
+    #[test]
+    fn an_empty_key_clears_and_a_refusal_does_not() {
+        let mut slot = Some([9u8; EXCHANGE_KEY_LEN]);
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Refused);
+        assert!(slot.is_some(), "refused leaves it");
+        OrbitNet::apply_exchange_key(&mut slot, ExchangeKeyInput::Clear);
+        assert_eq!(slot, None, "an empty array clears it");
+    }
+
+    /// The acceptor's public key is derived when the row is drawn, so answering a retried hello reads it
+    /// back rather than running a basepoint multiply per datagram an unauthenticated peer sends.
+    #[test]
+    fn the_rows_public_key_is_the_one_its_secret_derives() {
+        let row = pending([1u8; KEY_LEN], 5);
+        assert_eq!(
+            row.acceptor_public,
+            exchange_public_key(&row.acceptor_ephemeral),
+            "the cached public half matches the secret it was drawn from"
+        );
+    }
+
+    /// The row `drawn(seed)` produces against `joiner`.
+    fn pending(joiner: [u8; KEY_LEN], seed: u8) -> PendingJoin {
+        PendingJoin {
+            joiner_nonce: joiner,
+            acceptor_nonce: nonce_bytes(seed),
+            acceptor_ephemeral: [seed; EXCHANGE_KEY_LEN],
+            acceptor_public: exchange_public_key(&[seed; EXCHANGE_KEY_LEN]),
+            joiner_exchange: [0u8; EXCHANGE_KEY_LEN],
+            exchange: None,
+        }
+    }
+
+    /// A non-zero low-order point: `p - 1`, order 2. Every clamped scalar takes it to the identity, so
+    /// the Diffie-Hellman is non-contributory whatever this acceptor's secret was.
+    fn low_order_point() -> [u8; EXCHANGE_KEY_LEN] {
+        let mut point = [0xffu8; EXCHANGE_KEY_LEN];
+        point[0] = 0xec;
+        point[EXCHANGE_KEY_LEN - 1] = 0x7f;
+        point
+    }
+
+    #[test]
+    fn a_non_contributory_joiner_half_refuses_the_hello_rather_than_downgrading_it() {
+        // **The downgrade the three outcomes exist to separate.** An on-path attacker rewrites
+        // `joiner_exchange` to a low-order point on both hello legs. It is non-zero, so
+        // `offered_static_key` passes it through — a server that answered `NotOffered` here would
+        // fold no secret in, skip the confirmation check with it, and seat the connection on the key
+        // both wire nonce halves alone produce, which the attacker also holds.
+        let static_secret = [0x11u8; EXCHANGE_KEY_LEN];
+        let ephemeral = [0x33u8; EXCHANGE_KEY_LEN];
+        let honest = exchange_public_key(&[0x22u8; EXCHANGE_KEY_LEN]);
+
+        assert_eq!(
+            acceptor_exchange(Some(&static_secret), &ephemeral, &low_order_point()),
+            ExchangeOutcome::NonContributory
+        );
+        // And the two ordinary outcomes stay distinct from it, so the refusal above is the third
+        // state and not a rename of either.
+        assert_eq!(
+            acceptor_exchange(None, &ephemeral, &honest),
+            ExchangeOutcome::NotOffered,
+            "this acceptor holds no static key"
+        );
+        assert_eq!(
+            acceptor_exchange(Some(&static_secret), &ephemeral, &[0u8; EXCHANGE_KEY_LEN]),
+            ExchangeOutcome::NotOffered,
+            "the joiner offered no half"
+        );
+        assert_eq!(
+            acceptor_exchange(Some(&static_secret), &ephemeral, &honest),
+            ExchangeOutcome::Derived(
+                acceptor_exchange_secret(&static_secret, &ephemeral, &honest).unwrap()
+            )
+        );
+    }
+
     #[test]
     fn the_acceptor_half_is_minted_once_per_connection_and_joiner_half() {
-        let mut challenges: HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])> = HashMap::new();
+        let mut challenges: HashMap<i32, PendingJoin> = HashMap::new();
         let joiner = nonce_bytes(31);
-        let first = challenge_half(&mut challenges, 7, joiner, || nonce_bytes(131));
-        assert_eq!(first, nonce_bytes(131), "the first hello draws");
+        let first = challenge_half(&mut challenges, 7, joiner, || drawn(131));
+        assert_eq!(first, pending(joiner, 131), "the first hello draws");
         // A RETRIED HELLO REPEATS ITS HALF AND MUST GET THE SAME ANSWER. Re-minting would refuse the
         // confirmation the joiner is already sending, which provokes another hello, and the two ends
         // chase each other for as long as the loss lasts. The closure panics to prove no draw happened.
@@ -15158,32 +15778,34 @@ mod tests {
         // ANOTHER CONNECTION IS ANOTHER JOIN, even carrying the same joiner half — which is the shape
         // an observer replaying a recorded hello from its own socket arrives in.
         assert_eq!(
-            challenge_half(&mut challenges, 8, joiner, || nonce_bytes(138)),
-            nonce_bytes(138)
+            challenge_half(&mut challenges, 8, joiner, || drawn(138)),
+            pending(joiner, 138)
         );
         // A DIFFERENT JOINER HALF IS A RESTARTED SESSION, and it draws again — which is what makes the
         // key change and `handle_hello`'s rekey comparison notice.
-        let restarted = challenge_half(&mut challenges, 7, nonce_bytes(32), || nonce_bytes(132));
-        assert_eq!(restarted, nonce_bytes(132));
+        let restarted = challenge_half(&mut challenges, 7, nonce_bytes(32), || drawn(132));
+        assert_eq!(restarted, pending(nonce_bytes(32), 132));
         assert_ne!(restarted, first);
-        assert_eq!(
-            challenges.get(&7),
-            Some(&(nonce_bytes(32), nonce_bytes(132)))
-        );
+        assert_eq!(challenges.get(&7), Some(&pending(nonce_bytes(32), 132)));
         // And the half the restarted session replaced is gone, so a confirmation against it is not
         // seated. A replayed join is exactly that shape: a joiner half this connection is not on.
         assert_eq!(
-            challenge_half(&mut challenges, 7, joiner, || nonce_bytes(133)),
-            nonce_bytes(133),
+            challenge_half(&mut challenges, 7, joiner, || drawn(133)),
+            pending(joiner, 133),
             "the old pair was replaced, not kept beside the new one"
         );
+        // The exchange ephemeral rides the same row and is replaced with it, never on its own: the
+        // joiner confirms against the public half it was challenged with, so a re-drawn ephemeral
+        // would refuse a confirmation already in flight exactly as a re-drawn nonce would.
+        assert_ne!(first.acceptor_ephemeral, restarted.acceptor_ephemeral);
     }
 
     #[test]
     fn only_a_confirmation_quoting_the_issued_half_is_seated() {
-        let mut challenges: HashMap<i32, ([u8; KEY_LEN], [u8; KEY_LEN])> = HashMap::new();
+        let mut challenges: HashMap<i32, PendingJoin> = HashMap::new();
         let joiner = nonce_bytes(51);
         let issued = nonce_bytes(151);
+        let row = pending(joiner, 151);
         let opening = Handshake {
             joiner_nonce: joiner,
             acceptor_nonce: [0u8; KEY_LEN],
@@ -15191,15 +15813,15 @@ mod tests {
         };
         // THE OPENING LEG is challenged and seats nothing.
         assert_eq!(
-            hello_leg(&mut challenges, 7, &opening, || issued),
-            HelloLeg::Challenge(issued)
+            hello_leg(&mut challenges, 7, &opening, || drawn(151)),
+            HelloLeg::Challenge(row)
         );
         // A RETRIED OPENING HELLO is challenged again with the SAME half, and draws nothing.
         assert_eq!(
             hello_leg(&mut challenges, 7, &opening, || panic!(
                 "a retry must not re-mint"
             )),
-            HelloLeg::Challenge(issued)
+            HelloLeg::Challenge(row)
         );
         // A CONFIRMATION QUOTING A HALF THIS ACCEPTOR NEVER ISSUED is challenged, not seated. This is
         // the case a replayed join lands in, and the case a client holding a stale half converges from.
@@ -15213,7 +15835,7 @@ mod tests {
                 hello_leg(&mut challenges, 7, &confirmation, || panic!(
                     "a mismatch must not re-mint"
                 )),
-                HelloLeg::Challenge(issued),
+                HelloLeg::Challenge(row),
                 "a nonzero half this acceptor did not issue is still only challenged"
             );
         }
@@ -15226,7 +15848,7 @@ mod tests {
             hello_leg(&mut challenges, 7, &confirmation, || panic!(
                 "a confirmation must not re-mint"
             )),
-            HelloLeg::Confirm(issued)
+            HelloLeg::Confirm(row)
         );
         // AND IT IS STILL SEATED ON THE RETRY, because a confirmation is retried until the welcome
         // lands and the row has to outlive the leg that seats the session.
@@ -15234,13 +15856,13 @@ mod tests {
             hello_leg(&mut challenges, 7, &confirmation, || panic!(
                 "a retried confirmation must not re-mint"
             )),
-            HelloLeg::Confirm(issued)
+            HelloLeg::Confirm(row)
         );
         // THE SAME CONFIRMATION FROM ANOTHER CONNECTION IS NOT SEATED. An observer that recorded a
         // whole join and replays both legs from its own socket is challenged on a half drawn now.
         assert_eq!(
-            hello_leg(&mut challenges, 8, &confirmation, || nonce_bytes(158)),
-            HelloLeg::Challenge(nonce_bytes(158))
+            hello_leg(&mut challenges, 8, &confirmation, || drawn(158)),
+            HelloLeg::Challenge(pending(joiner, 158))
         );
     }
 
@@ -15251,15 +15873,16 @@ mod tests {
         let named = Challenge {
             joiner_nonce: joiner,
             acceptor_nonce: acceptor,
+            acceptor_exchange: [0u8; EXCHANGE_KEY_LEN],
         };
         // Nothing to answer yet, and a challenge for somebody else's join.
         assert_eq!(
-            challenge_answer(None, None, &named),
+            challenge_answer(None, None, false, &named),
             ChallengeAnswer::Ignore,
             "a client that has drawn no half of its own"
         );
         assert_eq!(
-            challenge_answer(Some(nonce_bytes(42)), None, &named),
+            challenge_answer(Some(nonce_bytes(42)), None, false, &named),
             ChallengeAnswer::Ignore,
             "a challenge echoing a half this client is not on"
         );
@@ -15269,9 +15892,10 @@ mod tests {
             challenge_answer(
                 Some(joiner),
                 None,
+                false,
                 &Challenge {
                     joiner_nonce: nonce_bytes(40),
-                    acceptor_nonce: acceptor,
+                    ..named
                 }
             ),
             ChallengeAnswer::Ignore
@@ -15281,9 +15905,10 @@ mod tests {
             challenge_answer(
                 Some(joiner),
                 None,
+                false,
                 &Challenge {
-                    joiner_nonce: joiner,
                     acceptor_nonce: [0u8; KEY_LEN],
+                    ..named
                 }
             ),
             ChallengeAnswer::Ignore
@@ -15292,16 +15917,129 @@ mod tests {
         // disturbing the key, and a DIFFERENT half is adopted rather than refused — which is what makes
         // the join self-healing when the acceptor no longer holds the pending half.
         assert_eq!(
-            challenge_answer(Some(joiner), None, &named),
+            challenge_answer(Some(joiner), None, false, &named),
             ChallengeAnswer::Adopt
         );
         assert_eq!(
-            challenge_answer(Some(joiner), Some(acceptor), &named),
+            challenge_answer(Some(joiner), Some(acceptor), false, &named),
             ChallengeAnswer::Confirm
         );
         assert_eq!(
-            challenge_answer(Some(joiner), Some(nonce_bytes(142)), &named),
+            challenge_answer(Some(joiner), Some(nonce_bytes(142)), false, &named),
             ChallengeAnswer::Adopt
+        );
+    }
+
+    /// **A pinned client refuses a downgrade.** The exchange is authenticated by the pin and by nothing
+    /// else, so a challenge carrying no exchange key is refused rather than seated — otherwise anything
+    /// on the path strips 32 bytes and the client joins on the key that observer can compute, while
+    /// reporting a security property it does not have.
+    #[test]
+    fn a_pinned_client_refuses_a_challenge_that_offers_no_exchange() {
+        let joiner = nonce_bytes(61);
+        let bare = Challenge {
+            joiner_nonce: joiner,
+            acceptor_nonce: nonce_bytes(161),
+            acceptor_exchange: [0u8; EXCHANGE_KEY_LEN],
+        };
+        assert_eq!(
+            challenge_answer(Some(joiner), None, true, &bare),
+            ChallengeAnswer::Unauthenticated
+        );
+        // And a retried challenge is refused too, rather than confirmed against a key already seated:
+        // this client never seated one.
+        assert_eq!(
+            challenge_answer(Some(joiner), Some(nonce_bytes(161)), true, &bare),
+            ChallengeAnswer::Unauthenticated
+        );
+        // A client that pinned nothing takes the same frame, which is what keeps a server holding a
+        // static key usable by clients that have not been given the public half.
+        assert_eq!(
+            challenge_answer(Some(joiner), None, false, &bare),
+            ChallengeAnswer::Adopt
+        );
+        // And an offered exchange is adopted normally.
+        let offered = Challenge {
+            acceptor_exchange: [0x9a; EXCHANGE_KEY_LEN],
+            ..bare
+        };
+        assert_eq!(
+            challenge_answer(Some(joiner), None, true, &offered),
+            ChallengeAnswer::Adopt
+        );
+        // A challenge for another join is still ignored rather than reported as a downgrade: the pin
+        // says nothing about a frame this client is not waiting for.
+        assert_eq!(
+            challenge_answer(Some(nonce_bytes(62)), None, true, &bare),
+            ChallengeAnswer::Ignore
+        );
+    }
+
+    /// The join's two ends, end to end, through the same free functions production uses: a pinned
+    /// client and a server holding the matching static key derive one key, and an on-path attacker
+    /// holding every public value on the wire derives another.
+    #[test]
+    fn a_pinned_join_keys_on_a_value_an_on_path_observer_cannot_compute() {
+        let server_static = [0x11u8; EXCHANGE_KEY_LEN];
+        let server_public = exchange_public_key(&server_static);
+        let client_ephemeral = [0x22u8; EXCHANGE_KEY_LEN];
+        let server_ephemeral = [0x33u8; EXCHANGE_KEY_LEN];
+        let joiner = nonce_bytes(71);
+        let acceptor = nonce_bytes(171);
+
+        let client_side = joiner_exchange_secret(
+            &client_ephemeral,
+            &server_public,
+            &exchange_public_key(&server_ephemeral),
+        )
+        .unwrap();
+        let server_side = acceptor_exchange_secret(
+            &server_static,
+            &server_ephemeral,
+            &exchange_public_key(&client_ephemeral),
+        )
+        .unwrap();
+        assert_eq!(client_side, server_side, "both ends derive the same secret");
+
+        let key = session_key_from(
+            fold_secrets(None, Some(&client_side)).as_ref(),
+            joiner,
+            acceptor,
+        );
+        // The observer. It read both nonce halves and both exchange public keys — every byte the join
+        // put on the wire — and holds no secret half, so the only key it can derive is the one the
+        // unpinned regime uses.
+        let observer = session_key_from(None, joiner, acceptor);
+        assert_ne!(key, observer);
+        let mut datagram = b"input for tick 1".to_vec();
+        SessionAuth::new(key)
+            .seal(Direction::ToServer, &mut datagram)
+            .unwrap();
+        // `open` takes the caller's scratch buffer: with no secret it is untouched, and under one the
+        // plaintext lands there. One signature covers both regimes.
+        let mut plain = Vec::new();
+        assert_eq!(
+            SessionAuth::new(observer).open(Direction::ToServer, &datagram, &mut plain),
+            Err(AuthError::BadTag),
+            "the observer's key opens nothing this session sealed"
+        );
+
+        // An imposter running its own exchange is refused by the pin: it answers with an ephemeral of
+        // its own and cannot supply the static half, so the client derives bytes it cannot match.
+        let imposter_static = [0x44u8; EXCHANGE_KEY_LEN];
+        let imposter_side = acceptor_exchange_secret(
+            &imposter_static,
+            &[0x55u8; EXCHANGE_KEY_LEN],
+            &exchange_public_key(&client_ephemeral),
+        )
+        .unwrap();
+        assert_ne!(
+            session_key_from(
+                fold_secrets(None, Some(&imposter_side)).as_ref(),
+                joiner,
+                acceptor
+            ),
+            key
         );
     }
 

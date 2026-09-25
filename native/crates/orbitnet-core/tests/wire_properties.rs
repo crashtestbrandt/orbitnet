@@ -106,7 +106,7 @@
 
 use orbitnet_core::auth::{
     compress_secret, derive_cipher_key, siphash24, AuthError, Direction, ReplayWindow, SessionAuth,
-    SipHasher, CIPHER_TRAILER_LEN, KEY_LEN, SEQ_LEN, TRAILER_LEN,
+    SipHasher, CIPHER_TRAILER_LEN, EXCHANGE_KEY_LEN, KEY_LEN, SEQ_LEN, TRAILER_LEN,
 };
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
@@ -457,6 +457,7 @@ fn arb_handshake() -> impl Strategy<Value = Handshake> {
         any::<u64>(),
         any::<[u8; KEY_LEN]>(),
         any::<u64>(),
+        any::<[u8; EXCHANGE_KEY_LEN]>(),
     )
         .prop_map(
             |(
@@ -467,6 +468,7 @@ fn arb_handshake() -> impl Strategy<Value = Handshake> {
                 resume_token,
                 acceptor_nonce,
                 confirm,
+                joiner_exchange,
             )| {
                 Handshake {
                     protocol_version,
@@ -476,6 +478,7 @@ fn arb_handshake() -> impl Strategy<Value = Handshake> {
                     resume_token,
                     acceptor_nonce,
                     confirm,
+                    joiner_exchange,
                 }
             },
         )
@@ -1326,15 +1329,16 @@ proptest! {
         prop_assert_eq!(Handshake::decode(&handshake.encode())?, handshake);
     }
 
-    /// The challenge, which carries both nonce halves and nothing else. Fixed width, so the property
-    /// that matters is that neither half is swapped for the other on the way back -- a swap is
+    /// The challenge, which carries both nonce halves and the acceptor's exchange key. Fixed width, so
+    /// the property that matters is that no field is swapped for another on the way back -- a swap is
     /// invisible to a length check and would key the two ends differently.
     #[test]
     fn a_challenge_round_trips(
         joiner_nonce in any::<[u8; KEY_LEN]>(),
         acceptor_nonce in any::<[u8; KEY_LEN]>(),
+        acceptor_exchange in any::<[u8; EXCHANGE_KEY_LEN]>(),
     ) {
-        let challenge = Challenge { joiner_nonce, acceptor_nonce };
+        let challenge = Challenge { joiner_nonce, acceptor_nonce, acceptor_exchange };
         let bytes = challenge.encode();
         let mut reader = Reader::new(&bytes);
         prop_assert_eq!(reader.u8()?, FrameKind::Challenge.tag());

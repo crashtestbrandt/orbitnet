@@ -216,12 +216,26 @@ are game decisions, and any default here would be wrong for somebody.
   nonce halves, one drawn by each end**: the joiner sends its half in its opening handshake, the server
   answers with a half of its own, and the joiner confirms. A client may send nothing until the server's half
   lands, because half of the key's input is the server's. An attacker who cannot read the session's traffic
-  cannot forge a datagram, and one connected peer cannot forge another's, but with no secret configured the
-  fold is a public function of two values that are both on the wire, so **an on-path observer who reads the
-  exchange can do everything the client can**.
+  cannot forge a datagram, and one connected peer cannot forge another's, but with neither secret configured
+  the fold is a public function of two values that are both on the wire, so **an on-path observer who reads
+  the exchange can do everything the client can**.
 - **`Net.set_session_secret()` closes that, and the secret has to come from a channel the game already
   authenticates** — a lobby, a matchmaker ticket. The halves stay what they are; the key becomes a derivation
   over the secret and their fold, so an observer reading the whole exchange learns nothing.
+- **`Net.set_pinned_server_key()` closes it for a game that has no such channel.** The server holds a static
+  X25519 key (`Net.set_server_static_key()`) and publishes the public half; the client pins that half, the
+  join's two existing legs carry an ephemeral key each, and the session key is derived from an exchange only
+  the holder of the static secret can complete. **The pin is what authenticates the server** — an
+  unauthenticated exchange is substituted by exactly the on-path attacker it defends against, so a client
+  that pinned nothing runs none, and a client that pinned a key refuses a join the server answered without
+  one rather than downgrading. **A pinned public key demands less of its channel than a shared secret
+  does**: integrity and no confidentiality, so it may ship inside the build, and a peer holding it can
+  verify the server while being unable to impersonate it. That is why a secret cannot reach a game with no
+  account service and this can.
+  **It authenticates the server to the client and nobody else**; refusing a client is still what the secret,
+  the resume token and the transport are for. **A server whose key changes every session cannot be pinned**,
+  so a player-hosted listen server reached by a direct-connect address box stays on the bullets above. Trust
+  on first use is not offered.
 - **A recorded join can no longer be replayed.** The server draws its half fresh per connection, so an
   observer presenting a handshake it captured is challenged on a half it has never seen: it cannot produce
   the confirmation, and the session it would open is keyed on bytes that are not the recorded key. What this
@@ -236,12 +250,10 @@ are game decisions, and any default here would be wrong for somebody.
   and it is zero for a session that configures no secret;
   [docs/protocol.md](docs/protocol.md#what-a-session-secret-encrypts) measures it and states what a secret
   still does not hide — how many datagrams go out, when, and how long each one is.
-- **A key exchange is still not implemented.** An X25519 exchange would remove the out-of-band secret. An
-  **unauthenticated** one would not close the on-path forgery above — it is substituted by exactly that
-  attacker, and buys only a demotion to passive-only. An **authenticated** one is open work: it was priced at
-  several hundred lines of hand-written constant-time field arithmetic because `orbitnet-core`'s empty
-  `[dependencies]` was read as a rule, and that reading has been settled against, so a vetted implementation
-  is the option — which is what the payload cipher above already is.
+- **A key exchange removes the out-of-band secret, and the pin is what authenticates it.** X25519 over the
+  join's two existing legs derives the session key from bytes only the holder of the server's static secret
+  can produce. An **unauthenticated** exchange would not close the on-path forgery above — it is substituted
+  by exactly that attacker — which is why a client that pinned nothing runs none.
   [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
 - **A harness holds the tag compare to constant time.**
   `native/crates/orbitnet-core/tests/constant_time.rs` asserts that the compare's own source, compiled on its
@@ -249,8 +261,10 @@ are game decisions, and any default here would be wrong for somebody.
   differing in which tag byte is wrong are separable by timing. The branch assertion runs on every pull
   request. The measurement is `just native-timing`, and it gates no pull request, because a shared CI
   runner's noise floor is too high for its verdict to mean anything — a nightly job runs it on the
-  self-hosted box instead. **It covers that ten-line compare and nothing else** — not the field arithmetic
-  an exchange would need, and not the payload cipher, whose own tag compare is the dependency's.
+  self-hosted box instead. **It covers that ten-line compare and nothing else** — not the payload cipher,
+  whose own tag compare is the dependency's, and not the curve arithmetic under the key exchange, whose
+  constant-time properties are `x25519-dalek`'s claim and that project's review rather than a measurement
+  taken here.
 - **Transport encryption is a second, independent layer, and a session may have either or both.** An ENet
   session carries every payload in the clear unless a session secret is configured. A Steam session's packets
   are encrypted and its peer identity authenticated by SteamNetworkingSockets, whatever OrbitNet does on top.

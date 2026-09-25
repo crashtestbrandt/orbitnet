@@ -25,35 +25,29 @@
 //! be written here at all instead of taken as a dependency. That shape does not generalise: a stream cipher
 //! is close to it, an elliptic curve is not.
 //!
-//! **The key is folded from two nonces, one drawn by each end, and from a session secret when the game
-//! supplies one.** The joiner sends its half in the handshake, the acceptor answers with a half of its
-//! own, and both ends fold the pair into the session nonce with [`session_nonce`]. With no secret that
-//! fold is a public function of two values an observer can read, so what this authenticates is a
-//! datagram's membership in a session, not a peer's identity:
+//! **The key is folded from two nonces, one drawn by each end, and from up to two secrets.** The joiner
+//! sends its half in the handshake, the acceptor answers with a half of its own, and both ends fold the
+//! pair into the session nonce with [`session_nonce`]. A session may then add a secret the game
+//! distributed, an X25519 key exchange, both, or neither. With neither, the fold is a public function of
+//! two values an observer can read, so what this authenticates is a datagram's membership in a session
+//! rather than a peer's identity:
 //!
 //! - An attacker who cannot read the session's traffic cannot forge a datagram at all, whatever
 //!   sender id it puts on it. That is the case the transport does not cover.
 //! - One connected peer cannot forge another's datagrams: each session has its own key.
-//! - **An on-path observer who can read the exchange can do everything the client can.** With no
-//!   session secret both halves are in the clear — one in the handshake, one in the challenge — so the
-//!   fold is a public function of public values, and an observer that read both frames holds the key.
-//!   A secret both ends already hold narrows it, with the derivation below and no new dependency.
+//! - **An on-path observer who can read the exchange can do everything the client can.** With neither
+//!   secret configured both halves are in the clear — one in the handshake, one in the challenge — so
+//!   the fold is a public function of public values, and an observer that read both frames holds the
+//!   key. Either secret narrows it.
 //!
-//!   An X25519 exchange is not implemented. Unauthenticated ECDH is substituted by exactly the on-path
-//!   attacker in question, so it would demote this adversary to passive-only and buy nothing else --
-//!   that refusal stands on its own. An AUTHENTICATED exchange is open work: it was priced at several
-//!   hundred lines of hand-written constant-time field arithmetic because this crate's empty
-//!   `[dependencies]` was read as a rule, and that reading has been settled against. A vetted
-//!   implementation is preferred to a hand-written one; `Cargo.toml`'s header states what one has to
-//!   clear. `README.md` records the same for a reader who never opens this file.
-//!
-//!   **`tests/constant_time.rs` is the timing harness that decision said was missing.** It asserts
-//!   that `tags_equal`'s source, compiled on its own under each shipped profile's flags, emits no
-//!   branch, and that two refused datagrams differing in which tag byte is wrong are not separable
-//!   by a t-test against a tolerance it measures on the box it runs on. It covers this compare and
-//!   nothing else: field arithmetic written here later would need its own coverage on top of it.
-//!   The branch assertion is in `just native-test`; `just native-timing` runs the measurement by
-//!   hand, and no job runs it.
+//! **`tests/constant_time.rs` is the timing harness.** It asserts that `tags_equal`'s source, compiled
+//! on its own under each shipped profile's flags, emits no branch, and that two refused datagrams
+//! differing in which tag byte is wrong are not separable by a t-test against a tolerance it measures
+//! on the box it runs on. It covers this compare and nothing else. The curve arithmetic below is a
+//! dependency's and is covered by that dependency's own review, not by this harness; nothing
+//! hand-written here past the compare needs constant time, because SipHash has no secret-dependent
+//! branch or table lookup by construction. The branch assertion is in `just native-test`;
+//! `just native-timing` runs the measurement by hand, and no job runs it.
 //!
 //! ## Deriving the key from a secret both ends already hold
 //!
@@ -108,6 +102,56 @@
 //! there would buy nothing: both halves of the nonce the key is folded from cross the wire, so an
 //! observer that read the join computes the key that hid the payload.
 //!
+//! ## Deriving the key from an exchange, against an acceptor key the joiner pinned
+//!
+//! The regime above needs a secret both ends already hold, which needs a channel the game already
+//! authenticated. A game with no account service has none. [`joiner_exchange_secret`] and
+//! [`acceptor_exchange_secret`] are the other answer: an X25519 exchange on the two legs the join
+//! already has, authenticated by an acceptor **static public key the joiner pinned before it
+//! connected**.
+//!
+//! **What authenticates the acceptor is the pin and nothing else.** The exchange contributes two
+//! Diffie-Hellman values: one between the joiner's ephemeral and the pinned static key, which only the
+//! holder of that key's secret half can compute, and one between the two ephemerals, which is what
+//! keeps a static secret leaked later from recovering a recorded join. An exchange with no pinned key
+//! is substituted by exactly the on-path attacker it defends against, so **an unpinned joiner does not
+//! run one**, and a pinned joiner refuses a join the acceptor answered with no exchange.
+//!
+//! **The pin is a public key and the session secret is a shared one, and that is the whole difference.**
+//! Both have to reach the client out of band; what they demand of that channel is not the same.
+//!
+//! | | A session secret | A pinned acceptor key |
+//! | --- | --- | --- |
+//! | What the client holds | the same bytes the acceptor holds | the public half only |
+//! | What the channel must provide | integrity **and** confidentiality | integrity |
+//! | May it ship inside the game build | no — every player then holds it | yes — it is public by design |
+//! | Can a holder impersonate the acceptor | yes | no |
+//! | Per what | per trust domain, rotated per lobby or ticket | per acceptor identity, for that key's life |
+//! | What a recording is worth if the credential leaks later | every past session's key | nothing, because of the ephemeral half |
+//!
+//! **That difference is what makes the exchange available to a game with no account service.** A
+//! published key, a key baked into the build, a key in a server-browser row — all are channels with
+//! integrity and no confidentiality, and all of them carry a pin. None of them can carry a secret.
+//!
+//! **It authenticates the acceptor to the joiner and nobody to anybody else.** The joiner is anonymous:
+//! anyone who can reach the acceptor runs the exchange and derives a key. Refusing a joiner is what the
+//! session secret, the resume token and the transport are for, and none of them moves here.
+//!
+//! **Where a pin cannot come from.** An acceptor whose key changes every session — a listen server a
+//! player hosts, reached through a direct-connect address box — has nothing to pin. That case stays on
+//! the regime it is on, and the limits above are its limits. Trust on first use is not offered: it is
+//! unauthenticated on exactly the join an attacker is present for, and a client that believed its answer
+//! would report a security property it does not have.
+//!
+//! Two ceilings the exchange does not lift, on top of the three above:
+//!
+//! - **The key is still 128 bits and the tag still 64.** X25519's own level is higher than either, so
+//!   what bounds a forged datagram is unchanged.
+//! - **It encrypts nothing.** It changes who can derive the key. Every payload is still in the clear.
+//!
+//! [`fold_secrets`] is what lets a game configure both: the exchange's output and a supplied secret
+//! fold into the one input [`derive_session_key`] takes.
+//!
 //! ## Both ends contribute a nonce, which is what refuses a replayed join
 //!
 //! **While the nonce was the joiner's alone, an observer could present a recorded one again.** The
@@ -154,6 +198,8 @@
 
 use chacha20poly1305::aead::inout::InOutBuf;
 use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit};
+
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 /// Bytes of session key. 128 bits, the SipHash key width.
 pub const KEY_LEN: usize = 16;
@@ -571,6 +617,170 @@ pub fn confirm_tag(key: &[u8; KEY_LEN], nonce: &[u8; KEY_LEN], protocol_version:
     hasher.write(nonce);
     hasher.write(&protocol_version.to_le_bytes());
     hasher.finish()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The key exchange
+// ---------------------------------------------------------------------------------------------
+
+/// Bytes of an X25519 key, secret or public. Both are 32.
+pub const EXCHANGE_KEY_LEN: usize = 32;
+
+/// Domain label keying the low half of the exchange fold. Exactly [`KEY_LEN`] bytes, as a SipHash key.
+pub const EXCHANGE_LABEL_LOW: [u8; KEY_LEN] = *b"orbitnet-exch-lo";
+
+/// Domain label keying the high half of the exchange fold. Exactly [`KEY_LEN`] bytes, as a SipHash key.
+pub const EXCHANGE_LABEL_HIGH: [u8; KEY_LEN] = *b"orbitnet-exch-hi";
+
+/// Domain label prefixing the low half of [`fold_secrets`].
+pub const MIXED_SECRET_LABEL_LOW: &[u8] = b"orbitnet-mixed-lo";
+
+/// Domain label prefixing the high half of [`fold_secrets`].
+pub const MIXED_SECRET_LABEL_HIGH: &[u8] = b"orbitnet-mixed-hi";
+
+/// The public key matching an X25519 secret.
+///
+/// The acceptor publishes this and the joiner pins it; the two ephemerals put theirs on the wire. A
+/// secret is 32 bytes of any value — X25519 clamps the scalar rather than rejecting one — so this is
+/// total and a game may hand it whatever its CSPRNG produced.
+#[must_use]
+pub fn exchange_public_key(secret: &[u8; EXCHANGE_KEY_LEN]) -> [u8; EXCHANGE_KEY_LEN] {
+    PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
+}
+
+/// The exchange's contribution to the session key, computed by the **joiner**.
+///
+/// `ephemeral` is this join's ephemeral secret, `pinned_static` the acceptor's long-lived public key
+/// this client trusts, and `acceptor_ephemeral_public` the half the [`crate::codec::Challenge`]
+/// carried. `None` means the exchange produced nothing usable and the join must be refused; see
+/// [`exchange_fold`] for which inputs cause it.
+#[must_use]
+pub fn joiner_exchange_secret(
+    ephemeral: &[u8; EXCHANGE_KEY_LEN],
+    pinned_static: &[u8; EXCHANGE_KEY_LEN],
+    acceptor_ephemeral_public: &[u8; EXCHANGE_KEY_LEN],
+) -> Option<[u8; KEY_LEN]> {
+    let ephemeral = StaticSecret::from(*ephemeral);
+    let joiner_public = PublicKey::from(&ephemeral).to_bytes();
+    let to_static = ephemeral.diffie_hellman(&PublicKey::from(*pinned_static));
+    let to_ephemeral = ephemeral.diffie_hellman(&PublicKey::from(*acceptor_ephemeral_public));
+    exchange_fold(
+        pinned_static,
+        &joiner_public,
+        acceptor_ephemeral_public,
+        &to_static,
+        &to_ephemeral,
+    )
+}
+
+/// The exchange's contribution to the session key, computed by the **acceptor**.
+///
+/// `static_secret` is the long-lived secret whose public half joiners pin, `ephemeral` this join's
+/// ephemeral secret, and `joiner_ephemeral_public` the half the opening
+/// [`crate::codec::Handshake`] carried. `None` has the same meaning as on the joiner's side.
+#[must_use]
+pub fn acceptor_exchange_secret(
+    static_secret: &[u8; EXCHANGE_KEY_LEN],
+    ephemeral: &[u8; EXCHANGE_KEY_LEN],
+    joiner_ephemeral_public: &[u8; EXCHANGE_KEY_LEN],
+) -> Option<[u8; KEY_LEN]> {
+    let static_secret = StaticSecret::from(*static_secret);
+    let ephemeral = StaticSecret::from(*ephemeral);
+    let static_public = PublicKey::from(&static_secret).to_bytes();
+    let acceptor_public = PublicKey::from(&ephemeral).to_bytes();
+    let joiner = PublicKey::from(*joiner_ephemeral_public);
+    let to_static = static_secret.diffie_hellman(&joiner);
+    let to_ephemeral = ephemeral.diffie_hellman(&joiner);
+    exchange_fold(
+        &static_public,
+        joiner_ephemeral_public,
+        &acceptor_public,
+        &to_static,
+        &to_ephemeral,
+    )
+}
+
+/// Both shared values and the three public keys, folded to [`KEY_LEN`] bytes.
+///
+/// **Two Diffie-Hellman values, and they answer different questions.**
+///
+/// | Value | Between | What it is for |
+/// | --- | --- | --- |
+/// | `to_static` | the joiner's ephemeral and the acceptor's **pinned static** key | authentication: only the holder of the pinned key's secret half can compute it |
+/// | `to_ephemeral` | the two ephemerals | forward secrecy: a static secret leaked later does not recover a recorded join's key |
+///
+/// **All three public keys are folded in with them**, which binds the result to the transcript. An
+/// attacker that substitutes an ephemeral in flight makes the two ends fold different bytes, so the
+/// keys differ and the confirmation fails; an attacker that swapped one without this would have both
+/// ends agree on a key derived from values only one of them chose.
+///
+/// **A non-contributory result is refused.** The all-zero public key, and the other low-order points,
+/// force a shared value of zero whatever the other side's secret was — so a peer that reads it as a key
+/// is keying on a value the attacker chose. `was_contributory` is the constant-time check for it, and
+/// either value failing refuses the whole exchange.
+///
+/// **The fold is SipHash and not a standard KDF**, the same two-pass construction
+/// [`compress_secret`] uses on a game-supplied secret, with the labels as keys and the transcript as the
+/// message. It is not HKDF and claims nothing HKDF claims. What bounds this exchange is downstream of
+/// it: the key is 128 bits and the tag it protects is 64, so a wider fold would change no number a
+/// reader of this module cares about, and it would cost a hash dependency to produce.
+fn exchange_fold(
+    static_public: &[u8; EXCHANGE_KEY_LEN],
+    joiner_public: &[u8; EXCHANGE_KEY_LEN],
+    acceptor_public: &[u8; EXCHANGE_KEY_LEN],
+    to_static: &SharedSecret,
+    to_ephemeral: &SharedSecret,
+) -> Option<[u8; KEY_LEN]> {
+    if !to_static.was_contributory() || !to_ephemeral.was_contributory() {
+        return None;
+    }
+    let mut low = SipHasher::new(&EXCHANGE_LABEL_LOW);
+    let mut high = SipHasher::new(&EXCHANGE_LABEL_HIGH);
+    for hasher in [&mut low, &mut high] {
+        hasher.write(static_public);
+        hasher.write(joiner_public);
+        hasher.write(acceptor_public);
+        hasher.write(to_static.as_bytes());
+        hasher.write(to_ephemeral.as_bytes());
+    }
+    Some(join_halves(low.finish(), high.finish()))
+}
+
+/// The one secret [`derive_session_key`] takes, from the two a session may hold.
+///
+/// `supplied` is [`compress_secret`]'s output for a secret the game distributed; `exchanged` is
+/// [`joiner_exchange_secret`] or [`acceptor_exchange_secret`]. Both are optional and independent, so
+/// there are four cases:
+///
+/// | `supplied` | `exchanged` | Result |
+/// | --- | --- | --- |
+/// | `None` | `None` | `None` — the key is the session nonce alone, and an on-path observer holds it |
+/// | `Some` | `None` | the supplied secret |
+/// | `None` | `Some` | the exchange's output |
+/// | `Some` | `Some` | a fold of the two, keyed on the supplied secret |
+///
+/// **Configuring both is at least as strong as either**, because the fold is a keyed PRF of one over
+/// the other: an attacker has to hold the supplied secret AND break the exchange. A game with a lobby
+/// token and a published server key does not have to choose.
+#[must_use]
+pub fn fold_secrets(
+    supplied: Option<&[u8; KEY_LEN]>,
+    exchanged: Option<&[u8; KEY_LEN]>,
+) -> Option<[u8; KEY_LEN]> {
+    match (supplied, exchanged) {
+        (None, None) => None,
+        (Some(supplied), None) => Some(*supplied),
+        (None, Some(exchanged)) => Some(*exchanged),
+        (Some(supplied), Some(exchanged)) => {
+            let mut low = SipHasher::new(supplied);
+            low.write(MIXED_SECRET_LABEL_LOW);
+            low.write(exchanged);
+            let mut high = SipHasher::new(supplied);
+            high.write(MIXED_SECRET_LABEL_HIGH);
+            high.write(exchanged);
+            Some(join_halves(low.finish(), high.finish()))
+        }
+    }
 }
 
 /// Compare two tags without branching on their contents.
@@ -1927,5 +2137,256 @@ mod tests {
         budget.open(0);
         assert!(budget.admit());
         assert_eq!(budget.blocks(), 1);
+    }
+    // --- the key exchange ---------------------------------------------------------------------
+
+    /// One acceptor static secret, one acceptor ephemeral and one joiner ephemeral, all distinct.
+    const ACCEPTOR_STATIC: [u8; EXCHANGE_KEY_LEN] = [0x11; EXCHANGE_KEY_LEN];
+    const ACCEPTOR_EPHEMERAL: [u8; EXCHANGE_KEY_LEN] = [0x22; EXCHANGE_KEY_LEN];
+    const JOINER_EPHEMERAL: [u8; EXCHANGE_KEY_LEN] = [0x33; EXCHANGE_KEY_LEN];
+
+    /// Both sides of one honest exchange, as the join runs it.
+    fn honest_exchange() -> (Option<[u8; KEY_LEN]>, Option<[u8; KEY_LEN]>) {
+        let acceptor_static_public = exchange_public_key(&ACCEPTOR_STATIC);
+        let acceptor_ephemeral_public = exchange_public_key(&ACCEPTOR_EPHEMERAL);
+        let joiner_ephemeral_public = exchange_public_key(&JOINER_EPHEMERAL);
+        (
+            joiner_exchange_secret(
+                &JOINER_EPHEMERAL,
+                &acceptor_static_public,
+                &acceptor_ephemeral_public,
+            ),
+            acceptor_exchange_secret(
+                &ACCEPTOR_STATIC,
+                &ACCEPTOR_EPHEMERAL,
+                &joiner_ephemeral_public,
+            ),
+        )
+    }
+
+    /// The whole point: two peers that never exchanged a secret arrive at the same 16 bytes, and an
+    /// observer who read every public value on the wire cannot produce them.
+    #[test]
+    fn both_ends_of_an_honest_exchange_derive_the_same_secret() {
+        let (joiner, acceptor) = honest_exchange();
+        assert_eq!(joiner, acceptor);
+        assert!(joiner.is_some());
+        assert_ne!(joiner.unwrap(), [0u8; KEY_LEN]);
+    }
+
+    /// **The pin is what authenticates the acceptor.** A joiner pinning some other acceptor's key runs
+    /// the exchange to completion and derives different bytes, so its confirmation fails and the
+    /// acceptor's reply does not open at it. This is the check the whole scheme rests on.
+    #[test]
+    fn a_joiner_pinning_another_key_derives_a_different_secret() {
+        let imposter_static = [0x44; EXCHANGE_KEY_LEN];
+        let joiner = joiner_exchange_secret(
+            &JOINER_EPHEMERAL,
+            &exchange_public_key(&imposter_static),
+            &exchange_public_key(&ACCEPTOR_EPHEMERAL),
+        );
+        let (_, acceptor) = honest_exchange();
+        assert!(joiner.is_some());
+        assert_ne!(joiner, acceptor);
+    }
+
+    /// An on-path attacker that substitutes the acceptor's **ephemeral** cannot supply the static half, so
+    /// the two ends disagree. It holds the ephemeral secret it injected and the acceptor's public key,
+    /// which is everything an observer has, and it is not enough.
+    #[test]
+    fn substituting_the_acceptor_ephemeral_breaks_the_agreement() {
+        let attacker_ephemeral = [0x55; EXCHANGE_KEY_LEN];
+        let joiner = joiner_exchange_secret(
+            &JOINER_EPHEMERAL,
+            &exchange_public_key(&ACCEPTOR_STATIC),
+            &exchange_public_key(&attacker_ephemeral),
+        );
+        let (honest_joiner, acceptor) = honest_exchange();
+        assert_ne!(joiner, acceptor);
+        assert_ne!(joiner, honest_joiner);
+    }
+
+    /// And substituting the **joiner's** ephemeral breaks it from the other direction: the acceptor folds
+    /// the key it received, the joiner folds the one it sent, and the transcript differs even before
+    /// the shared values do.
+    #[test]
+    fn substituting_the_joiner_ephemeral_breaks_the_agreement() {
+        let attacker_ephemeral = [0x66; EXCHANGE_KEY_LEN];
+        let acceptor = acceptor_exchange_secret(
+            &ACCEPTOR_STATIC,
+            &ACCEPTOR_EPHEMERAL,
+            &exchange_public_key(&attacker_ephemeral),
+        );
+        let (joiner, _) = honest_exchange();
+        assert_ne!(joiner, acceptor);
+    }
+
+    /// **A low-order public key is refused rather than keyed on.** The all-zero key forces a shared
+    /// value of zero whatever the other side's secret was, so a peer that accepted it would key on
+    /// bytes the attacker chose. Both DH values are checked, so either position refuses the exchange.
+    #[test]
+    fn a_non_contributory_public_key_refuses_the_exchange() {
+        let zero = [0u8; EXCHANGE_KEY_LEN];
+        assert_eq!(
+            joiner_exchange_secret(
+                &JOINER_EPHEMERAL,
+                &zero,
+                &exchange_public_key(&ACCEPTOR_EPHEMERAL)
+            ),
+            None,
+            "an all-zero pinned key"
+        );
+        assert_eq!(
+            joiner_exchange_secret(
+                &JOINER_EPHEMERAL,
+                &exchange_public_key(&ACCEPTOR_STATIC),
+                &zero
+            ),
+            None,
+            "an all-zero acceptor ephemeral"
+        );
+        assert_eq!(
+            acceptor_exchange_secret(&ACCEPTOR_STATIC, &ACCEPTOR_EPHEMERAL, &zero),
+            None,
+            "and an all-zero joiner ephemeral"
+        );
+        // A NON-ZERO low-order point, `p - 1`. The all-zero arms above are the easy case and a caller
+        // may screen for them by value; this one cannot be told from an honest key without doing the
+        // arithmetic, so it is the value the check has to catch.
+        let mut order_two = [0xffu8; EXCHANGE_KEY_LEN];
+        order_two[0] = 0xec;
+        order_two[EXCHANGE_KEY_LEN - 1] = 0x7f;
+        assert_eq!(
+            acceptor_exchange_secret(&ACCEPTOR_STATIC, &ACCEPTOR_EPHEMERAL, &order_two),
+            None,
+            "a non-zero low-order joiner ephemeral"
+        );
+        assert_eq!(
+            joiner_exchange_secret(
+                &JOINER_EPHEMERAL,
+                &exchange_public_key(&ACCEPTOR_STATIC),
+                &order_two
+            ),
+            None,
+            "and a non-zero low-order acceptor ephemeral"
+        );
+    }
+
+    /// **The three public keys bind the fold to the transcript**, and this is the test that fails if
+    /// they stop being folded in. Every other exchange test varies a secret, so the two Diffie-Hellman
+    /// values already differ and the assertion passes on those alone; here the shared values are held
+    /// identical and only the transcript moves, which is the substitution
+    /// [`exchange_fold`]'s header says the binding refuses.
+    #[test]
+    fn the_fold_binds_the_three_public_keys() {
+        let a = StaticSecret::from(ACCEPTOR_STATIC);
+        let b = StaticSecret::from(JOINER_EPHEMERAL);
+        let to_static = a.diffie_hellman(&PublicKey::from(&b));
+        let to_ephemeral = b.diffie_hellman(&PublicKey::from(&a));
+        let fold = |static_public, joiner_public, acceptor_public| {
+            exchange_fold(
+                &static_public,
+                &joiner_public,
+                &acceptor_public,
+                &to_static,
+                &to_ephemeral,
+            )
+            .expect("an honest pair of shared values is contributory")
+        };
+        let base = fold(
+            [1u8; EXCHANGE_KEY_LEN],
+            [2u8; EXCHANGE_KEY_LEN],
+            [3u8; EXCHANGE_KEY_LEN],
+        );
+        assert_ne!(
+            base,
+            fold(
+                [9u8; EXCHANGE_KEY_LEN],
+                [2u8; EXCHANGE_KEY_LEN],
+                [3u8; EXCHANGE_KEY_LEN]
+            ),
+            "the acceptor's static public key"
+        );
+        assert_ne!(
+            base,
+            fold(
+                [1u8; EXCHANGE_KEY_LEN],
+                [9u8; EXCHANGE_KEY_LEN],
+                [3u8; EXCHANGE_KEY_LEN]
+            ),
+            "the joiner's ephemeral public key"
+        );
+        assert_ne!(
+            base,
+            fold(
+                [1u8; EXCHANGE_KEY_LEN],
+                [2u8; EXCHANGE_KEY_LEN],
+                [9u8; EXCHANGE_KEY_LEN]
+            ),
+            "the acceptor's ephemeral public key"
+        );
+    }
+
+    /// A fresh ephemeral per join is what makes the derived secret per-join, the same property the
+    /// nonce halves have. Reusing one would hand every session of that acceptor the same key.
+    #[test]
+    fn a_fresh_joiner_ephemeral_changes_the_secret() {
+        let (first, _) = honest_exchange();
+        let second = joiner_exchange_secret(
+            &[0x77; EXCHANGE_KEY_LEN],
+            &exchange_public_key(&ACCEPTOR_STATIC),
+            &exchange_public_key(&ACCEPTOR_EPHEMERAL),
+        );
+        assert_ne!(first, second);
+    }
+
+    /// A public key is a pure function of its secret, and two different secrets do not share one.
+    #[test]
+    fn a_public_key_is_derived_from_its_secret() {
+        assert_eq!(
+            exchange_public_key(&ACCEPTOR_STATIC),
+            exchange_public_key(&ACCEPTOR_STATIC)
+        );
+        assert_ne!(
+            exchange_public_key(&ACCEPTOR_STATIC),
+            exchange_public_key(&ACCEPTOR_EPHEMERAL)
+        );
+    }
+
+    /// The four cases a session can be in, and the one that matters: configuring both secrets produces
+    /// bytes that are neither of them, so an attacker holding one still has to break the other.
+    #[test]
+    fn folding_two_secrets_depends_on_both() {
+        let supplied = compress_secret(b"a lobby token");
+        let exchanged = honest_exchange().0.unwrap();
+        assert_eq!(fold_secrets(None, None), None);
+        assert_eq!(fold_secrets(Some(&supplied), None), Some(supplied));
+        assert_eq!(fold_secrets(None, Some(&exchanged)), Some(exchanged));
+        let both = fold_secrets(Some(&supplied), Some(&exchanged)).unwrap();
+        assert_ne!(both, supplied);
+        assert_ne!(both, exchanged);
+        assert_eq!(
+            fold_secrets(Some(&supplied), Some(&exchanged)),
+            Some(both),
+            "and it is deterministic, or the two ends would not agree"
+        );
+        assert_ne!(
+            fold_secrets(Some(&exchanged), Some(&supplied)),
+            Some(both),
+            "the two arguments are not interchangeable"
+        );
+    }
+
+    /// The exchange feeds the derivation that already exists, so a session under it seats a key
+    /// neither half of the wire nonce decides and the confirm tag recomputes over it.
+    #[test]
+    fn an_exchanged_secret_keys_a_session_end_to_end() {
+        let exchanged = honest_exchange().0.unwrap();
+        let nonce = session_nonce(&[1; KEY_LEN], &[2; KEY_LEN]);
+        let key = derive_session_key(&fold_secrets(None, Some(&exchanged)).unwrap(), &nonce);
+        assert_ne!(key, nonce, "the exchange changed the key");
+        let tag = confirm_tag(&key, &nonce, 0x0009_0000);
+        assert_eq!(tag, confirm_tag(&key, &nonce, 0x0009_0000));
+        assert_ne!(tag, confirm_tag(&nonce, &nonce, 0x0009_0000));
     }
 }

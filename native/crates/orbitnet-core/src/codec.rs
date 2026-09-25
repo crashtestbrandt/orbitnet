@@ -20,7 +20,7 @@
 use core::fmt;
 use std::collections::BTreeMap;
 
-use crate::auth::{confirm_tag, derive_session_key, session_nonce, KEY_LEN};
+use crate::auth::{confirm_tag, derive_session_key, session_nonce, EXCHANGE_KEY_LEN, KEY_LEN};
 use crate::columnar::changed_mask;
 use crate::protocol::{protocol_major, PropSchema, PROTOCOL_VERSION};
 use crate::seats::SeatIndex;
@@ -67,12 +67,13 @@ pub enum CodecError {
     /// this is refused at [`Handshake::check_compatibility`] and not at [`Handshake::check_hello`],
     /// which is the check an acceptor runs before it spends a nonce answering.
     MissingAcceptorNonce,
-    /// This peer holds a **session secret** and the remote handshake could not confirm the same one:
-    /// its [`Handshake::confirm`] tag is absent, or it is a tag over some other secret.
+    /// This peer derived a **session secret** and the remote handshake could not confirm the same one:
+    /// its [`Handshake::confirm`] tag is absent, or it is a tag over other bytes.
     ///
-    /// One side configured a secret and the other did not, or the two were handed different bytes.
-    /// See [`Handshake::check_compatibility`] for which direction of that misconfiguration this
-    /// reports and which one cannot be reported at all.
+    /// Two configurations reach it. One side set a session secret and the other did not, or the two
+    /// were handed different bytes; or the joiner ran the key exchange against a pinned acceptor key
+    /// that is not this acceptor's. See [`Handshake::check_compatibility`] for which direction of a
+    /// misconfiguration this reports and which one cannot be reported at all.
     SecretMismatch,
 }
 
@@ -102,9 +103,10 @@ impl fmt::Display for CodecError {
             ),
             CodecError::SecretMismatch => write!(
                 f,
-                "OrbitNet handshake could not confirm this session's shared secret. This peer holds \
-                 one and the joining peer proved a different one, or none at all. Both ends must be \
-                 handed the same secret before they start."
+                "OrbitNet handshake could not confirm this session's derived secret. This peer holds \
+                 one and the joining peer proved a different one, or none at all. Either the two ends \
+                 were handed different session secrets, or the joiner pinned a server key that is not \
+                 this server's."
             ),
         }
     }
@@ -624,9 +626,11 @@ impl FrameHeader {
 /// | the joiner's confirmation | the challenged half, quoted back | the tag, under a secret | [`Self::check_compatibility`], then seat the session |
 ///
 /// The key is [`crate::auth::session_nonce`] of the two halves, fed to
-/// [`crate::auth::derive_session_key`] when a session secret is configured and seated verbatim when one
-/// is not. The offsets and widths are identical either way; the regime is a local decision neither end
-/// puts on the wire.
+/// [`crate::auth::derive_session_key`] when the session holds a secret and seated verbatim when it holds
+/// none. A secret is [`crate::auth::fold_secrets`]'s output over what the game supplied and what the key
+/// exchange produced, so a session may hold one, the other, both or neither. The offsets and widths are
+/// identical in every case; which secrets are in force is a local decision neither end puts on the wire.
+/// [`Self::joiner_exchange`] is the one exception and says only whether an exchange is offered.
 ///
 /// **The confirmation is a whole handshake rather than a smaller frame of its own**, which costs 41
 /// bytes it could have saved on a once-per-join reliable frame. What it buys is that an acceptor stores
@@ -712,13 +716,32 @@ pub struct Handshake {
     /// against nothing. What that observer still cannot do is derive the key, which is the whole of what
     /// a secret buys.
     pub confirm: u64,
+    /// The joiner's **ephemeral X25519 public key** for this join, or all zeroes for "this peer offers
+    /// no key exchange".
+    ///
+    /// **A joiner sends one only when it has pinned an acceptor static key.** The exchange is
+    /// authenticated by that pin and by nothing else, so a joiner with no pin would be running one
+    /// against whoever answered — which is the on-path attacker the exchange exists to refuse.
+    /// [`crate::auth`] carries the reasoning.
+    ///
+    /// **The same value rides both legs**, because the ephemeral is minted once per join beside
+    /// [`Self::joiner_nonce`]. The acceptor reads it off whichever leg it is answering, and a leg
+    /// carrying a different value derives a different key — so the confirmation fails and the join is
+    /// refused. Changing it between legs is therefore a denial of service rather than a downgrade, which
+    /// is a capability an on-path attacker has anyway.
+    ///
+    /// **A trailing, optional field.** All zeroes is the absent value and is also a low-order point, so
+    /// a peer that treated it as a key would be refused by the exchange's own contributory check rather
+    /// than keying on it.
+    pub joiner_exchange: [u8; EXCHANGE_KEY_LEN],
 }
 
 impl Handshake {
     /// Build a handshake for this build at `tickrate`. Carries no session identity, neither nonce, no
-    /// resume token and no confirmation; see [`Handshake::with_session`],
+    /// resume token, no confirmation and no exchange key; see [`Handshake::with_session`],
     /// [`Handshake::with_joiner_nonce`], [`Handshake::with_acceptor_nonce`],
-    /// [`Handshake::with_resume_token`] and [`Handshake::with_confirm`].
+    /// [`Handshake::with_resume_token`], [`Handshake::with_confirm`] and
+    /// [`Handshake::with_joiner_exchange`].
     #[must_use]
     pub fn local(tickrate: u16) -> Self {
         Self {
@@ -729,6 +752,7 @@ impl Handshake {
             resume_token: 0,
             acceptor_nonce: [0; KEY_LEN],
             confirm: 0,
+            joiner_exchange: [0; EXCHANGE_KEY_LEN],
         }
     }
 
@@ -775,10 +799,19 @@ impl Handshake {
         self
     }
 
+    /// The same handshake, offering this join's ephemeral public key to the exchange.
+    ///
+    /// A caller sets it only when it holds a pinned acceptor static key; see [`Self::joiner_exchange`].
+    #[must_use]
+    pub fn with_joiner_exchange(mut self, joiner_exchange: [u8; EXCHANGE_KEY_LEN]) -> Self {
+        self.joiner_exchange = joiner_exchange;
+        self
+    }
+
     /// Encode, including the leading magic.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(MAGIC.len() + 30 + 2 * KEY_LEN);
+        let mut writer = Writer::with_capacity(MAGIC.len() + 30 + 2 * KEY_LEN + EXCHANGE_KEY_LEN);
         writer.bytes(&MAGIC);
         writer.u32(self.protocol_version);
         writer.u16(self.tickrate);
@@ -787,13 +820,15 @@ impl Handshake {
         writer.u64(self.resume_token);
         writer.bytes(&self.acceptor_nonce);
         writer.u64(self.confirm);
+        writer.bytes(&self.joiner_exchange);
         writer.into_inner()
     }
 
     /// Decode, validating the magic.
     ///
     /// **Everything after the protocol version decodes best-effort**, to a zero tick rate, no session
-    /// identity, two all-zero nonces, a `0` resume token and a `0` confirmation. That is not laxity:
+    /// identity, two all-zero nonces, a `0` resume token, a `0` confirmation and no exchange key. That is
+    /// not laxity:
     /// `handle_hello` answers a decode error by returning, so a peer whose handshake is short — an older
     /// build, a truncated frame — would be dropped in silence with no rejection message at all. Decoding
     /// it far enough to reach [`Handshake::check_compatibility`] is what produces the operator-readable
@@ -803,7 +838,8 @@ impl Handshake {
     /// token is what a first-time joiner does. An all-zero [`Self::acceptor_nonce`] is the absent value
     /// too, and it is what an opening hello carries by definition. A `0` [`Self::confirm`] is refused
     /// nothing either, unless the reading peer holds a secret — see
-    /// [`Handshake::check_compatibility`].
+    /// [`Handshake::check_compatibility`]. An all-zero [`Self::joiner_exchange`] declines the key
+    /// exchange, which is what every joiner holding no pin sends.
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         let mut reader = Reader::new(buf);
         if reader.bytes(MAGIC.len())? != MAGIC {
@@ -822,6 +858,10 @@ impl Handshake {
             acceptor_nonce.copy_from_slice(bytes);
         }
         let confirm = reader.u64().unwrap_or(0);
+        let mut joiner_exchange = [0u8; EXCHANGE_KEY_LEN];
+        if let Ok(bytes) = reader.bytes(EXCHANGE_KEY_LEN) {
+            joiner_exchange.copy_from_slice(bytes);
+        }
         Ok(Self {
             protocol_version,
             tickrate,
@@ -830,6 +870,7 @@ impl Handshake {
             resume_token,
             acceptor_nonce,
             confirm,
+            joiner_exchange,
         })
     }
 
@@ -877,9 +918,12 @@ impl Handshake {
     ///    which is answered with a [`Challenge`] rather than seated. An acceptor that tracks which half
     ///    it issued compares against that instead, and this rule is what is left for a caller that does
     ///    not.
-    /// 4. **A peer holding a secret must see a [`Self::confirm`] tag over that secret.** `secret` is the
-    ///    already-folded 16 bytes from [`crate::auth::compress_secret`]; the tag is recomputed from the
+    /// 4. **A peer holding a secret must see a [`Self::confirm`] tag over that secret.** `secret` is
+    ///    [`crate::auth::fold_secrets`]'s output over the game-supplied secret and the key exchange's,
+    ///    so `Some` covers a session holding either or both; the tag is recomputed from the
     ///    [`crate::auth::session_nonce`] of the remote's two halves and its version, and compared.
+    ///    A joiner whose exchange derived different bytes — it pinned some other acceptor's key — fails
+    ///    here exactly as one holding the wrong session secret does.
     ///
     /// **Rule 4 reads both halves, which is what refuses a replayed join.** A confirmation captured off
     /// a recorded join is a tag over that join's folded nonce, and the acceptor's half of this one was
@@ -927,7 +971,7 @@ impl Handshake {
 /// without already holding them.
 ///
 /// ```text
-/// frame kind 0x05 | joiner nonce echoed (16) | acceptor nonce (16)
+/// frame kind 0x05 | joiner nonce echoed (16) | acceptor nonce (16) | acceptor exchange key (32)
 /// ```
 ///
 /// **The acceptor's half is drawn per join, and that is what refuses a replayed one.** An observer
@@ -952,33 +996,53 @@ pub struct Challenge {
     pub joiner_nonce: [u8; KEY_LEN],
     /// The acceptor's half of the session nonce, drawn fresh for this join.
     pub acceptor_nonce: [u8; KEY_LEN],
+    /// The acceptor's **ephemeral X25519 public key** for this join, or all zeroes for "this acceptor
+    /// runs no key exchange".
+    ///
+    /// **All zeroes whenever either end declined.** The acceptor sends one only when it holds a static
+    /// key AND the opening [`Handshake::joiner_exchange`] offered one, so a joiner with no pin is
+    /// answered with zeroes and costs the acceptor no curve arithmetic.
+    ///
+    /// **A pinned joiner refuses a join answered with zeroes.** Falling back would let an attacker
+    /// strip 32 bytes and take the whole exchange away; the refusal is what makes the pin binding.
+    pub acceptor_exchange: [u8; EXCHANGE_KEY_LEN],
 }
 
 impl Challenge {
     /// Encode, with the frame kind tag leading.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(1 + 2 * KEY_LEN);
+        let mut writer = Writer::with_capacity(1 + 2 * KEY_LEN + EXCHANGE_KEY_LEN);
         writer.u8(FrameKind::Challenge.tag());
         writer.bytes(&self.joiner_nonce);
         writer.bytes(&self.acceptor_nonce);
+        writer.bytes(&self.acceptor_exchange);
         writer.into_inner()
     }
 
     /// Decode the payload after the kind tag has been consumed.
     ///
-    /// **Neither field decodes best-effort.** Both are required, unlike the handshake's trailing options:
+    /// **Neither nonce decodes best-effort.** Both are required, unlike the handshake's trailing options:
     /// reading a short challenge as all-zero bytes would have the joiner derive a key off a field that was
     /// never sent, and then fail every tag with nothing to say why. A joiner answers the error by waiting
     /// for its own handshake retry, which is the same recovery a lost challenge gets.
+    ///
+    /// **[`Self::acceptor_exchange`] does decode best-effort**, to all zeroes, because for that field the
+    /// absent value is a decision rather than a truncation: an acceptor running no exchange sends exactly
+    /// those bytes. A joiner holding a pin refuses either way, by name, rather than keying on them.
     pub fn decode(reader: &mut Reader<'_>) -> Result<Self, CodecError> {
         let mut joiner_nonce = [0u8; KEY_LEN];
         joiner_nonce.copy_from_slice(reader.bytes(KEY_LEN)?);
         let mut acceptor_nonce = [0u8; KEY_LEN];
         acceptor_nonce.copy_from_slice(reader.bytes(KEY_LEN)?);
+        let mut acceptor_exchange = [0u8; EXCHANGE_KEY_LEN];
+        if let Ok(bytes) = reader.bytes(EXCHANGE_KEY_LEN) {
+            acceptor_exchange.copy_from_slice(bytes);
+        }
         Ok(Self {
             joiner_nonce,
             acceptor_nonce,
+            acceptor_exchange,
         })
     }
 }
@@ -2124,17 +2188,22 @@ mod tests {
         assert_eq!(decoded.acceptor_nonce, TEST_ACCEPTOR);
     }
 
-    /// The challenge is the acceptor's whole contribution, and both of its fields are load-bearing:
-    /// the echo tells a joiner this challenge is for the join it is in, and the half is what the key
-    /// folds in.
+    /// The challenge is the acceptor's whole contribution, and every field is load-bearing: the echo
+    /// tells a joiner this challenge is for the join it is in, the half is what the key folds in, and
+    /// the exchange key is what a pinned joiner authenticates the acceptor with.
     #[test]
     fn a_challenge_round_trips() {
         let challenge = Challenge {
             joiner_nonce: TEST_NONCE,
             acceptor_nonce: TEST_ACCEPTOR,
+            acceptor_exchange: [0x5c; EXCHANGE_KEY_LEN],
         };
         let bytes = challenge.encode();
-        assert_eq!(bytes.len(), 1 + 2 * KEY_LEN, "kind byte then two halves");
+        assert_eq!(
+            bytes.len(),
+            1 + 2 * KEY_LEN + EXCHANGE_KEY_LEN,
+            "kind byte, two halves, then the exchange key"
+        );
         assert_eq!(bytes[0], FrameKind::Challenge.tag());
         assert_eq!(FrameKind::from_tag(bytes[0]), Ok(FrameKind::Challenge));
         let mut reader = Reader::new(&bytes);
@@ -2144,15 +2213,17 @@ mod tests {
 
     /// NEITHER HALF DECODES BEST-EFFORT. A short challenge read as all-zero bytes would have the joiner
     /// derive its key off a field that was never sent, and then fail every tag with nothing to say why.
-    /// The joiner answers the error by waiting for its own handshake retry.
+    /// The joiner answers the error by waiting for its own handshake retry. The trailing exchange key is
+    /// the one field that does decode best-effort, so the sweep stops where it begins.
     #[test]
     fn a_truncated_challenge_is_an_error_rather_than_a_zero_half() {
         let bytes = Challenge {
             joiner_nonce: TEST_NONCE,
             acceptor_nonce: TEST_ACCEPTOR,
+            acceptor_exchange: [0x5c; EXCHANGE_KEY_LEN],
         }
         .encode();
-        for keep in 1..bytes.len() {
+        for keep in 1..=2 * KEY_LEN {
             let mut reader = Reader::new(&bytes[1..keep]);
             assert_eq!(
                 Challenge::decode(&mut reader),
@@ -2211,17 +2282,18 @@ mod tests {
         assert_ne!(decoded.confirm, 0, "a held secret produces a real tag");
     }
 
-    /// Every field at its declared width in its declared order, and the acceptor's half appended after
-    /// the resume token so the confirmation stays the last field on the frame.
+    /// Every field at its declared width in its declared order, and each new one appended so the
+    /// fields in front of it keep their offsets.
     #[test]
     fn the_handshake_layout_is_the_declared_widths_in_the_declared_order() {
         let bytes = confirmation_under(&test_secret(), TEST_NONCE, TEST_ACCEPTOR)
             .with_session(7)
             .with_resume_token(11)
+            .with_joiner_exchange([0x77; EXCHANGE_KEY_LEN])
             .encode();
         assert_eq!(
             bytes.len(),
-            MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8 + KEY_LEN + 8
+            MAGIC.len() + 4 + 2 + 8 + KEY_LEN + 8 + KEY_LEN + 8 + EXCHANGE_KEY_LEN
         );
         let nonce_at = MAGIC.len() + 4 + 2 + 8;
         assert_eq!(&bytes[nonce_at..nonce_at + KEY_LEN], &TEST_NONCE[..]);
@@ -2235,6 +2307,11 @@ mod tests {
             &bytes[acceptor_at..acceptor_at + KEY_LEN],
             &TEST_ACCEPTOR[..],
             "and the acceptor's half directly after the token"
+        );
+        assert_eq!(
+            &bytes[acceptor_at + KEY_LEN + 8..],
+            &[0x77; EXCHANGE_KEY_LEN][..],
+            "and the exchange key last, after the confirm tag"
         );
     }
 
@@ -2301,16 +2378,18 @@ mod tests {
         );
     }
 
-    /// The confirmation is the newest trailing field and decodes to `0` — "this peer configured no
-    /// secret" — when it is absent. `0` is refused nothing by a peer that holds no secret either, which is
-    /// what keeps a session with no secret configured on exactly the path it was on before.
+    /// The confirmation decodes to `0` — "this peer configured no secret" — when it is absent. `0` is
+    /// refused nothing by a peer that holds no secret either, which is what keeps a session with no
+    /// secret configured on exactly the path it was on before. The exchange key behind it decodes to
+    /// all zeroes for the same reason, so the sweep runs over the confirmation's own eight bytes.
     #[test]
     fn a_handshake_truncated_before_its_confirm_tag_decodes_to_no_confirmation() {
         let full = confirmation_under(&test_secret(), TEST_NONCE, TEST_ACCEPTOR)
             .with_session(7)
             .with_resume_token(0x0123_4567_89ab_cdef);
         let bytes = full.encode();
-        for keep in (bytes.len() - 8)..bytes.len() {
+        let confirm_end = bytes.len() - EXCHANGE_KEY_LEN;
+        for keep in (confirm_end - 8)..confirm_end {
             let decoded = Handshake::decode(&bytes[..keep]).unwrap();
             assert_eq!(decoded.confirm, 0, "keep {keep}");
             assert_eq!(

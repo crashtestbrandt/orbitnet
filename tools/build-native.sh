@@ -54,6 +54,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NATIVE="$ROOT/native"
 
+# WHERE CARGO ACTUALLY PUTS THE ARTIFACTS, which is not always `native/target`. A contributor with a shared
+# cargo cache sets `CARGO_TARGET_DIR`, cargo honours it, and a script that reads `$NATIVE/target` then finds
+# nothing: on macOS `lipo` reported "no eligible inputs found" after two builds that had both succeeded.
+# Asking cargo rather than assuming keeps the two in agreement.
+TARGET_ROOT="${CARGO_TARGET_DIR:-$NATIVE/target}"
+
 DEFAULT_PROFILES=(template_debug template_release)
 
 usage() {
@@ -426,15 +432,15 @@ build)
 				fi
 			done
 			lipo -create -output "$OUTDIR/$ship" \
-				"$NATIVE/target/x86_64-apple-darwin/$CARGO_DIR/$BUILT_NAME" \
-				"$NATIVE/target/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
+				"$TARGET_ROOT/x86_64-apple-darwin/$CARGO_DIR/$BUILT_NAME" \
+				"$TARGET_ROOT/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
 			lipo -info "$OUTDIR/$ship"
 		else
 			TARGET_ARGS=()
-			outdir="$NATIVE/target/$CARGO_DIR"
+			outdir="$TARGET_ROOT/$CARGO_DIR"
 			if [ -n "$CROSS_TARGET" ]; then
 				TARGET_ARGS=(--target "$CROSS_TARGET")
-				outdir="$NATIVE/target/$CROSS_TARGET/$CARGO_DIR"
+				outdir="$TARGET_ROOT/$CROSS_TARGET/$CARGO_DIR"
 			fi
 			if [ "${#RUSTC_ARGS[@]}" -gt 0 ]; then
 				( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" "${TARGET_ARGS[@]}" -p orbitnet-godot -- "${RUSTC_ARGS[@]}" )

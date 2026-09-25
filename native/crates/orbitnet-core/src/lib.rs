@@ -2,7 +2,8 @@
 //!
 //! Nothing in this crate knows about Godot. Every type is a plain-data structure with pure
 //! behavior, which is what lets the whole thing be exercised by `cargo test` in milliseconds
-//! instead of standing up a scene tree, a physics world and two peers.
+//! instead of standing up a scene tree, a physics world and two peers. `x25519-dalek` is the one
+//! runtime dependency, and `Cargo.toml`'s header states what it had to clear.
 //!
 //! The split mirrors the four costs that motivated moving off the GDScript backend (see
 //! docs/architecture.md):
@@ -15,8 +16,9 @@
 //!   `memcmp` changed-masks, masked merges. No `Variant`, no per-tick allocation.
 //! * [`protocol`] — property schema description and the schema hash peers agree on.
 //! * [`codec`] — the wire encoding: varints, frame headers, handshake, entity blocks.
-//! * [`auth`] — what the receive path refuses: the per-datagram tag, the replay window, and the
-//!   per-peer input budget, plus the payload cipher a session secret switches on.
+//! * [`auth`] — what the receive path refuses: the per-datagram MAC, the replay window, and the
+//!   per-peer input budget, plus the payload cipher a session secret switches on and the X25519
+//!   exchange a session's key may be derived from.
 //! * [`freshness`] — the #67 fix: per-(entity, tick) input confidence, so `is_fresh` keys on
 //!   input *novelty* rather than tick visitation, plus the tick-indexed memo ring.
 //! * [`interest`] — AOI: the uniform grid, per-seat interest sets with hysteresis, and the
@@ -46,8 +48,9 @@ pub mod slots;
 pub mod tick;
 
 pub use auth::{
-    compress_secret, confirm_tag, derive_cipher_key, derive_session_key, session_nonce, AuthError,
-    Direction, ReceiveBudget, ReplayWindow, SessionAuth, CIPHER_KEY_LEN, KEY_LEN,
+    acceptor_exchange_secret, compress_secret, confirm_tag, derive_cipher_key, derive_session_key,
+    exchange_public_key, fold_secrets, joiner_exchange_secret, session_nonce, AuthError, Direction,
+    ReceiveBudget, ReplayWindow, SessionAuth, CIPHER_KEY_LEN, EXCHANGE_KEY_LEN, KEY_LEN,
 };
 pub use clock::ClockEstimator;
 pub use codec::{Challenge, CodecError, FrameHeader, FrameKind, Handshake, Reader, Writer};
