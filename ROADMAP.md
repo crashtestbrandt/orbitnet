@@ -59,13 +59,7 @@ Parent: [#105](https://github.com/crashtestbrandt/orbitnet/issues/105) `epic(rel
 
 | Item | Issue | Why now |
 | --- | --- | --- |
-| The send path is single-threaded | [#91](https://github.com/crashtestbrandt/orbitnet/issues/91) | `docs/architecture.md:214` already names what is movable and why a worker pool should be feature-gated above a peer threshold. Parent [#106](https://github.com/crashtestbrandt/orbitnet/issues/106) `epic(perf)`, not this tier's: it is send-path cost, and neither it nor #65 can be accepted before Tier 1 has a recorded baseline. |
-
-## Also filed
-
-| Issue | Item |
-| --- | --- |
-| [#65](https://github.com/crashtestbrandt/orbitnet/issues/65) | The `ss3` respack paid per admitted block on the send path, below current bench resolution. Parent [#106](https://github.com/crashtestbrandt/orbitnet/issues/106) `epic(perf)`, with #91. |
+| The send path is single-threaded | [#91](https://github.com/crashtestbrandt/orbitnet/issues/91) | `docs/architecture.md:214` already names what is movable and why a worker pool should be feature-gated above a peer threshold. Parent [#106](https://github.com/crashtestbrandt/orbitnet/issues/106) `epic(perf)`, not this tier's: it is send-path cost. Its deliverable is a peer threshold **measured rather than picked**, so it waits on Tier 1 having netbench history the threshold can be read off. |
 
 ## Recorded and not scheduled
 
