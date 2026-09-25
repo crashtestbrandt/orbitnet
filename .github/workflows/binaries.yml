@@ -143,12 +143,25 @@ jobs:
       # AFTER THE UPLOAD, deliberately. The artifact is what you need in order to debug a smoke failure, so
       # it is published before anything can fail.
       #
-      # THE LINUX LEG SKIPS ALL OF THIS. check.yml's `godot` job already runs the load smoke and the four
-      # unit suites on Linux for every pull request; repeating them here would buy nothing and would need
-      # Godot installed on a third box.
+      # ONLY THE LEGS WHOSE OWN RUNNER CAN LOAD WHAT THEY BUILT, named rather than excluded. Loading is the
+      # whole point of these steps, so the condition is "this box can `dlopen` this artifact":
+      #
+      #   windows      builds x86_64 on an x86_64 box. Loads.
+      #   macos        builds a UNIVERSAL dylib on an arm64 box, so the fat file carries a slice this
+      #                runner can load.
+      #   linux        skipped because check.yml's `godot` job already runs the load smoke and the four
+      #                unit suites on Linux for every pull request. Repeating them buys nothing.
+      #   linux_arm64  CROSS-BUILT on the x86_64 Linux box, so its artifact cannot be loaded by the runner
+      #                that produced it at all. Nothing here can execute it, and a step that tried would
+      #                fail on every run.
+      #
+      # AN ALLOWLIST, NOT `!= 'linux'`. That test read correctly while there were three legs and admitted
+      # `linux_arm64` the moment a fourth arrived -- it would have staged an aarch64 library where the
+      # descriptor resolves it and handed it to Godot on an x86_64 host. A new leg now has to opt in, which
+      # is the safe direction for a condition about what a machine can execute.
       # =================================================================================================
       - name: Check Godot on this runner
-        if: matrix.platform != 'linux'
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -172,7 +185,7 @@ jobs:
       # compile the same two profiles again and prove less: it would no longer be the uploaded artifact
       # under test.
       - name: Install the freshly built library where the descriptor resolves it
-        if: matrix.platform != 'linux'
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
         shell: bash
         run: |
           set -euo pipefail
@@ -188,7 +201,7 @@ jobs:
       # exported properties bind, signals reach GDScript, ticks advance, and freeing a registered entity
       # does not panic the frame. See the script header for which half proves what.
       - name: Extension load smoke (throwaway project)
-        if: matrix.platform != 'linux'
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
         shell: bash
         run: tools/orbitnet-smoke.sh --skip-build
 
@@ -196,7 +209,7 @@ jobs:
       # physics and no sockets. The probes are the expensive third layer and are deliberately not here --
       # they are multi-process, they bind UDP ports, and they are slow.
       - name: Unit suites
-        if: matrix.platform != 'linux'
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
         shell: bash
         run: |
           set -euo pipefail

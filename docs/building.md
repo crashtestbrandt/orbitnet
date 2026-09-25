@@ -175,7 +175,8 @@ On an arm64 Linux host none of this applies. `tools/build-native.sh host` report
 `check.yml` runs all of its jobs on `ubuntu-latest` and cannot speak for the other two platforms. A bad
 `[libraries]` entry, a wrong-architecture build or a missing entry symbol fails at `dlopen` on the affected
 platform and nowhere else, so a Linux-only gate stays green while a Windows checkout takes the `Net` autoload
-down. The two self-hosted legs of `binaries.yml` already hold the library they just built, so they test it:
+down. The Windows and macOS legs of `binaries.yml` already hold a library their own runner can load, so they
+test it:
 
 | Step | What it proves |
 |---|---|
@@ -190,7 +191,10 @@ down. The two self-hosted legs of `binaries.yml` already hold the library they j
   rather than reporting `godot: command not found` from inside a test script. Set **`GODOT_BIN`** to the
   binary's path on a runner where Godot is not on `PATH` under the name `godot`.
 - **The probes stay Linux-only.** They are multi-process, they bind UDP ports and they are slow.
-- **The Linux leg runs neither.** `check.yml` already runs both on Linux for every pull request.
+- **Neither Linux leg runs either step, for different reasons.** `linux` skips them because `check.yml`
+  already runs both on Linux for every pull request. **`linux_arm64` cannot run them at all**: it is
+  cross-built on the x86_64 box, so the runner that produced the artifact cannot load it. The steps name the
+  two legs that do run rather than excluding the ones that do not, so a future cross-built leg has to opt in.
 
 ## CI runs on GitHub-hosted runners
 
