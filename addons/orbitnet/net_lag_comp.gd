@@ -134,23 +134,55 @@ static var observed_interp_ticks: float = 1.0
 ## The floor the measurement is clamped to, and the value used before any measurement exists.
 const INTERP_TICKS: float = 1.0
 
-## The ceiling on the MEASURED interpolation term, in ticks.
+## The ceiling on the interpolation term, in ticks at `tick_hz`. It is [member max_delay_ms] expressed in the
+## units the term is measured in.
 ##
-## A send path so starved that a body arrives every twentieth tick is broken in a way a deeper rewind does not
-## fix -- it would only trade missed shots for shots that land on targets who had already taken cover. The clamp
-## keeps a pathological measurement from turning the rewind into a time machine, and [member max_delay_ms] bounds
-## the total independently.
-const MAX_INTERP_TICKS: float = 8.0
+## **[member max_delay_ms] is what bounds a rewind, and it always was.** A window is the interpolation term plus
+## the round trip, and [method rewind_ticks_for] clamps that sum to [member max_delay_ms] whatever either half
+## asked for. A tighter ceiling on the interpolation half alone cannot make any shot's window deeper or shallower
+## than that. All it decides is how much of the budget the interpolation half may claim before the round trip is
+## added, so deriving it from the same figure leaves one number governing rewind depth.
+##
+## It replaces a flat `8.0` ticks, which was wrong in two independent ways.
+##
+## | Failure | Consequence |
+## | --- | --- |
+## | It bound below the measurement | A two-box run measured a far-band inter-arrival of 8.71 ticks, already past it, and an authority rendering under its own net rate measured 14.4. Every shot at a far body was rewound short by the difference, and under-rewind is the direction that costs a shooter a hit they saw land. |
+## | It was denominated in ticks | Eight ticks is 67 ms at 120 Hz, 133 ms at 60 and 267 ms at 30 -- three policies from one line. That is the failure [member delay_ms] is written in milliseconds to avoid, and a bound on a window owes the same answer. |
+##
+## **A deeper rewind still does not repair a starved send path**, and nothing here claims otherwise. What
+## contains the pathological measurement is the ceiling on the total: a measured two hundred ticks and a measured
+## twenty resolve to the same window, because both saturate [member max_delay_ms] once the round trip is added.
+## The ring holds that window at every rate, because [method retain_ticks] derives residency from the same
+## figure, so the deepest depth this can produce is always inside the retention margin.
+##
+## **The ceiling never falls below [constant INTERP_TICKS].** A game that lowers [member max_delay_ms] under one
+## tick's worth of time still gets the one-tick floor the term's own definition requires. A non-finite or
+## non-positive `tick_hz` cannot express a ceiling at all and collapses to that floor; every window built from
+## this rejects such a rate on its own and answers with the flat fallback.
+static func max_interp_ticks(tick_hz: float) -> float:
+	if not is_finite(tick_hz) or tick_hz <= 0.0:
+		return INTERP_TICKS
+	return maxf(INTERP_TICKS, max_delay_ms * 0.001 * tick_hz)
 
 ## Re-read the send path's measured inter-arrival. SERVER ONLY, once per net tick.
 ##
 ## A zero or absent figure means the window has not published yet (the accounting is per second) or nothing was
 ## admitted at all; both leave the floor in place rather than inventing a number.
+##
+## **NaN, infinity and a non-positive figure are all rejected**, which is the rule the band figures already
+## take. None of them is a cadence, and the ceiling that used to neutralize an infinite measurement no longer
+## lives at this call.
+##
+## **Stored raw above the floor.** The ceiling is denominated in time and this call names no tick rate, so it
+## cannot apply one -- [method max_interp_ticks] is applied once, where the window is built and the rate is
+## known. That is already the rule the per-band figures follow, and it keeps one measurement from being
+## truncated at two different places by two different numbers.
 static func refresh_observed_interp(interarrival: float) -> void:
-	if is_nan(interarrival) or interarrival <= 0.0:
+	if not is_finite(interarrival) or interarrival <= 0.0:
 		observed_interp_ticks = INTERP_TICKS
 		return
-	observed_interp_ticks = clampf(interarrival, INTERP_TICKS, MAX_INTERP_TICKS)
+	observed_interp_ticks = maxf(interarrival, INTERP_TICKS)
 
 ## The same measurement, per peer: how far behind the server's present the remote bodies on one peer's screen
 ## are drawn, in net ticks.
@@ -160,8 +192,8 @@ static func refresh_observed_interp(interarrival: float) -> void:
 ## while a peer in a dense part of the world waits several. The round-trip term this is added to
 ## ([method Net.peer_rtt_ms]) is already per peer, and pooling only this half granted a peer served every tick a
 ## window measured partly from peers served every eighth: over-rewound above the pool mean, under-rewound below
-## it, up to the [constant MAX_INTERP_TICKS] ceiling. Under-rewind is the direction that costs a shooter a hit
-## they saw land.
+## it, up to the ceiling [method max_interp_ticks] sets. Under-rewind is the direction that costs a shooter a
+## hit they saw land.
 ##
 ## A peer with no entry falls back to [member observed_interp_ticks] rather than to [constant INTERP_TICKS]. A fresh
 ## joiner has no cadence of its own yet, and the session's pooled mean is a better estimate of the one it is
@@ -174,15 +206,18 @@ static var _peer_interp_ticks: Dictionary[int, float] = {}
 ## Re-read the send path's measured inter-arrival for ONE peer. SERVER ONLY, once per net tick per synced peer,
 ## from [method Net.interarrival_ticks].
 ##
-## A zero, negative or NaN figure drops this peer's entry rather than pinning it to the floor. Those are the
-## answers for a peer whose window admitted nothing and for a peer the backend does not know, and neither is a
-## measurement of a one-tick cadence. Dropping returns that peer to the pooled fallback, which is what a peer
-## with nothing measured about it should get.
+## A zero, negative, NaN or infinite figure drops this peer's entry rather than pinning it to the floor. Those
+## are the answers for a peer whose window admitted nothing and for a peer the backend does not know, and none
+## of them is a measurement of a one-tick cadence. Dropping returns that peer to the pooled fallback, which is
+## what a peer with nothing measured about it should get.
+##
+## **Stored raw above the floor**, for the reason [method refresh_observed_interp] gives. A peer measured at a
+## cadence past the ceiling keeps that figure here and is truncated once, at the window.
 static func refresh_observed_interp_for(peer: int, interarrival: float) -> void:
-	if is_nan(interarrival) or interarrival <= 0.0:
+	if not is_finite(interarrival) or interarrival <= 0.0:
 		_peer_interp_ticks.erase(peer)
 		return
-	_peer_interp_ticks[peer] = clampf(interarrival, INTERP_TICKS, MAX_INTERP_TICKS)
+	_peer_interp_ticks[peer] = maxf(interarrival, INTERP_TICKS)
 
 ## The interpolation term for one shooter, in net ticks: that peer's own measured cadence, or
 ## [member observed_interp_ticks] when nothing has been measured about it yet.
@@ -210,7 +245,7 @@ static var observed_interp_mid_ticks: float = 0.0
 static var observed_interp_far_ticks: float = 0.0
 
 ## The pooled inter-arrival across every band, raw and unclamped -- the DENOMINATOR of the band ratio, and the
-## same figure [method refresh_observed_interp] receives before clamping it into [member observed_interp_ticks].
+## same figure [method refresh_observed_interp] receives before flooring it into [member observed_interp_ticks].
 ## It is not the mean of the three band figures: the backend derives it as total band members over total band
 ## sends, so the near band, which supplies most of the sends, dominates it.
 static var _pooled_interp_raw: float = 0.0
@@ -230,7 +265,7 @@ static var band_scale_m: float = 0.0
 ##
 ## FIVE TERMS IN ONE CALL because they are one window's worth of evidence and a ratio built from two windows
 ## describes neither. `pooled` is the same figure [method refresh_observed_interp] takes; it is passed again
-## rather than read back from [member observed_interp_ticks] because that one is clamped and this one is the
+## rather than read back from [member observed_interp_ticks] because that one is floored and this one is the
 ## ratio's denominator.
 ##
 ## A per-tick refresh into scalars rather than a read per shot, for the reason the pooled figure is refreshed
@@ -284,12 +319,16 @@ static func band_interp_scale(band: Band) -> float:
 ## the estimate the two margins support, and it degenerates correctly: with no band evidence the scale is 1.0
 ## and this is exactly [method observed_interp_for].
 ##
-## Clamped ONCE, at the end, to the same floor and ceiling every other window term takes. A band figure drawn
-## from a handful of sends can be an arbitrary multiple of the pooled one, and [constant MAX_INTERP_TICKS] is
-## what stops that turning the rewind into a time machine -- with [member max_delay_ms] bounding the total
-## independently after it.
-static func observed_interp_for_band(peer: int, band: Band) -> float:
-	return clampf(observed_interp_for(peer) * band_interp_scale(band), INTERP_TICKS, MAX_INTERP_TICKS)
+## Clamped once, at the end, to the same floor and ceiling every other window term takes. A band figure drawn
+## from a handful of sends can be an arbitrary multiple of the pooled one, and [method max_interp_ticks] is what
+## keeps the product inside the deepest window [member max_delay_ms] allows.
+##
+## **`tick_hz` is a parameter because the ceiling is denominated in time and this term is denominated in ticks.**
+## The rate the loop is running at is the only thing that converts between them, and a caller that cannot name it
+## would be clamped against a ceiling belonging to some other rate.
+static func observed_interp_for_band(peer: int, band: Band, tick_hz: float) -> float:
+	return clampf(observed_interp_for(peer) * band_interp_scale(band), INTERP_TICKS,
+		max_interp_ticks(tick_hz))
 
 ## The band a target at `target_pos` sits in for a shooter at `shooter_pos`, with band edges derived from
 ## `band_scale` at `scale/3` and `2*scale/3`. Pure -- the whole banding rule is a unit test.
@@ -387,7 +426,7 @@ static func rewind_ms_for_shooter(rtt_ms: float, tick_hz: float, interp_ticks: f
 	var ticks: float = observed_interp_ticks if interp_ticks < 0.0 else interp_ticks
 	if is_nan(ticks):
 		ticks = INTERP_TICKS
-	var interp_ms: float = clampf(ticks, INTERP_TICKS, MAX_INTERP_TICKS) * 1000.0 / tick_hz
+	var interp_ms: float = clampf(ticks, INTERP_TICKS, max_interp_ticks(tick_hz)) * 1000.0 / tick_hz
 	# An infinite measurement is not rejected, for the same reason an infinite `ms` is not rejected above: the
 	# clamp in rewind_ticks_for is what answers it, and answering "the ceiling" is correct.
 	return interp_ms + maxf(0.0, rtt_ms)
@@ -445,7 +484,8 @@ static func rewind_ticks_for_peer_shot(is_authority_shooter: bool, peer: int, rt
 ## still takes no rewind -- both rules live in [method rewind_ticks_for_shot] and neither is re-stated here.
 static func rewind_ticks_for_peer_shot_band(is_authority_shooter: bool, peer: int, rtt_ms: float,
 		tick_hz: float, band: Band) -> int:
-	return rewind_ticks_for_shot(is_authority_shooter, rtt_ms, tick_hz, observed_interp_for_band(peer, band))
+	return rewind_ticks_for_shot(is_authority_shooter, rtt_ms, tick_hz,
+		observed_interp_for_band(peer, band, tick_hz))
 
 ## The three ABSOLUTE ticks one shot is resolved at, indexed by [enum Band] -- the array [method resolve_hit]
 ## takes, and the only thing a shot site has to build to get a per-target rewind.

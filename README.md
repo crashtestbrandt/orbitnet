@@ -278,15 +278,24 @@ so do a **0.3.x or 0.4.x peer and a current one**: the join grew from two frames
 grew a 16-byte field. A major mismatch is refused ahead of every other compatibility rule, in both
 directions, so there is no mixed-version session to diagnose — upgrade every end together.
 
-**The table below is the 0.2.x API break only.** Coming from 0.3.x or 0.4.x, the wire major is the whole of
-the upgrade and no `Net` call changed meaning. The three changes below raise nothing either — the 0.2.1 call
-still compiles, still runs, and means something else.
+**The table below is the 0.2.x API break only.** No `Net` call changed meaning in 0.3.x or 0.4.x. The three
+changes below raise nothing either — the 0.2.1 call still compiles, still runs, and means something else.
 
 | Change | What breaks | What to do |
 |---|---|---|
 | **`Net.peer_rtt_ms()` is capped** at `Net.rtt_believed_max_ms`, 250 ms by default | a scoreboard ping reads 250 for every player on a worse link | display `Net.peer_rtt_raw_ms()`, and keep `peer_rtt_ms()` for anything that feeds a rewind |
 | **Resuming a seat needs `Net.set_resume_token()`** beside `Net.set_session_id()` | a game that persisted only the session id is seated as a newcomer | persist `Net.resume_token()` too, and restore both before the join |
 | **A `NetCommand` validator returning a non-zero `int` is a refusal** carrying that code | a validator that returned a truthy int to mean "applied" now refuses every request | return `true`, or `NetCommand.CODE_OK` (`0`), to apply |
+
+**Coming from 0.4.x, two `NetLagComp` members changed.** The interpolation ceiling is now derived from
+`NetLagComp.max_delay_ms` at the rate the loop is running, rather than being a flat count of ticks, so it can
+no longer be named without a rate. Both are parse-time breaks in a game that calls them. Nothing on `Net`
+moved — the 1.0 freeze covers that surface, and this one is still open to change before then.
+
+| Change | What breaks | What to do |
+|---|---|---|
+| **`NetLagComp.MAX_INTERP_TICKS` is removed** | a game that read the flat 8-tick ceiling | call `NetLagComp.max_interp_ticks(tick_hz)` for the ceiling at a given rate |
+| **`NetLagComp.observed_interp_for_band()` takes a third argument**, `tick_hz` | the two-argument call no longer parses | pass the rate the loop is running at, `float(Net.effective_tickrate())` |
 
 ## License
 
