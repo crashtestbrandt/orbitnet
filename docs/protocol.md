@@ -797,12 +797,20 @@ retries. What differs is whether the other end can say why.
   `Net.has_session_secret()` on both ends when a join hangs**; it is the only thing that distinguishes this
   from a dead link.
 
-**Why not a key exchange instead.** An X25519 exchange inside `orbitnet-core` is roughly 400 lines of new
-field arithmetic in a crate with zero dependencies and `overflow-checks` on, and the only constant-time
-groundwork this repository has is the ten-line tag compare. And an **unauthenticated** exchange does not
-close the on-path forgery above anyway: an exchange with no key the client already trusts is substituted by
-exactly that attacker. It would demote the adversary from on-path to passive-only, at that cost. A secret the
-game already authenticated closes it, and it needs no new primitive.
+**Why not a key exchange instead.** An **unauthenticated** exchange does not close the on-path forgery above
+anyway: an exchange with no key the client already trusts is substituted by exactly that attacker. It would
+demote the adversary from on-path to passive-only and nothing more. A secret the game already authenticated
+closes it, and it needs no new primitive.
+
+**An authenticated exchange is open work, and its price has changed.** Writing X25519 here was roughly 400
+lines of new field arithmetic in a crate with zero dependencies and `overflow-checks` on, whose only
+constant-time groundwork is the ten-line tag compare. That estimate was the answer, and it rested on reading
+the empty `[dependencies]` as a rule. That reading has been settled against — `orbitnet-core` may take a
+**vetted** cryptographic dependency — so an exchange is ordinary work against a reviewed implementation.
+`native/crates/orbitnet-core/Cargo.toml`'s header states what such a dependency has to clear — it ships in
+every export, so a licence, a `THIRD_PARTY.md` row and a reason the hand-written version would be worse are
+all required. **The hand-written SipHash-2-4 stays**: it is already here, already held to constant time by the
+test below, and a keyed PRF with no table lookups is the one shape that was affordable to write.
 
 **What holds the tag compare to constant time.** `native/crates/orbitnet-core/tests/constant_time.rs`, in two
 assertions that fail for different reasons.

@@ -18,8 +18,9 @@
 //! ## The MAC, and what it is and is not worth
 //!
 //! [`siphash24`] is SipHash-2-4: a keyed pseudo-random function designed for exactly this — short
-//! messages, a 64-bit tag, no table lookups. It is ~40 lines of integer arithmetic, which is what lets
-//! `orbitnet-core` stay at zero dependencies.
+//! messages, a 64-bit tag, no table lookups. It is ~40 lines of integer arithmetic, which is why it could
+//! be written here at all instead of taken as a dependency. That shape does not generalise: a stream cipher
+//! is close to it, an elliptic curve is not.
 //!
 //! **The key is folded from two nonces, one drawn by each end, and from a session secret when the game
 //! supplies one.** The joiner sends its half in the handshake, the acceptor answers with a half of its
@@ -35,11 +36,13 @@
 //!   fold is a public function of public values, and an observer that read both frames holds the key.
 //!   A secret both ends already hold narrows it, with the derivation below and no new dependency.
 //!
-//!   An X25519 exchange was considered and declined. It would demote this adversary to passive-only,
-//!   which is a real narrowing rather than none -- but unauthenticated ECDH is substituted by exactly
-//!   the on-path attacker in question, so the price is several hundred lines of hand-written
-//!   constant-time field arithmetic in a zero-dependency crate. `README.md` records the same decision
-//!   for a reader who never opens this file.
+//!   An X25519 exchange is not implemented. Unauthenticated ECDH is substituted by exactly the on-path
+//!   attacker in question, so it would demote this adversary to passive-only and buy nothing else --
+//!   that refusal stands on its own. An AUTHENTICATED exchange is open work: it was priced at several
+//!   hundred lines of hand-written constant-time field arithmetic because this crate's empty
+//!   `[dependencies]` was read as a rule, and that reading has been settled against. A vetted
+//!   implementation is preferred to a hand-written one; `Cargo.toml`'s header states what one has to
+//!   clear. `README.md` records the same for a reader who never opens this file.
 //!
 //!   **`tests/constant_time.rs` is the timing harness that decision said was missing.** It asserts
 //!   that `tags_equal`'s source, compiled on its own under each shipped profile's flags, emits no

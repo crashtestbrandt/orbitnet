@@ -7,16 +7,40 @@ license.workspace = true
 repository.workspace = true
 description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 
-# Deliberately ZERO RUNTIME dependencies, and deliberately NO dependency on `godot`.
-# Everything here is a pure function of plain data so it runs under `cargo test`
-# in milliseconds and can be reused outside Godot. The one entry below this table is
-# `[dev-dependencies]`, which is compiled for tests and linked into nothing.
+# No dependency on `godot`, and no `Variant` in any signature. Everything here is a pure function of plain
+# data, so it runs under `cargo test` in milliseconds and can be reused outside Godot. That is the boundary,
+# and it does not move.
+#
+# A vetted cryptographic dependency is allowed here. `[dependencies]` is empty today, and that emptiness
+# describes the crate. It had been read as a rule, and under that reading the only way to add a cipher or a
+# key exchange was to hand-write it. That is settled: an audited implementation is preferred to a
+# hand-written one, and the empty list vetoes nothing.
+#
+# What that changes. An AEAD or a key exchange is ordinary work against a reviewed implementation, where it
+# used to cost several hundred lines of hand-written constant-time field arithmetic in a crate whose only
+# constant-time groundwork is a ten-line tag compare. That cost was the argument for declining X25519, and the
+# argument was the rule.
+#
+# What a dependency here has to clear. A runtime dependency ships inside every export, which the
+# `[dev-dependencies]` entry below does not, so it answers for more:
+#   * A licence from the set CONTRIBUTING.md names -- MIT / Apache-2.0 / BSD / MPL-2.0 -- and a
+#     `THIRD_PARTY.md` row with it, in the same commit.
+#   * A reason the hand-written version would be worse. That is the whole point of the change; a dependency
+#     taken to save typing is not what this settled.
+#   * The millisecond test run, which is worth keeping. A build script or a proc-macro tree costs more than
+#     its own compile time.
+#   * The engine boundary above, which nothing may cross.
+#
+# Hand-written SipHash-2-4 in `auth.rs` stays. It is ~40 lines, a keyed PRF with no table lookups and no
+# secret-dependent branches, already here, and already held to constant time by `tests/constant_time.rs`.
+# That shape generalises to a stream cipher and not to an elliptic curve, which is why it was affordable
+# under the rule and why it does not need replacing now the rule is gone.
 [dependencies]
 
 # The generator behind `tests/wire_properties.rs`, and the ONLY dependency this crate has of any
 # kind. A `[dev-dependencies]` entry is compiled for `cargo test` and for nothing else: it is absent
-# from `cargo build`, from the cdylib `orbitnet-godot` links, and from every release asset, so the
-# zero-dependency rule above still describes what ships. `[dependencies]` stays empty.
+# from `cargo build`, from the cdylib `orbitnet-godot` links, and from every release asset, so it changes
+# nothing about what ships. `[dependencies]` is still empty.
 #
 # Default features off. `fork` and `timeout` run each case in a subprocess to survive an abort or a
 # hang; this crate is `#![forbid(unsafe_code)]`, so a failing case panics and `std`'s own
