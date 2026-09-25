@@ -26,18 +26,23 @@ Regenerate this list with `cargo tree` in `native/` after any dependency change.
 | `libc` | MIT OR Apache-2.0 | POSIX signal handling for the native crash handler (`crash.rs`, Unix only). Windows uses raw `extern "system"` declarations instead of a second dependency. |
 | `nanoserde`, `nanoserde-derive` | MIT | Build-time JSON parsing inside gdext's codegen. Not linked into the shipped library. |
 | `heck`, `proc-macro2`, `quote`, `unicode-ident`, `venial` | MIT OR Apache-2.0 (`venial`: MIT) | Proc-macro machinery used at build time by gdext's macros. Not linked into the shipped library. |
+| `x25519-dalek`, `curve25519-dalek`, `subtle` | **BSD-3-Clause** | X25519, behind the authenticated key exchange in `orbitnet-core`'s `auth.rs`. `subtle` is the constant-time primitive both are written against. |
+| `zeroize` | Apache-2.0 OR MIT | Wipes key material on drop, under `x25519-dalek`. |
+| `rand_core` | MIT OR Apache-2.0 | The RNG trait `x25519-dalek` names in signatures OrbitNet does not call: randomness is drawn by the host engine and handed in as bytes. |
+| `cfg-if` | MIT OR Apache-2.0 | Backend selection inside `curve25519-dalek`. |
 
 `orbitnet-core` and `orbitnet-godot` are this project's own crates and carry this project's license.
 
 ## `orbitnet-core`'s runtime dependencies
 
 **These ship inside every export**, which is what makes them answer for more than the dev-only tree below.
-The whole of it is one crate and its transitive closure: `chacha20poly1305`, the **payload cipher** a session
-that configures `Net.set_session_secret()` runs over every datagram. `orbitnet-core` had none before it, and
-`native/crates/orbitnet-core/Cargo.toml`'s header carries what one has to clear and why this one was taken
-rather than hand-written.
+There are two roots and their transitive closures: `chacha20poly1305`, the **payload cipher** a session that
+configures `Net.set_session_secret()` runs over every datagram, and `x25519-dalek`, the **key exchange** a
+client runs against a pinned server key. `orbitnet-core` had neither before them, and
+`native/crates/orbitnet-core/Cargo.toml`'s header carries what one has to clear and why each was taken rather
+than hand-written.
 
-Regenerate this list with `cargo tree -p orbitnet-core --edges normal` in `native/`.
+Regenerate this list with `cargo tree -p orbitnet-core --edges normal,build` in `native/`.
 
 | Crate | License | Why it is here |
 |---|---|---|
@@ -46,15 +51,28 @@ Regenerate this list with `cargo tree -p orbitnet-core --edges normal` in `nativ
 | `aead`, `cipher`, `universal-hash`, `crypto-common`, `inout`, `block-buffer` | MIT OR Apache-2.0 | RustCrypto's trait and buffer plumbing the three crates above are written against. |
 | `hybrid-array`, `typenum` | MIT OR Apache-2.0 | Fixed-length array types, which is how key, nonce and tag widths are checked at compile time. |
 | `ctutils`, `cmov` | Apache-2.0 OR MIT | The constant-time conditional move Poly1305's tag comparison is built on. |
-| `cfg-if` | MIT OR Apache-2.0 | Platform selection between ChaCha20's SIMD backends. |
-| `cpufeatures` | MIT OR Apache-2.0 | Runtime CPU feature detection for Poly1305's x86 backend. **x86 and x86-64 only**; it is absent from an aarch64 build's tree. |
+| `x25519-dalek` | **BSD-3-Clause** | The key exchange a client runs against a pinned server static key. |
+| `curve25519-dalek`, `subtle` | **BSD-3-Clause** | Its curve arithmetic and the constant-time primitives under it. |
+| `zeroize` | Apache-2.0 OR MIT | Wipes secret material on drop, under `x25519-dalek`. |
+| `rand_core` | MIT OR Apache-2.0 | A trait in signatures OrbitNet does not call: randomness is drawn by the host engine and handed in. |
+| `cfg-if` | MIT OR Apache-2.0 | Backend selection inside both trees. |
+| `rustc_version`, `semver` | MIT OR Apache-2.0 | `curve25519-dalek`'s build script, which picks its arithmetic backend from the target. Build-time only; not linked. |
 
-The command above prints **14 crates** on an aarch64 host, and 15 on x86-64 with `cpufeatures`. No crate in
-that tree has a build script or a proc-macro, which is why `cargo test -p orbitnet-core` still runs in
-under a second. `libc` is `cpufeatures`' own dependency and is already in the tree for the crash handler.
+Measured on an aarch64 host: **19 crates linked**, and **21** with build dependencies included. `libc` is
+already in the tree for the crash handler.
 
-**Default features are off.** `chacha20poly1305`'s `alloc` and `getrandom` features are not enabled: the
-in-place, detached-tag API needs neither, and switching `getrandom` off keeps its platform-backend crates out
+**Two more are locked and build only on x86-64**, because `curve25519-dalek` and `poly1305` both gate a SIMD
+backend on the architecture.
+
+| Crate | License | When it builds |
+|---|---|---|
+| `curve25519-dalek-derive` | MIT OR Apache-2.0 | A proc-macro applying target features to the x86-64 simd backend. Not linked into the shipped library. |
+| `cpufeatures` | MIT OR Apache-2.0 | Runtime CPU feature detection, for Poly1305's and curve25519's x86-64 backends. Absent from an aarch64 build's tree. |
+
+**Default features are off on both roots.** `chacha20poly1305`'s `alloc` and `getrandom` are not enabled: the
+in-place, detached-tag API needs neither. `x25519-dalek` takes only `static_secrets` and `zeroize`, leaving
+`precomputed-tables` off — it would ship a table of curve points inside every export to speed up a multiply
+this crate does twice per join and never at rest. Between them that keeps `getrandom`'s platform backends out
 of the runtime tree entirely.
 
 ## `orbitnet-core`'s dev-dependencies
@@ -71,15 +89,16 @@ the rows the runtime table above already covers out of it.
 |---|---|---|
 | `proptest` | MIT OR Apache-2.0 | The generator behind `crates/orbitnet-core/tests/wire_properties.rs`: round-trip properties over the wire codec, and the arbitrary-bytes sweep of every public decoder. |
 | `bitflags`, `num-traits`, `regex-syntax`, `unarray` | MIT OR Apache-2.0 | `proptest`'s own dependencies. |
-| `rand`, `rand_core`, `rand_chacha`, `rand_xorshift`, `getrandom`, `ppv-lite86` | MIT OR Apache-2.0 | The seeded RNG `proptest` generates and shrinks cases with. |
+| `rand`, `rand_core`, `rand_chacha`, `rand_xorshift`, `getrandom`, `ppv-lite86` | MIT OR Apache-2.0 | The seeded RNG `proptest` generates and shrinks cases with. `rand_core` resolves to a second, older version here than the one `x25519-dalek` takes. |
 | `zerocopy` | BSD-2-Clause OR Apache-2.0 OR MIT | Byte-level casts inside `ppv-lite86`. |
 | `libc` | MIT OR Apache-2.0 | Platform selection under `getrandom`, and already in the tree for the crash handler. `cfg-if` sits here too and is in the runtime table above. |
 | `autocfg` | Apache-2.0 OR MIT | `num-traits`' build script. |
 
-The command above prints the runtime table's rows and these together — **28 crates** on an aarch64 host, 14
-of them the runtime table's.
+The command above prints the runtime table's rows and these together — **34 crates** on an aarch64 host,
+19 of them the runtime table's. `cfg-if` appears in both lists and is counted once; `rand_core` resolves to
+two versions, the newer for `x25519-dalek` and the older for `proptest`.
 
-**Five more crates are locked and never built.** `native/Cargo.lock` resolves a dependency's optional
+**Six more crates are locked and never built.** `native/Cargo.lock` resolves a dependency's optional
 features and every target's backends, so it pins crates no build of this workspace compiles. They are listed
 for completeness, and each one's license is compatible anyway:
 
@@ -89,6 +108,7 @@ for completeness, and each one's license is compatible anyway:
 | `wasip2`, `wit-bindgen` | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | `getrandom`'s WASI backend, selected on no platform OrbitNet builds for. |
 | `zerocopy-derive` | BSD-2-Clause OR Apache-2.0 OR MIT | `zerocopy`'s optional `derive` feature, which `ppv-lite86` does not enable. |
 | `syn` | MIT OR Apache-2.0 | `zerocopy-derive`'s dependency, and reached from nowhere else. |
+| `fiat-crypto` | MIT OR Apache-2.0 OR BSD-1-Clause | `curve25519-dalek`'s formally verified field arithmetic backend, gated on `cfg(curve25519_dalek_backend = "fiat")`. That is an opt-in selector rather than an architecture, and this workspace never sets it. |
 
 The choice of `proptest` over `cargo-fuzz` is recorded in the header comment of
 `native/crates/orbitnet-core/tests/wire_properties.rs`.

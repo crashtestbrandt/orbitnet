@@ -82,6 +82,9 @@ evasion. Those need an authenticated layer above it, and `set_session_id()` is w
 | `peer_resume_token(peer: int) -> int` | Server-side, diagnostics. |
 | `resume_policy()` / `set_resume_policy(p)` | `Net.ResumePolicy.ALWAYS` (the default), `ONLY_IF_DROPPED`, or `NEVER`. |
 | `set_session_secret(secret: PackedByteArray)` / `has_session_secret() -> bool` | Derive the per-datagram key from a secret both ends already share, **and encrypt every payload** under it. **Before `set_mode()`**, on both ends. An empty array clears it. There is no getter for the bytes. See [protocol.md](protocol.md#what-a-session-secret-encrypts). |
+| `set_server_static_key(key: PackedByteArray)` / `has_server_static_key() -> bool` | Server-side: the 32-byte static key clients authenticate this server against. **Before `set_mode()`**. `generate_server_static_key() -> PackedByteArray` draws one; store it and reuse it, or every pin already distributed stops working. |
+| `server_public_key() -> PackedByteArray` | Server-side: the 32 bytes to publish. Public by construction — safe in a build, a website or a server-browser row. |
+| `set_pinned_server_key(key: PackedByteArray)` / `has_pinned_server_key() -> bool` | Client-side: pin that public key. **Before `set_mode()`**. The join then runs an X25519 exchange against it, and a pinned client **refuses** a join the server answered without one rather than downgrading. |
 | `peer_session_id(peer: int) -> int` | Server-side: the identity `peer` presented. **Key your roster on this.** 0 for an unknown peer and one that claimed none. |
 | `is_session_held(session_id: int) -> bool` | Server-side: whether a dropped session is still reclaimable. |
 | `reconnect_grace() -> float` / `set_reconnect_grace(s: float) -> void` | Seconds a dropped peer's session is held open. Wall-clock, server-side, 30 s by default. 0 disables resume — a drop is forgotten in the same frame and `peer_dropped` reports `held = false`. |
@@ -90,8 +93,11 @@ evasion. Those need an authenticated layer above it, and `set_session_id()` is w
 welcome; a rejoiner must quote it back. Without it, anyone who *saw* a session id — off a roster broadcast, a
 kill feed, a log line, a screenshot — could present it and take that player's body. **It does not stop an
 on-path observer**, who reads the welcome the token traveled in; that boundary is the same one the session key
-has, and `set_session_secret()` is what moves it — under a secret the observer cannot confirm the handshake
-that quotes a token, whether or not it read one.
+has, and it moves two ways: `set_session_secret()` for a game that can distribute a secret over a channel it
+already authenticated, `set_pinned_server_key()` for one that cannot. **A pinned public key demands only
+integrity of its channel and may ship inside the build**, where a shared secret demands confidentiality too
+and cannot. Under a secret the observer also cannot confirm the handshake that quotes a token, whether or not
+it read one. See [protocol.md](protocol.md#the-key-exchange-and-what-authenticates-the-server).
 
 #### Releasing a dropped connection's seats
 

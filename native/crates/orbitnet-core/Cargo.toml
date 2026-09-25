@@ -11,7 +11,7 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # data, so it runs under `cargo test` in milliseconds and can be reused outside Godot. That is the boundary,
 # and it does not move.
 #
-# A vetted cryptographic dependency is allowed here. `[dependencies]` held nothing until the payload cipher
+# A vetted cryptographic dependency is allowed here. `[dependencies]` held nothing until the two entries
 # below, and that emptiness described the crate. It had been read as a rule, and under that reading the only
 # way to add a cipher or a key exchange was to hand-write it. That is settled: an audited implementation is
 # preferred to a hand-written one, and the list vetoes nothing.
@@ -19,7 +19,7 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # What that changes. An AEAD or a key exchange is ordinary work against a reviewed implementation, where it
 # used to cost several hundred lines of hand-written constant-time field arithmetic in a crate whose only
 # constant-time groundwork is a ten-line tag compare. That cost was the argument for declining X25519, and the
-# argument was the rule.
+# argument was the rule. The exchange below is the first item to be built that way.
 #
 # What a dependency here has to clear. A runtime dependency ships inside every export, which the
 # `[dev-dependencies]` entry below does not, so it answers for more:
@@ -58,6 +58,33 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # the caller supplies the buffer, and every nonce here is derived rather than drawn. That keeps the
 # platform-backend crates `getrandom` would add out of the tree entirely.
 chacha20poly1305 = { version = "0.11", default-features = false }
+
+# X25519, for the authenticated key exchange in `auth.rs`. The first entry in this list, and it clears the
+# four points above:
+#
+#   * BSD-3-Clause, and so is everything it pulls that is not MIT / Apache-2.0. `THIRD_PARTY.md` carries the
+#     rows.
+#   * The hand-written version would be worse, and by a wide margin. Curve25519 is constant-time field
+#     arithmetic over a 255-bit prime -- roughly 400 lines here, none of it reviewable by anyone working on
+#     this repository, in a crate whose only constant-time groundwork is a ten-line tag compare.
+#     `tests/constant_time.rs` covers that compare and says in its own header that arithmetic written later
+#     needs its own coverage. This is the case the settled rule was settled for.
+#   * The test run stays in milliseconds; what this costs is a one-off build. `curve25519-dalek` carries a
+#     build script (`rustc_version` -> `semver`) that picks its arithmetic backend from the target, and on
+#     **x86-64 only** it also pulls the `curve25519-dalek-derive` proc-macro and `cpufeatures` for the simd
+#     backend. On aarch64 it builds neither. That is a proc-macro on one of the two architectures this
+#     ships for, and it was weighed against writing the curve by hand.
+#   * It touches no engine type, so the boundary this crate is held to is intact: no `godot`
+#     dependency, no `Variant` in any signature, and `#![forbid(unsafe_code)]` still on the crate.
+#     `x25519-dalek` is `#![no_std]` itself and carries no engine type of its own.
+#
+# Features, all three defaults off:
+#   * `static_secrets` gives `StaticSecret`, the only secret type constructible from bytes. Randomness is
+#     drawn by the host engine and handed in, which is what keeps `getrandom` out of this tree.
+#   * `zeroize` wipes secret material on drop.
+#   * `precomputed-tables` is OFF. It trades a table of precomputed curve points, shipped inside every
+#     export, for a faster basepoint multiply. This crate does two of those per join and none at rest.
+x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets", "zeroize"] }
 
 # The generator behind `tests/wire_properties.rs`. A `[dev-dependencies]` entry is compiled for
 # `cargo test` and for nothing else: it is absent from `cargo build`, from the cdylib `orbitnet-godot`

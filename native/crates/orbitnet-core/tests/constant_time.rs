@@ -15,6 +15,15 @@
 //! | `the_branch_scanner_reads_both_architectures` | the scanner's line parsing and four branch spellings, from x86-64 and AArch64 fixtures, on whichever host it runs | `just native-test`, every PR |
 //! | `the_tag_compare_is_not_distinguishable_by_timing` | two refused datagrams differing in which tag byte is wrong are not separable by a Welch t-test | the nightly `constant-time` workflow on the self-hosted box, and `just native-timing` by hand |
 //!
+//! **It covers that compare and nothing else, and `auth.rs` now has a curve behind it.** The X25519
+//! exchange is `x25519-dalek`'s code, not this repository's: its constant-time properties are that
+//! project's claim and that project's review, and nothing here measures them. Extending this harness to
+//! cover them would mean timing a dependency's field arithmetic through its public API, which is a
+//! different test with a different premise. What is still true is that nothing hand-written in `auth.rs`
+//! past this compare needs constant time — SipHash has no secret-dependent branch and no table lookup by
+//! construction — so the gap this harness leaves is the dependency's own and is named as such in
+//! `auth.rs`, `README.md` and `docs/protocol.md`.
+//!
 //! ## The codegen assertion, and why it needs no disassembler
 //!
 //! It reads `src/auth.rs`, extracts the text of `fn tags_equal` verbatim, writes it to a temporary

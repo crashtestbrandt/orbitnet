@@ -145,10 +145,11 @@ One rule: **`orbitnet-core` never sees a `Variant`**, and never depends on `godo
 function of plain data, which is why its tests run in milliseconds. A `godot` type in a core signature means
 logic has leaked across the boundary.
 
-**That crate may take a vetted dependency.** Its `[dependencies]` held nothing until `chacha20poly1305`, the
-payload cipher. Keeping it empty had been read as a rule, and under that reading the only way to add
-cryptography was to hand-write it — which is how a key exchange came to be priced at several hundred lines of
-constant-time field arithmetic and declined. The emptiness described the crate and carried no veto.
+**That crate may take a vetted dependency.** Its `[dependencies]` held nothing until two landed together:
+`chacha20poly1305`, the payload cipher, and `x25519-dalek`, behind the authenticated key exchange. Keeping it
+empty had been read as a rule, and under that reading the only way to add cryptography was to hand-write it —
+which is how a key exchange came to be priced at several hundred lines of constant-time field arithmetic and
+declined. The list describes the crate and carries no veto.
 
 Such a dependency is a **runtime** dependency and ships inside every export, so it has to clear more than a
 dev-dependency does: a licence from the set below with its `THIRD_PARTY.md` row in the same commit, and a

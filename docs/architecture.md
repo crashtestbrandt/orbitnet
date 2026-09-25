@@ -19,10 +19,11 @@ class registration, `Variant` ↔ packed-row conversion, the entity registry, si
 **The rule that keeps it honest: core never sees a `Variant`.** A `godot` type in a core signature means logic
 has leaked across the boundary. `#![forbid(unsafe_code)]` throughout.
 
-**`orbitnet-core`'s dependency list is open to cryptography**, and holds one entry: `chacha20poly1305`,
-the payload cipher a session under a shared secret runs. A **vetted** cipher or key exchange belongs there in
-preference to a hand-written one, and `native/crates/orbitnet-core/Cargo.toml`'s header states what such a
-dependency has to clear. The `godot` boundary above is the rule the crate actually holds.
+**`orbitnet-core`'s dependency list is open to cryptography**, and holds two entries: `chacha20poly1305`, the
+payload cipher a session under a shared secret runs, and `x25519-dalek`, behind the authenticated key exchange
+in `auth.rs`. A **vetted** cipher or key exchange belongs there in preference to a hand-written one, and
+`native/crates/orbitnet-core/Cargo.toml`'s header states what such a dependency has to clear. The `godot`
+boundary above is the rule the crate actually holds.
 
 **`[dev-dependencies]` answers for less.** `proptest` is compiled for `cargo test` and is absent from
 `cargo build`, from the cdylib and from every release asset, so it changes nothing about what ships.
