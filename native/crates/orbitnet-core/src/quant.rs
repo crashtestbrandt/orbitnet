@@ -106,6 +106,26 @@ const SS3_SCALE: f32 = 16383.0;
 /// quantum a value can move across a wire trip, and far too small to cost accuracy. See
 /// [`dropped_index`].
 const SS3_TIE_BAND: f32 = 8.0 * FRAC_1_SQRT_2 / SS3_SCALE;
+/// How far the largest component has to lead the next one before [`quat_to_ss3`] may skip its
+/// decode-and-re-pack check. Sixteen quanta of the 15-bit payload — twice [`SS3_TIE_BAND`].
+///
+/// **The check only ever changes the answer when the dropped index moves**, and the index cannot
+/// move while this much separation holds. Decoding perturbs the four components by a bounded
+/// amount: a stored small by at most half a quantum, and the `sqrt`-reconstructed largest by at
+/// most 2.14 quanta (three smalls, each off by half a quantum, each scaled by twice
+/// `FRAC_1_SQRT_2`, over a sum of the two near-equal magnitudes that is at least 0.99). So the
+/// decoded separation is within 2.64 quanta of this one, and any lead above `SS3_TIE_BAND + 2.64`
+/// quanta — 10.64 — leaves the decoded form with the same tied set and therefore the same index.
+/// Sixteen is that bound with six quanta of slack.
+///
+/// Measured against the bound over 2.08 million orientations — uniform random, a 30x30x30 grid of
+/// near-balanced diagonals, and pairs separated by a deliberate 0 to 25 quanta: the widest
+/// separation at which any pack failed the check was **9.29 quanta**, below both the analytic bound
+/// and this constant. `ss3_skip_gate_admits_only_stable_packs` is that sweep.
+///
+/// **99.84% of uniformly random rotations clear it**, so the check is skipped on all but a couple of
+/// sends in a thousand. See [`quat_to_ss3`].
+const SS3_SKIP_GAP: f32 = 16.0 * FRAC_1_SQRT_2 / SS3_SCALE;
 
 /// Pack a unit quaternion `[x, y, z, w]` into 6 bytes (three 15-bit components + largest index).
 ///
@@ -129,15 +149,19 @@ const SS3_TIE_BAND: f32 = 8.0 * FRAC_1_SQRT_2 / SS3_SCALE;
 /// not move: the index is transmitted, [`ss3_to_quat`] is unchanged, and a peer on either side of
 /// this change decodes the same bytes to the same rotation.
 ///
-/// **IT COSTS A DECODE PER ENCODE**: 38 ns per call against 8 ns before, measured over a spread of
-/// 4096 orientations. That is the price of the invariant, paid once per `@ss3` property per entity
-/// per tick on the authority, and it buys a sender and a receiver that agree byte for byte. The
-/// check cannot move to [`canonicalize_value`], which is where it would be paid once rather than per
-/// send: that function iterates decode∘encode to a fixed point using THIS encoder, so a fast encoder
-/// with no fixed point leaves it nothing to converge on. A cheaper sufficient condition — bounding
-/// how near a quantized small sits to a bucket edge, and skipping the decode when every one of them
-/// is clear — would keep the invariant and skip the check for most orientations, and is the obvious
-/// place to look if this ever measures.
+/// **The check costs a decode**: 35 ns per call against 8 ns without it, measured over a spread of
+/// 4096 orientations. That is the price of the invariant, and it buys a sender and a receiver that
+/// agree byte for byte. It cannot move to [`canonicalize_value`], which is where it would be paid
+/// once rather than per send: that function iterates decode∘encode to a fixed point using this
+/// encoder, so a fast encoder with no fixed point leaves it nothing to converge on.
+///
+/// **[`SS3_SKIP_GAP`] skips the check when the dropped index cannot move.** The check changes the
+/// answer only when a decode reorders the components, and a largest component leading the next one
+/// by sixteen quanta still leads it after a decode. The gate is four `abs` and a compare, it admits
+/// 99.84% of uniformly random rotations, and the bytes it returns are the bytes the full check
+/// returns — `ss3_skip_gate_agrees_with_the_full_check` pins the two against each other. Per-call
+/// cost over a uniform random population: **7.5 ns against 35 ns**, from `tests/quant_bench.rs`.
+/// The constant carries the bound the separation argument rests on and the sweep that measured it.
 #[must_use]
 pub fn quat_to_ss3(q: [f32; 4]) -> [u8; 6] {
     let mut q = q;
@@ -151,7 +175,14 @@ pub fn quat_to_ss3(q: [f32; 4]) -> [u8; 6] {
             *c *= inv;
         }
     }
-    let packed = pack_ss3_dropping(q, dropped_index(q));
+    let largest = dropped_index(q);
+    let packed = pack_ss3_dropping(q, largest);
+    // SKIP: the largest component leads the next one by more than a decode can close, so the decoded
+    // form drops the same index and re-packs to these same bytes. Nothing below can change the
+    // answer. See `SS3_SKIP_GAP`.
+    if largest_separation(q, largest) >= SS3_SKIP_GAP {
+        return packed;
+    }
     // FAST PATH: the encoding is already a fixed point of decode-then-encode, which every orientation
     // but a handful in a million is. One decode and one pack to prove it, and nothing more.
     let once = respack(packed);
@@ -180,6 +211,18 @@ pub fn quat_to_ss3(q: [f32; 4]) -> [u8; 6] {
         walk = next;
     }
     best
+}
+
+/// By how much `q[largest]` leads the largest of the other three, in magnitude. Negative when
+/// [`dropped_index`] resolved a tie in favour of a lower index than the strict maximum.
+fn largest_separation(q: [f32; 4], largest: usize) -> f32 {
+    let mut runner = 0.0f32;
+    for (i, c) in q.iter().enumerate() {
+        if i != largest {
+            runner = runner.max(c.abs());
+        }
+    }
+    q[largest].abs() - runner
 }
 
 /// One step of decode-then-encode: what a receiver reconstructs, re-packed the way a sender would.
@@ -690,6 +733,158 @@ mod tests {
             let n: f32 = back.iter().map(|c| c * c).sum::<f32>().sqrt();
             assert!((n - 1.0).abs() < 1e-5, "decoded quat must be unit: {n}");
         }
+    }
+
+    /// Deterministic LCG, the one the codec and interest suites use. No dev-dependency, and the
+    /// same walk every run.
+    fn ss3_lcg(state: &mut u32) -> u32 {
+        *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *state
+    }
+
+    /// A float in `[0, 1)`.
+    fn ss3_unit(state: &mut u32) -> f32 {
+        (ss3_lcg(state) >> 8) as f32 / 16_777_216.0
+    }
+
+    /// A uniformly distributed rotation (Shoemake's subgroup algorithm).
+    fn ss3_random_rotation(state: &mut u32) -> [f32; 4] {
+        let (u1, u2, u3) = (ss3_unit(state), ss3_unit(state), ss3_unit(state));
+        let (s1, s2) = ((1.0f32 - u1).sqrt(), u1.sqrt());
+        let t1 = 2.0 * std::f32::consts::PI * u2;
+        let t2 = 2.0 * std::f32::consts::PI * u3;
+        [s1 * t1.sin(), s1 * t1.cos(), s2 * t2.sin(), s2 * t2.cos()]
+    }
+
+    /// `quat_to_ss3`'s own prologue, so a sweep can pack the same vector the encoder packs.
+    fn ss3_normalize(q: [f32; 4]) -> [f32; 4] {
+        let mut q = q;
+        let norm_sq: f32 = q.iter().map(|c| c * c).sum();
+        if !norm_sq.is_finite() || norm_sq < 1e-12 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+        let inv = norm_sq.sqrt().recip();
+        for c in &mut q {
+            *c *= inv;
+        }
+        q
+    }
+
+    /// What [`quat_to_ss3`] did before [`SS3_SKIP_GAP`]: decode and re-pack every call, with no
+    /// separation gate in front of it. The two must answer the same bytes for every orientation.
+    fn ss3_full_check(q: [f32; 4]) -> [u8; 6] {
+        let q = ss3_normalize(q);
+        let packed = pack_ss3_dropping(q, dropped_index(q));
+        let once = respack(packed);
+        if once == packed {
+            return packed;
+        }
+        let mut best = packed.min(once);
+        let mut walk = once;
+        for _ in 0..6 {
+            let next = respack(walk);
+            if next == walk || next == packed {
+                break;
+            }
+            best = best.min(next);
+            walk = next;
+        }
+        best
+    }
+
+    /// The orientation sweep both gate tests run, in three arms:
+    ///
+    /// * **uniform random rotations** — what a session actually sends, and what the 99.8% skip rate
+    ///   is measured over;
+    /// * **a grid of near-balanced diagonals** — every component within 3e-3 of 0.5, the family that
+    ///   forced the dropped-index rule and the only one that produces cycles in bulk;
+    /// * **deliberate separations** — a random rotation with one component moved to a chosen number
+    ///   of quanta below the largest, walking straight through `SS3_SKIP_GAP` from both sides.
+    ///
+    /// `ORBITNET_SS3_SWEEP` multiplies the first and third arms. The figures
+    /// [`SS3_SKIP_GAP`] records come from `ORBITNET_SS3_SWEEP=10`; the default keeps
+    /// `cargo test` under a second in the unoptimized profile.
+    fn ss3_sweep(mut visit: impl FnMut([f32; 4])) {
+        let scale: u32 = std::env::var("ORBITNET_SS3_SWEEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let quantum = FRAC_1_SQRT_2 / SS3_SCALE;
+        let mut state = 0x1234_5678u32;
+
+        for _ in 0..200_000 * scale {
+            visit(ss3_random_rotation(&mut state));
+        }
+        for a in 0..30 {
+            for b in 0..30 {
+                for c in 0..30 {
+                    let axis = |k: i32| 0.5 + (k as f32 - 15.0) * 2e-4;
+                    visit([axis(a), axis(b), axis(c), 0.5]);
+                }
+            }
+        }
+        for step in 0..100 {
+            for _ in 0..50 * scale {
+                let mut q = ss3_normalize(ss3_random_rotation(&mut state));
+                let largest = dropped_index(q);
+                let runner = (largest + 1) % 4;
+                q[runner] = q[largest].abs() - step as f32 * quantum * 0.25;
+                visit(q);
+            }
+        }
+    }
+
+    #[test]
+    fn ss3_skip_gate_agrees_with_the_full_check() {
+        ss3_sweep(|q| {
+            assert_eq!(
+                quat_to_ss3(q),
+                ss3_full_check(q),
+                "the separation gate changed the wire bytes for {q:?}"
+            );
+        });
+    }
+
+    /// **The gate's soundness claim, measured**: no orientation whose pack fails the decode check
+    /// clears [`SS3_SKIP_GAP`]. The test also reports how close the sweep got, which is the constant's
+    /// margin — the separation argument bounds it at 10.64 quanta and the sweep reaches 9.30.
+    #[test]
+    fn ss3_skip_gate_admits_only_stable_packs() {
+        let quantum = FRAC_1_SQRT_2 / SS3_SCALE;
+        let mut widest_unstable = f32::NEG_INFINITY;
+        let mut unstable = 0u64;
+        let mut admitted = 0u64;
+        let mut total = 0u64;
+        ss3_sweep(|raw| {
+            let q = ss3_normalize(raw);
+            let largest = dropped_index(q);
+            let packed = pack_ss3_dropping(q, largest);
+            let separation = largest_separation(q, largest);
+            total += 1;
+            if separation >= SS3_SKIP_GAP {
+                admitted += 1;
+            }
+            if respack(packed) != packed {
+                unstable += 1;
+                widest_unstable = widest_unstable.max(separation);
+                assert!(
+                    separation < SS3_SKIP_GAP,
+                    "the gate admitted an unstable pack at {separation} ({} quanta): {q:?}",
+                    separation / quantum
+                );
+            }
+        });
+        assert!(
+            unstable > 0,
+            "the sweep reached no unstable pack at all, so it is not exercising the gate"
+        );
+        println!(
+            "ss3 skip gate: {admitted}/{total} admitted ({:.4}), {unstable} unstable, \
+             widest unstable separation {:.3} quanta against a gate of {:.1}",
+            admitted as f64 / total as f64,
+            widest_unstable / quantum,
+            SS3_SKIP_GAP / quantum
+        );
     }
 
     #[test]
