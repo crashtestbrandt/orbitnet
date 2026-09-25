@@ -167,6 +167,15 @@ Export that variable yourself to point at some other toolchain. **With no linker
 start** and prints the install lines above. A leg that skipped or produced nothing would upload an empty
 artifact and fail the tag after every other platform had already built.
 
+**The CI legs install it themselves.** `binaries.yml` and `release.yml` each carry an
+`Install the aarch64 cross linker` step ahead of the build, guarded to the `linux_arm64` leg. It is a no-op
+when a linker is already present or `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` is set, and otherwise
+installs the package above through whichever of `apt-get`, `dnf` or `pacman` the runner has. It needs
+non-interactive `sudo` for the account the runner service runs as; without that, or on a box using another
+package manager, the step fails naming what to install by hand. The install lives in CI rather than in
+`tools/build-native.sh` because a build script that installs packages is one that can change a contributor's
+machine.
+
 On an arm64 Linux host none of this applies. `tools/build-native.sh host` reports `linux_arm64` there, and
 `just native-install` builds and stages the library that host's Godot will load.
 

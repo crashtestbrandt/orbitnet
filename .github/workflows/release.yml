@@ -121,6 +121,60 @@ jobs:
           ( cd native && rustc --version ) || echo "rustc does not resolve directly; cargo will resolve it"
 
 
+      # THE aarch64 CROSS LINKER, WHICH `rustup target add` DOES NOT INSTALL. rustc shells out to a C
+      # linker to produce a cdylib, and for a foreign architecture that linker carries the target's own
+      # libc and crt objects -- a separate package, not part of the Rust toolchain. Without it this leg
+      # fails inside tools/build-native.sh's preflight, which is where the failure belongs but not where
+      # it can be fixed.
+      #
+      # IN CI RATHER THAN IN tools/build-native.sh. A build script that installs packages is a build
+      # script that mutates a contributor's machine. The script keeps refusing and printing the install
+      # line; provisioning a box this workflow already owns is the workflow's job.
+      #
+      # IDEMPOTENT, and a no-op on a box that already carries the linker -- including a native arm64
+      # runner, where there is nothing to cross to.
+      - name: Install the aarch64 cross linker
+        if: matrix.platform == 'linux_arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-}" ]; then
+            echo "linker set in the environment: $CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+            exit 0
+          fi
+          for cc in aarch64-linux-gnu-gcc aarch64-unknown-linux-gnu-gcc aarch64-linux-gnu-cc; do
+            if command -v "$cc" >/dev/null 2>&1; then
+              echo "already installed: $(command -v "$cc")"
+              exit 0
+            fi
+          done
+          # `sudo -n`: a runner service must never sit at a password prompt. If it cannot elevate, say so
+          # with the command to run by hand rather than hanging or guessing.
+          sudo=""
+          if [ "$(id -u)" -ne 0 ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "::error::no aarch64 cross linker and no sudo on this runner. Install it for the account"
+              echo "the runner service runs as: gcc-aarch64-linux-gnu (apt/dnf) or aarch64-linux-gnu-gcc (pacman)."
+              exit 1
+            fi
+            sudo="sudo -n"
+          fi
+          if command -v apt-get >/dev/null 2>&1; then
+            $sudo apt-get update
+            $sudo apt-get install -y gcc-aarch64-linux-gnu
+          elif command -v dnf >/dev/null 2>&1; then
+            $sudo dnf install -y gcc-aarch64-linux-gnu
+          elif command -v pacman >/dev/null 2>&1; then
+            $sudo pacman -S --noconfirm aarch64-linux-gnu-gcc
+          else
+            echo "::error::no aarch64 cross linker, and no apt-get, dnf or pacman to install one."
+            echo "This box uses another package manager. Install an aarch64 Linux GNU cross gcc for the"
+            echo "account the runner service runs as, or export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
+            echo "pointing at a linker it already has."
+            exit 1
+          fi
+          command -v aarch64-linux-gnu-gcc
+
       - name: Build both descriptor profiles
         shell: bash
         run: tools/build-native.sh build ${{ matrix.platform }} staged
