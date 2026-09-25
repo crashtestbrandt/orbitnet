@@ -331,14 +331,100 @@ func test_the_interpolation_term_is_the_send_paths_measured_inter_arrival() -> v
 	NetLagComp.refresh_observed_interp(0.25)
 	assert_almost_eq(NetLagComp.observed_interp_ticks, NetLagComp.INTERP_TICKS, 1e-4,
 		"...and a sub-tick measurement cannot buy a window shallower than one tick")
-	# The CEILING: a send path so starved that a body arrives every twentieth tick is broken in a way a deeper
-	# rewind does not fix -- it would trade missed shots for shots landing on targets already behind cover.
+	# No ceiling here. The ceiling is denominated in time and this call names no tick rate, so the measurement
+	# is stored as it was measured and truncated once, where the window is built and the rate is known.
 	NetLagComp.refresh_observed_interp(50.0)
-	assert_almost_eq(NetLagComp.observed_interp_ticks, NetLagComp.MAX_INTERP_TICKS, 1e-4,
-		"a pathological measurement clamps rather than turning the rewind into a time machine")
+	assert_almost_eq(NetLagComp.observed_interp_ticks, 50.0, 1e-4,
+		"the measurement is stored raw above the floor rather than truncated at the store")
+	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, 60.0, 50.0), NetLagComp.max_delay_ms, 1e-4,
+		"...and a pathological one is answered by the window ceiling instead")
 	NetLagComp.observed_interp_ticks = saved
 	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, 60.0), 1000.0 / 60.0, 1e-4,
 		"a shooter on a perfect link still gets the interpolation term -- their screen is a tick behind regardless")
+
+# --- the interpolation ceiling: derived from the window ceiling rather than picked in ticks ------------
+# The ceiling used to be a flat 8.0 ticks, and it bound below what the send path measured. A two-box run read
+# a far-band inter-arrival of 8.71 ticks, and an authority rendering under its own net rate read 14.4, so a
+# shot at a far body was rewound short by the difference -- the direction that costs a shooter a hit they saw
+# land. It was also denominated in ticks, which makes it 67 ms at 120 Hz, 133 at 60 and 267 at 30.
+#
+# The ceiling is now `max_delay_ms` converted at the rate the loop is running, which is the bound that was
+# doing the work all along: the window is interpolation plus round trip and `rewind_ticks_for` clamps that sum.
+#
+# `max_delay_ms` is a process-wide static like `per_shooter` and `delay_ms`; each case that writes it restores it.
+
+func test_a_measured_gap_past_the_old_ceiling_is_rewound_to_in_full() -> void:
+	var saved: float = NetLagComp.observed_interp_ticks
+	NetLagComp.reset_observed_interp()
+	for gap: float in [8.71, 14.36]:
+		NetLagComp.refresh_observed_interp_for(31, gap)
+		assert_almost_eq(NetLagComp.observed_interp_for(31), gap, 1e-4,
+			"a measured gap of %.2f ticks is kept as measured rather than truncated to 8" % gap)
+		assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, 60.0, NetLagComp.observed_interp_for(31)),
+			gap * 1000.0 / 60.0, 1e-4, "...and the window is the whole gap rather than 8 ticks of it")
+	# What the old clamp cost on that run, in the units a player feels: 8.71 measured, 8 granted, at 60 Hz.
+	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, 60.0, 8.71),
+		8.0 * 1000.0 / 60.0 + 0.71 * 1000.0 / 60.0, 1e-4,
+		"the 0.71 ticks the old ceiling discarded are now in the window")
+	NetLagComp.reset_observed_interp()
+	NetLagComp.observed_interp_ticks = saved
+
+func test_the_interpolation_ceiling_is_the_window_ceiling_in_ticks() -> void:
+	# One number governs rewind depth. A tighter ceiling on the interpolation half could only ever decide how
+	# much of that same budget the half was allowed to claim before the round trip was added.
+	for hz: float in [30.0, 60.0, 120.0, 144.0]:
+		assert_almost_eq(NetLagComp.max_interp_ticks(hz), NetLagComp.max_delay_ms * 0.001 * hz, 1e-4,
+			"the ceiling at %.0f Hz is max_delay_ms expressed in that rate's ticks" % hz)
+		assert_almost_eq(NetLagComp.max_interp_ticks(hz) * 1000.0 / hz, NetLagComp.max_delay_ms, 1e-4,
+			"...so it is the same wall-clock depth at every rate, which a flat 8 ticks was not")
+		assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, hz, 10000.0), NetLagComp.max_delay_ms, 1e-4,
+			"an absurd measurement asks for the ceiling and gets exactly it at %.0f Hz" % hz)
+
+func test_a_pathological_measurement_still_cannot_deepen_a_window() -> void:
+	# The containment the old constant claimed was already coming from `max_delay_ms`: two broken measurements
+	# an order of magnitude apart resolve to one depth, and the ring still holds the tick it reaches.
+	var was: bool = NetLagComp.per_shooter
+	NetLagComp.per_shooter = true
+	assert_eq(NetLagComp.rewind_ticks_for_shooter(100.0, 60.0, 20.0),
+		NetLagComp.rewind_ticks_for_shooter(100.0, 60.0, 200.0),
+		"a 20-tick and a 200-tick measurement both saturate the window ceiling")
+	assert_eq(NetLagComp.rewind_ticks_for_shooter(100.0, 60.0, 200.0),
+		NetLagComp.rewind_ticks_for(NetLagComp.max_delay_ms, 60.0),
+		"...at exactly the deepest window max_delay_ms allows, and no deeper")
+	for hz: int in [30, 60, 120]:
+		var deepest: int = NetLagComp.rewind_ticks_for(
+			NetLagComp.rewind_ms_for_shooter(250.0, float(hz), 10000.0), float(hz))
+		assert_true(deepest < NetLagComp.retain_ticks(hz),
+			"a window built from a pathological measurement (%d ticks at %d Hz) is still inside the ring's residency (%d)" % [
+				deepest, hz, NetLagComp.retain_ticks(hz)])
+	NetLagComp.per_shooter = was
+
+func test_a_healthy_send_path_never_reaches_the_ceiling() -> void:
+	# Repairing the send path narrows the gap, and this change has to be inert once it is narrow: at a cadence
+	# of one to four ticks the term is carried whole at every rate, ceiling or no ceiling.
+	for hz: float in [30.0, 60.0, 120.0]:
+		for gap: float in [1.0, 2.0, 3.4, 4.0]:
+			assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, hz, gap), gap * 1000.0 / hz, 1e-4,
+				"a %.1f-tick cadence at %.0f Hz is carried whole" % [gap, hz])
+
+func test_the_ceiling_moves_with_the_number_it_is_derived_from() -> void:
+	var was: float = NetLagComp.max_delay_ms
+	NetLagComp.max_delay_ms = 120.0
+	assert_almost_eq(NetLagComp.max_interp_ticks(60.0), 7.2, 1e-4,
+		"lowering the window ceiling lowers the interpolation ceiling with it")
+	# The floor wins whenever the derived ceiling would fall under one tick. A body cannot render fresher than
+	# the tick it arrived on, and an inverted clamp has no defined answer.
+	NetLagComp.max_delay_ms = 5.0
+	assert_almost_eq(NetLagComp.max_interp_ticks(60.0), NetLagComp.INTERP_TICKS, 1e-4,
+		"a ceiling under one tick collapses onto the floor")
+	NetLagComp.max_delay_ms = was
+
+func test_an_unusable_tick_rate_expresses_no_ceiling() -> void:
+	for hz: float in [0.0, -60.0, NAN, INF]:
+		assert_almost_eq(NetLagComp.max_interp_ticks(hz), NetLagComp.INTERP_TICKS, 1e-4,
+			"a rate of %f converts no milliseconds into ticks" % hz)
+	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(50.0, 0.0), -1.0, 1e-6,
+		"and the window builder answers the rate itself rather than the ceiling it could not express")
 
 func test_the_interpolation_term_is_scoped_to_the_peer_that_fired() -> void:
 	# The defect: the round-trip half of the window was per peer and the interpolation half was one
@@ -382,18 +468,21 @@ func test_a_peer_with_no_measurement_falls_back_to_the_pooled_figure() -> void:
 		"no measurement anywhere leaves the floor in place rather than inventing a number")
 	NetLagComp.observed_interp_ticks = saved
 
-func test_a_peers_measurement_is_clamped_like_the_pooled_one() -> void:
-	# The same floor and ceiling, for the same reasons: a body cannot render fresher than the tick it arrived
-	# on, and a send path so starved that a row arrives every twentieth tick is broken in a way a deeper rewind
-	# does not fix.
+func test_a_peers_measurement_takes_the_same_floor_as_the_pooled_one() -> void:
+	# The same floor, for the same reason: a body cannot render fresher than the tick it arrived on. And no
+	# ceiling here either -- the ceiling is denominated in time and this call names no tick rate, so a peer
+	# measured past it keeps that figure and is truncated once, where the window is built.
 	var saved: float = NetLagComp.observed_interp_ticks
 	NetLagComp.reset_observed_interp()
 	NetLagComp.refresh_observed_interp_for(4, 0.25)
 	assert_almost_eq(NetLagComp.observed_interp_for(4), NetLagComp.INTERP_TICKS, 1e-4,
 		"a sub-tick measurement cannot buy a window shallower than one tick")
 	NetLagComp.refresh_observed_interp_for(4, 50.0)
-	assert_almost_eq(NetLagComp.observed_interp_for(4), NetLagComp.MAX_INTERP_TICKS, 1e-4,
-		"a pathological measurement clamps rather than turning the rewind into a time machine")
+	assert_almost_eq(NetLagComp.observed_interp_for(4), 50.0, 1e-4,
+		"the measurement is stored raw above the floor rather than truncated at the store")
+	assert_almost_eq(NetLagComp.rewind_ms_for_shooter(0.0, 60.0, NetLagComp.observed_interp_for(4)),
+		NetLagComp.max_delay_ms, 1e-4,
+		"...and a pathological one is answered by the window ceiling instead")
 	NetLagComp.reset_observed_interp()
 	NetLagComp.observed_interp_ticks = saved
 
@@ -405,7 +494,7 @@ func test_an_absent_measurement_drops_the_peer_rather_than_pinning_it() -> void:
 	NetLagComp.reset_observed_interp()
 	NetLagComp.refresh_observed_interp(5.0)
 	NetLagComp.refresh_observed_interp_for(9, 2.0)
-	for absent: float in [0.0, -1.0, NAN]:
+	for absent: float in [0.0, -1.0, NAN, INF]:
 		NetLagComp.refresh_observed_interp_for(9, 2.0)
 		NetLagComp.refresh_observed_interp_for(9, absent)
 		assert_almost_eq(NetLagComp.observed_interp_for(9), 5.0, 1e-4,
@@ -669,11 +758,11 @@ func test_the_band_term_is_the_peers_own_cadence_scaled_by_its_bands_staleness()
 	NetLagComp.reset_observed_interp()
 	NetLagComp.refresh_observed_interp_for(11, 3.0)
 	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 90.0)   # near fresher than pooled, far staler
-	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.NEAR), 2.0, 1e-4,
+	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.NEAR, 60.0), 2.0, 1e-4,
 		"a near target: the peer's 3.0 scaled by 2/3")
-	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.MID), 4.0, 1e-4,
+	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.MID, 60.0), 4.0, 1e-4,
 		"a mid target: scaled by 4/3")
-	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.FAR), 6.0, 1e-4,
+	assert_almost_eq(NetLagComp.observed_interp_for_band(11, NetLagComp.Band.FAR, 60.0), 6.0, 1e-4,
 		"a far target: scaled by 6/3 -- three depths from one shooter, which is the whole point")
 	NetLagComp.reset_observed_interp()
 	NetLagComp.observed_interp_ticks = saved
@@ -687,18 +776,18 @@ func test_no_band_evidence_leaves_every_target_on_the_pooled_figure() -> void:
 	var flat: float = NetLagComp.observed_interp_for(12)
 	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 3.0, 0.0)   # measured, but no band scale configured
 	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
-		assert_almost_eq(NetLagComp.observed_interp_for_band(12, band), flat, 1e-4,
+		assert_almost_eq(NetLagComp.observed_interp_for_band(12, band, 60.0), flat, 1e-4,
 			"an unconfigured band scale leaves band %d on the pooled figure" % band)
 	NetLagComp.refresh_band_interp(2.0, 0.0, 0.0, 3.0, 90.0)   # only the near band published anything
-	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.MID), flat, 1e-4,
+	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.MID, 60.0), flat, 1e-4,
 		"a band that published no measurement stays on the pooled figure")
-	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.FAR), flat, 1e-4,
+	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.FAR, 60.0), flat, 1e-4,
 		"...both of them")
-	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.NEAR), 2.0, 1e-4,
+	assert_almost_eq(NetLagComp.observed_interp_for_band(12, NetLagComp.Band.NEAR, 60.0), 2.0, 1e-4,
 		"...while the band that did publish one is still scaled by it")
 	NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, 0.0, 90.0)   # nothing pooled to divide by
 	for band: NetLagComp.Band in [NetLagComp.Band.NEAR, NetLagComp.Band.MID, NetLagComp.Band.FAR]:
-		assert_almost_eq(NetLagComp.observed_interp_for_band(12, band), flat, 1e-4,
+		assert_almost_eq(NetLagComp.observed_interp_for_band(12, band, 60.0), flat, 1e-4,
 			"no pooled measurement is no ratio, so band %d takes the pooled fallback" % band)
 	NetLagComp.reset_observed_interp()
 	NetLagComp.observed_interp_ticks = saved
@@ -712,10 +801,10 @@ func test_a_degenerate_band_measurement_is_no_measurement() -> void:
 	var flat: float = NetLagComp.observed_interp_for(13)
 	for junk: float in [NAN, INF, -INF, -1.0, 0.0]:
 		NetLagComp.refresh_band_interp(junk, junk, junk, 3.0, 90.0)
-		assert_almost_eq(NetLagComp.observed_interp_for_band(13, NetLagComp.Band.FAR), flat, 1e-4,
+		assert_almost_eq(NetLagComp.observed_interp_for_band(13, NetLagComp.Band.FAR, 60.0), flat, 1e-4,
 			"a band figure of %f is no measurement, not a window built from it" % junk)
 		NetLagComp.refresh_band_interp(2.0, 4.0, 6.0, junk, 90.0)
-		assert_almost_eq(NetLagComp.observed_interp_for_band(13, NetLagComp.Band.FAR), flat, 1e-4,
+		assert_almost_eq(NetLagComp.observed_interp_for_band(13, NetLagComp.Band.FAR, 60.0), flat, 1e-4,
 			"...and neither is a pooled denominator of %f" % junk)
 	NetLagComp.reset_observed_interp()
 	NetLagComp.observed_interp_ticks = saved
@@ -728,12 +817,15 @@ func test_the_band_term_takes_the_same_floor_and_ceiling_as_every_other() -> voi
 	NetLagComp.reset_observed_interp()
 	NetLagComp.refresh_observed_interp_for(14, 8.0)
 	NetLagComp.refresh_band_interp(1.0, 1.0, 40.0, 2.0, 90.0)   # a far band 20x the pooled figure
-	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.FAR),
-		NetLagComp.MAX_INTERP_TICKS, 1e-4,
-		"a pathological band ratio clamps rather than turning the rewind into a time machine")
+	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.FAR, 60.0),
+		NetLagComp.max_interp_ticks(60.0), 1e-4,
+		"a pathological band ratio clamps to the deepest window max_delay_ms allows")
+	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.FAR, 120.0),
+		NetLagComp.max_interp_ticks(120.0), 1e-4,
+		"...and the same ratio at twice the rate clamps at twice the ticks, which is the same duration")
 	NetLagComp.refresh_observed_interp_for(14, 1.0)
 	NetLagComp.refresh_band_interp(0.1, 1.0, 1.0, 10.0, 90.0)   # a near band a hundredth of the pooled figure
-	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.NEAR),
+	assert_almost_eq(NetLagComp.observed_interp_for_band(14, NetLagComp.Band.NEAR, 60.0),
 		NetLagComp.INTERP_TICKS, 1e-4,
 		"and a fresh band cannot buy a window shallower than the tick a body arrived on")
 	NetLagComp.reset_observed_interp()
@@ -767,7 +859,7 @@ func test_two_peers_at_two_ranges_are_four_windows() -> void:
 	assert_true(slow_near < slow_far, "...for both shooters")
 	assert_true(fast_far < slow_far, "and the slower peer is still rewound deeper at the same range")
 	assert_eq(fast_far, NetLagComp.rewind_ticks_for_shot(false, 100.0, 60.0,
-		NetLagComp.observed_interp_for_band(21, NetLagComp.Band.FAR)),
+		NetLagComp.observed_interp_for_band(21, NetLagComp.Band.FAR, 60.0)),
 		"each depth is exactly the shot policy with that peer's own band term")
 	NetLagComp.reset_observed_interp()
 	NetLagComp.observed_interp_ticks = saved

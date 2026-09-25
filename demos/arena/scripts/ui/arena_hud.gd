@@ -279,7 +279,9 @@ func _shot_line() -> String:
 	return "SHOTS   refused: %s%s" % [_last_refusal, batched]
 
 ## How far behind the server's present each peer draws its remote bodies, in net ticks -- that peer's OWN
-## measured send cadence, not the session's mean. Half of the rewind window above is this number.
+## measured send cadence, not the session's mean. This is the raw measurement the rewind window's
+## interpolation half is built from, printed before the window applies its `max_delay_ms`-derived ceiling to
+## it, so a starved send path prints a figure deeper than any window above it will actually use.
 func _interp_line() -> String:
 	if not Net.is_server():
 		return "INTERP  measured on the server; a client does not see the other peers' cadences"
