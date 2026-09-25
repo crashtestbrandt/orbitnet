@@ -1,6 +1,6 @@
 name: binaries
 
-# Build the extension for all three platforms whenever the Rust changes, and upload the results as
+# Build the extension for every platform leg whenever the Rust changes, and upload the results as
 # workflow ARTIFACTS. It commits nothing.
 #
 # NO BINARY IS COMMITTED TO THIS REPOSITORY at all -- not on a push, not on a tag. `release.yml` commits
@@ -37,6 +37,13 @@ jobs:
           # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
           # here.
           - platform: linux
+            runner: [self-hosted, Linux, X64, legion]
+          # LINUX ARM64 CROSS-COMPILES ON THE x86_64 BOX. Same runner labels as the leg above,
+          # `aarch64-unknown-linux-gnu` as the cargo target, no arm64 hardware anywhere. It is its own
+          # leg because tools/build-native.sh maps one platform key onto one shipped filename and
+          # tools/check-descriptor-parity.sh proves every key has a leg that runs it. The box needs an
+          # aarch64 linker (`gcc-aarch64-linux-gnu`); the build refuses to start without one.
+          - platform: linux_arm64
             runner: [self-hosted, Linux, X64, legion]
           - platform: windows
             runner: [self-hosted, Windows, X64, legion-win]
@@ -110,8 +117,9 @@ jobs:
           ( cd native && rustc --version ) || echo "rustc does not resolve directly; cargo will resolve it"
 
 
-      # One script for both workflows and all three platforms. macOS cross-builds both architectures and
-      # lipos them per profile; legion-mac is ARM64, but that is only the HOST.
+      # One script for both workflows and every platform key. Two of those keys are cross builds on a host
+      # of another architecture: macOS builds both architectures and lipos them per profile (legion-mac is
+      # ARM64, but that is only the HOST), and `linux_arm64` targets aarch64 from the x86_64 box.
       - name: Build both descriptor profiles
         shell: bash
         run: tools/build-native.sh build ${{ matrix.platform }} staged

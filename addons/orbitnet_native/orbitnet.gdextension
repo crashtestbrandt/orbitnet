@@ -7,7 +7,7 @@
 ; to fill it:
 ;   * `just native-install` builds THIS host's library from native/. What a contributor runs, and what
 ;     every CI job does before it loads anything.
-;   * A release zip (`orbitnet-<version>.zip`) ships bin/ already populated for all three platforms.
+;   * A release zip (`orbitnet-<version>.zip`) ships bin/ already populated for every platform below.
 ;     That is the Asset Library payload and what a manual install copies.
 ;   * A consumer pins a release tag and downloads its assets, verifying the bytes against
 ;     addons/orbitnet_native/binaries.json -- the sha256 of every published asset, including the zip,
@@ -56,13 +56,16 @@ reloadable = false
 
 linux.debug.x86_64 = "res://addons/orbitnet_native/bin/liborbitnet.linux.template_debug.x86_64.so"
 linux.release.x86_64 = "res://addons/orbitnet_native/bin/liborbitnet.linux.template_release.x86_64.so"
+linux.debug.arm64 = "res://addons/orbitnet_native/bin/liborbitnet.linux.template_debug.arm64.so"
+linux.release.arm64 = "res://addons/orbitnet_native/bin/liborbitnet.linux.template_release.arm64.so"
 windows.debug.x86_64 = "res://addons/orbitnet_native/bin/orbitnet.windows.template_debug.x86_64.dll"
 windows.release.x86_64 = "res://addons/orbitnet_native/bin/orbitnet.windows.template_release.x86_64.dll"
 macos.debug = "res://addons/orbitnet_native/bin/liborbitnet.macos.template_debug.universal.dylib"
 macos.release = "res://addons/orbitnet_native/bin/liborbitnet.macos.template_release.universal.dylib"
 
-; No linux arm64 entry: nothing builds it yet. Adding one is a matrix entry in the build workflows, a
-; platform case in tools/build-native.sh and a line here -- the Rust is arch-agnostic.
+; The linux arm64 entries are CROSS-BUILT on the x86_64 Linux runner, under the `linux_arm64` platform
+; key: one more matrix leg on the box that already builds the x86_64 libraries, with no arm64 hardware
+; anywhere in the release path.
 ; No web entries: Godot's web export cannot load a GDExtension at all.
 ; No android/ios entries yet; mobile lands with the export-preset pass (ENet over UDP needs no protocol
 ; change, so this is a build-matrix question, not a netcode one).

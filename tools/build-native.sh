@@ -17,15 +17,23 @@
 #                     native profiler can attribute frames to Rust functions and source lines. Not a
 #                     descriptor entry: a developer swaps it in. Published as a release asset only.
 #
-# macOS builds BOTH architectures per profile and lipos them together. A single-arch dylib works on
-# the machine that built it and fails on the other half of the Mac install base.
+# macOS builds BOTH architectures per profile and lipos them together, PROFILING INCLUDED. A single-arch
+# dylib works on the machine that built it and fails on the other half of the Mac install base. The
+# profiling `.dSYM` is produced from the lipo'd dylib rather than per architecture, so one bundle covers
+# both slices -- see the macOS branch under `build`.
+#
+# `linux_arm64` CROSS-COMPILES ON THE x86_64 LINUX RUNNER. It targets `aarch64-unknown-linux-gnu` and
+# carries the same runner labels as `linux`, so no arm64 hardware is involved -- the shape macOS already
+# uses to build an x86_64 slice on an arm64 box. It needs an aarch64 LINKER, which `rustup target add`
+# does not install, and the build refuses to start without one rather than failing from inside a cargo
+# error or uploading an empty artifact.
 #
 # Usage:
 #   tools/build-native.sh host                            print this machine's platform
 #   tools/build-native.sh names <platform> [profile...]   print shipped filenames; build nothing
 #   tools/build-native.sh build <platform> <outdir> [profile...]
 #
-# <platform> is linux | windows | macos. Profiles default to the two the descriptor names.
+# <platform> is linux | linux_arm64 | windows | macos. Profiles default to the two the descriptor names.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -37,14 +45,24 @@ usage() {
 	printf 'usage: %s host\n' "$0" >&2
 	printf '       %s names <platform> [profile...]\n' "$0" >&2
 	printf '       %s build <platform> <outdir> [profile...]\n' "$0" >&2
-	printf 'platform: linux | windows | macos    profile: template_debug | template_release | profiling\n' >&2
+	printf 'platform: linux | linux_arm64 | windows | macos    profile: template_debug | template_release | profiling\n' >&2
 	exit 2
 }
 
 # Cargo's own output filename for a platform, and the two halves of the shipped name around the profile.
+# CROSS_TARGET is the rustup target this platform builds when it is not the host's own; empty means a
+# native build. It drives `rustup target add`, cargo's `--target` and the directory the output lands in,
+# so a cross platform is one case here rather than a branch in three places.
 platform_parts() {
+	CROSS_TARGET=""
 	case "$1" in
 		linux)   BUILT_NAME="liborbitnet.so";  SHIP_PREFIX="liborbitnet.linux";  SHIP_SUFFIX="x86_64.so" ;;
+		linux_arm64)
+			BUILT_NAME="liborbitnet.so";  SHIP_PREFIX="liborbitnet.linux";  SHIP_SUFFIX="arm64.so"
+			# THE GNU TARGET, NOT musl. The descriptor entry sits beside a Godot export template linked
+			# against glibc, and a musl cdylib loaded into a glibc process is a different libc in one
+			# address space.
+			CROSS_TARGET="aarch64-unknown-linux-gnu" ;;
 		windows) BUILT_NAME="orbitnet.dll";    SHIP_PREFIX="orbitnet.windows";   SHIP_SUFFIX="x86_64.dll"
 			# THE MSVC ABI, PINNED. `rust-toolchain.toml` fixes the channel and not the host triple, so
 			# the ABI otherwise comes from whichever rustup the runner service's account owns -- and a
@@ -55,7 +73,7 @@ platform_parts() {
 			# it should be too; and the msvc linker is what writes a PDB. A gnu build keeps DWARF inside
 			# the DLL, which no Windows profiler reads: a PE records a CodeView key, and nothing in the
 			# image stands in for the PDB that key names.
-			WIN_TARGET="x86_64-pc-windows-msvc" ;;
+			CROSS_TARGET="x86_64-pc-windows-msvc" ;;
 		macos)   BUILT_NAME="liborbitnet.dylib"; SHIP_PREFIX="liborbitnet.macos"; SHIP_SUFFIX="universal.dylib" ;;
 		*) printf 'build-native: unknown platform %s\n' "$1" >&2; exit 2 ;;
 	esac
@@ -74,14 +92,46 @@ profile_parts() {
 
 shipped_name() {
 	platform_parts "$1"
-	# macOS PROFILING is arm64, not universal. A universal profiling dylib would need two debug maps
-	# lipo'd together, which produces nothing dsymutil can turn into a usable .dSYM -- and the profile
-	# export presets target arm64 anyway. The two descriptor profiles stay universal.
-	if [ "$1" = macos ] && [ "$2" = profiling ]; then
-		printf '%s.profiling.arm64.dylib\n' "$SHIP_PREFIX"
+	# NO PER-PROFILE EXCEPTION. macOS `profiling` used to ship as `liborbitnet.macos.profiling.arm64.dylib`
+	# on the reasoning that two per-architecture debug maps cannot be lipo'd into a usable .dSYM. That is
+	# still true, and it stopped being the constraint once the order changed. The two slices are lipo'd
+	# FIRST and `dsymutil` runs on the fat dylib, reading both slices' debug maps and writing one fat
+	# .dSYM that carries both UUIDs. Every profile on every platform now takes the same name shape. See
+	# the macOS branch under `build`.
+	printf '%s.%s.%s\n' "$SHIP_PREFIX" "$2" "$SHIP_SUFFIX"
+}
+
+# The aarch64 Linux cross build links with a toolchain rustup does not install, and a missing linker
+# surfaces as "unrecognized file format" out of the middle of a cargo error -- or, on a runner, as a leg
+# that quietly produces nothing. Name the requirement here instead, before anything is compiled.
+require_aarch64_linux_linker() {
+	# A native aarch64 host links with its own `cc`; nothing to cross to.
+	case "$(uname -s)/$(uname -m)" in
+		Linux/aarch64|Linux/arm64) return ;;
+	esac
+	# An explicit setting wins: a box may carry a clang or a crosstool-ng toolchain under any name.
+	# An `if`, not `a && return`: under `set -e` a false `&&` list is a failed statement and kills the run.
+	if [ -n "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-}" ]; then
+		printf 'build-native: aarch64 cross linker %s (from the environment)\n' \
+			"$CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"
 		return
 	fi
-	printf '%s.%s.%s\n' "$SHIP_PREFIX" "$2" "$SHIP_SUFFIX"
+	for cc in aarch64-linux-gnu-gcc aarch64-unknown-linux-gnu-gcc aarch64-linux-gnu-cc; do
+		if command -v "$cc" >/dev/null 2>&1; then
+			export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$cc"
+			printf 'build-native: aarch64 cross linker %s\n' "$(command -v "$cc")"
+			return
+		fi
+	done
+	printf 'build-native: no aarch64 cross linker on this machine, so the linux_arm64 build cannot link.\n' >&2
+	printf '  `rustup target add aarch64-unknown-linux-gnu` installs the Rust std libraries only. rustc\n' >&2
+	printf '  shells out to a C linker for the cdylib, and that is a separate package:\n' >&2
+	printf '    Debian/Ubuntu  sudo apt-get install -y gcc-aarch64-linux-gnu\n' >&2
+	printf '    Fedora/RHEL    sudo dnf install -y gcc-aarch64-linux-gnu\n' >&2
+	printf '    Arch           sudo pacman -S aarch64-linux-gnu-gcc\n' >&2
+	printf '    Nix            pkgsCross.aarch64-multiplatform.stdenv.cc\n' >&2
+	printf '  Or export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER pointing at a linker you have.\n' >&2
+	exit 1
 }
 
 MODE="${1:-}"
@@ -91,7 +141,15 @@ shift || usage
 case "$MODE" in
 host)
 	case "$(uname -s)" in
-		Linux) printf 'linux\n' ;;
+		# THE ARCHITECTURE MATTERS ON LINUX AND NOWHERE ELSE. Windows ships x86_64 only and macOS ships
+		# one universal dylib, so `uname -m` changes nothing there. On Linux the two architectures are
+		# two files and two descriptor entries, and `just native-install` on an arm64 box must build and
+		# stage the one Godot will load.
+		Linux)
+			case "$(uname -m)" in
+				aarch64|arm64) printf 'linux_arm64\n' ;;
+				*) printf 'linux\n' ;;
+			esac ;;
 		Darwin) printf 'macos\n' ;;
 		MINGW*|MSYS*|CYGWIN*|Windows_NT) printf 'windows\n' ;;
 		*) printf 'build-native: unsupported host %s\n' "$(uname -s)" >&2; exit 1 ;;
@@ -113,17 +171,22 @@ build)
 	platform_parts "$PLATFORM"
 	mkdir -p "$OUTDIR"
 
-	if [ "$PLATFORM" = windows ]; then
-		# `cd native` FIRST, for the reason spelled out in the macOS branch below.
-		( cd "$NATIVE" && rustup target add "$WIN_TARGET" )
+	# BEFORE ANY CARGO WORK. A leg with no cross linker must say so in its first seconds rather than
+	# after a full dependency build.
+	if [ "$PLATFORM" = linux_arm64 ]; then
+		require_aarch64_linux_linker
+	fi
+
+	# `cd native` FIRST, in both of the `rustup target add` calls below. native/rust-toolchain.toml pins
+	# the toolchain cargo uses in that directory, while the repository root has no override and resolves
+	# to rustup's default. Running `rustup target add` from the root installs the std libraries onto the
+	# DEFAULT toolchain, which the pinned one cannot see, and the cross build then fails with "can't find
+	# crate for `std`".
+	if [ -n "$CROSS_TARGET" ]; then
+		( cd "$NATIVE" && rustup target add "$CROSS_TARGET" )
 	fi
 
 	if [ "$PLATFORM" = macos ]; then
-		# `cd native` FIRST. native/rust-toolchain.toml pins the toolchain cargo uses in that
-		# directory, while the repository root has no override and resolves to rustup's default.
-		# Running `rustup target add` from the root installs the std libraries onto the DEFAULT
-		# toolchain, which the pinned one cannot see, and the cross build then fails with
-		# "can't find crate for `std`".
 		( cd "$NATIVE" && rustup target add x86_64-apple-darwin aarch64-apple-darwin )
 	fi
 
@@ -135,36 +198,36 @@ build)
 		# A PROFILING build needs a per-platform rustc flag that a plain `cargo build` does not pass,
 		# and without it the artifact is published but unusable by a profiler:
 		#   linux  a Rust cdylib link does not request a GNU build ID in this toolchain, and perf
-		#          records build IDs when locating ELF images.
-		#   macos  rustc's default leaves DWARF in the object files and links only a debug map, so the
-		#          dylib alone is unsymbolizable. `packed` runs dsymutil and emits the .dSYM.
+		#          records build IDs when locating ELF images. Both architectures, same reason.
+		#   macos  rustc leaves DWARF in the object files and links only a debug map, so the dylib alone
+		#          is unsymbolizable. `unpacked` is that behavior REQUESTED rather than inherited, and it
+		#          leaves the object files in place for the dsymutil run below -- `packed` would run
+		#          dsymutil per architecture and delete them, and two per-architecture .dSYMs cannot be
+		#          combined after the fact.
 		#   windows nothing extra -- the MSVC linker always writes a PDB and stamps the image with the
 		#          CodeView key naming it.
 		if [ "$p" = profiling ]; then
 			case "$PLATFORM" in
-				linux)   RUSTC_ARGS=(-C link-arg=-Wl,--build-id) ;;
-				macos)   RUSTC_ARGS=(-C split-debuginfo=packed) ;;
-				windows) RUSTC_ARGS=() ;;
+				linux|linux_arm64) RUSTC_ARGS=(-C link-arg=-Wl,--build-id) ;;
+				macos)             RUSTC_ARGS=(-C split-debuginfo=unpacked) ;;
+				windows)           RUSTC_ARGS=() ;;
 			esac
 		else
 			RUSTC_ARGS=()
 		fi
 
-		if [ "$PLATFORM" = macos ] && [ "$p" = profiling ]; then
-			# arm64 only, and the .dSYM rides beside it. See shipped_name().
-			( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" -p orbitnet-godot \
-				--target aarch64-apple-darwin -- "${RUSTC_ARGS[@]}" )
-			built="$NATIVE/target/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
-			[ -s "$built" ] || { printf 'build-native: cargo produced nothing at %s\n' "$built" >&2; exit 1; }
-			install -m 0755 "$built" "$OUTDIR/$ship"
-			[ -d "$built.dSYM" ] || { printf 'build-native: no .dSYM beside %s\n' "$built" >&2; exit 1; }
-			rm -rf "$OUTDIR/$ship.dSYM"
-			# -L dereferences: cargo leaves target/<profile>/*.dSYM as a symlink into deps/, and a
-			# staged symlink points back at a tree the next build rewrites.
-			cp -RLp "$built.dSYM" "$OUTDIR/$ship.dSYM"
-		elif [ "$PLATFORM" = macos ]; then
-			( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot --target x86_64-apple-darwin )
-			( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot --target aarch64-apple-darwin )
+		if [ "$PLATFORM" = macos ]; then
+			# EVERY PROFILE IS UNIVERSAL, profiling included. Build both architectures, lipo them, and for
+			# `profiling` run dsymutil on the RESULT: it walks each slice's debug map in turn and writes a
+			# single fat .dSYM whose UUIDs are the fat dylib's own, which is what a debugger matches on.
+			for arch_target in x86_64-apple-darwin aarch64-apple-darwin; do
+				if [ "${#RUSTC_ARGS[@]}" -gt 0 ]; then
+					( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" -p orbitnet-godot \
+						--target "$arch_target" -- "${RUSTC_ARGS[@]}" )
+				else
+					( cd "$NATIVE" && cargo build "${CARGO_FLAG[@]}" -p orbitnet-godot --target "$arch_target" )
+				fi
+			done
 			lipo -create -output "$OUTDIR/$ship" \
 				"$NATIVE/target/x86_64-apple-darwin/$CARGO_DIR/$BUILT_NAME" \
 				"$NATIVE/target/aarch64-apple-darwin/$CARGO_DIR/$BUILT_NAME"
@@ -172,9 +235,9 @@ build)
 		else
 			TARGET_ARGS=()
 			outdir="$NATIVE/target/$CARGO_DIR"
-			if [ "$PLATFORM" = windows ]; then
-				TARGET_ARGS=(--target "$WIN_TARGET")
-				outdir="$NATIVE/target/$WIN_TARGET/$CARGO_DIR"
+			if [ -n "$CROSS_TARGET" ]; then
+				TARGET_ARGS=(--target "$CROSS_TARGET")
+				outdir="$NATIVE/target/$CROSS_TARGET/$CARGO_DIR"
 			fi
 			if [ "${#RUSTC_ARGS[@]}" -gt 0 ]; then
 				( cd "$NATIVE" && cargo rustc "${CARGO_FLAG[@]}" "${TARGET_ARGS[@]}" -p orbitnet-godot -- "${RUSTC_ARGS[@]}" )
@@ -186,12 +249,53 @@ build)
 			install -m 0755 "$built" "$OUTDIR/$ship"
 		fi
 
-		# Prove the profiling artifact is actually symbolizable, rather than trusting the flag.
-		if [ "$p" = profiling ] && [ "$PLATFORM" = linux ] && command -v readelf >/dev/null 2>&1; then
+		# Prove the profiling artifact is actually symbolizable, rather than trusting the flag. readelf
+		# reads a foreign-architecture ELF, so the aarch64 cross artifact is checked on the x86_64 box
+		# that produced it.
+		if [ "$p" = profiling ] && { [ "$PLATFORM" = linux ] || [ "$PLATFORM" = linux_arm64 ]; } \
+			&& command -v readelf >/dev/null 2>&1; then
 			readelf -S --wide "$OUTDIR/$ship" | grep -q '\.debug_info' \
 				|| { printf 'build-native: %s has no .debug_info\n' "$ship" >&2; exit 1; }
 			readelf -n "$OUTDIR/$ship" | grep -q 'Build ID' \
 				|| { printf 'build-native: %s has no ELF build ID\n' "$ship" >&2; exit 1; }
+		fi
+
+		# THE .dSYM IS BUILT FROM THE STAGED FAT DYLIB, and it has to cover every slice. A debugger
+		# matches a bundle to an image by UUID, so comparing the dylib's UUID set against the bundle's is
+		# the whole proof: a bundle covering one architecture symbolizes on that machine and silently
+		# leaves the other half of the install base with addresses, which is the failure the universal
+		# policy exists to prevent.
+		if [ "$p" = profiling ] && [ "$PLATFORM" = macos ]; then
+			# Asserted rather than skipped the way the readelf checks above are. readelf is a diagnostic
+			# and a host without it still produced the library; the .dSYM IS the artifact, so a missing
+			# dsymutil means there is nothing to ship and the build has to say so.
+			command -v dsymutil >/dev/null 2>&1 || {
+				printf 'build-native: no dsymutil on PATH. It ships with the Xcode command line tools:\n' >&2
+				printf '  xcode-select --install\n' >&2
+				exit 1; }
+			rm -rf "$OUTDIR/$ship.dSYM"
+			dsymutil "$OUTDIR/$ship"
+			dwarf="$OUTDIR/$ship.dSYM/Contents/Resources/DWARF/$ship"
+			[ -s "$dwarf" ] || {
+				printf 'build-native: dsymutil wrote no DWARF at %s. The object files it reads are the\n' "$dwarf" >&2
+				printf '  ones `-C split-debuginfo=unpacked` leaves under target/; a `packed` build deletes them.\n' >&2
+				exit 1; }
+			# One UUID line per slice, so the count is the slice count. TWO, spelled out: universal here
+			# means x86_64 and arm64, and a single-arch dylib with a matching single-arch bundle would
+			# otherwise satisfy an equality test while shipping the exact defect this replaces.
+			lib_uuids="$(dwarfdump --uuid "$OUTDIR/$ship" | awk '/^UUID:/ {print $2}' | sort)"
+			sym_uuids="$(dwarfdump --uuid "$dwarf" | awk '/^UUID:/ {print $2}' | sort)"
+			# `|| true` because `grep -c` exits 1 on a count of zero, and under `set -euo pipefail` that
+			# kills the assignment and the script with it -- before the branch below can print which UUIDs
+			# each side actually had, which is the only useful thing in an Actions log.
+			slices="$(printf '%s\n' "$lib_uuids" | grep -c . || true)"
+			if [ "$slices" -ne 2 ] || [ "$lib_uuids" != "$sym_uuids" ]; then
+				printf 'build-native: %s.dSYM does not cover both slices of the dylib.\n' "$ship" >&2
+				printf '  dylib UUIDs: %s\n' "$(printf '%s' "$lib_uuids" | tr '\n' ' ')" >&2
+				printf '  .dSYM UUIDs: %s\n' "$(printf '%s' "$sym_uuids" | tr '\n' ' ')" >&2
+				exit 1
+			fi
+			lipo -info "$dwarf"
 		fi
 
 		# The msvc linker always writes a PDB and stamps the image with the CodeView key naming it.
@@ -202,7 +306,7 @@ build)
 			pdb="$outdir/orbitnet.pdb"
 			[ -s "$pdb" ] || {
 				printf 'build-native: no PDB at %s. The msvc linker always writes one, so this means the\n' "$pdb" >&2
-				printf '  build did not use %s. Check `rustup target list --installed`.\n' "$WIN_TARGET" >&2
+				printf '  build did not use %s. Check `rustup target list --installed`.\n' "$CROSS_TARGET" >&2
 				exit 1; }
 			cp -p "$pdb" "$OUTDIR/orbitnet.pdb"
 			printf 'build-native: shipping orbitnet.pdb beside the DLL\n'
