@@ -818,18 +818,22 @@ assertions that fail for different reasons.
 | Assertion | How | Where it runs |
 |---|---|---|
 | The compare's source emits no conditional branch and no call | `fn tags_equal`'s text is read out of `auth.rs`, compiled **on its own** with `rustc --emit=asm` under each shipped profile's flags, and the emitted mnemonics scanned | `just native-test`, every pull request |
-| Two refused datagrams differing in which tag byte is wrong are not separable by timing | a dudect-style Welch t-test against a tolerance measured on the box in the same run, with a deliberately leaky compare as the control | `just native-timing`, by hand on an idle machine |
+| Two refused datagrams differing in which tag byte is wrong are not separable by timing | a dudect-style Welch t-test against a tolerance measured on the box in the same run, with a deliberately leaky compare as the control | the nightly `constant-time` workflow on the self-hosted box, and `just native-timing` by hand on an idle machine |
 
 Two limits on that table, both recorded at length in the test's header comment.
 
 - **The codegen assertion judges the compare compiled in isolation.** The shipped library contains no
   `tags_equal` symbol: the fold is inlined into `SessionAuth::open`. A rewrite that compiles branchless on
   its own and branchy once inlined at that call site would pass.
-- **The measurement is not a pull-request gate, and today runs in no job.** A shared CI runner is a noisy
-  virtual machine whose noise floor is higher than the difference being measured, so there the tolerance
-  inflates until the test passes on anything. The test asserts that the leaky control clears the tolerance by
-  4x and fails if it does not, so a box too noisy to resolve a known leak reports a failure rather than a
-  pass.
+- **The measurement is not a pull-request gate.** A shared CI runner is a noisy virtual machine whose noise
+  floor is higher than the difference being measured, so there the tolerance inflates until the test passes
+  on anything. The test asserts that the leaky control clears the tolerance by 4x and fails if it does not,
+  so a box too noisy to resolve a known leak reports a failure rather than a pass.
+- **A nightly runs it on the self-hosted box.** `.github/workflows/constant-time.yml` runs
+  `just native-timing` there on a schedule, with no pull-request trigger. A leak verdict fails the job and a
+  run with no harness output fails it; a run too noisy to render a verdict is retried once and then leaves a
+  warning, so the box being busy does not produce a red build nobody reads. The step summary carries the
+  nulls, the tolerance, the control's multiple of it and each judged draw, and the logs are kept 90 days.
 
 ## The resume token
 
