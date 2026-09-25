@@ -24,6 +24,19 @@
 //!   see `__fastfail` — what the CRT raises on detected heap corruption, and the Windows counterpart
 //!   of the `SIGABRT` case above. A fail-fast bypasses every frame-based and vector-based handler by
 //!   design, so nothing in-process can catch it. Only an out-of-process collector sees that one.
+//! * **Android**: nothing. [`install`] succeeds and installs no handler, for two independent reasons:
+//!     * **Bionic ships no `<execinfo.h>`.** The `backtrace` / `backtrace_symbols_fd` pair the POSIX
+//!       branch links against does not exist on Android, and the NDK links a shared library with
+//!       `-Wl,--no-undefined`, so compiling that branch for an android ABI fails at link time.
+//!     * **The premise above does not hold there.** `debuggerd` writes a tombstone carrying the
+//!       signal, the fault address and a symbolized native backtrace for every fatal signal, in a
+//!       release build as much as a debug one, and the same trace reaches `logcat`. The platform
+//!       already does what this module adds on desktop, so a second in-process record would only
+//!       repeat it with fewer symbols.
+//!
+//!   Both are properties of Android itself rather than of this build, so no toolchain change would
+//!   make a handler land here. [`install`] still returns `true` there, the same as on any target with
+//!   no handler branch, and no `crash-native.log` is ever written.
 //!
 //! ## Windows Error Reporting is READ, never written
 //!
@@ -50,6 +63,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Frames captured per crash. Deep enough to cross the Godot/GDScript/extension boundary, small
 /// enough to live on the (possibly alternate, possibly tiny) signal stack.
+///
+/// The cfg names the platforms that install a handler at all. Android is a unix that does not, so an
+/// ungated const is dead code in that build and `clippy -D warnings` fails the leg.
+#[cfg(any(windows, all(unix, not(target_os = "android"))))]
 const MAX_FRAMES: usize = 64;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -219,7 +236,7 @@ pub(crate) fn local_dumps() -> LocalDumps {
 }
 
 /// Append `bytes` to `fd`, retrying a short write. Async-signal-safe (write(2) only).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 unsafe fn write_all(fd: i32, bytes: &[u8]) {
     let mut off = 0usize;
     while off < bytes.len() {
@@ -240,6 +257,9 @@ unsafe fn write_all(fd: i32, bytes: &[u8]) {
 
 /// Render `value` as decimal into `buf`, returning the written slice. No allocation, no formatting
 /// machinery — `core::fmt` is not async-signal-safe.
+///
+/// Same cfg as `MAX_FRAMES` above, plus `test`: the suite below covers it on the host.
+#[cfg(any(windows, all(unix, not(target_os = "android")), test))]
 fn render_u64(value: u64, buf: &mut [u8; 24]) -> &[u8] {
     if value == 0 {
         buf[0] = b'0';
@@ -255,7 +275,7 @@ fn render_u64(value: u64, buf: &mut [u8; 24]) -> &[u8] {
     &buf[i..]
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 mod platform {
     use super::{render_u64, write_all, LOG_PATH, MAX_FRAMES, PATH_READY};
     use std::sync::atomic::Ordering;
@@ -714,7 +734,14 @@ mod platform {
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+/// No handler: Android, and any target that is neither unix nor windows.
+///
+/// Android is deliberate rather than unfinished — see the module header. Bionic ships no
+/// `<execinfo.h>`, so the `backtrace` pair the POSIX module links against does not exist there and the
+/// NDK link fails on an undefined symbol; and Android's own `debuggerd` already writes a tombstone
+/// with a symbolized native backtrace for every fatal signal, in release builds as well as debug,
+/// which is the gap this module exists to close on desktop.
+#[cfg(any(target_os = "android", not(any(unix, windows))))]
 mod platform {
     pub(super) fn install() {}
 }

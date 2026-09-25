@@ -17,12 +17,15 @@ cd "$ROOT"
 DESCRIPTOR="addons/orbitnet_native/orbitnet.gdextension"
 RELEASE_WF=".github/workflows/release.yml"
 WORKFLOWS=".github/workflows/binaries.yml $RELEASE_WF"
-# FOUR PLATFORM KEYS ACROSS THREE OPERATING SYSTEMS. tools/build-native.sh maps one key onto one shipped
-# filename per profile, so the two Linux architectures are two keys and both workflows carry a leg for
-# each. `linux_arm64` is spelled the same in build-native.sh, binaries.yml and release.yml; the leg grep
-# below matches `[a-z0-9_]+` only, so an underscore is the separator that works in every place the key
-# is spelled.
-PLATFORMS=(linux linux_arm64 windows macos)
+# Seven platform keys across four operating systems. tools/build-native.sh maps one key onto one shipped
+# filename per profile, so an architecture that ships its own file is its own key: the two Linux
+# architectures are two keys and the three android ABIs are three more, while macOS is one key for two
+# architectures because they end up in one file. Both workflows carry a leg for every key.
+#
+# Each key is spelled the same in build-native.sh, binaries.yml and release.yml; the leg grep below
+# matches `[a-z0-9_]+` only, so an underscore is the separator that works in every place the key is
+# spelled.
+PLATFORMS=(linux linux_arm64 windows macos android_arm64 android_arm32 android_x86_64)
 
 # Filenames the descriptor points at, deduplicated: several entries may name one file.
 # `|| true` then an explicit emptiness check: under `set -euo pipefail` a grep that matches nothing kills

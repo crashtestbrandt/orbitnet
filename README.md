@@ -67,7 +67,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 |---|---|
 | **Godot** | 4.4+ (built against the 4.4 API; loads in anything at or above it) |
 | **Language** | GDScript. No C# bindings. |
-| **Platforms** | Linux x86_64, Windows x86_64, macOS universal; Linux arm64 from the next release. Android and iOS have no published build yet — see [ROADMAP.md](ROADMAP.md) |
+| **Platforms** | Linux x86_64, Windows x86_64, macOS universal; Linux arm64 and Android arm64/arm32/x86_64 from the next release, built and published but not tested on a device. iOS has no published build — see [docs/building.md](docs/building.md#ios-is-not-a-key-yet) |
 | **Transports** | ENet out of the box; Steam via [GodotSteam](https://godotsteam.com/), selected by export-preset feature tag |
 | **Not supported** | Web — Godot's web export cannot load a GDExtension |
 

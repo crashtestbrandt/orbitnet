@@ -33,9 +33,28 @@ addr2line -e liborbitnet.linux.template_release.x86_64.so 0x1a2b3c
 | Linux, macOS | `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT` | `sigaction` on a dedicated alt stack (`SA_ONSTACK`), so a stack-overflow `SIGSEGV` is captured too |
 | Windows | Access violations and friends | `SetUnhandledExceptionFilter` |
 | Windows | **`__fastfail` — not caught** | Bypasses every in-process handler; see below |
+| Android | **Nothing — no handler is installed** | The platform already collects it; see below |
 
 `SIGABRT` is the one Godot's handler omits even in debug builds, and it is the one that matters: glibc raises
 it when it detects heap corruption, which is how a write-after-free actually kills a process.
+
+## Android installs no handler, deliberately
+
+**`Net.install_native_crash_handler()` returns `true` on Android and registers nothing.** The return value
+reports that the slot was claimed, not that a handler exists, so a caller that gates a "native crash
+reports enabled" line on it has to exclude Android itself. Two independent reasons, either sufficient:
+
+- **Bionic ships no `<execinfo.h>`.** The `backtrace` / `backtrace_symbols_fd` pair the POSIX branch calls
+  does not exist there, and the NDK links a shared library with `-Wl,--no-undefined`, so that branch cannot
+  be compiled for an Android ABI at all.
+- **The gap this page describes does not exist on Android.** `debuggerd` writes a tombstone carrying the
+  signal, the fault address and a symbolized native backtrace for every fatal signal, in a release build as
+  much as a debug one, and the same trace reaches `logcat`. A second in-process record would repeat it with
+  fewer symbols.
+
+Read a native crash there with `adb logcat` or the tombstone under `/data/tombstones`, and upload the
+`profiling` library's symbols to whichever crash service the app uses. No `crash-native.log` is written on
+Android, so a caller must not treat its absence as evidence the process exited cleanly.
 
 ## The Windows fail-fast gap
 

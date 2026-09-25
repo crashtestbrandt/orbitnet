@@ -49,6 +49,16 @@ jobs:
             runner: [self-hosted, Windows, X64, legion-win]
           - platform: macos
             runner: [self-hosted, macOS, ARM64, legion-mac]
+          # The android ABIs cross-compile on the x86_64 Linux box too, one leg per ABI because Android
+          # ships one .so per ABI and the descriptor names each one. They link with the NDK's clang
+          # wrappers rather than a distribution cross gcc; the step below resolves or installs an NDK,
+          # and the build refuses to start without one.
+          - platform: android_arm64
+            runner: [self-hosted, Linux, X64, legion]
+          - platform: android_arm32
+            runner: [self-hosted, Linux, X64, legion]
+          - platform: android_x86_64
+            runner: [self-hosted, Linux, X64, legion]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -117,9 +127,11 @@ jobs:
           ( cd native && rustc --version ) || echo "rustc does not resolve directly; cargo will resolve it"
 
 
-      # One script for both workflows and every platform key. Two of those keys are cross builds on a host
-      # of another architecture: macOS builds both architectures and lipos them per profile (legion-mac is
-      # ARM64, but that is only the HOST), and `linux_arm64` targets aarch64 from the x86_64 box.
+      # One script for both workflows and every platform key. Most of those keys are cross builds on a
+      # host of another architecture: macOS builds both architectures and lipos them per profile
+      # (legion-mac is ARM64, but that is only the HOST), `linux_arm64` targets aarch64 from the x86_64
+      # box, and the three android keys target their ABIs from that same box.
+      #
       # THE aarch64 CROSS LINKER, WHICH `rustup target add` DOES NOT INSTALL. rustc shells out to a C
       # linker to produce a cdylib, and for a foreign architecture that linker carries the target's own
       # libc and crt objects -- a separate package, not part of the Rust toolchain. Without it this leg
@@ -174,6 +186,71 @@ jobs:
           fi
           command -v aarch64-linux-gnu-gcc
 
+      # The Android NDK, which `rustup target add` does not install either. rustc shells out to a C
+      # linker for a cdylib, and for an android ABI that linker is the NDK's clang wrapper, carrying
+      # Bionic's libc and crt objects. Without one this leg fails in tools/build-native.sh's preflight,
+      # which names the requirement but cannot satisfy it on a runner.
+      #
+      # Provisioning happens here rather than in tools/build-native.sh, for the same reason as the step
+      # above: a `tools/` script that installed packages would mutate a contributor's machine.
+      #
+      # It calls tools/build-native.sh's own search rather than repeating it. A second copy that drifted
+      # would fail a leg on a box the build itself can build on -- the box provisioned with the apt
+      # package docs/building.md recommends, for instance, whose NDK lands somewhere a narrower search
+      # never looks. The step exports ANDROID_NDK_HOME so the build resolves the same install it just
+      # reported.
+      #
+      # The `sdkmanager` path is what the aarch64 step's `apt-get` path is: provisioning a box this
+      # workflow already owns. An NDK is a licensed SDK component rather than a distribution package, so
+      # a runner with no command-line tools cannot be provisioned from here and the step says what to
+      # install instead.
+      - name: Locate the Android NDK
+        if: startsWith(matrix.platform, 'android')
+        shell: bash
+        env:
+          # One edit moves every android leg to another NDK, and it is only what gets installed: a box
+          # already carrying an NDK keeps it. Any r23 or newer works -- the clang wrappers this build
+          # links with have been in the same place since the side-by-side layout arrived.
+          ANDROID_NDK_VERSION: '26.3.11579264'
+        run: |
+          set -euo pipefail
+          ndk="$(tools/build-native.sh ndk-root)"
+          installed=0
+          if [ -z "$ndk" ] && command -v sdkmanager >/dev/null 2>&1; then
+            echo "no NDK on this runner; installing ndk;${ANDROID_NDK_VERSION}"
+            # Licences are accepted non-interactively for the same reason `sudo -n` is used above: a
+            # runner service must never sit at a prompt. `|| true` because sdkmanager exits non-zero once
+            # every licence is already accepted.
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+            installed=1
+            ndk="$(tools/build-native.sh ndk-root)"
+          fi
+          # Two distinct failures, because they need opposite responses. Telling an operator to install
+          # command-line tools that are already present, on a run where sdkmanager just wrote an NDK,
+          # sends them at the wrong thing.
+          if [ -z "$ndk" ] && [ "$installed" -eq 1 ]; then
+            echo "::error::sdkmanager installed ndk;${ANDROID_NDK_VERSION} and tools/build-native.sh still finds no NDK."
+            echo "It searches ANDROID_NDK_HOME, ANDROID_NDK_ROOT, ANDROID_NDK, NDK_HOME and"
+            echo 'ANDROID_NDK_LATEST_HOME, then ndk/<version> under ANDROID_SDK_ROOT, ANDROID_HOME,'
+            echo '$HOME/Android/Sdk, $HOME/Library/Android/sdk, /usr/lib/android-sdk and /opt/android-sdk,'
+            echo 'then /usr/lib/android-ndk and /opt/android-ndk*.'
+            echo "sdkmanager wrote outside all of those. Set ANDROID_NDK_HOME on the runner to the"
+            echo "directory it wrote, or point ANDROID_SDK_ROOT at the SDK it installed into."
+            exit 1
+          fi
+          if [ -z "$ndk" ]; then
+            echo "::error::no Android NDK on this runner, and no sdkmanager to install one."
+            echo "This leg cross-compiles the extension for one android ABI and links it with the NDK's"
+            echo "clang wrapper. Install the NDK for the account the runner service runs as -- Android"
+            echo "Studio's SDK Manager, or 'sdkmanager --install \"ndk;${ANDROID_NDK_VERSION}\"' from the"
+            echo "command-line tools -- and set ANDROID_NDK_HOME to its root."
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ndk: $ndk"
+          ls "$ndk/toolchains/llvm/prebuilt"
+
       - name: Build both descriptor profiles
         shell: bash
         run: tools/build-native.sh build ${{ matrix.platform }} staged
@@ -208,11 +285,16 @@ jobs:
       #   linux_arm64  CROSS-BUILT on the x86_64 Linux box, so its artifact cannot be loaded by the runner
       #                that produced it at all. Nothing here can execute it, and a step that tried would
       #                fail on every run.
+      #   android_*    cross-built on that same box, and for a different operating system as well as a
+      #                different ABI. Loading one needs a device or an emulator, which no runner in this
+      #                fleet has. The android libraries are built and published untested -- see
+      #                docs/building.md.
       #
       # AN ALLOWLIST, NOT `!= 'linux'`. That test read correctly while there were three legs and admitted
       # `linux_arm64` the moment a fourth arrived -- it would have staged an aarch64 library where the
       # descriptor resolves it and handed it to Godot on an x86_64 host. A new leg now has to opt in, which
-      # is the safe direction for a condition about what a machine can execute.
+      # is the safe direction for a condition about what a machine can execute, and it is why the three
+      # android legs added later needed no change here.
       # =================================================================================================
       - name: Check Godot on this runner
         if: matrix.platform == 'windows' || matrix.platform == 'macos'
