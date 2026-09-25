@@ -131,8 +131,13 @@ into `server.csv`.
 just native-check    # fmt + clippy -D warnings + tests + build + the load smoke
 ```
 
-One rule: **`orbitnet-core` never sees a `Variant`.** Zero dependencies, no `godot`, which is why its tests
-run in milliseconds. A `godot` type in a core signature means logic has leaked across the boundary.
+One rule: **`orbitnet-core` never sees a `Variant`.** Zero runtime dependencies, no `godot`, which is why
+its tests run in milliseconds. A `godot` type in a core signature means logic has leaked across the boundary.
+
+**`[dependencies]` stays empty; `[dev-dependencies]` does not have to.** A generator or test-only crate is
+compiled for `cargo test` and is linked into no build, so it does not weaken the rule above. `proptest` is
+the one such entry today, behind `crates/orbitnet-core/tests/wire_properties.rs`. Add one only together with
+its license row in `THIRD_PARTY.md`, in the same change.
 
 **Do not commit binaries.** `addons/orbitnet_native/bin/` is gitignored and no workflow ever adds to it.
 `binaries.yml` proves every platform builds on every `native/**` push; `release.yml` publishes the bytes as
