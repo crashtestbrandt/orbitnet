@@ -34,7 +34,7 @@
 
   "sync": {
     "build": ["just", "export-rts-server"],
-    "build_dir": "build",
+    "build_dir": "build/rts-server",
     "build_min_bytes": 1048576
   },
 
