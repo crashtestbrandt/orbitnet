@@ -263,38 +263,40 @@ Every run imports the demo project before it launches anything, and says so.
 A bringup failure prints the errors found anywhere in that process's log before the tail. A GDScript parse
 cascade is longer than a tail, and the first script it names is the one to read.
 
-## Multi-machine
+## Across machines
 
-Every mode validates the same arguments first, so `--dry-run` and `--preflight` need the full environment a
-real run needs — `--dry-run` resolves it into the printed plan without contacting a host, `--preflight` is the
-mode that contacts them.
+`bench.sh` runs the server and every client on one machine. That conditions a loopback socket, which cannot
+produce a real link's bandwidth cap, a NAT or the shape of a relayed transport — and it puts the server in
+contention with its own clients for one machine's cores, so a send-path cost measured there describes the
+harness. A run across machines is taken with [OrbitOrc](https://github.com/crashtestbrandt/orbitorc): an
+agent on each box, a control plane they dial into, and `orbitorc.json` at this repository's root declaring
+the three modes `bench.sh` launches — the dedicated server, the relay and the bot client.
 
 ```sh
-export SERVER_HOST=box-a CLIENT_HOSTS="box-b box-c" PROFILE=relayed
-just netbench-gauntlet --dry-run     # print the ssh/rsync/scp plan and the resolved arguments; contact nothing
-just netbench-gauntlet --preflight   # contact every host and validate it; launch nothing
-just netbench-gauntlet               # preflight, then the full run
+orbitorc doctor                                                           # every box, and what each would refuse
+orbitorc run orbitnet --authority-box box-a --load-box box-b --measure 30 --load-per-box 4 --wait
+orbitorc run orbitnet --authority-box box-a --load-box box-b --link relay --measure 30 --wait   # conditioned
+orbitorc pull <job> --box box-b --file metrics.csv --out artifacts/        # each client's CSV
+orbitorc pull <job> --box box-a --file job.log --out artifacts/            # the server's per-window lines
 ```
 
-One SSH controller drives a server host plus bot-client hosts. Needs reachable hosts, passwordless SSH and
-Godot 4 on each. A real run preflights first; `SKIP_PREFLIGHT=1` bypasses that.
+- **The authority gets a box to itself, and the load goes elsewhere.** A run refuses to place bot clients
+  beside the server unless told to, and says why.
+- **Every host keeps its own native binary and imports the demo before launch**, for the same reasons the
+  single-box bench does. `doctor` reports a checkout that has never been built, an LFS pointer where the
+  library should be, and a stale import cache, before anything is launched.
+- **The verdict counts the clients it expected.** A client that joined and simulated nothing — every
+  simulation column flat zero while the transport columns carry numbers — fails the run rather than
+  passing it.
+- **What the run does not judge** is this repository's own bench rules. The server's `NETSEND` lines are
+  in its pulled `job.log`; folding them into `server.csv` for `compare.py` is what `bench.sh` does inline and
+  is not yet a script that takes a pulled log.
 
-- **`PROFILE` means two different things.** Under `RELAY=1` it is the impairment the relay injects. Under
-  `RELAY=0` — the default — nothing is injected and it is only the RTT gate's reference, so it must be set
-  explicitly to the link the operator expects (`clean` for a LAN, `broadband` / `cross_region` / `relayed` for
-  a WAN). The script refuses `RELAY=0` with no `PROFILE` rather than gate a real link against an imaginary one.
-- **Each host keeps its own native binary.** The rsync carries the GDScript and the projects but excludes
-  `addons/orbitnet_native/bin/`: a library is per-platform, and this bench exists to run cross-OS. Run
-  `just native-install` once on every host. Preflight fails when a host has none, including a host with no
-  checkout yet — the rsync that creates the checkout still brings no library.
-- **Every host imports the demo before launch**, for the same reason the single-box bench does — a stale global
-  class cache resolves every `class_name` to `Variant`. A host whose import fails stops the run there.
-- **Each host appears once.** `CLIENT_HOSTS` must name distinct hosts: each entry wipes its own remote artifact
-  directory at bringup, so a repeat would delete the logs of the clients the first pass launched. Use
-  `CLIENTS_PER_HOST=<n>` to put several clients on one host.
-- **The verdict counts the clients it expected**, not the logs that arrived, so an unreachable host cannot
-  shrink the fleet and still pass.
-- **No real-host run is recorded yet.** Every number on this page comes from a loopback run.
+**The first recorded real-host run (2026-09-29):** the authority on a Windows box with no desktop session,
+two bot clients on a Mac joining it over the LAN. The server printed its ready marker 539 ms after launch,
+the clients 404 and 503 ms after theirs; the 20 s window held to the clients' own exits; both measured, with
+`resim_ticks`, `rollback_ms` and `net_ms` moving. The server's own log shows both peers seated and
+`peers=2 entities=210` on the wire line.
 
 ## Which bench supports which claim
 
@@ -304,16 +306,16 @@ Godot 4 on each. A real run preflights first; `SKIP_PREFLIGHT=1` bypasses that.
 | the netcode holds up at a given latency / jitter / loss | `bench.sh` |
 | prediction reconverges under **bursty** loss | `bench.sh`, `worst_case_burst` |
 | duplicate and out-of-order datagrams are handled | `bench.sh`, `relayed` — an approximation of the shape, on loopback |
-| the session survives a **NAT** between the peers | `gauntlet.sh` only |
-| the path's real **MTU** does not split or drop a fat channel's frames | `gauntlet.sh` only |
-| a **relayed transport** delivers remote poses at the rate the game expects | `gauntlet.sh`, and only over a path the operator has confirmed is relayed — see below |
+| the session survives a **NAT** between the peers | a run across machines only |
+| the path's real **MTU** does not split or drop a fat channel's frames | a run across machines only |
+| a **relayed transport** delivers remote poses at the rate the game expects | a run across machines, and only over a path the operator has confirmed is relayed — see below |
 | the send rate fits a real uplink's **bandwidth** | neither — nothing here caps bandwidth |
 
-`gauntlet.sh` launches clients with `--join=<server>:<port>` over ENet, which is the direct path between the
-two machines or, under `RELAY=1`, this repository's own local impairment relay. Neither is a hosted relay
-service. A mesh VPN's fallback relay can carry the traffic incidentally, but the script neither forces that nor
-detects it, so a run supports the relay row only when the operator establishes the path is relayed and records
-that alongside the numbers. The **Steam transport**, which is the consumer that actually rides a relay service,
+A run across machines launches clients with `--join=<server>:<port>` over ENet, which is the direct path
+between the two machines or, with `--link relay`, this repository's own impairment relay on the server's box.
+Neither is a hosted relay service. A mesh VPN's fallback relay can carry the traffic incidentally, but nothing
+forces that or detects it, so a run supports the relay row only when the operator establishes the path is
+relayed and records that alongside the numbers. The **Steam transport**, which is the consumer that actually rides a relay service,
 is launched by neither bench: that path has no coverage here today.
 
 ## What it deliberately does not do
@@ -325,5 +327,5 @@ is launched by neither bench: that path has no coverage here today.
 - **A conditioned loopback socket reproduces only part of a relayed link.** The `relayed` profile models a
   relay's reordering and duplication as probabilities. It has no knob for the relay's own **MTU**, its
   mid-session reroute, or the extra hop's queueing, because the relay shell conditions timing and delivery and
-  never resizes a datagram. A conclusion about behaviour **over a relay** needs a gauntlet run on a confirmed
-  relayed path.
+  never resizes a datagram. A conclusion about behavior **over a relay** needs a run across machines on a
+  confirmed relayed path.
