@@ -1,0 +1,180 @@
+{
+  "_comment": [
+    "What a remote fleet may launch in this repository. Read by an OrbitOrc agent out of this",
+    "checkout; nothing in this file is code and nothing here is evaluated.",
+    "",
+    "The three modes below are the ones tools/netbench/bench.sh launches on ONE box. A fleet run puts",
+    "the server on one machine and the bot clients on others, which is the arrangement bench.sh cannot",
+    "produce: it conditions a loopback socket and every process contends for the same cores, so a",
+    "send-path cost measured there describes the harness. See docs/netbench.md.",
+    "",
+    "PORTS. The defaults here are 47900/47910, deliberately clear of 47800/47810, which bench.sh and",
+    "the two-process gates bind. A run on this box must not make an unrelated CI probe fail to bind."
+  ],
+
+  "schema": 1,
+  "project": "orbitnet",
+  "engine_project": "demos/arena",
+
+  "ports": { "game": 47900, "relay": 47910 },
+
+  "checks": {
+    "_comment": [
+      "What a job here needs in order to mean anything, relative to the checkout. These are not where a",
+      "build lands -- they are what must already be present, and the native library is the one whose",
+      "absence ruins a run quietly: every class it registers resolves to nothing, so the project dies at",
+      "load or comes up empty and writes a full metrics file of zeros."
+    ],
+    "requires": [
+      "addons/orbitnet_native/bin",
+      "demos/arena/addons/orbitnet",
+      "demos/arena/addons/orbitnet_native/bin"
+    ]
+  },
+
+  "sync": {
+    "build": ["just", "export-rts-server"],
+    "build_dir": "build",
+    "build_min_bytes": 1048576
+  },
+
+  "measurement": {
+    "_comment": [
+      "Which columns testify that a client actually simulated. An ALLOW-LIST on purpose: an",
+      "ignore-list would let a new transport counter rescue a run in which nothing simulated, which is",
+      "the exact answer the verdict exists to refuse. Every column here is a property of the locally",
+      "predicted body being reconciled against the server.",
+      "",
+      "judged_modes holds only the modes that CAN move them. A dedicated server has no predicted body",
+      "and writes zeros by construction, so accusing it would be a false accusation."
+    ],
+    "artifact": "metrics.csv",
+    "evidence": [
+      "resim_ticks",
+      "rollback_ms",
+      "net_ms",
+      "reconcile_error",
+      "reconcile_smooth",
+      "reconcile_snap"
+    ],
+    "known_other": [
+      "tick",
+      "time",
+      "rtt_ms",
+      "jitter_ms",
+      "stretch",
+      "offset_ms",
+      "rx_bytes_s",
+      "rx_datagrams_s",
+      "rx_packets_s",
+      "tx_bytes_s",
+      "tx_packets_s",
+      "tx_wire_bytes_s",
+      "tx_peak_peer_bytes_s",
+      "blocks_admitted_s",
+      "blocks_full_s",
+      "blocks_deferred_s",
+      "blocks_culled_s",
+      "want_full_nacks_s",
+      "unproven_acks_s",
+      "starve_ticks_max",
+      "unsent_backlog_max",
+      "interest_ms",
+      "interest_entities",
+      "interarrival_near",
+      "interarrival_mid",
+      "interarrival_far",
+      "loss_pct"
+    ],
+    "judged_modes": ["bench"]
+  },
+
+  "events": {
+    "_comment": "The demo prints one of these per state transition; the prefix differs per demo project.",
+    "pattern": "^[A-Z]+-STATE (\\w+)()"
+  },
+
+  "modes": {
+    "server": {
+      "_comment": [
+        "The authority. ORBITNET_DEBUG=1 is the server-side measurement: every send-path column reads",
+        "zero in a client CSV because a client is not the authority and runs none of it. The backend",
+        "prints a per-second wire line under this variable, and that line is the only way a send-path",
+        "change can be compared at all.",
+        "",
+        "quit-after is a backstop, not the measurement window. The window is the clients' own."
+      ],
+      "ready": "-STATE PLAYING",
+      "gui": false,
+      "env": { "ORBITNET_DEBUG": "1" },
+      "engine": ["--headless"],
+      "argv": ["--dedicated={port}", "--quit-after={quit_after}", "--wire-log"],
+      "defaults": { "port": 47900, "quit_after": 200 }
+    },
+
+    "relay": {
+      "_comment": [
+        "The conditioned link, and the honest conditioner: ENet ships none, and wrapping the peer would",
+        "sit above retransmit. It runs as a script rather than a session -- it builds no world -- and it",
+        "must outlive the whole run, because staggered client bringup pushes the last window well past",
+        "relay start."
+      ],
+      "ready": "RELAY: bound",
+      "gui": false,
+      "script": "res://addons/orbitnet/bench/relay_main.gd",
+      "argv": [
+        "--relay-listen={listen}",
+        "--relay-target={target}",
+        "--relay-profile={profile}",
+        "--relay-seed={seed}",
+        "--relay-duration={duration}"
+      ],
+      "defaults": { "listen": 47910, "profile": "congested_wifi", "seed": 1, "duration": 3600 },
+      "required": ["target"]
+    },
+
+    "bench": {
+      "_comment": [
+        "A bot client. It drives the real input path through a BenchPolicy, streams per-tick metrics to",
+        "a CSV and self-evaluates on finish. Headless by request rather than by declaration: the same",
+        "mode is what a person drives on a machine with a display, and forcing headless is how a fleet",
+        "puts several on one box.",
+        "",
+        "SEAT COUNT BOUNDS THE FLEET. This demo seats 24; a client past the seat count is admitted as an",
+        "observer, drives no body, and reports no samples -- which the measurement verdict then reads as",
+        "a run that measured nothing."
+      ],
+      "ready": "-STATE PLAYING",
+      "gui": true,
+      "argv": [
+        "--join={join}",
+        "--bench",
+        "--bench-bot={bot}",
+        "--bench-seed={seed}",
+        "--bench-metrics={metrics}",
+        "--bench-profile={profile}",
+        "--bench-duration={duration}"
+      ],
+      "defaults": { "bot": "strafe", "profile": "congested_wifi", "seed": 1, "duration": 25 },
+      "required": ["join"]
+    },
+
+    "observer": {
+      "_comment": "Watches without playing: no seat, no body, an interest center and a world declared by the server.",
+      "ready": "-STATE PLAYING",
+      "gui": true,
+      "argv": ["--join={join}", "--observe", "--watch={watch}"],
+      "defaults": { "watch": 0 },
+      "required": ["join"]
+    },
+
+    "probe": {
+      "_comment": "The automated arena gate: boot, membership, veto, resume. Runs headless in CI and on a box.",
+      "ready": "",
+      "gui": false,
+      "engine": ["--headless"],
+      "argv": ["--arena-probe", "--quit-after={quit_after}"],
+      "defaults": { "quit_after": 180 }
+    }
+  }
+}
