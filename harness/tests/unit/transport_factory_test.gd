@@ -83,8 +83,28 @@ func test_a_live_connection_takes_the_floor_and_a_stranger_id_takes_nothing() ->
 		assert_eq(NetTransport.hold_through_hitches(server, id + 1), 0,
 			"an id that named no connection takes nothing, rather than every connection")
 		assert_eq(NetTransport.hold_through_hitches(server), 1, "and every open connection is the one")
+		# The description names that one connection, with the state a handler reads as a session ends.
+		var described: String = NetTransport.describe_connections(server)
+		assert_true(described.contains("127.0.0.1:"), "the host describes the client's address (%s)" % described)
+		assert_true(described.contains("state=%d" % ENetPacketPeer.STATE_CONNECTED),
+			"...in ENet's connected state (%s)" % described)
+		assert_false(described.contains(";"), "one connection, one clause (%s)" % described)
+		assert_true(NetTransport.describe_connections(client).contains("state="),
+			"and the client describes its connection to the host")
 	client.close()
 	server.close()
+
+func test_describing_connections_is_empty_off_enet_and_names_none_on_an_idle_host() -> void:
+	# Called from a `server_disconnected` / `peer_disconnected` handler, which runs on every transport, so every
+	# transport must answer: "" where ENet holds nothing, and a sentence rather than "" on an open host with no
+	# connections, so a log line never reads as if the call was skipped.
+	assert_eq(NetTransport.describe_connections(null), "", "no peer at all")
+	assert_eq(NetTransport.describe_connections(OfflineMultiplayerPeer.new()), "", "an offline peer")
+	assert_eq(NetTransport.describe_connections(ENetMultiplayerPeer.new()), "", "an ENet peer that never opened")
+	var peer: ENetMultiplayerPeer = ENetMultiplayerPeer.new()
+	assert_eq(peer.create_server(0, 4), OK, "a host opens")   # port 0: the OS picks a free one
+	assert_eq(NetTransport.describe_connections(peer), "no open connections", "an open host with nobody joined")
+	peer.close()
 
 func test_a_host_opened_unadvertised_is_published_only_when_asked() -> void:
 	# A game that builds its world after setting the peer opens the host unadvertised and publishes it once the

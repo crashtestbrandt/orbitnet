@@ -225,6 +225,30 @@ static func hold_through_hitches(peer: MultiplayerPeer, peer_id: int = 0) -> int
 		held += 1
 	return held
 
+## What the transport knows about its open connections, one clause per connection: the far address and port,
+## ENet's peer state (`ENetPacketPeer.PeerState`), whether the connection is still active, the mean round trip in
+## milliseconds and the reliable packet loss as a ratio.
+##
+## For the log line a game writes as a connection ends. A client whose `server_disconnected` fires while the host
+## is alive has three possible causes -- ENet timed the host out, the host asked for the disconnect, or the host
+## reset the connection -- and the peer state and round trip at that moment are what tell them apart. Nothing
+## downstream can ask once the session is torn down, so the game calls this in the signal handler, before it
+## tears anything down. ENet only: "" offline, on a peer that never opened, and on Steam, whose connection
+## lives in the Steam client and reports through its own API.
+static func describe_connections(peer: MultiplayerPeer) -> String:
+	var enet: ENetMultiplayerPeer = peer as ENetMultiplayerPeer
+	# A peer that never opened, or one already closed, has no host to read; asked for its host anyway it logs an
+	# engine error, and this is called from handlers that run on every transport in every state.
+	if enet == null or enet.get_connection_status() == MultiplayerPeer.CONNECTION_DISCONNECTED or enet.host == null:
+		return ""
+	var parts: PackedStringArray = PackedStringArray()
+	for connection: ENetPacketPeer in enet.host.get_peers():
+		parts.push_back("%s:%d state=%d active=%s rtt=%.0fms loss=%.3f" % [
+			connection.get_remote_address(), connection.get_remote_port(), connection.get_state(),
+			str(connection.is_active()), connection.get_statistic(ENetPacketPeer.PEER_ROUND_TRIP_TIME),
+			connection.get_statistic(ENetPacketPeer.PEER_PACKET_LOSS) / float(ENetPacketPeer.PACKET_LOSS_SCALE)])
+	return "; ".join(parts) if not parts.is_empty() else "no open connections"
+
 # --- player identity (Steam-blind seam) ------------------------------------------------------------------
 ## Set (or clear, with "") this peer's local display-name override -- the `net.name` console cvar routes here. It
 ## wins over the transport's own name, so a handle works on ENet too and the name pipeline is testable offline.
