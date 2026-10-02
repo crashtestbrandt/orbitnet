@@ -89,10 +89,11 @@ concurrency:
 
 jobs:
   bench:
-    runs-on: [self-hosted, Linux, X64, legion]
+    # Pinned to quasitop. Each run is compared against this box's earlier runs.
+    runs-on: [self-hosted, Linux, X64, quasitop]
 
-    # A WEDGED RUN MUST NOT HOLD THE BOX. The concurrency group above is never cancelled and this fleet is
-    # one physical machine that binaries.yml's linux leg also uses, so a hung run blocks every later
+    # A WEDGED RUN MUST NOT HOLD THE BOX. The concurrency group above is never cancelled and quasitop also
+    # takes binaries.yml's linux legs, so a hung run blocks every later
     # netbench run and the next release build. The default job timeout is 360 minutes. bench.sh is
     # internally time-bounded, but the cold `cargo build` of both descriptor profiles and the Godot
     # download in front of it are not. Raise this if a first real run comes close to it.

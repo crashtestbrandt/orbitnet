@@ -93,10 +93,11 @@ concurrency:
 
 jobs:
   timing:
-    runs-on: [self-hosted, Linux, X64, legion]
+    # Pinned to quasitop. SPREAD and HEADROOM were derived from this box's series.
+    runs-on: [self-hosted, Linux, X64, quasitop]
 
-    # A wedged run must not hold the box. The concurrency group above is never cancelled and this fleet
-    # is one physical machine that binaries.yml and netbench.yml also use, so a hung run blocks the next
+    # A wedged run must not hold the box. The concurrency group above is never cancelled and quasitop
+    # also takes netbench.yml and binaries.yml's linux legs, so a hung run blocks the next
     # release build. The default job timeout is 360 minutes. The harness is internally bounded at about
     # 5 seconds per profile; the cold `cargo build` of both descriptor profiles in front of it is not.
     timeout-minutes: 30
