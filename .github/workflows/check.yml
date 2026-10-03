@@ -64,6 +64,13 @@ jobs:
       - name: Bench comparator self-test
         run: python3 tools/netbench/compare.py --self-test
 
+      # `tools/netbench/nack_gate.py` decides which server windows are steady state and whether their
+      # want_full NACK rate passes the profile's gate. The window rule is the part that was wrong before
+      # it existed, and `--self-test` asserts it against ramp, teardown and storm shapes copied from
+      # nightly runs. Standard library only, like the step above.
+      - name: Bench NACK gate self-test
+        run: python3 tools/netbench/nack_gate.py --self-test
+
       # The negative control for the Asset Library zip check. It synthesizes an archive per failure class
       # -- a library the descriptor names removed, a library replaced by Git LFS pointer text, a missing
       # licence, the EditorPlugin script plugin.cfg names missing, a stray file, a nested addon copy --

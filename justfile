@@ -60,10 +60,12 @@ version-stamp VERSION:
 
 # The bench comparison decides every performance claim this repository makes, and three of its
 # judgement rules were wrong at some point -- a column zero on both sides, a column zero only on the
-# baseline, and a relative tolerance below the columns' own run-to-run spread. Standard library only,
-# reads no artifacts, runs in milliseconds.
+# baseline, and a relative tolerance below the columns' own run-to-run spread. The NACK gate's window rule
+# was the fourth: it read the join ramp as steady state. Standard library only, reads no artifacts, runs in
+# milliseconds.
 bench-check:
     python3 tools/netbench/compare.py --self-test
+    python3 tools/netbench/nack_gate.py --self-test
 
 # Headless project load for each Godot project -- catches every GDScript compile and parse error, with the
 # project's warnings-as-errors promotion applied.

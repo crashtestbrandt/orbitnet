@@ -158,11 +158,21 @@ cost more than once. The interest pass and the send ordering run once per frame 
 `interest_ms` does not move with it. `net_ms` is a per-frame figure and the tick rate fixes the per-second
 cost.
 
-**`want_full_nacks_s` is reported at the end of a run and not gated.** Its own doc calls near-zero the
-acceptance bar for interest management being on, and `compare.py` already judges it as a fault counter — but
-`bench_gate.gd` evaluates on a client, where it is a structural `0.00`, so the bar read as met on every run
-without being measured once. The run now prints the server's maximum past the join window. No threshold: what
-a healthy rate is moves with the profile and the arena, and one run is not enough to set one.
+**`want_full_nacks_s` is gated per profile, on the server's rows.** `bench_gate.gd` evaluates on a client,
+where the counter is a structural `0.00`, so `tools/netbench/nack_gate.py` reads `server.csv` instead.
+
+- **The steady state** starts two windows after the last client joined and ends at the first window a client
+  leaves in. Each join costs one keyframe interval of NACKs per affected channel, and the fleet joins over
+  several windows. The rule this replaced dropped only the first window, so in seven of nine nightly runs the
+  maximum it printed, up to `6.00/s`, was join residual.
+- **The figure** is NACKs per peer-second over the steady windows. The worst single window is printed beside it.
+- **The threshold** is `max(0.25, 4 × the worst run in the profile's recorded series)` per peer-second.
+  `nack_gate.py`'s `SERIES` table records each series: how many runs, where they ran, and the worst one.
+- **A profile with no series is reported, not gated**, and its line says so.
+
+| Profile | Series | Worst run | Gate |
+| --- | --- | --- | --- |
+| `congested_wifi` | 9 nightly runs on `quasitop` | 0.013 /peer/s | 0.25 /peer/s |
 
 ## What a run asserts
 
@@ -172,6 +182,7 @@ a healthy rate is moves with the profile and the arena, and one run is not enoug
 | **Measured RTT** | lands near the profile's injected round trip, proving the conditioner is live and observed |
 | **Clock discipline** | mean \|stretch − 1\| within a bound that **scales with the profile** — a severe link legitimately rides nearer the cap |
 | **Reconcile snaps** | ≤ 25% of ticks. Some snaps are normal under loss; a storm means prediction never converges. |
+| **`want_full` NACKs** | the server's steady-state rate per peer-second within its profile's gate; **reported, not gated** on a profile with no recorded series. A gated profile with no steady window **fails**. |
 | **Resim depth** | **reported, not gated.** It legitimately deepens under latency and is bounded by `history_limit`; broken prediction shows up as snaps, not depth. |
 
 Each gate prints `PASS`/`FAIL` with the measured value and the bound, so a failing artifact is
