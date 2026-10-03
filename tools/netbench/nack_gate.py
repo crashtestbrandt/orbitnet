@@ -8,7 +8,7 @@
 without a `want_full` storm. A client reads it as a structural 0.00, so the server's own per-second window is the
 only place it is measured.
 
-**THE STEADY STATE IS WHERE THE WHOLE FLEET IS SEATED, AND TWO WINDOWS AFTER IT GOT THERE.**
+**The steady state** starts two windows after the whole fleet is seated.
 
 - The fleet joins one client at a time, a few seconds apart. Every join costs one keyframe interval of NACKs per
   affected channel: a peer that receives a block for an entity it has not registered yet drops it and asks.
@@ -19,19 +19,19 @@ only place it is measured.
   joined in plus the one after it cover it. `SETTLE_WINDOWS` is that two.
 - Windows after the fleet starts leaving are teardown and are dropped too.
 
-**THE FIGURE IS NACKs PER PEER-SECOND**: the steady windows' `want_full_nacks_s` summed, over their `peers`
+**The figure** is NACKs per peer-second: the steady windows' `want_full_nacks_s` summed, over their `peers`
 summed. A storm is per peer: a client holding a block it cannot place asks on every input frame until a full
 block arrives. Dividing by the peer count lets one threshold serve any fleet size.
 
-**A THRESHOLD IS DERIVED FROM A RECORDED SERIES, NEVER CHOSEN.** `SERIES` records, per profile, the worst run of
-a measured series and where the series came from. The threshold is `max(FLOOR, MARGIN * worst)`:
+**A threshold** is derived from a recorded series. `SERIES` records, per profile, the worst run of a measured
+series and where the series came from. The threshold is `max(FLOOR, MARGIN * worst)`:
 
 - `FLOOR` is 0.25 per peer-second. It is twenty times the worst nightly run on `congested_wifi`, and six times
   below the quietest failing night a downstream bench recorded before this gate existed (about 1.5 per
   peer-second).
 - `MARGIN` is 4, so a profile that legitimately NACKs under heavy loss is gated on a storm rather than on the
   number its series happened to see.
-- A profile with no series is REPORTED, NOT GATED, and the line says so. Add a row once a series exists: at
+- A profile with no series is reported and not gated, and the line says so. Add a row once a series exists: at
   least three runs, and say where they ran.
 
 Exit status: 0 for a pass or an ungated profile, 1 for a gated profile that failed or measured no steady window.

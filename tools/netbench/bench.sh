@@ -22,8 +22,9 @@
 # no body -- so a client past the seat count reports no samples and fails its own gate. arena seats 24 and
 # hockey 32; the RTS demo seats 2, so it takes at most two clients.
 #
-# PASS = every client logs BENCH-RESULT PASS, the relay bound, and the server's steady-state want_full NACK rate
-# passes its profile's gate (tools/netbench/nack_gate.py). Exits non-zero on any FAIL / bringup failure.
+# PASS = every client logs BENCH-RESULT PASS, the relay bound, no process logged a panic, and the server's
+# steady-state want_full NACK rate passes its profile's gate (tools/netbench/nack_gate.py). Exits non-zero on
+# any FAIL / bringup failure.
 # Uses the RAW godot binary + a pkill-by-cmdline sweep: killing the godot-quiet.sh wrapper orphans the child,
 # which squats the UDP port and poisons every later run.
 set -uo pipefail
@@ -269,10 +270,26 @@ for i in $(seq 1 "$CLIENTS"); do
 	echo "$line" | grep -q "BENCH-RESULT PASS" || grep -a "BENCH-GATE FAIL" "$snap" | sed 's/^/      /'
 done
 
+# --- panics ---
+# A panic in any process's log fails the run. gdext turns a Rust panic into a logged Godot error and the frame
+# goes on, so a panicking server keeps serving and every gate above can still pass, while the frame the panic
+# unwound out of sends nothing after it.
+echo "--- panics ---"
+panicked=0
+for snap in "$OUT"/server.log.snap "$OUT"/relay.log.snap "$OUT"/client*.log.snap; do
+	[ -f "$snap" ] || continue
+	panics="$(grep -ac 'ERROR: \[panic ' "$snap" || true)"
+	[ "${panics:-0}" -eq 0 ] && continue
+	echo "  $(basename "$snap" .log.snap): ${panics} panic(s) -- FAIL. The first:"
+	grep -a -m1 -A1 'ERROR: \[panic ' "$snap" | sed 's/^/      /'
+	panicked=1
+done
+if [ "$panicked" -eq 0 ]; then echo "  none"; else fail=1; fi
+
 # --- server send path ---
-# GATED PER PROFILE, AGAINST THE SERVER'S OWN ROWS. `want_full_nacks_s` is counted where a client's input frame
-# is decoded, so it is a server-side figure; `bench_gate.gd` evaluates on a CLIENT, where it is a structural
-# 0.00, and so reported the interest-management acceptance bar as met on every run without measuring it once.
+# The server's want_full NACK rate is gated per profile, on the server's own rows. `want_full_nacks_s` is
+# counted where a client's input frame is decoded, so a client reads a structural 0.00 and `bench_gate.gd`,
+# which evaluates on a client, cannot measure it.
 #
 # `nack_gate.py` holds the whole rule, with its own self-test in `just bench-check`:
 #   - The steady state is where every client is seated, from two windows after the last one joined to the

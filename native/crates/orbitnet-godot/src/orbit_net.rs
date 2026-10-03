@@ -35,6 +35,7 @@ use orbitnet_core::auth::{
     exchange_public_key, fold_secrets, joiner_exchange_secret, session_nonce, siphash24,
     EXCHANGE_KEY_LEN, MAX_INPUT_BLOCKS_PER_TICK, REPLAY_WINDOW,
 };
+use orbitnet_core::clock::STRETCH_CORRECTION_WINDOW_SECONDS;
 use orbitnet_core::codec::{
     apply_manifest_delta, decode_input_block_meta, decode_interest_delta, decode_interest_table,
     decode_manifest_delta, decode_manifest_full, decode_state_block_meta, diff_manifest,
@@ -4975,7 +4976,7 @@ impl OrbitNet {
             self.clock.stretch_with(
                 self.lead_bias_ticks * rate.dt(),
                 self.max_stretch.max(1.001),
-                0.5,
+                STRETCH_CORRECTION_WINDOW_SECONDS,
             )
         } else {
             1.0
@@ -4991,6 +4992,15 @@ impl OrbitNet {
             // aims its reseek at neither. Go quiet until fresh pongs describe the new timeline,
             // then the hard resync (which this stall has all but guaranteed) fires once, aimed.
             self.clock.clear();
+        } else if self.mode == MODE_CLIENT {
+            // THE WINDOW MUST SEE THE CORRECTION IT JUST CAUSED. The stretch moved the local clock
+            // `(stretch - 1) * delta` further than wall time, and every stored sample predates that.
+            // Left unshifted, the window reports the offset as it stood up to two seconds ago, the
+            // stretch keeps correcting an error it already removed, and the clock hunts between its
+            // bounds -- measured at about 90 ms peak to peak on a loaded two-core host. See
+            // `ClockEstimator::apply_local_correction`.
+            self.clock
+                .apply_local_correction((self.stretch_now - 1.0) * delta);
         }
         // One entry point whether or not the frame released a tick. `run_frame` charges the net
         // upkeep the same wall seconds either way; the split that used to live here is what
@@ -6777,7 +6787,10 @@ impl OrbitNet {
                         self.acc_band_sends[band.index()] += 1;
                         peer_sends += 1;
                     }
-                    index += 1;
+                    // NO STEP HERE. `admission_advances_cursor` above `match admission` is the one place
+                    // the cursor moves for a candidate that reached admission. A second step skipped the
+                    // candidate after every admitted block, and admitting the last candidate left the
+                    // cursor one past the end, where `order.len() - next` overflows.
                 }
                 next = index;
 

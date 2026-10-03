@@ -182,6 +182,7 @@ where the counter is a structural `0.00`, so `tools/netbench/nack_gate.py` reads
 | **Measured RTT** | lands near the profile's injected round trip, proving the conditioner is live and observed |
 | **Clock discipline** | mean \|stretch − 1\| within a bound that **scales with the profile** — a severe link legitimately rides nearer the cap |
 | **Reconcile snaps** | ≤ 25% of ticks. Some snaps are normal under loss; a storm means prediction never converges. |
+| **Panics** | none, in any process's log. gdext logs a Rust panic and the frame goes on, so a panicking server passes every other gate while each panic drops the rest of that frame's sends. |
 | **`want_full` NACKs** | the server's steady-state rate per peer-second within its profile's gate; **reported, not gated** on a profile with no recorded series. A gated profile with no steady window **fails**. |
 | **Resim depth** | **reported, not gated.** It legitimately deepens under latency and is bounded by `history_limit`; broken prediction shows up as snaps, not depth. |
 

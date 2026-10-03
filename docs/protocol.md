@@ -1251,6 +1251,17 @@ The server is ground truth. The client estimates offset from ping/pong samples a
 half** of the window — a fast sample spent least time queued, so its offset reading is least polluted.
 Correction is a bounded time stretch, not a jump.
 
+**Every stored sample is moved by the stretch applied after it.** A stretch of `s` held for `t` seconds moves
+the local clock `(s - 1) * t` further than the server's, so each sample's offset is shifted by that amount as the
+stretch is applied.
+
+- Without the shift, the window reports the offset as it stood up to two seconds ago. The stretch keeps
+  correcting an error it has already removed, and the clock swings between its two bounds.
+- Measured on two cores shared by the server, the relay and the clients, `lan` profile: the offset swung 56
+  to 111 ms peak to peak with the stretch on a bound for 19 to 63% of frames. After it: 7 to 8 ms, and no frame
+  on a bound.
+- `ClockEstimator::apply_local_correction` holds the rule; `clock.rs`'s header says why.
+
 **Catch-up must not spiral.** When a frame runs long, running the whole backlog makes the next frame longer
 still. `TickAccumulator` caps ticks per frame and **discards** the backlog it refuses to run, reporting that it
 did. Re-aligning afterward is the clock's job.
