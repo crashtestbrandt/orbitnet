@@ -378,9 +378,9 @@ jobs:
             echo "bench exit status: \`${BENCH_STATUS:-unknown}\` (reported, never gated)"
             echo
             echo '```'
-            # The verdict block: every client's BENCH-RESULT line, the relay, and the server send-path
-            # summary that only this run can produce.
-            grep -aE 'client[0-9]+:|RELAY-RESULT|want_full nacks|=== netbench' \
+            # The verdict block: every client's BENCH-RESULT line, the relay, any process that panicked,
+            # and the server send-path summary that only this run can produce.
+            grep -aE 'client[0-9]+:|RELAY-RESULT|panic\(s\)|want_full nacks|=== netbench' \
               "$out/bench-console.log" 2>/dev/null | tail -40 || echo 'no console output'
             echo '```'
             echo

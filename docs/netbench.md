@@ -172,6 +172,7 @@ a healthy rate is moves with the profile and the arena, and one run is not enoug
 | **Measured RTT** | lands near the profile's injected round trip, proving the conditioner is live and observed |
 | **Clock discipline** | mean \|stretch − 1\| within a bound that **scales with the profile** — a severe link legitimately rides nearer the cap |
 | **Reconcile snaps** | ≤ 25% of ticks. Some snaps are normal under loss; a storm means prediction never converges. |
+| **Panics** | none, in any process's log. gdext logs a Rust panic and the frame goes on, so a panicking server passes every other gate while each panic drops the rest of that frame's sends. |
 | **Resim depth** | **reported, not gated.** It legitimately deepens under latency and is bounded by `history_limit`; broken prediction shows up as snaps, not depth. |
 
 Each gate prints `PASS`/`FAIL` with the measured value and the bound, so a failing artifact is
