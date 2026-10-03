@@ -212,12 +212,16 @@ func _init() -> void:
 	# [orbitnet] block, and `aoi_weapon_range_test.gd` is what stops the radius drifting under a weapon.
 	var aoi_cfg: float = ProjectSettings.get_setting(&"orbitnet/aoi_radius", 0.0)
 	var aoi_band_cfg: float = ProjectSettings.get_setting(&"orbitnet/aoi_band_radius", 0.0)
+	# -1 means the setting is absent, and the backend keeps its own measured default.
+	var pool_cfg: int = ProjectSettings.get_setting(&"orbitnet/assembly_pool_peers", -1)
 	_orbit.sync_to_physics = sync_phys
 	_orbit.tickrate = tickrate_cfg
 	_orbit.history_limit = history_cfg
 	_orbit.max_stretch = stretch_cfg
 	_orbit.aoi_radius = maxf(0.0, aoi_cfg)
 	_orbit.set(&"aoi_band_radius", maxf(0.0, aoi_band_cfg))
+	if pool_cfg >= 0:
+		_orbit.set(&"assembly_pool_peers", pool_cfg)
 	add_child(_orbit)
 	# Bridge the backend's per-tick + post-loop signals into the facade signals. The backend signals only
 	# fire while the tick loop runs (networked), so OFFLINE these connections are inert.
@@ -1661,6 +1665,11 @@ func _backend_has(method: StringName) -> bool:
 ##                                     between 0.0 and 1.0 means the occupancy is hovering in the selector's
 ##                                     hysteresis band, which describes the arena rather than a fault. A session
 ##                                     with no aoi_radius reads 0.00 always: there is no distance to index.
+##   assembly_ms                    -- ms per flush spent assembling every peer's snapshot frames: ordering,
+##                                     admission, encoding and sealing. The handover to the transport is not in
+##                                     it. The phase orbitnet/assembly_pool_peers splits across threads.
+##   assembly_pooled                -- fraction of the window's flushes whose assembly ran on several threads:
+##                                     0.0 all on the main thread, 1.0 all pooled. Read it beside assembly_ms.
 ##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded
 ##                                     before rate tiering may be enabled.
 ##   peers / interest_entities      -- peers synced, and the mean size of ONE peer's interest set
@@ -1682,7 +1691,7 @@ func bandwidth_metrics() -> Dictionary[String, float]:
 		"want_full_nacks_s": 0.0, "unproven_acks_s": 0.0, "stale_blocks_s": 0.0, "blocks_oversize_s": 0.0,
 		"blocks_full_s": 0.0,
 		"starve_ticks_max": 0.0, "unsent_backlog_max": 0.0,
-		"interest_ms": 0.0, "interest_grid": 0.0,
+		"interest_ms": 0.0, "interest_grid": 0.0, "assembly_ms": 0.0, "assembly_pooled": 0.0,
 		"interarrival_near": 0.0, "interarrival_mid": 0.0, "interarrival_far": 0.0,
 		"interarrival_all": 0.0,
 		"peers": 0.0, "interest_entities": 0.0,

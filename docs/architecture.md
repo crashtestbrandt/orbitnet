@@ -247,9 +247,25 @@ Main-thread only, non-negotiable: `SceneMultiplayer` I/O, `Object::get`/`set`, s
 Movable: per-peer frame assembly (delta, quantize, pack — pure native memory, parallel across peers), input
 decode batches, AOI grid rebuild.
 
-**Single-threaded today.** At small peer counts thread overhead exceeds the work; a worker pool should be
-feature-gated above a peer threshold. One genuine Rust advantage: gdext's `Gd<T>` is not `Send`, so "don't
-touch Godot objects from a worker" is a **compile error** rather than a crash report.
+**Per-peer frame assembly runs on a worker pool at `orbitnet/assembly_pool_peers` synced peers and above**
+(default 12). Below it, and for input decode and the AOI rebuild, the server is single-threaded.
+
+- **What moves.** Ordering, admission, encoding and sealing, per peer. Each entity is bound once per flush on
+  the main thread, and assembly reads the plain data the binding lends out: the state ring, the property list
+  and the tick (`sync::BlockSource`). The transport handover stays on the main thread, after assembly.
+- **What it costs.** Single-threaded assembly is about 30 µs per peer. Waking the pool costs 80 to 100 µs a
+  flush, so at 8 peers no split helps. From 12 to 32 peers the split won in every run: by 16 to 29% at 12,
+  25 to 48% at 16 and 42 to 56% at 24. `DEFAULT_ASSEMBLY_POOL_PEERS` in `orbit_net.rs` carries the
+  measurement, including the cells above 48 peers where it lost.
+- **How it splits.** At least 3 peers per thread and at most 4 threads, the main thread included. The threads
+  persist across flushes, because spawning them per flush measured 60 to 100 µs slower.
+- **The same bytes either way.** Peers are split into contiguous chunks and the results are folded in chunk
+  order, so the pooled path hands the transport the datagrams the single-threaded one would, in the same
+  order. `assembly_tests` asserts it.
+- `Net.bandwidth_metrics()` publishes `assembly_ms` and `assembly_pooled`, the phase's cost and which path ran.
+
+gdext's `Gd<T>` is not `Send`, so touching a Godot object from a worker is a **compile error** rather than a
+crash report.
 
 ## The facade boundary
 

@@ -28,6 +28,19 @@ orbitnet-core = { workspace = true }
 # of class a lean build omits.
 godot = { version = "=0.5.4", features = ["api-4-4"] }
 
+# The persistent worker pool behind per-peer frame assembly (`orbit_net.rs`, `assemble_frames`), used at
+# `orbitnet/assembly_pool_peers` synced peers and above.
+#
+# - Licence: `MIT OR Apache-2.0`, and so are the five crates it pulls (`rayon-core`, `crossbeam-deque`,
+#   `crossbeam-epoch`, `crossbeam-utils`, `either`). Their `THIRD_PARTY.md` rows land in the same commit.
+# - Why not hand-written: each flush lends the pool's threads borrowed frame data. Threads that persist
+#   across flushes can hold a borrow only through `unsafe` lifetime erasure, or by copying every entity's
+#   history each flush. `rayon`'s scope is the reviewed form of the first.
+# - Why persistent: threads spawned per flush need none of that, and measured 60 to 100 us a flush slower,
+#   starting every flush on a cold allocator.
+# - Below the threshold the pool is never built, so a small session starts no threads.
+rayon = "1.12"
+
 # POSIX signal handling for the native crash handler (crash.rs). Already in the tree transitively via
 # godot-ffi, so making it direct pulls nothing new; Windows uses raw `extern "system"` kernel32
 # declarations instead of a second dependency.

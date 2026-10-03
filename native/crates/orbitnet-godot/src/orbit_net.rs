@@ -60,8 +60,8 @@ use orbitnet_core::{
 
 use crate::binding;
 use crate::sync::{
-    self, InputIntegration, OrbitRollbackSynchronizer, OrbitStateSynchronizer, StateIntegration,
-    STATE_HISTORY_DEPTH,
+    self, BlockSource, InputIntegration, OrbitRollbackSynchronizer, OrbitStateSynchronizer,
+    StateIntegration, STATE_HISTORY_DEPTH,
 };
 
 /// Network role, mirroring the facade's `Net.Mode`.
@@ -490,6 +490,14 @@ struct BandwidthMetrics {
     /// hovering in the selector's hysteresis band, which is a description of the arena rather than
     /// a fault.
     interest_grid: f64,
+    /// Milliseconds per flush spent assembling every peer's snapshot frames: ordering, admission,
+    /// encoding and sealing. The handover to the transport is not in it, because that stays on the
+    /// main thread whatever [`OrbitNet::assembly_pool_peers`] says. The phase the pool splits.
+    assembly_ms: f64,
+    /// Fraction of the window's flushes whose assembly was split across threads: `0.0` all on the
+    /// main thread, `1.0` all pooled. **The verdict, reported** -- read it beside `assembly_ms` to
+    /// know which path that figure is the cost of.
+    assembly_pooled: f64,
     /// Mean ticks between admissions, per distance band. The evidence to demand before rate
     /// tiering may be turned on: it says whether the far band is genuinely far.
     interarrival_near: f64,
@@ -526,7 +534,7 @@ impl BandwidthMetrics {
     /// only way the SERVER-SIDE counters (`want_full_nacks_s`, `unproven_acks_s`) can be read at
     /// all in a bench run, and a counter that exists in one consumer and not the other is a
     /// counter nobody notices is missing.
-    fn fields(&self) -> [(&'static str, f64); 25] {
+    fn fields(&self) -> [(&'static str, f64); 27] {
         [
             ("tx_bytes_s", self.tx_bytes_s),
             ("tx_datagrams_s", self.tx_datagrams_s),
@@ -546,6 +554,8 @@ impl BandwidthMetrics {
             ("unsent_backlog_max", self.unsent_backlog_max),
             ("interest_ms", self.interest_ms),
             ("interest_grid", self.interest_grid),
+            ("assembly_ms", self.assembly_ms),
+            ("assembly_pooled", self.assembly_pooled),
             ("interarrival_near", self.interarrival_near),
             ("interarrival_mid", self.interarrival_mid),
             ("interarrival_far", self.interarrival_far),
@@ -1738,6 +1748,13 @@ pub struct OrbitNet {
     #[export]
     send_budget: i32,
 
+    /// Synced peers at and above which per-peer frame assembly is split across threads (0 = never).
+    ///
+    /// Read from `orbitnet/assembly_pool_peers`. See [`assembly_threads`] for how many threads, and
+    /// [`DEFAULT_ASSEMBLY_POOL_PEERS`] for where the default came from.
+    #[export]
+    assembly_pool_peers: i32,
+
     /// Interest radius in meters (0 = no **distance** filter).
     ///
     /// The 100-player lever: with a radius set, each peer receives only the entities within it of
@@ -2203,6 +2220,11 @@ pub struct OrbitNet {
     acc_interest_grid_ticks: u64,
     acc_interest_peer_ticks: u64,
     acc_interest_members: u64,
+    /// Microseconds spent in per-peer frame assembly over the window, and how many flushes ran it.
+    acc_assembly_us: u64,
+    acc_assembly_flushes: u64,
+    /// Flushes of the window whose assembly was split across threads.
+    acc_assembly_pooled: u64,
     acc_band_sends: [u64; 3],
     acc_band_members: [u64; 3],
     /// `(sends, members)` per peer over the window: the same two counts as `acc_band_sends` and
@@ -2265,14 +2287,18 @@ pub struct OrbitNet {
     /// other, so the override list carries exactly the rows the linear path patches into the shared
     /// candidate vector. Pooled and refilled per connection.
     aoi_overrides: Vec<InterestCandidate>,
-    /// This peer's candidate set for the order build: `(id, distance²)`. Filled from the peer's
-    /// interest when culling is on and from every row when it is off, so the order loop has one
-    /// shape either way. Pooled, so a warm frame allocates nothing.
-    aoi_members: Vec<(u64, f32)>,
     /// The union diff one connection's update reports, pooled across peers and ticks. Both halves
     /// are consumed in the same loop that produced them; see [`OrbitNet::update_interest`].
     aoi_delta: InterestDelta,
-    order_scratch: Vec<(priority::Candidate, Band)>,
+    /// One [`AssemblyScratch`] per assembly thread, pooled so a warm flush allocates no buffers.
+    assembly_scratch: Vec<AssemblyScratch>,
+    /// What [`std::thread::available_parallelism`] answered when the node was built. Read once,
+    /// because asking is a system call and the answer does not change under a running session.
+    assembly_parallelism: usize,
+    /// The persistent threads per-peer frame assembly is split across, built the first time a flush
+    /// engages it and kept for the node's life. `None` inside if the build failed, and assembly then
+    /// stays on the main thread.
+    assembly_pool: std::sync::OnceLock<Option<AssemblyPool>>,
     /// Relevancy transitions awaiting their signal, as `(peer, entity id, entered)`.
     ///
     /// **Queued rather than emitted where they are found, and drained on a tick boundary** — the
@@ -2280,9 +2306,6 @@ pub struct OrbitNet {
     /// inside a packet handler, and emitting from either would run game code with a bind held on a
     /// synchronizer. See [`OrbitNet::announce_interest`].
     interest_events: Vec<(i32, u64, bool)>,
-    /// The wire slots one connection's section carries, pooled so a warm tick allocates nothing.
-    delta_left_scratch: Vec<u16>,
-    delta_entered_scratch: Vec<u16>,
     /// CLIENT: the generation of the interest set this peer holds.
     ///
     /// Set by a whole [`FrameKind::InterestTable`] and compared against every delta section, so a
@@ -2441,6 +2464,7 @@ impl INode for OrbitNet {
             display_offset: 0,
             resim_force: 0,
             max_stretch: 1.05,
+            assembly_pool_peers: DEFAULT_ASSEMBLY_POOL_PEERS,
             send_budget: MAX_FRAME_PAYLOAD as i32,
             aoi_radius: 0.0,
             // The shipped value is seeded from `[orbitnet]` in `project.godot` by `net.gd`, like
@@ -2532,6 +2556,9 @@ impl INode for OrbitNet {
             acc_interest_ticks: 0,
             acc_interest_grid_ticks: 0,
             acc_interest_peer_ticks: 0,
+            acc_assembly_us: 0,
+            acc_assembly_flushes: 0,
+            acc_assembly_pooled: 0,
             acc_interest_members: 0,
             acc_band_sends: [0; 3],
             acc_band_members: [0; 3],
@@ -2549,11 +2576,8 @@ impl INode for OrbitNet {
             aoi_path: PathSelector::new(),
             aoi_occupancy: OccupancyScratch::default(),
             aoi_overrides: Vec::new(),
-            aoi_members: Vec::new(),
             aoi_delta: InterestDelta::default(),
             interest_events: Vec::new(),
-            delta_left_scratch: Vec::new(),
-            delta_entered_scratch: Vec::new(),
             interest_mirror: std::collections::HashSet::new(),
             interest_mirror_seeded: false,
             interest_mirror_generation: 0,
@@ -2571,7 +2595,9 @@ impl INode for OrbitNet {
             seat_opened: Vec::new(),
             seat_closed: Vec::new(),
             seats_dirty: false,
-            order_scratch: Vec::new(),
+            assembly_scratch: Vec::new(),
+            assembly_parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            assembly_pool: std::sync::OnceLock::new(),
             mask_scratch: Vec::new(),
             signals_connected: false,
             debug_wire: std::env::var("ORBITNET_DEBUG").is_ok(),
@@ -4371,16 +4397,10 @@ impl OrbitNet {
                 .get_mut(&peer)
                 .and_then(|state| state.auth.as_mut()),
         };
-        // No key means no session — a server peer that has not handshaken, or a client that has not
-        // started. Nothing that reaches here is worth sending in the clear.
-        let Some(auth) = auth else {
+        // No key means no session. See `seal_datagram`, the one sealing rule.
+        let Some(sealed) = seal_datagram(direction, auth, bytes) else {
             return;
         };
-        let mut sealed = Vec::with_capacity(bytes.len() + auth.trailer_len());
-        sealed.extend_from_slice(bytes);
-        if auth.seal(direction, &mut sealed).is_none() {
-            return;
-        }
         self.send_raw(peer, &sealed, mode);
     }
 
@@ -5815,6 +5835,11 @@ impl OrbitNet {
             unsent_backlog_max: self.win_unsent_backlog_max as f64,
             interest_ms: self.acc_interest_us as f64 / ticks / 1000.0,
             interest_grid: self.acc_interest_grid_ticks as f64 / ticks,
+            assembly_ms: self.acc_assembly_us as f64
+                / self.acc_assembly_flushes.max(1) as f64
+                / 1000.0,
+            assembly_pooled: self.acc_assembly_pooled as f64
+                / self.acc_assembly_flushes.max(1) as f64,
             interarrival_near: band(self.acc_band_sends[0], self.acc_band_members[0]),
             interarrival_mid: band(self.acc_band_sends[1], self.acc_band_members[1]),
             interarrival_far: band(self.acc_band_sends[2], self.acc_band_members[2]),
@@ -5889,6 +5914,9 @@ impl OrbitNet {
         self.acc_interest_grid_ticks = 0;
         self.acc_interest_peer_ticks = 0;
         self.acc_interest_members = 0;
+        self.acc_assembly_us = 0;
+        self.acc_assembly_flushes = 0;
+        self.acc_assembly_pooled = 0;
         self.acc_band_sends = [0; 3];
         self.acc_band_members = [0; 3];
         self.acc_peer_band.clear();
@@ -6407,11 +6435,6 @@ impl OrbitNet {
         // firefight happens over, and reusing one for the other is what made this scorer inert.
         let band_scale = self.aoi_band_radius as f32;
         let tiering = self.rate_tiering;
-        let mut order = std::mem::take(&mut self.order_scratch);
-        let mut members = std::mem::take(&mut self.aoi_members);
-        // The section's wire slots, pooled: one connection's worth at a time, refilled per peer.
-        let mut delta_left = std::mem::take(&mut self.delta_left_scratch);
-        let mut delta_entered = std::mem::take(&mut self.delta_entered_scratch);
         // The receiver's own retention, in ticks, and THE SHORTER OF THE TWO LANES holds for both.
         // A rollback receiver keeps its bases in `auth_rows`, sized from the same `history_limit`
         // both ends read out of the `[orbitnet]` block. A state receiver keeps them in `history`,
@@ -6422,470 +6445,115 @@ impl OrbitNet {
         // exists to stop.
         let base_span = (self.history_limit.max(2) as u64).min(STATE_HISTORY_DEPTH as u64);
 
-        for peer_id in peer_ids {
-            let (want_full, ack_tick, ack_token, margin) = {
-                let Some(peer) = self.peers.get(&peer_id) else {
-                    continue; // disconnected while an earlier peer's frame was going out
-                };
-                (
-                    peer.want_full,
-                    u32::try_from(peer.newest_input_tick.max(0)).unwrap_or(u32::MAX),
-                    // What this peer must quote back to have its ack of this frame believed.
-                    peer.frame_token(current).unwrap_or(0),
-                    peer.margin_last,
-                )
-            };
+        let assembly_started = Instant::now();
+        // WHAT EVERY PEER'S BLOCKS ARE ENCODED FROM, TAKEN ONCE, ON THIS THREAD. Each entity is
+        // bound here and stays bound until every peer's frames are built, and what assembly reads
+        // is the plain data the binding lends out -- the state ring, the property list, the tick.
+        // That is what lets a worker thread assemble a peer: no Godot object crosses to it, and
+        // `Gd` not being `Send` makes reaching for one a compile error. One bind per entity per
+        // flush, where encoding through the handle cost one per admitted block per peer.
+        let handles: Vec<EntityHandle> = rows
+            .iter()
+            .map(|row| EntityHandle::resolve(&self.rollback_entities, &self.state_entities, row.id))
+            .collect();
+        let guards: Vec<EntityGuard<'_>> = handles.iter().map(EntityHandle::bind).collect();
+        let sources: Vec<Option<BlockSource<'_>>> =
+            guards.iter().map(|guard| guard.source(current)).collect();
+        let shared = AssemblyShared {
+            current,
+            passes,
+            budget,
+            filtering,
+            culling,
+            band_scale,
+            tiering,
+            base_span,
+            rows: &rows,
+            sources: &sources,
+            slots: &self.slots,
+            direction: session_directions(self.mode).map(|(outbound, _)| outbound),
+        };
+        // Every synced connection, in one order for both paths, so the pooled path hands the
+        // transport the same datagrams in the same order the single-threaded one does.
+        let mut targets: Vec<(i32, &mut PeerState)> = self
+            .peers
+            .iter_mut()
+            .filter(|(_, peer)| peer.synced)
+            .map(|(&id, peer)| (id, peer))
+            .collect();
+        let wanted = assembly_threads(
+            targets.len(),
+            self.assembly_pool_peers,
+            self.assembly_parallelism,
+        );
+        let pool = if wanted > 1 {
+            self.assembly_pool
+                .get_or_init(|| AssemblyPool::build(self.assembly_parallelism))
+                .as_ref()
+                .and_then(AssemblyPool::pool)
+        } else {
+            None
+        };
+        // A pool that could not be built leaves assembly on this thread, and the window says so.
+        let threads = if pool.is_some() { wanted } else { 1 };
+        let mut scratch = std::mem::take(&mut self.assembly_scratch);
+        if scratch.len() < threads {
+            scratch.resize_with(threads, AssemblyScratch::default);
+        }
+        let mut tallies: Vec<AssemblyTally> =
+            (0..threads).map(|_| AssemblyTally::default()).collect();
+        assemble_frames(&shared, &mut targets, &mut scratch, &mut tallies, pool);
+        drop(targets);
+        drop(sources);
+        drop(guards);
+        drop(handles);
+        self.assembly_scratch = scratch;
+        let mut datagrams: Vec<(i32, Vec<u8>)> = Vec::new();
+        for tally in tallies {
+            self.fold_assembly(tally, &mut datagrams);
+        }
+        self.acc_assembly_us += assembly_started.elapsed().as_micros() as u64;
+        self.acc_assembly_flushes += 1;
+        if threads > 1 {
+            self.acc_assembly_pooled += 1;
+        }
 
-            // --- order, over the surviving set only ---
-            //
-            // With the filter off there IS no surviving set — every row is a candidate, at a
-            // distance no radius will be compared against, which `band_of` reports as `Near` for all
-            // of them. Reading `peer.interest` there would read a structure nothing has maintained.
-            //
-            // The gate is `filtering`, not `culling`: with memberships declared and no radius, the
-            // pass DID run and `peer.interest` is exactly the set that survived it. `band_for_row`
-            // below still takes `culling`, because a membership refusal produces no distance and so
-            // no band — every surviving row takes the one constant weight, as it does with the
-            // radius off.
-            members.clear();
-            if filtering {
-                let Some(peer) = self.peers.get(&peer_id) else {
-                    continue;
-                };
-                members.extend(peer.interest.iter_with_distance());
-            } else {
-                members.extend(rows.iter().map(|row| (row.id, 0.0f32)));
-            }
-
-            order.clear();
-            let mut starve_max = 0u64;
-            let mut unsent = 0u64;
-            // This peer's own share of the two band counters, folded into `acc_peer_band` once the
-            // frame is built. The band arrays beside them stay global.
-            let mut peer_members = 0u64;
-            let mut peer_sends = 0u64;
-            {
-                let Some(peer) = self.peers.get(&peer_id) else {
-                    continue;
-                };
-                for &(id, dist_sq) in members.iter() {
-                    let Ok(index) = rows.binary_search_by_key(&id, |row| row.id) else {
-                        continue; // despawned between the gather and here
-                    };
-                    let row = &rows[index];
-                    // AN ENTITY WITH NO ANCHOR HAS NO DISTANCE, AND MUST NOT COLLECT A DISTANCE BOOST.
-                    //
-                    // `PeerInterest` stores always-relevant members at `0.0` (they are pushed at
-                    // `NEG_INFINITY` so the nearest-N cap can never evict them, then normalized), and
-                    // `band_of` reads `0.0` as `Near`. Typically only a handful of channels declare an
-                    // anchor — the ones that carry a position — while every other state channel a body owns
-                    // (its health, its equipment, its sensors, its lights, the doors around it) does not. Those
-                    // would all be scored as though they were in the viewer's face. At four-plus such channels
-                    // per body against the ONE anchored row that says where that body is, a distant player's
-                    // flashlight and hit points outbid their position 4:1 under budget pressure. That is remote-body
-                    // stutter by construction.
-                    //
-                    // `Far` rather than a middle band: "always relevant" is a statement about never being
-                    // culled, and says nothing about priority. Unanchored channels are on-change, so staleness
-                    // carries them the moment they have something to say, and `score = staleness x weight`
-                    // makes starvation impossible by construction whatever the weight is.
-                    let band = band_for_row(culling, row.anchor.is_some(), dist_sq, band_scale);
-                    let last_sent = peer.last_sent.get(&id).copied().unwrap_or(0);
-                    // Never sent: sorts ahead of everything already sent, which is what a re-entrant
-                    // entity needs — and why clearing `last_sent` at the leave is the whole of the
-                    // re-entry fix. NOT `u64::MAX`: that saturates the product and cancels the weight,
-                    // so a join burst ordered by node-path hash. See `priority::NEVER_SENT_STALENESS`.
-                    let staleness = if last_sent == 0 {
-                        unsent += 1;
-                        priority::NEVER_SENT_STALENESS
-                    } else {
-                        let age = current.saturating_sub(last_sent);
-                        starve_max = starve_max.max(age);
-                        age
-                    };
-                    let weight = priority::weight_for(band, row.priority, row.owner == peer_id);
-                    // **Weighted by the frame's tick count, because the figure it feeds is
-                    // denominated in ticks.** `interarrival_*` is `members / sends`, read as the
-                    // mean ticks between admissions, and a frame that advanced K ticks offered this
-                    // candidate K ticks of candidacy while the order was built once. Counting it
-                    // once would report the gap in frames and under-state the view lag the
-                    // lag-compensation rewind charges on an authority running below its tick rate.
-                    self.acc_band_members[band.index()] += u64::from(passes);
-                    peer_members += u64::from(passes);
-                    order.push((
-                        priority::Candidate {
-                            id,
-                            staleness,
-                            weight,
-                        },
-                        band,
-                    ));
-                }
-                // The candidate set as this tick actually used it, so the published figure is the
-                // number the order loop walked rather than the state of a structure that may not
-                // have been maintained.
-                self.acc_interest_members += members.len() as u64;
-                self.acc_interest_peer_ticks += 1;
-            }
-            self.win_starve_ticks_max = self.win_starve_ticks_max.max(starve_max);
-            self.win_unsent_backlog_max = self.win_unsent_backlog_max.max(unsent);
-
-            // Descending score, ties by ascending id — and it CALLS `priority::cmp` rather than restating it.
-            // The pairs carry the band through the sort without a parallel array, which is why this cannot use
-            // `priority::order`; writing the comparison out again left two copies of the shipping rule, and the
-            // tests could only ever reach the other one.
-            order.sort_unstable_by(|a, b| priority::cmp(&a.0, &b.0));
-
-            // --- the trailing interest-delta section, decided BEFORE the admit loop ---
-            //
-            // Built once per frame and ridden by the frame's **first** datagram. The section states this
-            // tick's relevancy transitions, so a copy on each datagram of a multi-tick frame would
-            // repeat a set the peer already applied — `apply_interest_section` is idempotent and
-            // announces nothing the second time, so the copies cost only bytes. The ack that retires
-            // it is the ordinary one every frame already carries and proves.
-            let (carries_delta, interest_generation, gate_shut) = {
-                let Some(peer) = self.peers.get_mut(&peer_id) else {
-                    continue;
-                };
-                // READ BESIDE THE SECTION IT STAMPS, not at the encode below: a whole set sent later
-                // in this same flush would bump it, and the section would then claim a generation it
-                // was not built against.
-                let generation = peer.interest_generation;
-                let shut = peer.interest_generation_acked != peer.interest_generation;
-                (
-                    build_interest_section(
-                        &self.slots,
-                        peer,
-                        filtering,
-                        current,
-                        &mut delta_left,
-                        &mut delta_entered,
-                    ),
-                    generation,
-                    shut,
-                )
-            };
-            // The reserve comes off the **first** datagram's budget alone, because a section appended
-            // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. Later
-            // datagrams of the same frame carry no section and spend the whole budget on blocks.
-            let first_admit_budget = budget.saturating_sub(interest_delta_reserve(
-                delta_left.len() + delta_entered.len(),
-            ));
-
-            // --- admit, once per datagram this frame owes ---
-            //
-            // `next` is this peer's cursor into the ordered set, and it only ever moves forward.
-            // That is what makes the second datagram of a multi-tick frame the next slice of the
-            // rota rather than a second copy of the first: every datagram of the frame encodes the
-            // same `current`, so re-admitting an entity would put identical bytes on the wire at a
-            // tick the peer already holds, and the receiver would discard them as stale.
-            //
-            // THE BUDGET BOUNDS THE BODY, AND THE DATAGRAM IS THE BODY PLUS THE FRAME HEADER. `send_budget`
-            // clamps to `MAX_FRAME_PAYLOAD` (1200) and every check below is against `body.len()`, so a full
-            // frame leaves here at 1200 plus the header's own bytes -- not at 1200. That is deliberate rather
-            // than an oversight, but it is not what the constant's name says: the real wire figure is header +
-            // body + the authentication trailer (12 bytes, or 20 under a session secret) + 12 (ENet) + 28
-            // (IPv4/UDP), which stays comfortably inside a 1500 B path MTU. Do not read
-            // `MAX_FRAME_PAYLOAD` as "the datagram size"; read it as "the entity payload one frame may carry".
-            let mut next = 0usize;
-            let mut pass = 0u32;
-            while send_pass_is_due(pass, passes, order.len() - next) {
-                let this_pass = pass;
-                pass += 1;
-                let admit_budget = if this_pass == 0 {
-                    first_admit_budget
-                } else {
-                    budget
-                };
-                let mut writer = Writer::with_capacity(budget + 256);
-                let mut body = Writer::with_capacity(budget);
-                let mut sent: Vec<(u64, u64)> = Vec::new();
-                // The subset of `sent` that went out full, so the keyframe clock is measured against
-                // what repairs a chain. Kept beside `sent` rather than widening it, because `sent` is
-                // moved into the ack log verbatim.
-                let mut sent_full: Vec<(u64, u64)> = Vec::new();
-
-                let mut index = next;
-                while index < order.len() {
-                    let (candidate, band) = order[index];
-                    if body.len() >= admit_budget {
-                        // Everything left wanted to go out and did not fit. Whether that is a defer
-                        // or the next datagram's opening slice is not known until the frame's last
-                        // datagram has run, so the count is charged once, below the pass loop.
-                        break;
-                    }
-                    let id = candidate.id;
-                    // The wire name for this entity. Missing only while `reconcile_slots` is holding
-                    // the entity back — a slot still inside its predecessor's reuse quarantine — which
-                    // is a delay this entity's next tick resolves, so it counts as deferred.
-                    let Some(slot) = self.slots.slot_of(id) else {
-                        self.acc_blocks_deferred += 1;
-                        index += 1;
-                        continue;
-                    };
-                    // Rate tiering is a deliberate hold-back, so it counts as culled, not deferred.
-                    // **It phases on the 64-bit id, not the wire slot**, and so does `full_block_due`
-                    // below. Either value spreads a set of entities across an interval — dense
-                    // sequential slots spread more evenly than hashes do, which
-                    // `send_phase_spreads_dense_sequential_indices` pins — but only the id is STABLE.
-                    // A slot is released and reissued, so an entity that took a different slot would
-                    // jump its tier phase and its keyframe phase with it, restarting the interval it
-                    // was part-way through.
-                    if tiering
-                        && !orbitnet_core::interest::send_phase(id, current, band.tiered_interval())
-                    {
-                        self.acc_blocks_culled += 1;
-                        index += 1;
-                        continue;
-                    }
-                    let last_full = self
-                        .peers
-                        .get(&peer_id)
-                        .and_then(|p| p.last_full.get(&id))
-                        .copied()
-                        .unwrap_or(0);
-                    let full_due =
-                        full_block_due(want_full, id, current, last_full, FULL_STATE_INTERVAL);
-                    // Masked deltas reference only CLIENT-ACKED ticks: the peer provably applied
-                    // that base, so loss can no longer leave it reconstructing against its own
-                    // prediction. No acked base yet (or an evicted row) degrades to a full block.
-                    let reference = if full_due {
-                        None
-                    } else {
-                        self.peers
-                            .get(&peer_id)
-                            .and_then(|p| p.acked_base.get(&id))
-                            .copied()
-                            .and_then(|base| delta_reference(base, current, base_span))
-                    };
-
-                    // An entity block's encoded size is not known until it is written, so the budget can only
-                    // be enforced by writing and un-writing. The pre-check above admits an entity whenever the
-                    // body is at `budget - 1`, and the block that follows can be any size -- which is how a frame
-                    // capped at MAX_FRAME_PAYLOAD went out at 1456 bytes and drew ENet's over-MTU warning. An
-                    // unreliable datagram past the path MTU fragments, and a lost fragment loses the whole frame.
-                    let body_before = body.len();
-                    // The lane the block came from travels with it. Only the state lane un-writes
-                    // an empty delta -- see [`block_is_un_written`].
-                    let (tick_sent, state_lane) =
-                        if let Some(sync) = self.rollback_entities.get(&id) {
-                            let Some(mut sync) = live_handle(sync) else {
-                                index += 1;
-                                continue;
-                            };
-                            let tick = sync.bind_mut().encode_block(
-                                &mut body,
-                                &mut self.mask_scratch,
-                                slot,
-                                current,
-                                reference,
-                            );
-                            (tick, false)
-                        } else if let Some(sync) = self.state_entities.get(&id) {
-                            let Some(mut sync) = live_handle(sync) else {
-                                index += 1;
-                                continue;
-                            };
-                            let tick = sync.bind_mut().encode_block(
-                                &mut body,
-                                &mut self.mask_scratch,
-                                slot,
-                                current,
-                                reference,
-                            );
-                            (tick, true)
-                        } else {
-                            (None, false)
-                        };
-                    // A candidate whose delta carries no change is un-written rather than admitted,
-                    // on the state lane alone. `block_is_un_written` holds the whole rule -- which lane
-                    // may do it and why the other may not, what counts as no change, what an un-write
-                    // does to the rota, what still bounds such a channel's staleness, and what a client
-                    // may read into a block's absence. The mask it is handed is the one the encoder
-                    // just left in `mask_scratch`, which only the delta branch fills, so the `full`
-                    // term is required. It is the encoder's own answer, rather than an inference at
-                    // this call site from having supplied a reference.
-                    let un_written = tick_sent.is_some_and(|(_, was_full)| {
-                        block_is_un_written(state_lane, was_full, &self.mask_scratch)
-                    });
-                    // `block_admission` orders the un-write against the over-budget check below, so
-                    // that the order is a rule a test can call rather than the shape this loop happens
-                    // to have. The un-write leads: the oversize branch exists so a datagram with
-                    // nothing in it yet still carries its first block rather than ending the stream,
-                    // and a block that states nothing would satisfy that branch while sending no state.
-                    //
-                    // **The cursor moves for every decision but `Defer`**, and
-                    // [`admission_advances_cursor`] is that rule. It runs before the arms so no arm can
-                    // forget it: leaving the cursor standing offers this candidate again, which spins
-                    // inside one datagram on an un-write and encodes a block twice on an admit.
-                    let admission =
-                        block_admission(un_written, body.len() <= admit_budget, sent.is_empty());
-                    if admission_advances_cursor(admission) {
-                        index += 1;
-                    }
-                    match admission {
-                        BlockAdmission::UnWrite => {
-                            body.truncate(body_before);
-                            self.acc_blocks_culled += 1;
-                            continue;
-                        }
-                        // IT DID NOT FIT, and the datagram carries nothing yet. Deferring is right whenever
-                        // the datagram already carries something -- but if it carries NOTHING, deferring this
-                        // block sends no datagram at all, which ends the stream rather than delaying it. An
-                        // entity that has never been sent scores `u64::MAX` staleness, so it is first again next tick,
-                        // does not fit again, and defers again: this peer never receives another snapshot for
-                        // the rest of the session, for every entity, silently. (The first implementation had no
-                        // un-write at all -- an oversized block simply went out, which is where ENet's over-MTU
-                        // warning came from.)
-                        //
-                        // So the datagram carries it anyway. One datagram past the path MTU fragments and a lost
-                        // fragment costs that frame; a wedged peer costs the session. The condition is counted
-                        // rather than swallowed, because "one entity's full state does not fit in a datagram"
-                        // is a fact about the schema that somebody has to be told.
-                        BlockAdmission::Oversize => {
-                            if let Some((tick, was_full)) = tick_sent {
-                                self.acc_blocks_oversize += 1;
-                                sent.push((id, tick));
-                                if was_full {
-                                    sent_full.push((id, tick));
-                                }
-                                self.acc_band_sends[band.index()] += 1;
-                                peer_sends += 1;
-                                break;
-                            }
-                            // No tick came back, so there is no row to admit. Nothing was written either
-                            // (an entity in neither map writes no bytes), so this is unreachable in
-                            // practice -- but if it happens, drop it and let the rest of the order run
-                            // rather than ending the datagram on an entity that contributed nothing.
-                            body.truncate(body_before);
-                            continue;
-                        }
-                        // The cursor stays on this candidate, so the frame's next datagram opens on it
-                        // against a whole budget. The count is charged once below the pass loop, where
-                        // what the frame's LAST datagram left behind is known.
-                        BlockAdmission::Defer => {
-                            body.truncate(body_before);
-                            break;
-                        }
-                        BlockAdmission::Admit => {}
-                    }
-                    if let Some((tick, was_full)) = tick_sent {
-                        sent.push((id, tick));
-                        if was_full {
-                            sent_full.push((id, tick));
-                        }
-                        self.acc_band_sends[band.index()] += 1;
-                        peer_sends += 1;
-                    }
-                    index += 1;
-                }
-                next = index;
-
-                // A LEAVE-ONLY TICK STILL SENDS. The gate is "did this frame carry anything", and a
-                // relevancy event is something: skipping the frame because no entity block was admitted
-                // is exactly the tick on which a peer needs to be told that an entity stopped being sent
-                // to it.
-                //
-                // AND A TICK WITH A SHUT INTEREST GATE STILL SENDS, carrying nothing but its header. The
-                // client's generation echo rides an input frame, a connection driving no body sends one
-                // only when a snapshot has arrived, and the echo is discharged when the frame is handed
-                // to an UNRELIABLE transport — so a single lost datagram leaves the client believing it
-                // has told the server something the server never heard. The client cannot detect that;
-                // nothing tells it whether its echo landed. The server can, because it holds both
-                // generations, so the server is what breaks the silence. One header per tick, only while
-                // a gate is shut, which is about a round trip.
-                //
-                // Both are facts about the **tick**, and the frame's first datagram discharges them.
-                // A later datagram of the same frame goes out only when it admitted an entity block
-                // of its own; a second header at the same tick, with the same ack fields and the
-                // same section, tells the peer nothing the first did not.
-                let carries = carries_delta && this_pass == 0;
-                let skipped = if this_pass == 0 {
-                    snapshot_frame_is_skipped(!sent.is_empty(), carries, gate_shut)
-                } else {
-                    sent.is_empty()
-                };
-                if skipped {
-                    continue;
-                }
-                let header = FrameHeader {
-                    kind: FrameKind::ServerSnapshot,
-                    tick: u32::try_from(current).unwrap_or(u32::MAX),
-                    ack_tick,
-                    ack_bits: 0,
-                    ack_token,
-                    margin_ticks: margin,
-                    flags: if carries {
-                        FrameHeader::FLAG_INTEREST_DELTA
-                    } else {
-                        0
-                    },
-                    entity_count: sent.len() as u32,
-                };
-                header.encode(&mut writer);
-                writer.bytes(body.as_slice());
-                // AFTER the blocks, which is what makes it invisible to a peer that does not know about
-                // it: a receiver reads exactly `entity_count` blocks and stops.
-                if carries {
-                    encode_interest_delta(
-                        interest_generation,
-                        &delta_left,
-                        &delta_entered,
-                        &mut writer,
-                    );
-                }
-                self.acc_blocks_admitted += sent.len() as u64;
-                self.acc_blocks_full += sent_full.len() as u64;
-                self.dbg_sent += sent.len() as u64;
-                self.dbg_sent_bytes += writer.len() as u64;
-                self.send_to(peer_id, writer.as_slice(), TransferMode::UNRELIABLE);
-
-                if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    peer.want_full = false;
-                    // The stamp is set by the FIRST frame to carry this prefix and does not move on a
-                    // re-send: what an ack has to reach is the frame whose arrival proves the client
-                    // applied these entries.
-                    if carries && peer.interest_delta_tick.is_none() {
-                        peer.interest_delta_tick = Some(current);
-                    }
-                    for &(id, tick) in &sent {
-                        peer.last_sent.insert(id, tick);
-                    }
-                    for &(id, tick) in &sent_full {
-                        peer.last_full.insert(id, tick);
-                    }
-                    peer.note_sent_frame(current, sent);
-                }
-            }
-
-            // Everything the frame's last datagram left behind wanted to go out and did not fit:
-            // budget pressure, which is a different fact from a cull and is counted as one. Charged
-            // once for the frame rather than once per datagram, so a multi-tick frame does not
-            // report the same waiting entity several times.
-            //
-            // **It is the per-datagram charge generalized, not a second policy.** On a frame of one
-            // datagram this bills exactly what charging `order.len() - index` at each break did: the
-            // cursor ends on the candidate that broke the loop, one past it where an oversized block
-            // was admitted. Every candidate the loop stepped over deliberately — a tiering
-            // hold-back, an un-written state delta, an entity whose slot is still in quarantine — is
-            // behind the cursor and already counted under its own name, so none of them reach this.
-            self.acc_blocks_deferred += (order.len() - next) as u64;
-
-            // Folded in after the pass loop, and ungated by whether a frame actually went out. A
-            // tick that offered this peer candidates and admitted none of them is part of that
-            // peer's cadence, and dropping it would bias the figure toward the peers that got
-            // served.
-            let acc = self.acc_peer_band.entry(peer_id).or_insert((0, 0));
-            acc.0 += peer_sends;
-            acc.1 += peer_members;
+        // THE TRANSPORT IS MAIN-THREAD ONLY, so every datagram is handed over here, after assembly,
+        // in peer order and in each peer's datagram order. Each one was sealed where it was built.
+        for (peer_id, sealed) in datagrams {
+            self.send_raw(peer_id, &sealed, TransferMode::UNRELIABLE);
         }
 
         self.aoi_rows = rows;
         self.aoi_observers = observers;
-        self.order_scratch = order;
-        self.aoi_members = members;
-        self.delta_left_scratch = delta_left;
-        self.delta_entered_scratch = delta_entered;
+    }
+
+    /// Fold one assembly tally into the window's accumulators, and queue its datagrams.
+    ///
+    /// Every figure here is a sum or a maximum, so the fold gives the same window whichever thread
+    /// assembled which peer.
+    fn fold_assembly(&mut self, tally: AssemblyTally, datagrams: &mut Vec<(i32, Vec<u8>)>) {
+        for band in 0..3 {
+            self.acc_band_members[band] += tally.band_members[band];
+            self.acc_band_sends[band] += tally.band_sends[band];
+        }
+        self.acc_interest_members += tally.interest_members;
+        self.acc_interest_peer_ticks += tally.interest_peer_ticks;
+        self.win_starve_ticks_max = self.win_starve_ticks_max.max(tally.starve_ticks_max);
+        self.win_unsent_backlog_max = self.win_unsent_backlog_max.max(tally.unsent_backlog_max);
+        self.acc_blocks_deferred += tally.blocks_deferred;
+        self.acc_blocks_culled += tally.blocks_culled;
+        self.acc_blocks_oversize += tally.blocks_oversize;
+        self.acc_blocks_admitted += tally.blocks_admitted;
+        self.acc_blocks_full += tally.blocks_full;
+        self.dbg_sent += tally.dbg_sent;
+        self.dbg_sent_bytes += tally.dbg_sent_bytes;
+        for (peer, sends, members) in tally.peer_band {
+            let acc = self.acc_peer_band.entry(peer).or_insert((0, 0));
+            acc.0 += sends;
+            acc.1 += members;
+        }
+        datagrams.extend(tally.datagrams);
     }
 
     /// The snapshot byte budget actually used, clamped to what the codec can carry.
@@ -9016,6 +8684,731 @@ fn retire_unnamed_interest(
         mirror.remove(&id);
         events.push((peer, id, false));
     }
+}
+
+/// Peers per assembly thread the pool will not split below. See [`assembly_threads`].
+const MIN_PEERS_PER_ASSEMBLY_THREAD: usize = 3;
+
+/// The most threads per-peer frame assembly is split across, the calling thread included.
+const MAX_ASSEMBLY_THREADS: usize = 4;
+
+/// The default for [`OrbitNet::assembly_pool_peers`]: synced peers at and above which per-peer frame
+/// assembly is split across threads. MEASURED, by `assembly_tests::assembly_cost_by_peers`.
+///
+/// Four runs on a shared 4-core Linux VM: a fixture of 24 bodies and 291 state channels with every row
+/// a candidate, flushes 4 ms apart so the pool wakes from sleep each time. Microseconds per flush, the
+/// range over the four runs. The split [`assembly_threads`] picks at this default is in bold.
+///
+/// | Peers | 1 thread | 2 threads | 3 threads | 4 threads |
+/// | --- | --- | --- | --- | --- |
+/// | 8 | **275 – 287** | 271 – 321 | 263 – 280 | 271 – 327 |
+/// | 12 | 391 – 426 | 354 – 515 | 349 – 442 | **299 – 334** |
+/// | 16 | 533 – 745 | 443 – 668 | 361 – 615 | **376 – 411** |
+/// | 24 | 762 – 1095 | 627 – 840 | 514 – 815 | **441 – 484** |
+/// | 32 | 1024 – 1218 | 723 – 1044 | 841 – 1224 | **545 – 1004** |
+/// | 48 | 1494 – 1593 | 1129 – 1317 | 1459 – 1494 | **1000 – 1507** |
+/// | 64 | 1975 – 2108 | 1400 – 1514 | 1141 – 2038 | **1226 – 2321** |
+/// | 96 | 2963 – 3434 | 1918 – 2951 | 1535 – 2562 | **2839 – 3523** |
+/// | 128 | 3879 – 4246 | 2205 – 3307 | 1725 – 2875 | **1615 – 3695** |
+///
+/// - Single-threaded assembly costs about 30 µs per peer after a sleep, and grows linearly.
+/// - Waking the pool costs 80 to 100 µs per flush on that host, so at 8 peers no split helps.
+/// - From 12 to 32 peers the 4-thread split beat one thread in every run: by 16 to 29% at 12, 25 to
+///   48% at 16 and 42 to 56% at 24.
+/// - From 48 up it won 9 of 12 cells. It lost one at 48 (by 1%), one at 64 and two at 96 (by 12 to
+///   17%), where 2 and 3 threads won every cell. A run spanning all four cores of a shared VM is the
+///   cell most exposed to a stolen core, so a dedicated host should see fewer of those.
+/// - Spawning threads per flush instead of keeping them measured 60 to 100 µs per flush more, and
+///   started every flush on a cold allocator, which is why the threads persist.
+const DEFAULT_ASSEMBLY_POOL_PEERS: i32 = 12;
+
+/// How many threads assemble this flush's frames, the calling thread included. `1` is the
+/// single-threaded path.
+///
+/// One below `pool_peers`, or when `pool_peers` is 0 or less. Above it, one thread per
+/// [`MIN_PEERS_PER_ASSEMBLY_THREAD`] peers, capped by the host's parallelism and by
+/// [`MAX_ASSEMBLY_THREADS`]: a thread given fewer peers than that spends more waking than working.
+fn assembly_threads(peers: usize, pool_peers: i32, parallelism: usize) -> usize {
+    if pool_peers <= 0 || peers < pool_peers as usize {
+        return 1;
+    }
+    (peers / MIN_PEERS_PER_ASSEMBLY_THREAD).clamp(1, parallelism.clamp(1, MAX_ASSEMBLY_THREADS))
+}
+
+/// How long dropping an [`AssemblyPool`] waits for its threads to exit before giving up on them.
+const ASSEMBLY_POOL_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The persistent threads behind [`assemble_frames`]: one fewer than the most a flush may split
+/// across, because the calling thread assembles a share of its own.
+///
+/// **DROPPING IT WAITS FOR ITS THREADS TO EXIT.** A `rayon::ThreadPool` only signals its threads on drop,
+/// and they finish exiting on their own schedule. Their code is in this library, and a library the engine
+/// unloads with one of its threads still running faults the process on the way out. So every thread
+/// reports its exit, and `Drop` waits for the count to reach zero, for at most
+/// [`ASSEMBLY_POOL_EXIT_WAIT`], before the node finishes dropping.
+struct AssemblyPool {
+    pool: Option<rayon::ThreadPool>,
+    /// Threads still running, and the signal each one's exit raises.
+    live: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl AssemblyPool {
+    /// `None` on a host with one hardware thread, or if the pool could not be built.
+    fn build(parallelism: usize) -> Option<Self> {
+        let threads = parallelism.clamp(1, MAX_ASSEMBLY_THREADS);
+        if threads < 2 {
+            return None;
+        }
+        let live = std::sync::Arc::new((
+            std::sync::Mutex::new(threads - 1),
+            std::sync::Condvar::new(),
+        ));
+        let exits = std::sync::Arc::clone(&live);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads - 1)
+            .thread_name(|index| format!("orbitnet-assembly-{index}"))
+            .exit_handler(move |_| {
+                let (count, signal) = &*exits;
+                if let Ok(mut count) = count.lock() {
+                    *count = count.saturating_sub(1);
+                }
+                signal.notify_all();
+            })
+            .build()
+            .ok()?;
+        Some(Self {
+            pool: Some(pool),
+            live,
+        })
+    }
+
+    fn pool(&self) -> Option<&rayon::ThreadPool> {
+        self.pool.as_ref()
+    }
+}
+
+impl Drop for AssemblyPool {
+    fn drop(&mut self) {
+        drop(self.pool.take());
+        let (count, signal) = &*self.live;
+        let Ok(count) = count.lock() else {
+            return;
+        };
+        let _ = signal.wait_timeout_while(count, ASSEMBLY_POOL_EXIT_WAIT, |live| *live > 0);
+    }
+}
+
+/// One registered entity's synchronizer, resolved by id for the length of one flush.
+enum EntityHandle {
+    Rollback(Gd<OrbitRollbackSynchronizer>),
+    State(Gd<OrbitStateSynchronizer>),
+    /// Freed this frame, or in neither registry. Assembly skips it, as it skipped a dead handle
+    /// before.
+    Gone,
+}
+
+impl EntityHandle {
+    fn resolve(
+        rollback: &BTreeMap<u64, Gd<OrbitRollbackSynchronizer>>,
+        state: &BTreeMap<u64, Gd<OrbitStateSynchronizer>>,
+        id: u64,
+    ) -> Self {
+        if let Some(sync) = rollback.get(&id) {
+            return live_handle(sync).map_or(Self::Gone, Self::Rollback);
+        }
+        if let Some(sync) = state.get(&id) {
+            return live_handle(sync).map_or(Self::Gone, Self::State);
+        }
+        Self::Gone
+    }
+
+    fn bind(&self) -> EntityGuard<'_> {
+        match self {
+            Self::Rollback(sync) => EntityGuard::Rollback(sync.bind()),
+            Self::State(sync) => EntityGuard::State(sync.bind()),
+            Self::Gone => EntityGuard::Gone,
+        }
+    }
+}
+
+/// An [`EntityHandle`] held bound while its [`BlockSource`] is read.
+enum EntityGuard<'a> {
+    Rollback(GdRef<'a, OrbitRollbackSynchronizer>),
+    State(GdRef<'a, OrbitStateSynchronizer>),
+    Gone,
+}
+
+impl EntityGuard<'_> {
+    fn source(&self, frame_tick: u64) -> Option<BlockSource<'_>> {
+        match self {
+            Self::Rollback(sync) => Some(sync.block_source(frame_tick)),
+            Self::State(sync) => Some(sync.block_source()),
+            Self::Gone => None,
+        }
+    }
+}
+
+/// What one flush's per-peer assembly reads and never writes: shared by every peer, and by every
+/// thread when the pool is engaged.
+struct AssemblyShared<'a> {
+    current: u64,
+    passes: u32,
+    budget: usize,
+    filtering: bool,
+    culling: bool,
+    band_scale: f32,
+    tiering: bool,
+    base_span: u64,
+    /// Ascending by id.
+    rows: &'a [EntityRow],
+    /// `sources[i]` encodes `rows[i]`.
+    sources: &'a [Option<BlockSource<'a>>],
+    slots: &'a SlotTable,
+    /// The direction a snapshot is sealed in, or `None` outside a session, where nothing is sent.
+    direction: Option<Direction>,
+}
+
+/// One assembly thread's reusable buffers, kept on the node between flushes.
+///
+/// **Aligned to 128 bytes, like [`AssemblyTally`], so two threads' buffers never share a cache line.**
+/// They sit side by side in one `Vec`, and every push writes a length field; unaligned, the second
+/// thread's lengths shared a line with the first's.
+#[derive(Default)]
+#[repr(align(128))]
+struct AssemblyScratch {
+    /// The ordered candidate set, each carrying its index into [`AssemblyShared::rows`].
+    order: Vec<(priority::Candidate, Band, usize)>,
+    members: Vec<(u64, f32)>,
+    /// The interest section's wire slots, one connection's worth at a time.
+    delta_left: Vec<u16>,
+    delta_entered: Vec<u16>,
+    /// The changed mask an encode leaves behind. See [`block_is_un_written`].
+    mask: Vec<bool>,
+}
+
+/// What one assembly thread counted and built, folded into the window by
+/// [`OrbitNet::fold_assembly`]. Aligned for the reason [`AssemblyScratch`] is.
+#[derive(Default)]
+#[repr(align(128))]
+struct AssemblyTally {
+    band_members: [u64; 3],
+    band_sends: [u64; 3],
+    interest_members: u64,
+    interest_peer_ticks: u64,
+    starve_ticks_max: u64,
+    unsent_backlog_max: u64,
+    blocks_deferred: u64,
+    blocks_culled: u64,
+    blocks_oversize: u64,
+    blocks_admitted: u64,
+    blocks_full: u64,
+    dbg_sent: u64,
+    dbg_sent_bytes: u64,
+    /// `(peer, sends, members)` for the per-peer cadence.
+    peer_band: Vec<(i32, u64, u64)>,
+    /// Sealed datagrams in the order they were built, each with the peer it goes to.
+    datagrams: Vec<(i32, Vec<u8>)>,
+}
+
+/// Assemble every target's frames: on this thread, or split across `tallies.len()` threads.
+///
+/// **THE SPLIT IS BY CONTIGUOUS CHUNKS OF `targets`, AND THE TALLIES COME BACK IN CHUNK ORDER**, so
+/// folding them in order hands the transport the same datagrams in the same order the
+/// single-threaded path does. Each peer's assembly reads [`AssemblyShared`] and writes only its own
+/// [`PeerState`], so no two threads touch the same memory.
+fn assemble_frames(
+    shared: &AssemblyShared<'_>,
+    targets: &mut [(i32, &mut PeerState)],
+    scratch: &mut [AssemblyScratch],
+    tallies: &mut [AssemblyTally],
+    pool: Option<&rayon::ThreadPool>,
+) {
+    let pool = match pool {
+        Some(pool) if tallies.len() > 1 && targets.len() > 1 => pool,
+        _ => {
+            let (Some(scratch), Some(tally)) = (scratch.first_mut(), tallies.first_mut()) else {
+                return;
+            };
+            for (peer_id, peer) in targets.iter_mut() {
+                assemble_peer(shared, *peer_id, peer, scratch, tally);
+            }
+            return;
+        }
+    };
+    let chunk = targets.len().div_ceil(tallies.len());
+    pool.in_place_scope(|scope| {
+        let mut work = targets
+            .chunks_mut(chunk)
+            .zip(scratch.iter_mut())
+            .zip(tallies.iter_mut());
+        // The calling thread takes the first chunk rather than waiting idle on the others.
+        let own = work.next();
+        for ((peers, scratch), tally) in work {
+            scope.spawn(move |_| {
+                for (peer_id, peer) in peers.iter_mut() {
+                    assemble_peer(shared, *peer_id, peer, scratch, tally);
+                }
+            });
+        }
+        if let Some(((peers, scratch), tally)) = own {
+            for (peer_id, peer) in peers.iter_mut() {
+                assemble_peer(shared, *peer_id, peer, scratch, tally);
+            }
+        }
+    });
+}
+
+/// The bytes one datagram goes out as: `bytes` with the session's authentication appended, or
+/// `None` when there is no session key to seal it under.
+///
+/// The one sealing rule, shared by [`OrbitNet::send_to`] and per-peer frame assembly. No key means no
+/// session -- a server peer that has not handshaken, or a client that has not started -- and nothing
+/// that reaches here is worth sending in the clear.
+fn seal_datagram(
+    direction: Direction,
+    auth: Option<&mut SessionAuth>,
+    bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let auth = auth?;
+    let mut sealed = Vec::with_capacity(bytes.len() + auth.trailer_len());
+    sealed.extend_from_slice(bytes);
+    auth.seal(direction, &mut sealed)?;
+    Some(sealed)
+}
+
+/// Build and seal one peer's snapshot frames for this flush: order its surviving set, decide its
+/// interest section, and spend the byte budget down the order once per datagram the frame owes.
+///
+/// **NO GODOT OBJECT IS IN REACH**, which is what lets [`assemble_frames`] run it on any thread. It reads
+/// [`AssemblyShared`], writes only this peer's own [`PeerState`], and leaves its counts and sealed
+/// datagrams in `tally` for the main thread to fold and hand to the transport.
+///
+/// See [`OrbitNet::send_snapshots`] for the shape -- gather once, cull, order, admit -- and
+/// [`OrbitNet::flush_network`] for why a frame sends one datagram per tick it advanced.
+fn assemble_peer(
+    shared: &AssemblyShared<'_>,
+    peer_id: i32,
+    peer: &mut PeerState,
+    scratch: &mut AssemblyScratch,
+    tally: &mut AssemblyTally,
+) {
+    let current = shared.current;
+    let passes = shared.passes;
+    let budget = shared.budget;
+    let rows = shared.rows;
+    let want_full = peer.want_full;
+    let ack_tick = u32::try_from(peer.newest_input_tick.max(0)).unwrap_or(u32::MAX);
+    // What this peer must quote back to have its ack of this frame believed.
+    let ack_token = peer.frame_token(current).unwrap_or(0);
+    let margin = peer.margin_last;
+    let AssemblyScratch {
+        order,
+        members,
+        delta_left,
+        delta_entered,
+        mask,
+    } = scratch;
+
+    // --- order, over the surviving set only ---
+    //
+    // With the filter off there IS no surviving set — every row is a candidate, at a
+    // distance no radius will be compared against, which `band_of` reports as `Near` for all
+    // of them. Reading `peer.interest` there would read a structure nothing has maintained.
+    //
+    // The gate is `filtering`, not `culling`: with memberships declared and no radius, the
+    // pass DID run and `peer.interest` is exactly the set that survived it. `band_for_row`
+    // below still takes `culling`, because a membership refusal produces no distance and so
+    // no band — every surviving row takes the one constant weight, as it does with the
+    // radius off.
+    members.clear();
+    if shared.filtering {
+        members.extend(peer.interest.iter_with_distance());
+    } else {
+        members.extend(rows.iter().map(|row| (row.id, 0.0f32)));
+    }
+
+    order.clear();
+    let mut starve_max = 0u64;
+    let mut unsent = 0u64;
+    // This peer's own share of the two band counters, folded into `acc_peer_band` once the
+    // frame is built. The band arrays beside them stay global.
+    let mut peer_members = 0u64;
+    let mut peer_sends = 0u64;
+    for &(id, dist_sq) in members.iter() {
+        let Ok(row_index) = rows.binary_search_by_key(&id, |row| row.id) else {
+            continue; // despawned between the gather and here
+        };
+        let row = &rows[row_index];
+        // AN ENTITY WITH NO ANCHOR HAS NO DISTANCE, AND MUST NOT COLLECT A DISTANCE BOOST.
+        //
+        // `PeerInterest` stores always-relevant members at `0.0` (they are pushed at
+        // `NEG_INFINITY` so the nearest-N cap can never evict them, then normalized), and
+        // `band_of` reads `0.0` as `Near`. Typically only a handful of channels declare an
+        // anchor — the ones that carry a position — while every other state channel a body owns
+        // (its health, its equipment, its sensors, its lights, the doors around it) does not. Those
+        // would all be scored as though they were in the viewer's face. At four-plus such channels
+        // per body against the ONE anchored row that says where that body is, a distant player's
+        // flashlight and hit points outbid their position 4:1 under budget pressure. That is remote-body
+        // stutter by construction.
+        //
+        // `Far` rather than a middle band: "always relevant" is a statement about never being
+        // culled, and says nothing about priority. Unanchored channels are on-change, so staleness
+        // carries them the moment they have something to say, and `score = staleness x weight`
+        // makes starvation impossible by construction whatever the weight is.
+        let band = band_for_row(
+            shared.culling,
+            row.anchor.is_some(),
+            dist_sq,
+            shared.band_scale,
+        );
+        let last_sent = peer.last_sent.get(&id).copied().unwrap_or(0);
+        // Never sent: sorts ahead of everything already sent, which is what a re-entrant
+        // entity needs — and why clearing `last_sent` at the leave is the whole of the
+        // re-entry fix. NOT `u64::MAX`: that saturates the product and cancels the weight,
+        // so a join burst ordered by node-path hash. See `priority::NEVER_SENT_STALENESS`.
+        let staleness = if last_sent == 0 {
+            unsent += 1;
+            priority::NEVER_SENT_STALENESS
+        } else {
+            let age = current.saturating_sub(last_sent);
+            starve_max = starve_max.max(age);
+            age
+        };
+        let weight = priority::weight_for(band, row.priority, row.owner == peer_id);
+        // **Weighted by the frame's tick count, because the figure it feeds is
+        // denominated in ticks.** `interarrival_*` is `members / sends`, read as the
+        // mean ticks between admissions, and a frame that advanced K ticks offered this
+        // candidate K ticks of candidacy while the order was built once. Counting it
+        // once would report the gap in frames and under-state the view lag the
+        // lag-compensation rewind charges on an authority running below its tick rate.
+        tally.band_members[band.index()] += u64::from(passes);
+        peer_members += u64::from(passes);
+        order.push((
+            priority::Candidate {
+                id,
+                staleness,
+                weight,
+            },
+            band,
+            row_index,
+        ));
+    }
+    // The candidate set as this tick actually used it, so the published figure is the
+    // number the order loop walked rather than the state of a structure that may not
+    // have been maintained.
+    tally.interest_members += members.len() as u64;
+    tally.interest_peer_ticks += 1;
+    tally.starve_ticks_max = tally.starve_ticks_max.max(starve_max);
+    tally.unsent_backlog_max = tally.unsent_backlog_max.max(unsent);
+
+    // Descending score, ties by ascending id — and it CALLS `priority::cmp` rather than restating it.
+    // The tuples carry the band and the row through the sort without a parallel array, which is why
+    // this cannot use `priority::order`; writing the comparison out again left two copies of the
+    // shipping rule, and the tests could only ever reach the other one.
+    order.sort_unstable_by(|a, b| priority::cmp(&a.0, &b.0));
+
+    // --- the trailing interest-delta section, decided BEFORE the admit loop ---
+    //
+    // Built once per frame and ridden by the frame's **first** datagram. The section states this
+    // tick's relevancy transitions, so a copy on each datagram of a multi-tick frame would
+    // repeat a set the peer already applied — `apply_interest_section` is idempotent and
+    // announces nothing the second time, so the copies cost only bytes. The ack that retires
+    // it is the ordinary one every frame already carries and proves.
+    //
+    // READ BESIDE THE SECTION IT STAMPS, not at the encode below: a whole set sent later
+    // in this same flush would bump it, and the section would then claim a generation it
+    // was not built against.
+    let interest_generation = peer.interest_generation;
+    let gate_shut = peer.interest_generation_acked != peer.interest_generation;
+    let carries_delta = build_interest_section(
+        shared.slots,
+        peer,
+        shared.filtering,
+        current,
+        delta_left,
+        delta_entered,
+    );
+    // The reserve comes off the **first** datagram's budget alone, because a section appended
+    // to a frame already filled to `MAX_FRAME_PAYLOAD` is a datagram past the path MTU. Later
+    // datagrams of the same frame carry no section and spend the whole budget on blocks.
+    let first_admit_budget = budget.saturating_sub(interest_delta_reserve(
+        delta_left.len() + delta_entered.len(),
+    ));
+
+    // --- admit, once per datagram this frame owes ---
+    //
+    // `next` is this peer's cursor into the ordered set, and it only ever moves forward.
+    // That is what makes the second datagram of a multi-tick frame the next slice of the
+    // rota rather than a second copy of the first: every datagram of the frame encodes the
+    // same `current`, so re-admitting an entity would put identical bytes on the wire at a
+    // tick the peer already holds, and the receiver would discard them as stale.
+    //
+    // THE BUDGET BOUNDS THE BODY, AND THE DATAGRAM IS THE BODY PLUS THE FRAME HEADER. `send_budget`
+    // clamps to `MAX_FRAME_PAYLOAD` (1200) and every check below is against `body.len()`, so a full
+    // frame leaves here at 1200 plus the header's own bytes -- not at 1200. That is deliberate rather
+    // than an oversight, but it is not what the constant's name says: the real wire figure is header +
+    // body + the authentication trailer (12 bytes, or 20 under a session secret) + 12 (ENet) + 28
+    // (IPv4/UDP), which stays comfortably inside a 1500 B path MTU. Do not read
+    // `MAX_FRAME_PAYLOAD` as "the datagram size"; read it as "the entity payload one frame may carry".
+    let mut next = 0usize;
+    let mut pass = 0u32;
+    while send_pass_is_due(pass, passes, order.len() - next) {
+        let this_pass = pass;
+        pass += 1;
+        let admit_budget = if this_pass == 0 {
+            first_admit_budget
+        } else {
+            budget
+        };
+        let mut writer = Writer::with_capacity(budget + 256);
+        let mut body = Writer::with_capacity(budget);
+        let mut sent: Vec<(u64, u64)> = Vec::new();
+        // The subset of `sent` that went out full, so the keyframe clock is measured against
+        // what repairs a chain. Kept beside `sent` rather than widening it, because `sent` is
+        // moved into the ack log verbatim.
+        let mut sent_full: Vec<(u64, u64)> = Vec::new();
+
+        let mut index = next;
+        while index < order.len() {
+            let (candidate, band, row_index) = order[index];
+            if body.len() >= admit_budget {
+                // Everything left wanted to go out and did not fit. Whether that is a defer
+                // or the next datagram's opening slice is not known until the frame's last
+                // datagram has run, so the count is charged once, below the pass loop.
+                break;
+            }
+            let id = candidate.id;
+            // The wire name for this entity. Missing only while `reconcile_slots` is holding
+            // the entity back — a slot still inside its predecessor's reuse quarantine — which
+            // is a delay this entity's next tick resolves, so it counts as deferred.
+            let Some(slot) = shared.slots.slot_of(id) else {
+                tally.blocks_deferred += 1;
+                index += 1;
+                continue;
+            };
+            // Rate tiering is a deliberate hold-back, so it counts as culled, not deferred.
+            // **It phases on the 64-bit id, not the wire slot**, and so does `full_block_due`
+            // below. Either value spreads a set of entities across an interval — dense
+            // sequential slots spread more evenly than hashes do, which
+            // `send_phase_spreads_dense_sequential_indices` pins — but only the id is STABLE.
+            // A slot is released and reissued, so an entity that took a different slot would
+            // jump its tier phase and its keyframe phase with it, restarting the interval it
+            // was part-way through.
+            if shared.tiering
+                && !orbitnet_core::interest::send_phase(id, current, band.tiered_interval())
+            {
+                tally.blocks_culled += 1;
+                index += 1;
+                continue;
+            }
+            // A synchronizer freed this frame has nothing to encode, and is passed over.
+            let Some(source) = shared.sources[row_index] else {
+                index += 1;
+                continue;
+            };
+            let last_full = peer.last_full.get(&id).copied().unwrap_or(0);
+            let full_due = full_block_due(want_full, id, current, last_full, FULL_STATE_INTERVAL);
+            // Masked deltas reference only CLIENT-ACKED ticks: the peer provably applied
+            // that base, so loss can no longer leave it reconstructing against its own
+            // prediction. No acked base yet (or an evicted row) degrades to a full block.
+            let reference = if full_due {
+                None
+            } else {
+                peer.acked_base
+                    .get(&id)
+                    .copied()
+                    .and_then(|base| delta_reference(base, current, shared.base_span))
+            };
+
+            // An entity block's encoded size is not known until it is written, so the budget can only
+            // be enforced by writing and un-writing. The pre-check above admits an entity whenever the
+            // body is at `budget - 1`, and the block that follows can be any size -- which is how a frame
+            // capped at MAX_FRAME_PAYLOAD went out at 1456 bytes and drew ENet's over-MTU warning. An
+            // unreliable datagram past the path MTU fragments, and a lost fragment loses the whole frame.
+            let body_before = body.len();
+            // The lane the block came from travels with it. Only the state lane un-writes
+            // an empty delta -- see [`block_is_un_written`].
+            let tick_sent = source.encode(&mut body, mask, slot, current, reference);
+            let state_lane = source.state_lane();
+            // A candidate whose delta carries no change is un-written rather than admitted,
+            // on the state lane alone. `block_is_un_written` holds the whole rule -- which lane
+            // may do it and why the other may not, what counts as no change, what an un-write
+            // does to the rota, what still bounds such a channel's staleness, and what a client
+            // may read into a block's absence. The mask it is handed is the one the encoder
+            // just left in `mask`, which only the delta branch fills, so the `full`
+            // term is required. It is the encoder's own answer, rather than an inference at
+            // this call site from having supplied a reference.
+            let un_written = tick_sent
+                .is_some_and(|(_, was_full)| block_is_un_written(state_lane, was_full, mask));
+            // `block_admission` orders the un-write against the over-budget check below, so
+            // that the order is a rule a test can call rather than the shape this loop happens
+            // to have. The un-write leads: the oversize branch exists so a datagram with
+            // nothing in it yet still carries its first block rather than ending the stream,
+            // and a block that states nothing would satisfy that branch while sending no state.
+            //
+            // **The cursor moves for every decision but `Defer`**, and
+            // [`admission_advances_cursor`] is that rule. It runs before the arms so no arm can
+            // forget it: leaving the cursor standing offers this candidate again, which spins
+            // inside one datagram on an un-write and encodes a block twice on an admit.
+            let admission =
+                block_admission(un_written, body.len() <= admit_budget, sent.is_empty());
+            if admission_advances_cursor(admission) {
+                index += 1;
+            }
+            match admission {
+                BlockAdmission::UnWrite => {
+                    body.truncate(body_before);
+                    tally.blocks_culled += 1;
+                    continue;
+                }
+                // IT DID NOT FIT, and the datagram carries nothing yet. Deferring is right whenever
+                // the datagram already carries something -- but if it carries NOTHING, deferring this
+                // block sends no datagram at all, which ends the stream rather than delaying it. An
+                // entity that has never been sent scores `u64::MAX` staleness, so it is first again next tick,
+                // does not fit again, and defers again: this peer never receives another snapshot for
+                // the rest of the session, for every entity, silently. (The first implementation had no
+                // un-write at all -- an oversized block simply went out, which is where ENet's over-MTU
+                // warning came from.)
+                //
+                // So the datagram carries it anyway. One datagram past the path MTU fragments and a lost
+                // fragment costs that frame; a wedged peer costs the session. The condition is counted
+                // rather than swallowed, because "one entity's full state does not fit in a datagram"
+                // is a fact about the schema that somebody has to be told.
+                BlockAdmission::Oversize => {
+                    if let Some((tick, was_full)) = tick_sent {
+                        tally.blocks_oversize += 1;
+                        sent.push((id, tick));
+                        if was_full {
+                            sent_full.push((id, tick));
+                        }
+                        tally.band_sends[band.index()] += 1;
+                        peer_sends += 1;
+                        break;
+                    }
+                    // No tick came back, so there is no row to admit. Nothing was written either
+                    // (a source with no row writes no bytes), so this is unreachable in practice --
+                    // but if it happens, drop it and let the rest of the order run rather than
+                    // ending the datagram on an entity that contributed nothing.
+                    body.truncate(body_before);
+                    continue;
+                }
+                // The cursor stays on this candidate, so the frame's next datagram opens on it
+                // against a whole budget. The count is charged once below the pass loop, where
+                // what the frame's LAST datagram left behind is known.
+                BlockAdmission::Defer => {
+                    body.truncate(body_before);
+                    break;
+                }
+                BlockAdmission::Admit => {}
+            }
+            if let Some((tick, was_full)) = tick_sent {
+                sent.push((id, tick));
+                if was_full {
+                    sent_full.push((id, tick));
+                }
+                tally.band_sends[band.index()] += 1;
+                peer_sends += 1;
+            }
+            // The cursor does not move here. `admission_advances_cursor`, above `match admission`, is
+            // the one place it moves for a candidate that reached admission. A second step would skip
+            // the next candidate, and after the last one would leave `next` past `order.len()`.
+        }
+        next = index;
+
+        // A LEAVE-ONLY TICK STILL SENDS. The gate is "did this frame carry anything", and a
+        // relevancy event is something: skipping the frame because no entity block was admitted
+        // is exactly the tick on which a peer needs to be told that an entity stopped being sent
+        // to it.
+        //
+        // AND A TICK WITH A SHUT INTEREST GATE STILL SENDS, carrying nothing but its header. The
+        // client's generation echo rides an input frame, a connection driving no body sends one
+        // only when a snapshot has arrived, and the echo is discharged when the frame is handed
+        // to an UNRELIABLE transport — so a single lost datagram leaves the client believing it
+        // has told the server something the server never heard. The client cannot detect that;
+        // nothing tells it whether its echo landed. The server can, because it holds both
+        // generations, so the server is what breaks the silence. One header per tick, only while
+        // a gate is shut, which is about a round trip.
+        //
+        // Both are facts about the **tick**, and the frame's first datagram discharges them.
+        // A later datagram of the same frame goes out only when it admitted an entity block
+        // of its own; a second header at the same tick, with the same ack fields and the
+        // same section, tells the peer nothing the first did not.
+        let carries = carries_delta && this_pass == 0;
+        let skipped = if this_pass == 0 {
+            snapshot_frame_is_skipped(!sent.is_empty(), carries, gate_shut)
+        } else {
+            sent.is_empty()
+        };
+        if skipped {
+            continue;
+        }
+        let header = FrameHeader {
+            kind: FrameKind::ServerSnapshot,
+            tick: u32::try_from(current).unwrap_or(u32::MAX),
+            ack_tick,
+            ack_bits: 0,
+            ack_token,
+            margin_ticks: margin,
+            flags: if carries {
+                FrameHeader::FLAG_INTEREST_DELTA
+            } else {
+                0
+            },
+            entity_count: sent.len() as u32,
+        };
+        header.encode(&mut writer);
+        writer.bytes(body.as_slice());
+        // AFTER the blocks, which is what makes it invisible to a peer that does not know about
+        // it: a receiver reads exactly `entity_count` blocks and stops.
+        if carries {
+            encode_interest_delta(interest_generation, delta_left, delta_entered, &mut writer);
+        }
+        tally.blocks_admitted += sent.len() as u64;
+        tally.blocks_full += sent_full.len() as u64;
+        tally.dbg_sent += sent.len() as u64;
+        tally.dbg_sent_bytes += writer.len() as u64;
+        // Sealed here, where it was built: each peer's key and sequence are its own, so this is
+        // per-peer work like the rest. The main thread hands the bytes to the transport.
+        if let Some(direction) = shared.direction {
+            if let Some(sealed) = seal_datagram(direction, peer.auth.as_mut(), writer.as_slice()) {
+                tally.datagrams.push((peer_id, sealed));
+            }
+        }
+
+        peer.want_full = false;
+        // The stamp is set by the FIRST frame to carry this prefix and does not move on a
+        // re-send: what an ack has to reach is the frame whose arrival proves the client
+        // applied these entries.
+        if carries && peer.interest_delta_tick.is_none() {
+            peer.interest_delta_tick = Some(current);
+        }
+        for &(id, tick) in &sent {
+            peer.last_sent.insert(id, tick);
+        }
+        for &(id, tick) in &sent_full {
+            peer.last_full.insert(id, tick);
+        }
+        peer.note_sent_frame(current, sent);
+    }
+
+    // Everything the frame's last datagram left behind wanted to go out and did not fit:
+    // budget pressure, which is a different fact from a cull and is counted as one. Charged
+    // once for the frame rather than once per datagram, so a multi-tick frame does not
+    // report the same waiting entity several times.
+    //
+    // **It is the per-datagram charge generalized, not a second policy.** On a frame of one
+    // datagram this bills exactly what charging `order.len() - index` at each break did: the
+    // cursor ends on the candidate that broke the loop, one past it where an oversized block
+    // was admitted. Every candidate the loop stepped over deliberately — a tiering
+    // hold-back, an un-written state delta, an entity whose slot is still in quarantine — is
+    // behind the cursor and already counted under its own name, so none of them reach this.
+    tally.blocks_deferred += (order.len() - next) as u64;
+
+    // Folded in after the pass loop, and ungated by whether a frame actually went out. A
+    // tick that offered this peer candidates and admitted none of them is part of that
+    // peer's cadence, and dropping it would bias the figure toward the peers that got
+    // served.
+    tally.peer_band.push((peer_id, peer_sends, peer_members));
 }
 
 /// Which of a client input frame's blocks ride this tick, and where the next walk starts.
@@ -16762,5 +17155,494 @@ mod tests {
             "the measured length, not 1.0"
         );
         assert_eq!(timer, 0.0, "the overshoot is discarded rather than carried");
+    }
+}
+
+/// Per-peer frame assembly off the main thread: the pooled path builds what the single-threaded one
+/// builds, and the measurement the pool's threshold was read off.
+///
+/// Everything here is plain data -- rings, schemas, a slot table and `PeerState`s -- because
+/// [`assemble_peer`] touches no Godot object. That is also why the harness can measure the real
+/// function rather than a model of it.
+#[cfg(test)]
+mod assembly_tests {
+    use super::*;
+    use orbitnet_core::{
+        ColumnarHistory, PropKind, PropRole, QuantKind, SchemaBuilder, MEMBERSHIP_GLOBAL,
+    };
+    use std::collections::BTreeSet;
+
+    /// The tick every fixture frame is built at.
+    const CURRENT: u64 = 1_000;
+
+    /// A session's entities, as the send path sees them after the gather.
+    ///
+    /// Shaped like a shooter arena: `bodies` rollback bodies carrying a pose, and `channels` state
+    /// channels each carrying a handful of on-change integers. Every entity has rows at the current
+    /// tick and two ticks back, and the two differ, so a peer holding the older one as its acked base
+    /// gets a masked delta and a peer holding none gets a full row.
+    struct Fixture {
+        rows: Vec<EntityRow>,
+        histories: Vec<ColumnarHistory>,
+        body_schema: SchemaBuilder,
+        channel_schema: SchemaBuilder,
+        bodies: usize,
+        slots: SlotTable,
+    }
+
+    impl Fixture {
+        fn new(bodies: usize, channels: usize) -> Self {
+            let mut body_schema = SchemaBuilder::new();
+            body_schema.push_quantized(
+                "position",
+                PropKind::Vec3,
+                PropRole::State,
+                QuantKind::Half,
+            );
+            body_schema.push_quantized(
+                "velocity",
+                PropKind::Vec3,
+                PropRole::State,
+                QuantKind::Half,
+            );
+            body_schema.push_quantized("rotation", PropKind::Quat, PropRole::State, QuantKind::Ss3);
+            body_schema.push("health", PropKind::I32, PropRole::State);
+            body_schema.push("grounded", PropKind::Bool, PropRole::State);
+            let mut channel_schema = SchemaBuilder::new();
+            for name in ["a", "b", "c", "d"] {
+                channel_schema.push(name, PropKind::I32, PropRole::State);
+            }
+            let mut rows = Vec::new();
+            let mut histories = Vec::new();
+            for index in 0..bodies + channels {
+                let body = index < bodies;
+                // Ascending, as the gather sorts them, and in no lane's id order.
+                let id = 0x1000 + index as u64 * 7;
+                let schema = if body { &body_schema } else { &channel_schema };
+                let mut history = ColumnarHistory::new(schema.row_stride(), 64);
+                for (step, tick) in [CURRENT - 2, CURRENT].into_iter().enumerate() {
+                    let row = Self::row(schema, index, step, body);
+                    assert!(history.write_row(tick, &row));
+                }
+                histories.push(history);
+                rows.push(EntityRow {
+                    id,
+                    owner: if body { 2 + index as i32 } else { 0 },
+                    seat: 0,
+                    anchor: body.then_some([index as f32, 0.0, 0.0]),
+                    membership: MEMBERSHIP_GLOBAL,
+                    priority: 1,
+                });
+            }
+            let registered: BTreeSet<u64> = rows.iter().map(|row| row.id).collect();
+            let mut slots = SlotTable::new();
+            slots.reconcile(&registered, CURRENT);
+            Self {
+                rows,
+                histories,
+                body_schema,
+                channel_schema,
+                bodies,
+                slots,
+            }
+        }
+
+        /// One entity's row at one of its two ticks. Bodies move every tick; a channel changes one
+        /// value in four, which is what an on-change channel looks like.
+        fn row(schema: &SchemaBuilder, index: usize, step: usize, body: bool) -> Vec<u8> {
+            let mut row = vec![0u8; schema.row_stride()];
+            let mut put = |prop: usize, bytes: &[u8]| {
+                let offset = schema.props()[prop].offset;
+                row[offset..offset + bytes.len()].copy_from_slice(bytes);
+            };
+            let moved = step as f32;
+            if body {
+                let f = index as f32;
+                let floats = |values: &[f32]| -> Vec<u8> {
+                    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+                };
+                put(0, &floats(&[f + moved * 0.25, 1.0, f * 0.5 - moved]));
+                put(1, &floats(&[0.5 + moved, 0.0, -0.25]));
+                let angle = 0.1 * f + 0.05 * moved;
+                put(2, &floats(&[0.0, angle.sin(), 0.0, angle.cos()]));
+                put(3, &(100 - index as i32 % 7).to_le_bytes());
+                put(4, &[u8::from(step == 0)]);
+            } else {
+                for prop in 0..4 {
+                    let changes = prop == index % 4 && step == 1;
+                    let value = index as i32 * 10 + prop as i32 + i32::from(changes);
+                    put(prop, &value.to_le_bytes());
+                }
+            }
+            row
+        }
+
+        fn sources(&self) -> Vec<Option<BlockSource<'_>>> {
+            self.histories
+                .iter()
+                .enumerate()
+                .map(|(index, history)| {
+                    let body = index < self.bodies;
+                    let schema = if body {
+                        &self.body_schema
+                    } else {
+                        &self.channel_schema
+                    };
+                    Some(BlockSource::new(
+                        history,
+                        schema.props(),
+                        Some(CURRENT),
+                        !body,
+                    ))
+                })
+                .collect()
+        }
+
+        /// `count` synced peers. Even peers hold an acked base for every entity, so they are sent
+        /// deltas; odd peers hold none and are sent full rows. Each peer has its own key.
+        fn peers(&self, count: usize) -> Vec<(i32, PeerState)> {
+            (0..count)
+                .map(|index| {
+                    let mut peer = PeerState {
+                        synced: true,
+                        auth: Some(SessionAuth::new([index as u8 + 1; KEY_LEN])),
+                        token_salt: Some([index as u8 + 7; KEY_LEN]),
+                        newest_input_tick: CURRENT as i64 - 3,
+                        ..Default::default()
+                    };
+                    if index % 2 == 0 {
+                        for row in &self.rows {
+                            peer.acked_base.insert(row.id, CURRENT - 2);
+                            peer.last_sent.insert(row.id, CURRENT - 2);
+                            peer.last_full.insert(row.id, CURRENT - 8);
+                        }
+                    }
+                    (2 + index as i32, peer)
+                })
+                .collect()
+        }
+
+        fn shared<'a>(
+            &'a self,
+            sources: &'a [Option<BlockSource<'a>>],
+            passes: u32,
+        ) -> AssemblyShared<'a> {
+            AssemblyShared {
+                current: CURRENT,
+                passes,
+                budget: MAX_FRAME_PAYLOAD,
+                filtering: false,
+                culling: false,
+                band_scale: 0.0,
+                tiering: false,
+                base_span: STATE_HISTORY_DEPTH as u64,
+                rows: &self.rows,
+                sources,
+                slots: &self.slots,
+                direction: Some(Direction::ToClient),
+            }
+        }
+    }
+
+    /// A pool for `threads` assembly threads, the calling thread included: `None` for one.
+    fn pool(threads: usize) -> Option<rayon::ThreadPool> {
+        (threads > 1).then(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads - 1)
+                .build()
+                .expect("a test pool")
+        })
+    }
+
+    /// Assemble every peer on `threads` threads and return what the main thread would fold.
+    fn assemble(
+        shared: &AssemblyShared<'_>,
+        peers: &mut [(i32, PeerState)],
+        threads: usize,
+    ) -> Vec<AssemblyTally> {
+        let mut targets: Vec<(i32, &mut PeerState)> =
+            peers.iter_mut().map(|(id, peer)| (*id, peer)).collect();
+        let mut scratch: Vec<AssemblyScratch> =
+            (0..threads).map(|_| AssemblyScratch::default()).collect();
+        let mut tallies: Vec<AssemblyTally> =
+            (0..threads).map(|_| AssemblyTally::default()).collect();
+        assemble_frames(
+            shared,
+            &mut targets,
+            &mut scratch,
+            &mut tallies,
+            pool(threads).as_ref(),
+        );
+        tallies
+    }
+
+    /// Every figure a tally carries, summed the way `OrbitNet::fold_assembly` sums them.
+    /// `(counts, per-peer cadence, datagrams)`, in that order.
+    type Folded = (Vec<u64>, Vec<(i32, u64, u64)>, Vec<(i32, Vec<u8>)>);
+
+    fn folded(tallies: &[AssemblyTally]) -> Folded {
+        let mut sums = vec![0u64; 13];
+        let mut cadence = Vec::new();
+        let mut datagrams = Vec::new();
+        for tally in tallies {
+            for band in 0..3 {
+                sums[band] += tally.band_members[band];
+                sums[3 + band] += tally.band_sends[band];
+            }
+            sums[6] += tally.interest_members;
+            sums[7] = sums[7].max(tally.starve_ticks_max);
+            sums[8] += tally.blocks_deferred + 1_000 * tally.blocks_culled;
+            sums[9] += tally.blocks_admitted;
+            sums[10] += tally.blocks_full;
+            sums[11] += tally.dbg_sent_bytes;
+            sums[12] += tally.blocks_oversize;
+            cadence.extend(tally.peer_band.iter().copied());
+            datagrams.extend(tally.datagrams.iter().cloned());
+        }
+        (sums, cadence, datagrams)
+    }
+
+    /// Dropping the pool returns only once every one of its threads has exited, so no thread of this
+    /// library outlives the node that owned it.
+    #[test]
+    fn dropping_the_pool_waits_for_its_threads() {
+        let Some(pool) = AssemblyPool::build(MAX_ASSEMBLY_THREADS) else {
+            return; // a one-thread host builds no pool
+        };
+        let live = std::sync::Arc::clone(&pool.live);
+        pool.pool().expect("built").install(|| ());
+        drop(pool);
+        let remaining = *live.0.lock().expect("not poisoned");
+        assert_eq!(
+            remaining, 0,
+            "{remaining} pool thread(s) still running after the drop"
+        );
+    }
+
+    #[test]
+    fn block_sources_and_peer_state_may_cross_threads() {
+        fn sync<T: Sync>() {}
+        fn send<T: Send>() {}
+        sync::<BlockSource<'static>>();
+        sync::<AssemblyShared<'static>>();
+        send::<PeerState>();
+        send::<AssemblyScratch>();
+        send::<AssemblyTally>();
+    }
+
+    /// THE POOL BUILDS EXACTLY WHAT ONE THREAD BUILDS: the same sealed bytes, to the same peers, in the
+    /// same order, the same counts, and the same per-peer state left behind for the next frame.
+    ///
+    /// One and two passes, so a multi-datagram frame is covered, at a peer count that does not divide
+    /// evenly into the threads.
+    #[test]
+    fn the_pooled_path_builds_what_the_single_threaded_path_builds() {
+        let fixture = Fixture::new(24, 120);
+        let sources = fixture.sources();
+        for passes in [1_u32, 2] {
+            let shared = fixture.shared(&sources, passes);
+            let mut alone = fixture.peers(11);
+            let mut pooled = fixture.peers(11);
+            let one = folded(&assemble(&shared, &mut alone, 1));
+            let four = folded(&assemble(&shared, &mut pooled, 4));
+            assert!(
+                !one.2.is_empty(),
+                "the fixture sent nothing, so it proves nothing"
+            );
+            assert!(
+                one.0[9] > 0 && one.0[10] > 0,
+                "neither deltas nor full rows were admitted"
+            );
+            assert_eq!(one.0, four.0, "passes {passes}: the counts differ");
+            assert_eq!(
+                one.1, four.1,
+                "passes {passes}: the per-peer cadence differs"
+            );
+            assert_eq!(one.2, four.2, "passes {passes}: the datagrams differ");
+            for ((id_a, a), (id_b, b)) in alone.iter().zip(&pooled) {
+                assert_eq!(id_a, id_b);
+                assert_eq!(a.last_sent, b.last_sent, "peer {id_a}: last_sent");
+                assert_eq!(a.last_full, b.last_full, "peer {id_a}: last_full");
+                assert_eq!(a.sent_log, b.sent_log, "peer {id_a}: sent_log");
+                assert_eq!(a.want_full, b.want_full, "peer {id_a}: want_full");
+            }
+        }
+    }
+
+    /// A peer count of one, or one thread, takes the single-threaded path, and a pool with more
+    /// threads than peers leaves the spare tallies empty rather than splitting a peer.
+    #[test]
+    fn more_threads_than_peers_still_builds_every_frame_once() {
+        let fixture = Fixture::new(4, 8);
+        let sources = fixture.sources();
+        let shared = fixture.shared(&sources, 1);
+        let mut alone = fixture.peers(3);
+        let mut pooled = fixture.peers(3);
+        let one = folded(&assemble(&shared, &mut alone, 1));
+        let eight = folded(&assemble(&shared, &mut pooled, 8));
+        assert_eq!(one.2, eight.2);
+        assert_eq!(one.2.len(), 3, "one datagram per peer: {:?}", one.2.len());
+    }
+
+    /// EVERY CANDIDATE THE BUDGET HAS ROOM FOR IS SENT, the last one included.
+    ///
+    /// Odd and even candidate counts, all small enough to fit one datagram: each peer's frame carries
+    /// every entity once. A cursor stepped twice per admitted block sent every other candidate, and on
+    /// an odd count admitted the last one and left the cursor past the end of the order, which panics
+    /// in this test profile.
+    #[test]
+    fn a_frame_with_room_for_every_candidate_sends_every_candidate() {
+        for (bodies, channels) in [(3, 4), (4, 4), (1, 0), (2, 9)] {
+            let fixture = Fixture::new(bodies, channels);
+            let sources = fixture.sources();
+            let shared = fixture.shared(&sources, 1);
+            for threads in [1, 2] {
+                let mut peers = fixture.peers(4);
+                let (counts, _, datagrams) = folded(&assemble(&shared, &mut peers, threads));
+                let candidates = (bodies + channels) as u64;
+                assert_eq!(datagrams.len(), 4, "one datagram per peer");
+                assert_eq!(
+                    counts[9],
+                    4 * candidates,
+                    "{bodies} bodies + {channels} channels on {threads} thread(s): every candidate, once per peer"
+                );
+                for (_, peer) in &peers {
+                    assert_eq!(peer.last_sent.len(), candidates as usize);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pool_engages_at_its_threshold_and_never_when_it_is_zero() {
+        assert_eq!(assembly_threads(100, 0, 8), 1, "0 means never");
+        assert_eq!(assembly_threads(100, -1, 8), 1);
+        assert_eq!(assembly_threads(7, 8, 8), 1, "below the threshold");
+        assert!(assembly_threads(64, 8, 8) > 1, "at and above it");
+        assert_eq!(
+            assembly_threads(64, 8, 1),
+            1,
+            "one hardware thread is one thread"
+        );
+        assert!(
+            assembly_threads(1_000, 1, 64) <= MAX_ASSEMBLY_THREADS,
+            "capped however many cores the box has"
+        );
+        assert!(
+            assembly_threads(DEFAULT_ASSEMBLY_POOL_PEERS.max(1) as usize, 1, 64) >= 1,
+            "and never zero"
+        );
+        for peers in 1..200 {
+            let threads = assembly_threads(peers, 1, 64);
+            assert!(
+                threads == 1 || peers / threads >= MIN_PEERS_PER_ASSEMBLY_THREAD,
+                "{peers} peers split {threads} ways leaves a thread under its minimum"
+            );
+        }
+    }
+
+    /// THE MEASUREMENT THE THRESHOLD WAS READ OFF. Not a gate.
+    ///
+    /// Times [`assemble_frames`] over the fixture at several peer counts on one to four threads, the
+    /// thread spawns included, and prints microseconds per flush.
+    ///
+    /// - Each cell is the median of `ORBITNET_ASSEMBLY_REPS` repetitions (default 7), and each
+    ///   repetition the median of fifty flushes. The thread counts are interleaved within a repetition, so a noisy stretch of the
+    ///   host lands on every column alike.
+    /// - Every flush does the same work: each peer's ack log is cleared between flushes, outside the
+    ///   timed region, because a fixed tick would otherwise grow it without bound.
+    /// - Flushes are `ORBITNET_ASSEMBLY_GAP_MS` apart (default 4), untimed, so the pool's threads have
+    ///   gone to sleep when a flush starts and the wake-up is in the figure, as it is between two net
+    ///   ticks of a running session.
+    ///
+    /// Run with `cargo test --release -p orbitnet-godot assembly_cost_by_peers -- --ignored --nocapture`.
+    /// `ORBITNET_ASSEMBLY_BODIES` and `ORBITNET_ASSEMBLY_CHANNELS` resize the session.
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn assembly_cost_by_peers() {
+        const THREADS: [usize; 4] = [1, 2, 3, 4];
+        const FLUSHES: usize = 50;
+        let size = |name: &str, default: usize| -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let repetitions_wanted = size("ORBITNET_ASSEMBLY_REPS", 7).max(1);
+        let bodies = size("ORBITNET_ASSEMBLY_BODIES", 24);
+        let channels = size("ORBITNET_ASSEMBLY_CHANNELS", 291);
+        let gap = std::time::Duration::from_millis(size("ORBITNET_ASSEMBLY_GAP_MS", 4) as u64);
+        let fixture = Fixture::new(bodies, channels);
+        let sources = fixture.sources();
+        let shared = fixture.shared(&sources, 1);
+        println!(
+            "assembly: {bodies} bodies + {channels} channels, every row a candidate, one pass, {} hardware threads, flushes {} ms apart",
+            std::thread::available_parallelism().map_or(1, |n| n.get()),
+            gap.as_millis()
+        );
+        println!(
+            "{:>6} {:>10} {:>10} {:>10} {:>10}   us per flush",
+            "peers", "1 thread", "2", "3", "4"
+        );
+        let counts: Vec<usize> = std::env::var("ORBITNET_ASSEMBLY_PEERS")
+            .ok()
+            .map(|list| {
+                list.split(',')
+                    .filter_map(|v| v.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128]);
+        for peers in counts {
+            let mut states: Vec<Vec<(i32, PeerState)>> =
+                THREADS.iter().map(|_| fixture.peers(peers)).collect();
+            let mut scratch: Vec<Vec<AssemblyScratch>> = THREADS
+                .iter()
+                .map(|&threads| (0..threads).map(|_| AssemblyScratch::default()).collect())
+                .collect();
+            let pools: Vec<Option<rayon::ThreadPool>> = THREADS.iter().map(|&t| pool(t)).collect();
+            let mut repetitions: Vec<Vec<f64>> = vec![Vec::new(); THREADS.len()];
+            for repetition in 0..=repetitions_wanted {
+                for (column, &threads) in THREADS.iter().enumerate() {
+                    let mut flushes = Vec::with_capacity(FLUSHES);
+                    for _ in 0..FLUSHES {
+                        for (_, peer) in states[column].iter_mut() {
+                            peer.sent_log.clear();
+                        }
+                        std::thread::sleep(gap);
+                        let mut targets: Vec<(i32, &mut PeerState)> = states[column]
+                            .iter_mut()
+                            .map(|(id, peer)| (*id, peer))
+                            .collect();
+                        let mut tallies: Vec<AssemblyTally> =
+                            (0..threads).map(|_| AssemblyTally::default()).collect();
+                        let started = Instant::now();
+                        assemble_frames(
+                            &shared,
+                            &mut targets,
+                            &mut scratch[column],
+                            &mut tallies,
+                            pools[column].as_ref(),
+                        );
+                        flushes.push(started.elapsed().as_secs_f64() * 1e6);
+                    }
+                    flushes.sort_by(f64::total_cmp);
+                    // The first repetition warms the maps and the allocator, and is discarded.
+                    if repetition > 0 {
+                        repetitions[column].push(flushes[FLUSHES / 2]);
+                    }
+                }
+            }
+            let cells: Vec<f64> = repetitions
+                .iter_mut()
+                .map(|samples| {
+                    samples.sort_by(f64::total_cmp);
+                    samples[samples.len() / 2]
+                })
+                .collect();
+            println!(
+                "{:>6} {:>10.0} {:>10.0} {:>10.0} {:>10.0}",
+                peers, cells[0], cells[1], cells[2], cells[3]
+            );
+        }
     }
 }

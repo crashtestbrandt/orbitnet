@@ -767,6 +767,7 @@ sync_to_physics=true    ; net tick AT the physics rate
 tickrate=60             ; the rate used when sync_to_physics is false
 history_limit=128       ; rollback history depth, PER ROLLBACK ENTITY
 max_time_stretch=1.05   ; decoupled mode only
+assembly_pool_peers=12  ; synced peers at which frame assembly splits across threads, 0 = never
 ```
 
 Read once, when the facade constructs the backend. `history_limit` is per rollback entity, so it is a real
