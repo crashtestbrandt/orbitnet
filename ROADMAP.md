@@ -18,9 +18,9 @@ Parent: [#101](https://github.com/crashtestbrandt/orbitnet/issues/101) `epic(mea
 
 Ranked first because every other tier is measured through it, and a gap here hides the rest.
 
-| Item | Issue | Why now |
-| --- | --- | --- |
-| `want_full_nacks_s` has no threshold | [#69](https://github.com/crashtestbrandt/orbitnet/issues/69) | PR #70 landed the server-side window and the scheduled nightly now records it. `bench.sh:272` still reports the counter without asserting it, which is that issue's item 2; the threshold needs run history behind it before it can be picked. |
+**Every row here has landed. The parent can close.** `bench.sh` gates the server's steady-state
+`want_full_nacks_s` per profile through `tools/netbench/nack_gate.py`, against a recorded series for each of
+ten profiles; `docs/netbench.md` carries the table.
 
 ## Tier 2 — Coverage
 
