@@ -22,7 +22,8 @@
 # no body -- so a client past the seat count reports no samples and fails its own gate. arena seats 24 and
 # hockey 32; the RTS demo seats 2, so it takes at most two clients.
 #
-# PASS = every client logs BENCH-RESULT PASS, the relay bound, and no process logged a panic. Exits non-zero on
+# PASS = every client logs BENCH-RESULT PASS, the relay bound, no process logged a panic, and the server's
+# steady-state want_full NACK rate passes its profile's gate (tools/netbench/nack_gate.py). Exits non-zero on
 # any FAIL / bringup failure.
 # Uses the RAW godot binary + a pkill-by-cmdline sweep: killing the godot-quiet.sh wrapper orphans the child,
 # which squats the UDP port and poisons every later run.
@@ -270,10 +271,9 @@ for i in $(seq 1 "$CLIENTS"); do
 done
 
 # --- panics ---
-# A PANIC FAILS THE RUN, on any process. gdext turns a Rust panic into a logged Godot error and the frame goes
-# on, so a panicking server keeps serving and every gate above can still pass. The frame the panic unwound out
-# of sent nothing after it. A cursor stepped twice per admitted block panicked about 700 times per run this
-# way, and every gate passed.
+# A panic in any process's log fails the run. gdext turns a Rust panic into a logged Godot error and the frame
+# goes on, so a panicking server keeps serving and every gate above can still pass, while the frame the panic
+# unwound out of sends nothing after it.
 echo "--- panics ---"
 panicked=0
 for snap in "$OUT"/server.log.snap "$OUT"/relay.log.snap "$OUT"/client*.log.snap; do
@@ -287,33 +287,24 @@ done
 if [ "$panicked" -eq 0 ]; then echo "  none"; else fail=1; fi
 
 # --- server send path ---
-# REPORTED, NOT GATED. The counters below are the server's own, and until the window line existed no
-# netbench run could print them at all: `bench_gate.gd` evaluates on a CLIENT, where `want_full_nacks_s` is
-# a structural 0.00, so its own "near zero is the interest-management acceptance bar" line reported the bar
-# as met on every run without measuring it once.
+# The server's want_full NACK rate is gated per profile, on the server's own rows. `want_full_nacks_s` is
+# counted where a client's input frame is decoded, so a client reads a structural 0.00 and `bench_gate.gd`,
+# which evaluates on a client, cannot measure it.
 #
-# No threshold here. What a healthy rate is depends on the profile and the arena, and picking one from a
-# single run is how a gate ends up asserting the number it happened to see. Two runs of the same seed are
-# comparable through `compare.py`, which already judges this column as a fault counter -- it just had no
-# column to read. A THRESHOLD IS A SEPARATE CHANGE, and it needs a week of runs behind it.
-#
-# THE FIRST WINDOW IS THE JOIN WINDOW and is excluded. A peer that receives a block for an entity it has not
-# registered yet drops the block and still acks the frame, so every join costs one keyframe interval of
-# NACKs per affected channel. That residual is real, bounded and correct; reading it as the steady-state
-# rate reports bring-up.
+# `nack_gate.py` holds the whole rule, with its own self-test in `just bench-check`:
+#   - The steady state is every window with a peer in it except a join window and the one after it. The fleet
+#     joins over several windows, not one, and each join costs a keyframe interval of NACKs per affected
+#     channel, which is bounded and correct.
+#   - The figure is NACKs per peer-second over those windows.
+#   - The threshold comes from a recorded series of runs on that profile. A profile with no series is
+#     reported and not gated, and the line says so.
 #
 # The figure is per wall second, like every other `*_s` column. The window is charged the wall time of every
 # frame whether or not that frame advanced a tick. An artifact captured before the window ran on one time
 # base reports this and every other per-second column low, by a factor that depends on how far the server's
 # frame rate ran above its net tick rate -- see docs/netbench.md. Compare like with like.
 echo "--- server send path ---"
-nacks="$(grep -ao 'want_full_nacks_s=[0-9.]*' "$OUT/server.log.snap" | cut -d= -f2 | tail -n +2 || true)"
-nack_n="$(printf '%s' "$nacks" | grep -c . || true)"
-if [ "${nack_n:-0}" -eq 0 ]; then
-	echo "  want_full nacks: NO STEADY-STATE WINDOW (the server published none past the join window)"
-else
-	echo "  want_full nacks MAX $(printf '%s\n' "$nacks" | sort -g | tail -1)/s over ${nack_n} steady-state window(s) -- reported, not gated"
-fi
+python3 "$SCRIPT_DIR/nack_gate.py" "$OUT/server.csv" --profile "$PROFILE" || fail=1
 
 echo "(artifacts: $OUT  -- per-client CSVs + logs)"
 if [ "$fail" -ne 0 ]; then echo "=== netbench: FAIL ($DEMO) ==="; exit 1; fi
