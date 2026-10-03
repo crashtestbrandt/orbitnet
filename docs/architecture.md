@@ -253,10 +253,14 @@ decode batches, AOI grid rebuild.
 - **What moves.** Ordering, admission, encoding and sealing, per peer. Each entity is bound once per flush on
   the main thread, and assembly reads the plain data the binding lends out: the state ring, the property list
   and the tick (`sync::BlockSource`). The transport handover stays on the main thread, after assembly.
-- **What it costs.** Single-threaded assembly is about 30 µs per peer. Waking the pool costs 80 to 100 µs a
-  flush, so at 8 peers no split helps. From 12 to 32 peers the split won in every run: by 16 to 29% at 12,
-  25 to 48% at 16 and 42 to 56% at 24. `DEFAULT_ASSEMBLY_POOL_PEERS` in `orbit_net.rs` carries the
-  measurement, including the cells above 48 peers where it lost.
+- **Why once per flush.** Binding at each encode binds once per candidate tried per peer, and every unchanged
+  state channel is tried. A bind measured about 7.7 µs in a `template_debug` build, where gdext runs its
+  strict checks, and 0.15 µs in `template_release`. In a live session of 315 entities and 11 peers, the send
+  path went from 18.9 to 3.4 ms a flush in a debug build and from 1.6 to 1.0 ms in release, on one thread.
+- **What the split costs.** In the measurement fixture, single-threaded assembly is about 30 µs per peer and
+  waking the pool costs 80 to 100 µs a flush, so at 8 peers no split helps. From 12 to 32 peers the split won
+  in every run: by 16 to 29% at 12, 25 to 48% at 16 and 42 to 56% at 24. `DEFAULT_ASSEMBLY_POOL_PEERS` in
+  `orbit_net.rs` carries the measurement, including the cells above 48 peers where it lost.
 - **How it splits.** At least 3 peers per thread and at most 4 threads, the main thread included. The threads
   persist across flushes, because spawning them per flush measured 60 to 100 µs slower.
 - **The same bytes either way.** Peers are split into contiguous chunks and the results are folded in chunk
