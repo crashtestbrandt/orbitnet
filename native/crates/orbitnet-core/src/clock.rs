@@ -9,9 +9,29 @@
 //! queued, so its offset reading is the least polluted. Correction is then applied as a bounded
 //! *time stretch* rather than a jump, so the simulation speeds up or slows down by a few percent
 //! instead of teleporting. Only a genuinely large offset earns a hard reseek.
+//!
+//! **Every stored sample is moved by the correction applied after it was taken**
+//! ([`ClockEstimator::apply_local_correction`]).
+//!
+//! - A sample is the offset at the moment its pong arrived. A stretch of `s` held for `t` wall
+//!   seconds moves the local clock `(s - 1) * t` further than the remote one, so the offset every
+//!   older sample recorded is out of date by exactly that much.
+//! - Without the shift, the window reports the offset as it stood up to a window's length ago
+//!   (eight samples at the four-per-second ping rate is two seconds). The stretch keeps correcting an
+//!   error it has already removed, overshoots, and the sign flips. The loop then cycles between the
+//!   two stretch bounds.
+//! - Measured on a loaded two-core host with a 15 ms link: the offset swung about 90 ms peak to peak
+//!   with a period of a few seconds and the stretch sat at each bound in turn.
+//! - The shift adds no lag, and the lowest-RTT half still rejects queued samples as before.
 
 /// Number of `(rtt, offset)` samples kept in the estimation window.
 pub const DEFAULT_SAMPLE_CAPACITY: usize = 8;
+
+/// Seconds over which the decoupled client's stretch closes the error it measures.
+///
+/// The stretch is `1 + error / window`, clamped to the configured bound. At `0.5` and the default
+/// `1.05` bound the stretch is linear for an error inside 25 ms and saturates beyond it.
+pub const STRETCH_CORRECTION_WINDOW_SECONDS: f64 = 0.5;
 
 /// A single clock observation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,6 +96,26 @@ impl ClockEstimator {
         }
         self.next = (self.next + 1) % self.capacity;
         true
+    }
+
+    /// Account for a correction the caller applied to its own clock after the stored samples were
+    /// taken.
+    ///
+    /// `seconds` is how much further the local clock advanced than wall time because the caller
+    /// chose to move it: `(stretch - 1) * wall_seconds` for a stretched frame, positive when the
+    /// local clock was sped up. Each stored offset is `remote - local`, so each shrinks by
+    /// `seconds`, and [`Self::offset`] then describes the clocks as they stand now. See the module
+    /// header for what the unshifted window did.
+    ///
+    /// Only a DELIBERATE correction belongs here. A local clock that fell behind wall time on its
+    /// own, such as a stall, is what the samples measure. A non-finite value is ignored.
+    pub fn apply_local_correction(&mut self, seconds: f64) {
+        if !seconds.is_finite() {
+            return;
+        }
+        for sample in &mut self.samples {
+            sample.offset -= seconds;
+        }
     }
 
     /// Mean round-trip time in seconds, or 0 when no samples have arrived.
@@ -422,5 +462,321 @@ mod tests {
         // The ring cursor reset too, so the next samples fill from the start.
         clock.push_sample(0.1, 0.1);
         assert_eq!(clock.sample_count(), 1);
+    }
+
+    #[test]
+    fn a_local_correction_moves_the_stored_offsets_and_not_later_ones() {
+        let mut clock = ClockEstimator::with_capacity(4);
+        clock.push_sample(0.02, 0.10);
+        // Sped up by 40 ms: the local clock is 40 ms closer to the remote one than the sample says.
+        clock.apply_local_correction(0.04);
+        assert!(
+            (clock.offset() - 0.06).abs() < 1e-12,
+            "offset {}",
+            clock.offset()
+        );
+        // A sample taken after the correction already measured it, so it is not moved. It is the
+        // faster of the two, so it is the one the lowest-RTT half keeps.
+        clock.push_sample(0.01, 0.10);
+        assert!(
+            (clock.offset() - 0.10).abs() < 1e-12,
+            "offset {}",
+            clock.offset()
+        );
+        // Slowed down by 10 ms: the gap widens again.
+        clock.apply_local_correction(-0.01);
+        assert!(
+            (clock.offset() - 0.11).abs() < 1e-12,
+            "offset {}",
+            clock.offset()
+        );
+        // The round trip is not a clock reading and does not move.
+        assert!((clock.rtt() - 0.015).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_poison_correction_is_ignored_and_an_empty_window_stays_empty() {
+        let mut clock = ClockEstimator::default();
+        clock.apply_local_correction(0.5);
+        assert_eq!(clock.sample_count(), 0);
+        assert_eq!(clock.offset(), 0.0);
+        clock.push_sample(0.02, 0.10);
+        clock.apply_local_correction(f64::NAN);
+        clock.apply_local_correction(f64::INFINITY);
+        assert!((clock.offset() - 0.10).abs() < 1e-12);
+    }
+
+    /// splitmix64. The closed-loop model's only source of noise, so it needs no dependency and
+    /// replays exactly.
+    struct Noise(u64);
+
+    impl Noise {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform in `[0, 1)`.
+        fn unit(&mut self) -> f64 {
+            (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+    }
+
+    /// One frame of a headless process sharing a two-core host with another: 0.5 to 2 ms of work,
+    /// and about one frame in twenty preempted for 4 to 10 ms.
+    fn shared_core_frame(noise: &mut Noise) -> f64 {
+        if noise.unit() < 0.05 {
+            noise.range(0.004, 0.010)
+        } else {
+            noise.range(0.0005, 0.002)
+        }
+    }
+
+    /// 60 Hz, the rate the hunt was reported at.
+    const MODEL_DT: f64 = 1.0 / 60.0;
+
+    /// What one run of [`run_loop`] observed after its settling time.
+    struct LoopTrace {
+        /// The true lead-adjusted error, `(remote - local) / dt + lead`, once per wall second.
+        true_error_ticks: Vec<f64>,
+        /// `(wall, error)` for the error the controller acted on, `offset() / dt + lead`, every
+        /// frame.
+        seen_error_ticks: Vec<(f64, f64)>,
+        /// Frames whose stretch sat on one of its bounds.
+        frames_at_bound: usize,
+    }
+
+    impl LoopTrace {
+        fn true_peak_to_peak(&self) -> f64 {
+            let max = self
+                .true_error_ticks
+                .iter()
+                .copied()
+                .fold(f64::MIN, f64::max);
+            let min = self
+                .true_error_ticks
+                .iter()
+                .copied()
+                .fold(f64::MAX, f64::min);
+            max - min
+        }
+
+        fn worst_seen(&self) -> f64 {
+            self.seen_error_ticks
+                .iter()
+                .map(|&(_, e)| e.abs())
+                .fold(0.0, f64::max)
+        }
+
+        /// How far the seen error crossed zero after a lead step, worst over every step.
+        ///
+        /// A step of the lead moves the error by one tick, and the controller then drives it back
+        /// to zero. A loop that reaches zero and keeps going is overshooting.
+        fn worst_overshoot(&self, step_every: f64) -> f64 {
+            let mut worst = 0.0_f64;
+            let mut segment = Vec::new();
+            let mut current = None;
+            for &(wall, error) in &self.seen_error_ticks {
+                let index = (wall / step_every) as u64;
+                if current != Some(index) {
+                    worst = worst.max(Self::segment_overshoot(&segment));
+                    segment.clear();
+                    current = Some(index);
+                }
+                segment.push(error);
+            }
+            worst.max(Self::segment_overshoot(&segment))
+        }
+
+        fn segment_overshoot(segment: &[f64]) -> f64 {
+            let Some(&first) = segment.first() else {
+                return 0.0;
+            };
+            let sign = first.signum();
+            let deepest = segment.iter().map(|e| sign * e).fold(f64::MAX, f64::min);
+            (-deepest).max(0.0)
+        }
+    }
+
+    /// The decoupled client clock loop end to end, over a modelled 15 ms link between two headless
+    /// processes on one loaded host.
+    ///
+    /// - The remote clock is wall time, advanced once per server frame. A pong carries it as of the
+    ///   frame before the one that answered, which is what a server that drains before it steps
+    ///   stamps.
+    /// - The client runs the loop in the order the backend does: drain the pongs that arrived, take
+    ///   the stretch from the window, advance the local clock by `wall * stretch`, then, with
+    ///   `compensate`, shift the window by the correction just applied.
+    /// - A ping every 0.25 s of wall, sent on a frame boundary, 7.5 ms each way plus up to 0.25 ms.
+    /// - The default 1.05 bound, and a start 50 ms behind the remote with an empty window: the state
+    ///   a hard resync leaves. `lead_ticks` is the lead bias at a wall time.
+    fn run_loop(compensate: bool, seed: u64, lead_ticks: fn(f64) -> f64) -> LoopTrace {
+        const SECONDS: f64 = 60.0;
+        const MAX_STRETCH: f64 = 1.05;
+        const ONE_WAY: f64 = 0.0075;
+        const LINK_NOISE: f64 = 0.000_25;
+        const SETTLE: f64 = 8.0;
+
+        let mut server_noise = Noise(seed ^ 0x5E4E_E4F4);
+        let mut client_noise = Noise(seed ^ 0xC11E_4700);
+        let mut link_noise = Noise(seed ^ 0x0071_4C00);
+        let mut server_frames = vec![0.0];
+        while server_frames[server_frames.len() - 1] < SECONDS + 1.0 {
+            let last = server_frames[server_frames.len() - 1];
+            server_frames.push(last + shared_core_frame(&mut server_noise));
+        }
+
+        let mut clock = ClockEstimator::default();
+        let mut wall = 0.0_f64;
+        let mut local = -0.05_f64;
+        let mut ping_timer = 0.0_f64;
+        // (arrives at, sent at, remote clock the server stamped)
+        let mut in_flight: Vec<(f64, f64, f64)> = Vec::new();
+        let mut next_report = SETTLE;
+        let mut trace = LoopTrace {
+            true_error_ticks: Vec::new(),
+            seen_error_ticks: Vec::new(),
+            frames_at_bound: 0,
+        };
+
+        while wall < SECONDS {
+            let frame = shared_core_frame(&mut client_noise);
+            wall += frame;
+            in_flight.retain(|&(arrives, sent, stamp)| {
+                if arrives > wall {
+                    return true;
+                }
+                let rtt = wall - sent;
+                clock.push_sample(rtt, stamp + rtt * 0.5 - local);
+                false
+            });
+            let lead = lead_ticks(wall);
+            let stretch = clock.stretch_with(
+                lead * MODEL_DT,
+                MAX_STRETCH,
+                STRETCH_CORRECTION_WINDOW_SECONDS,
+            );
+            if wall >= SETTLE {
+                if (stretch - MAX_STRETCH).abs() < 1e-12
+                    || (stretch - 1.0 / MAX_STRETCH).abs() < 1e-12
+                {
+                    trace.frames_at_bound += 1;
+                }
+                trace
+                    .seen_error_ticks
+                    .push((wall, clock.offset() / MODEL_DT + lead));
+            }
+            local += frame * stretch;
+            if compensate {
+                clock.apply_local_correction((stretch - 1.0) * frame);
+            }
+            if wall >= next_report {
+                next_report += 1.0;
+                trace
+                    .true_error_ticks
+                    .push((wall - local) / MODEL_DT + lead);
+            }
+            ping_timer += frame;
+            if ping_timer >= 0.25 {
+                ping_timer -= 0.25;
+                let reaches_server = wall + ONE_WAY + link_noise.range(0.0, LINK_NOISE);
+                let answered = server_frames.partition_point(|&f| f < reaches_server);
+                let stamp = server_frames[answered - 1];
+                let back = server_frames[answered] + ONE_WAY + link_noise.range(0.0, LINK_NOISE);
+                in_flight.push((back, wall, stamp));
+            }
+        }
+        trace
+    }
+
+    fn steady_lead(_wall: f64) -> f64 {
+        1.0
+    }
+
+    /// The lead bias walking 0 to 4 ticks and back, one tick every two seconds, as the reported
+    /// trace's did.
+    fn walking_lead(wall: f64) -> f64 {
+        const WALK: [f64; 8] = [0.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0];
+        WALK[(wall / LEAD_STEP_SECONDS) as usize % WALK.len()]
+    }
+
+    const LEAD_STEP_SECONDS: f64 = 2.0;
+
+    /// THE CLOCK SETTLES once the window is shifted by the correction applied after each sample,
+    /// and the same model without the shift keeps swinging.
+    ///
+    /// The unshifted run is the negative control. It asserts the model reproduces the hunt, so the
+    /// shifted run passing is evidence the shift removed it. Thresholds are in 60 Hz ticks.
+    #[test]
+    fn the_shifted_window_settles_where_the_unshifted_one_hunts() {
+        for seed in 1_u64..=5 {
+            let shifted = run_loop(true, seed, steady_lead);
+            let unshifted = run_loop(false, seed, steady_lead);
+            eprintln!(
+                "seed {seed}: shifted p2p {:.2} ticks, at bound {} | unshifted p2p {:.2} ticks, at bound {}",
+                shifted.true_peak_to_peak(),
+                shifted.frames_at_bound,
+                unshifted.true_peak_to_peak(),
+                unshifted.frames_at_bound,
+            );
+            assert!(
+                unshifted.true_peak_to_peak() > 1.25,
+                "seed {seed}: the model no longer reproduces the hunt ({:.2} ticks peak to peak)",
+                unshifted.true_peak_to_peak()
+            );
+            assert!(
+                shifted.true_peak_to_peak() < 0.5,
+                "seed {seed}: the shifted loop still swings {:.2} ticks peak to peak",
+                shifted.true_peak_to_peak()
+            );
+            assert_eq!(
+                shifted.frames_at_bound, 0,
+                "seed {seed}: a settled loop has no reason to sit on a stretch bound"
+            );
+        }
+    }
+
+    /// A STEP OF THE LEAD IS MET WITHOUT OVERSHOOT, so a walking lead bias does not set the clock
+    /// swinging.
+    ///
+    /// The reported trace had the lead walking 0 to 4 ticks while the clock hunted. Each step moves
+    /// the error the controller chases by one tick. The shifted loop walks it back to zero and stops
+    /// there, so the error it acts on stays inside the two-tick band a readiness rule would test.
+    /// The unshifted loop carries on past zero.
+    #[test]
+    fn a_lead_step_is_met_without_overshoot() {
+        for seed in 1_u64..=5 {
+            let shifted = run_loop(true, seed, walking_lead);
+            let unshifted = run_loop(false, seed, walking_lead);
+            eprintln!(
+                "seed {seed}: shifted overshoot {:.2} ticks, worst seen {:.2} | unshifted overshoot {:.2} ticks, worst seen {:.2}",
+                shifted.worst_overshoot(LEAD_STEP_SECONDS),
+                shifted.worst_seen(),
+                unshifted.worst_overshoot(LEAD_STEP_SECONDS),
+                unshifted.worst_seen(),
+            );
+            assert!(
+                unshifted.worst_overshoot(LEAD_STEP_SECONDS) > 0.5,
+                "seed {seed}: the model no longer overshoots without the shift ({:.2} ticks)",
+                unshifted.worst_overshoot(LEAD_STEP_SECONDS)
+            );
+            assert!(
+                shifted.worst_overshoot(LEAD_STEP_SECONDS) < 0.3,
+                "seed {seed}: the shifted loop overshot a lead step by {:.2} ticks",
+                shifted.worst_overshoot(LEAD_STEP_SECONDS)
+            );
+            assert!(
+                shifted.worst_seen() < 1.5,
+                "seed {seed}: the controller saw a {:.2}-tick error",
+                shifted.worst_seen()
+            );
+        }
     }
 }
