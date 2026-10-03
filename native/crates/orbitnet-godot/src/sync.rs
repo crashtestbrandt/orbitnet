@@ -324,7 +324,7 @@ pub(crate) fn integrate_input_row(
 /// What one entity's state block is encoded from: its state ring, its property list, the tick a block
 /// describes, and which lane it rides.
 ///
-/// **PLAIN DATA, SO ANY THREAD MAY READ IT.** Everything here borrows out of a synchronizer, and none of
+/// **Plain data, so any thread may read it.** Everything here borrows out of a synchronizer, and none of
 /// it is a Godot object. `OrbitNet` takes one per entity on the main thread while the synchronizers are
 /// bound, and per-peer frame assembly then reads them from whichever thread assembles that peer.
 /// `orbit_net`'s `assembly_tests` asserts `Sync` on it, which keeps it that way.

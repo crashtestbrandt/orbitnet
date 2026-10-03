@@ -6456,12 +6456,12 @@ impl OrbitNet {
         let base_span = (self.history_limit.max(2) as u64).min(STATE_HISTORY_DEPTH as u64);
 
         let assembly_started = Instant::now();
-        // WHAT EVERY PEER'S BLOCKS ARE ENCODED FROM, TAKEN ONCE, ON THIS THREAD. Each entity is
-        // bound here and stays bound until every peer's frames are built, and what assembly reads
-        // is the plain data the binding lends out -- the state ring, the property list, the tick.
-        // That is what lets a worker thread assemble a peer: no Godot object crosses to it, and
-        // `Gd` not being `Send` makes reaching for one a compile error. One bind per entity per
-        // flush, where encoding through the handle cost one per admitted block per peer.
+        // **Every peer's blocks are encoded from sources taken once, on this thread.** Each entity
+        // is bound here and stays bound until every peer's frames are built. Assembly reads the
+        // plain data the binding lends out: the state ring, the property list and the tick. No
+        // Godot object reaches a worker thread, and `Gd` not being `Send` makes reaching for one a
+        // compile error. One bind per entity per flush, where encoding through the handle cost one
+        // per admitted block per peer.
         let handles: Vec<EntityHandle> = rows
             .iter()
             .map(|row| EntityHandle::resolve(&self.rollback_entities, &self.state_entities, row.id))
@@ -6528,8 +6528,9 @@ impl OrbitNet {
             self.acc_assembly_pooled += 1;
         }
 
-        // THE TRANSPORT IS MAIN-THREAD ONLY, so every datagram is handed over here, after assembly,
-        // in peer order and in each peer's datagram order. Each one was sealed where it was built.
+        // **The transport is main-thread only.** Every datagram is handed over here, after
+        // assembly, in peer order and in each peer's datagram order. Each one was sealed where it
+        // was built.
         for (peer_id, sealed) in datagrams {
             self.send_raw(peer_id, &sealed, TransferMode::UNRELIABLE);
         }
@@ -8703,7 +8704,7 @@ const MIN_PEERS_PER_ASSEMBLY_THREAD: usize = 3;
 const MAX_ASSEMBLY_THREADS: usize = 4;
 
 /// The default for [`OrbitNet::assembly_pool_peers`]: synced peers at and above which per-peer frame
-/// assembly is split across threads. MEASURED, by `assembly_tests::assembly_cost_by_peers`.
+/// assembly is split across threads. Measured by `assembly_tests::assembly_cost_by_peers`.
 ///
 /// Four runs on a shared 4-core Linux VM: a fixture of 24 bodies and 291 state channels with every row
 /// a candidate, flushes 4 ms apart so the pool wakes from sleep each time. Microseconds per flush, the
@@ -8751,7 +8752,7 @@ const ASSEMBLY_POOL_EXIT_WAIT: std::time::Duration = std::time::Duration::from_s
 /// The persistent threads behind [`assemble_frames`]: one fewer than the most a flush may split
 /// across, because the calling thread assembles a share of its own.
 ///
-/// **DROPPING IT WAITS FOR ITS THREADS TO EXIT.** A `rayon::ThreadPool` only signals its threads on drop,
+/// **Dropping it waits for its threads to exit.** A `rayon::ThreadPool` only signals its threads on drop,
 /// and they finish exiting on their own schedule. Their code is in this library, and a library the engine
 /// unloads with one of its threads still running faults the process on the way out. So every thread
 /// reports its exit, and `Drop` waits for the count to reach zero, for at most
@@ -8922,8 +8923,8 @@ struct AssemblyTally {
 
 /// Assemble every target's frames: on this thread, or split across `tallies.len()` threads.
 ///
-/// **THE SPLIT IS BY CONTIGUOUS CHUNKS OF `targets`, AND THE TALLIES COME BACK IN CHUNK ORDER**, so
-/// folding them in order hands the transport the same datagrams in the same order the
+/// **The split is by contiguous chunks of `targets`, and the tallies come back in chunk order.**
+/// Folding them in order hands the transport the same datagrams in the same order the
 /// single-threaded path does. Each peer's assembly reads [`AssemblyShared`] and writes only its own
 /// [`PeerState`], so no two threads touch the same memory.
 fn assemble_frames(
@@ -8989,7 +8990,7 @@ fn seal_datagram(
 /// Build and seal one peer's snapshot frames for this flush: order its surviving set, decide its
 /// interest section, and spend the byte budget down the order once per datagram the frame owes.
 ///
-/// **NO GODOT OBJECT IS IN REACH**, which is what lets [`assemble_frames`] run it on any thread. It reads
+/// **No Godot object is in reach**, which is what lets [`assemble_frames`] run it on any thread. It reads
 /// [`AssemblyShared`], writes only this peer's own [`PeerState`], and leaves its counts and sealed
 /// datagrams in `tally` for the main thread to fold and hand to the transport.
 ///
@@ -17440,7 +17441,7 @@ mod assembly_tests {
         send::<AssemblyTally>();
     }
 
-    /// THE POOL BUILDS EXACTLY WHAT ONE THREAD BUILDS: the same sealed bytes, to the same peers, in the
+    /// **The pool builds what one thread builds**: the same sealed bytes, to the same peers, in the
     /// same order, the same counts, and the same per-peer state left behind for the next frame.
     ///
     /// One and two passes, so a multi-datagram frame is covered, at a peer count that does not divide
@@ -17494,12 +17495,12 @@ mod assembly_tests {
         assert_eq!(one.2.len(), 3, "one datagram per peer: {:?}", one.2.len());
     }
 
-    /// EVERY CANDIDATE THE BUDGET HAS ROOM FOR IS SENT, the last one included.
+    /// **Every candidate the budget has room for is sent**, the last one included.
     ///
-    /// Odd and even candidate counts, all small enough to fit one datagram: each peer's frame carries
-    /// every entity once. A cursor stepped twice per admitted block sent every other candidate, and on
-    /// an odd count admitted the last one and left the cursor past the end of the order, which panics
-    /// in this test profile.
+    /// - Odd and even candidate counts, all small enough to fit one datagram, so each peer's frame
+    ///   carries every entity once.
+    /// - A cursor stepped twice per admitted block fails it twice: every other candidate goes unsent,
+    ///   and on an odd count the cursor ends past the order, which panics in this test profile.
     #[test]
     fn a_frame_with_room_for_every_candidate_sends_every_candidate() {
         for (bodies, channels) in [(3, 4), (4, 4), (1, 0), (2, 9)] {
@@ -17551,10 +17552,10 @@ mod assembly_tests {
         }
     }
 
-    /// THE MEASUREMENT THE THRESHOLD WAS READ OFF. Not a gate.
+    /// **The measurement the threshold was read off.** Not a gate.
     ///
     /// Times [`assemble_frames`] over the fixture at several peer counts on one to four threads, the
-    /// thread spawns included, and prints microseconds per flush.
+    /// pool's wake-up included, and prints microseconds per flush.
     ///
     /// - Each cell is the median of `ORBITNET_ASSEMBLY_REPS` repetitions (default 7), and each
     ///   repetition the median of fifty flushes. The thread counts are interleaved within a repetition, so a noisy stretch of the
