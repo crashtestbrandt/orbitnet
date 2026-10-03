@@ -60,8 +60,8 @@ version-stamp VERSION:
 
 # The bench comparison decides every performance claim this repository makes, and three of its
 # judgement rules were wrong at some point -- a column zero on both sides, a column zero only on the
-# baseline, and a relative tolerance below the columns' own run-to-run spread. The NACK gate's window rule
-# was the fourth: it read the join ramp as steady state. Standard library only, reads no artifacts, runs in
+# baseline, and a relative tolerance below the columns' own run-to-run spread. The NACK gate's self-test
+# asserts which server windows count as steady state. Standard library only, reads no artifacts, runs in
 # milliseconds.
 bench-check:
     python3 tools/netbench/compare.py --self-test

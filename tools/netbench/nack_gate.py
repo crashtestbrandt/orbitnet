@@ -33,8 +33,9 @@ series and where the series came from. The threshold is `max(FLOOR, MARGIN * wor
   run on `clean` and `lan` (0.024), and six times below the quietest failing night a downstream bench recorded
   before this gate existed (5.98/s across four peers, about 1.5 per peer-second).
 - `MARGIN` is 4. Under 5 to 10% loss a base genuinely goes missing and a NACK is the right answer, so those
-  profiles are gated on a storm rather than on the number their series happened to see. A storm runs at about
-  9 to 14 per peer-second, which every threshold here is well below.
+  profiles are gated on a storm rather than on the number their series happened to see. A client forced to raise
+  `want_full` on every input frame measured 24.8 per peer-second on `congested_wifi`, twelve times the highest
+  threshold here.
 - A profile with no series is reported and not gated, and the line says so. Add a row once a series exists: at
   least three runs, and say where they ran.
 
