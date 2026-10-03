@@ -129,7 +129,7 @@ per window.
 | `blocks_admitted_s` / `blocks_deferred_s` / `blocks_culled_s` / `blocks_oversize_s` / `blocks_full_s` | what the admit loop did with each block |
 | `starve_ticks_max` / `unsent_backlog_max` | worst in-interest staleness, and the re-entry backlog it cannot see |
 | `interest_ms` / `interest_grid` / `interest_entities` | the interest pass's cost, which path ran, and the mean set size |
-| `assembly_ms` / `assembly_pooled` | per-peer frame assembly's cost per flush, and the fraction of flushes it ran on the worker pool |
+| `assembly_ms` / `assembly_pooled` | per-peer frame assembly's cost per flush, and the fraction of flushes it ran on the worker pool. Binding each entity is in it, and in a `template_debug` build, which every from-source run loads, binding is most of it. |
 | `interarrival_near` / `_mid` / `_far` / `_all` | mean ticks between admissions, per distance band. The candidacy count is weighted by the ticks each frame advanced, so the unit stays ticks whatever the authority's frame rate. |
 | `blocks_s` | entity blocks admitted per second, from the debug counter. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
 | `rx_applied_s` / `rx_rejected_s` / `rx_skipped_s` | inbound rows applied, refused, and unplaceable |

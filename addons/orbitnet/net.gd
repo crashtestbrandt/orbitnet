@@ -1665,9 +1665,10 @@ func _backend_has(method: StringName) -> bool:
 ##                                     between 0.0 and 1.0 means the occupancy is hovering in the selector's
 ##                                     hysteresis band, which describes the arena rather than a fault. A session
 ##                                     with no aoi_radius reads 0.00 always: there is no distance to index.
-##   assembly_ms                    -- ms per flush spent assembling every peer's snapshot frames: ordering,
-##                                     admission, encoding and sealing. The handover to the transport is not in
-##                                     it. The phase orbitnet/assembly_pool_peers splits across threads.
+##   assembly_ms                    -- ms per flush spent assembling every peer's snapshot frames: binding each
+##                                     entity, then ordering, admission, encoding and sealing. The handover to
+##                                     the transport is not in it. The phase orbitnet/assembly_pool_peers splits
+##                                     across threads. In a template_debug build the binding is most of it.
 ##   assembly_pooled                -- fraction of the window's flushes whose assembly ran on several threads:
 ##                                     0.0 all on the main thread, 1.0 all pooled. Read it beside assembly_ms.
 ##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded
