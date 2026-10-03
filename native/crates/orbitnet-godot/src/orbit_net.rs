@@ -6460,8 +6460,9 @@ impl OrbitNet {
         // is bound here and stays bound until every peer's frames are built. Assembly reads the
         // plain data the binding lends out: the state ring, the property list and the tick. No
         // Godot object reaches a worker thread, and `Gd` not being `Send` makes reaching for one a
-        // compile error. One bind per entity per flush, where encoding through the handle cost one
-        // per admitted block per peer.
+        // compile error. One bind per entity per flush, at any peer count. Binding at each encode
+        // instead binds once per candidate tried per peer, and every unchanged state channel is
+        // tried: it is encoded to find its delta empty, then un-written.
         let handles: Vec<EntityHandle> = rows
             .iter()
             .map(|row| EntityHandle::resolve(&self.rollback_entities, &self.state_entities, row.id))
