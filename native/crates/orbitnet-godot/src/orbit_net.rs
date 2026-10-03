@@ -6777,7 +6777,10 @@ impl OrbitNet {
                         self.acc_band_sends[band.index()] += 1;
                         peer_sends += 1;
                     }
-                    index += 1;
+                    // NO STEP HERE. `admission_advances_cursor` above `match admission` is the one place
+                    // the cursor moves for a candidate that reached admission. A second step skipped the
+                    // candidate after every admitted block, and admitting the last candidate left the
+                    // cursor one past the end, where `order.len() - next` overflows.
                 }
                 next = index;
 

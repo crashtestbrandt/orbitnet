@@ -22,7 +22,8 @@
 # no body -- so a client past the seat count reports no samples and fails its own gate. arena seats 24 and
 # hockey 32; the RTS demo seats 2, so it takes at most two clients.
 #
-# PASS = every client logs BENCH-RESULT PASS and the relay bound. Exits non-zero on any FAIL / bringup failure.
+# PASS = every client logs BENCH-RESULT PASS, the relay bound, and no process logged a panic. Exits non-zero on
+# any FAIL / bringup failure.
 # Uses the RAW godot binary + a pkill-by-cmdline sweep: killing the godot-quiet.sh wrapper orphans the child,
 # which squats the UDP port and poisons every later run.
 set -uo pipefail
@@ -267,6 +268,23 @@ for i in $(seq 1 "$CLIENTS"); do
 	# Echo the gate reasons for a failing client so the artifact is self-diagnosing.
 	echo "$line" | grep -q "BENCH-RESULT PASS" || grep -a "BENCH-GATE FAIL" "$snap" | sed 's/^/      /'
 done
+
+# --- panics ---
+# A PANIC FAILS THE RUN, on any process. gdext turns a Rust panic into a logged Godot error and the frame goes
+# on, so a panicking server keeps serving and every gate above can still pass. The frame the panic unwound out
+# of sent nothing after it. A cursor stepped twice per admitted block panicked about 700 times per run this
+# way, and every gate passed.
+echo "--- panics ---"
+panicked=0
+for snap in "$OUT"/server.log.snap "$OUT"/relay.log.snap "$OUT"/client*.log.snap; do
+	[ -f "$snap" ] || continue
+	panics="$(grep -ac 'ERROR: \[panic ' "$snap" || true)"
+	[ "${panics:-0}" -eq 0 ] && continue
+	echo "  $(basename "$snap" .log.snap): ${panics} panic(s) -- FAIL. The first:"
+	grep -a -m1 -A1 'ERROR: \[panic ' "$snap" | sed 's/^/      /'
+	panicked=1
+done
+if [ "$panicked" -eq 0 ]; then echo "  none"; else fail=1; fi
 
 # --- server send path ---
 # REPORTED, NOT GATED. The counters below are the server's own, and until the window line existed no
