@@ -161,18 +161,38 @@ cost.
 **`want_full_nacks_s` is gated per profile, on the server's rows.** `bench_gate.gd` evaluates on a client,
 where the counter is a structural `0.00`, so `tools/netbench/nack_gate.py` reads `server.csv` instead.
 
-- **The steady state** starts two windows after the last client joined and ends at the first window a client
-  leaves in. Each join costs one keyframe interval of NACKs per affected channel, and the fleet joins over
+- **The steady state** is every window with a peer in it, except a window in which a peer joined and the window
+  after it. Each join costs one keyframe interval of NACKs per affected channel, and the fleet joins over
   several windows. The rule this replaced dropped only the first window, so in seven of nine nightly runs the
   maximum it printed, up to `6.00/s`, was join residual.
+- **A leave does not end it.** A large fleet on a slow host is never seated all at once: 12 clients on 4 cores
+  peaked at 10 peers on the server.
 - **The figure** is NACKs per peer-second over the steady windows. The worst single window is printed beside it.
 - **The threshold** is `max(0.25, 4 × the worst run in the profile's recorded series)` per peer-second.
   `nack_gate.py`'s `SERIES` table records each series: how many runs, where they ran, and the worst one.
-- **A profile with no series is reported, not gated**, and its line says so.
+- **A profile with no series is reported, not gated**, and its line says so. `torture` has none.
 
-| Profile | Series | Worst run | Gate |
-| --- | --- | --- | --- |
-| `congested_wifi` | 9 nightly runs on `quasitop` | 0.013 /peer/s | 0.25 /peer/s |
+Each series is 3 runs on a 4-core Linux VM: 4 clients, `arena`, `strafe_fire`, seeds 1 to 3, 25 s.
+
+| Profile | Runs, NACKs per peer-second | Gate |
+| --- | --- | --- |
+| `clean` | 0.000, 0.000, 0.024 | 0.25 |
+| `lan` | 0.000, 0.000, 0.023 | 0.25 |
+| `broadband` | 0.000, 0.000, 0.000 | 0.25 |
+| `congested_wifi` | 0.000, 0.000, 0.062 | 0.25 |
+| `relayed` | 0.000, 0.000, 0.000 | 0.25 |
+| `mobile_4g` | 0.000, 0.074, 0.048 | 0.30 |
+| `cross_region` | 0.000, 0.000, 0.000 | 0.25 |
+| `worst_case` | 0.260, 0.401, 0.282 | 1.60 |
+| `worst_case_burst` | 0.132, 0.075, 0.261 | 1.04 |
+| `mobile_3g` | 0.392, 0.463, 0.516 | 2.06 |
+
+- Under 5 to 10% loss a base genuinely goes missing and a NACK is the right answer, which is why the last three
+  profiles read higher.
+- **Negative control:** a client forced to raise `want_full` on every input frame read 24.8 per peer-second on
+  `congested_wifi`, and the run failed.
+- The nightly's runs before the admission-cursor fix are not a series. Their servers panicked about 700 times a
+  run and dropped the rest of each panicking frame.
 
 ## What a run asserts
 

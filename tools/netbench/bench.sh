@@ -292,9 +292,9 @@ if [ "$panicked" -eq 0 ]; then echo "  none"; else fail=1; fi
 # which evaluates on a client, cannot measure it.
 #
 # `nack_gate.py` holds the whole rule, with its own self-test in `just bench-check`:
-#   - The steady state is where every client is seated, from two windows after the last one joined to the
-#     first window a client leaves in. The join ramp spans several windows, not one: each join costs a
-#     keyframe interval of NACKs per affected channel, which is bounded and correct.
+#   - The steady state is every window with a peer in it except a join window and the one after it. The fleet
+#     joins over several windows, not one, and each join costs a keyframe interval of NACKs per affected
+#     channel, which is bounded and correct.
 #   - The figure is NACKs per peer-second over those windows.
 #   - The threshold comes from a recorded series of runs on that profile. A profile with no series is
 #     reported and not gated, and the line says so.
@@ -304,7 +304,7 @@ if [ "$panicked" -eq 0 ]; then echo "  none"; else fail=1; fi
 # base reports this and every other per-second column low, by a factor that depends on how far the server's
 # frame rate ran above its net tick rate -- see docs/netbench.md. Compare like with like.
 echo "--- server send path ---"
-python3 "$SCRIPT_DIR/nack_gate.py" "$OUT/server.csv" --clients "$CLIENTS" --profile "$PROFILE" || fail=1
+python3 "$SCRIPT_DIR/nack_gate.py" "$OUT/server.csv" --profile "$PROFILE" || fail=1
 
 echo "(artifacts: $OUT  -- per-client CSVs + logs)"
 if [ "$fail" -ne 0 ]; then echo "=== netbench: FAIL ($DEMO) ==="; exit 1; fi
