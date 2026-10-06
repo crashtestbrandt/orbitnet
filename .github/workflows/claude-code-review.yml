@@ -89,7 +89,9 @@ jobs:
                 artifact and must never be edited or committed. No binaries in
                 `addons/orbitnet_native/bin/`.
               * COVERAGE -- a pure function belongs in a `tests/unit/*_test.gd` suite or a Rust `#[cfg(test)]`
-                module, not a probe. Exactly one probe gates PRs (`tools/rts-probe.sh`); flag any new one.
+                module, not a probe. Four probes gate PRs (`tools/determinism-probe.sh`,
+                `tools/server-shape-probe.sh`, `tools/rts-probe.sh`, `tools/arena-probe.sh`; CONTRIBUTING.md
+                says what each reaches); flag any new one.
               * RECORDED DECISIONS -- there are no ADRs, so a decision lives in the header comment of the
                 file it governs. A changed decision with an unchanged comment is a finding.
               * WRITTEN FOR A READER WHO HAS ONLY THIS REPOSITORY -- no other project's class, scene or

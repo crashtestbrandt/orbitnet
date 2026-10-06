@@ -346,7 +346,7 @@ arena-lint: (lint-project "demos/arena")
 # and the only one that fills BenchSubject's hit-registration columns.
 #
 # SEAT COUNT BOUNDS THE FLEET. A client past the demo's seats is admitted as an OBSERVER, drives no body, and
-# fails its own gate for having no samples. arena seats 24, hockey 32, rts 2.
+# fails its own gate as unseated, with the reason. arena seats 24, hockey 32, rts 2.
 #
 # NETBENCH_OUT=<dir> writes the artifacts somewhere stable instead of a temp directory, which is what makes a
 # before/after comparison possible: the same seed replays the same link, so two runs differ only by the change.

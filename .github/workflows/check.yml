@@ -56,6 +56,12 @@ jobs:
       - name: Descriptor / build-matrix parity
         run: tools/check-descriptor-parity.sh
 
+      # `addons/orbitnet/plugin.cfg`, the `[workspace.package]` version in `native/Cargo.toml` and the member
+      # entries in `native/Cargo.lock` are one version. release.yml re-stamps all three from the tag, but a
+      # pull request that moved one without the others used to stay green until that tag. Pure awk, no cargo.
+      - name: Version parity (plugin.cfg, Cargo.toml, Cargo.lock)
+        run: tools/version-parity.sh check
+
       # `tools/netbench/compare.py` judges every bench column. Its relative tolerances, its
       # `NOISE_FLOOR_ABS` absolute floors and its fault-counter handling are what separate a regression from
       # run-to-run noise, and `--self-test` asserts those verdicts against cases the script carries itself.

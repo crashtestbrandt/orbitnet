@@ -3,8 +3,9 @@
     "What a remote fleet may launch in this repository. Read by an OrbitOrc agent out of this",
     "checkout; nothing in this file is code and nothing here is evaluated.",
     "",
-    "The three modes below are the ones tools/netbench/bench.sh launches on ONE box. A fleet run puts",
-    "the server on one machine and the bot clients on others, which is the arrangement bench.sh cannot",
+    "Three of the five modes below (server, relay, bench) are the ones tools/netbench/bench.sh launches",
+    "on ONE box; observer and probe are the arena demo's other two entry points. A fleet run puts the",
+    "server on one machine and the bot clients on others, which is the arrangement bench.sh cannot",
     "produce: it conditions a loopback socket and every process contends for the same cores, so a",
     "send-path cost measured there describes the harness. See docs/netbench.md.",
     "",
@@ -33,8 +34,14 @@
   },
 
   "sync": {
-    "build": ["just", "export-rts-server"],
-    "build_dir": "build/rts-server",
+    "_comment": [
+      "What a sync builds after it moves the checkout. Every mode above runs demos/arena from source, so",
+      "what a box needs after a sync is this host's native library, mirrored into the demo -- which is",
+      "`just native-install`, and what `checks.requires` looks for. The RTS server export this used to",
+      "name is loaded by nothing here."
+    ],
+    "build": ["just", "native-install"],
+    "build_dir": "addons/orbitnet_native/bin",
     "build_min_bytes": 1048576
   },
 
@@ -141,8 +148,8 @@
         "puts several on one box.",
         "",
         "SEAT COUNT BOUNDS THE FLEET. This demo seats 24; a client past the seat count is admitted as an",
-        "observer, drives no body, and reports no samples -- which the measurement verdict then reads as",
-        "a run that measured nothing."
+        "observer, drives no body, and fails its own gate as unseated -- which the measurement verdict",
+        "then reads as a run that measured nothing."
       ],
       "ready": "-STATE PLAYING",
       "gui": true,
