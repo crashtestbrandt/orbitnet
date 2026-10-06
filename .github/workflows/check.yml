@@ -9,6 +9,14 @@ name: check
 #
 # `pull_request`, NOT `pull_request_target`, for the same family of reasons: fork PRs get no secrets and no
 # write token, which is exactly right for a gate that only needs to read the diff.
+#
+# A CHANGE TO DOCUMENTATION ALONE RUNS `gates` AND NOTHING ELSE. `gates` classifies the diff as its first
+# step, and `native` and `godot` run only when the change is code. tools/ci-changes.sh records what counts
+# as documentation, and that any doubt counts as code. The classification lives in `gates` rather than in a
+# job of its own because `gates` runs on every pull request anyway: every pull request keeps a reported
+# status, and a fourth job would add a runner start to every run for a ten-second step. The cost is that
+# `native` now waits for `gates`, about ten seconds on a code pull request. No status check is required on
+# main today; if one is ever required, require `gates`, which is never skipped.
 
 on:
   push:
@@ -28,8 +36,27 @@ env:
 jobs:
   gates:
     runs-on: ubuntu-latest
+    # `code` drives the `if:` on the two jobs below.
+    outputs:
+      code: ${{ steps.changes.outputs.code }}
     steps:
+      # Full history, for the diff the classifier takes: on a pull request the checkout is GitHub's merge
+      # commit and `HEAD^1` is the base tip; on a push the range is the event's before and after. The
+      # repository packs to about 7 MiB, so this costs a second or two.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The self-test first: a classifier that is wrong fails this job rather than skipping the others.
+      - name: Change classifier self-test
+        run: tools/ci-changes.sh --self-test
+
+      - name: Classify the diff (documentation only, or code)
+        id: changes
+        env:
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_AFTER: ${{ github.event.after }}
+        run: tools/ci-changes.sh >> "$GITHUB_OUTPUT"
 
       # No Godot needed for any of these.
       # Called directly rather than through `just`: the recipes are one line each and a hosted runner has
@@ -87,6 +114,8 @@ jobs:
 
   native:
     runs-on: ubuntu-latest
+    needs: gates
+    if: needs.gates.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -105,6 +134,7 @@ jobs:
   godot:
     runs-on: ubuntu-latest
     needs: [gates, native]
+    if: needs.gates.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
 
