@@ -128,8 +128,12 @@ UNJUDGED = ("rtt_ms", "jitter_ms", "stretch", "offset_ms", "interest_entities", 
 
 # The server's own per-second wire line, folded out of its log by bench.sh.
 SERVER_CSV = "server.csv"
+
+# A per-second server column that already describes ONE peer, so dividing it by the peer count again would be
+# wrong. Every other `*_s` column in server.csv is a total across every synced peer. See `server_columns`.
+PER_PEER_EXEMPT = frozenset({"tx_peak_peer_bytes_s"})
 SERVER_LOWER_IS_BETTER = {
-    "tx_bytes_s": "server egress: snapshot payload bytes per second, across every peer",
+    "tx_bytes_s": "server egress: snapshot payload bytes per second, per synced peer",
     "rx_rejected_s": "inbound rows the server refused",
     "rx_skipped_s": "inbound rows the server could not place",
 }
@@ -179,31 +183,49 @@ def load_run(directory: str, warmup_s: float) -> dict[str, list[float]]:
 
 
 def load_server(directory: str, warmup_s: float) -> dict[str, list[float]]:
-    """The server's own per-second rows, or an empty map when the run carries no server.csv.
+    """The server's own per-second rows, or an empty map when the run carries no server.csv. See `server_columns`."""
+    path = os.path.join(directory, SERVER_CSV)
+    if not os.path.exists(path):
+        return {}
+    with open(path, newline="") as handle:
+        return server_columns(list(csv.DictReader(handle)), warmup_s)
+
+
+def per_peer(column: str) -> bool:
+    """Whether a server column is a per-second total across every peer, and is judged per synced peer."""
+    return column.endswith("_s") and column not in PER_PEER_EXEMPT
+
+
+def server_columns(rows: list[dict[str, str]], warmup_s: float) -> dict[str, list[float]]:
+    """Pool server.csv rows into a column -> values map: only seconds with a peer, warm-up dropped, totals per peer.
 
     THE SERVER IS UP BEFORE THE FLEET IS. Its first rows are the seconds between binding the port and the
     first client arriving: `peers` is 0 and every wire column with it. Pooling those makes each figure a
     function of how long bringup happened to take, which is the one thing a comparison must not depend on.
     So the series starts at the first second the server had a peer, and the same warm-up the client series
-    drops comes off after that -- the first full-state burst is on the server's side of the link too.
-    """
-    path = os.path.join(directory, SERVER_CSV)
-    pooled: dict[str, list[float]] = {}
-    if not os.path.exists(path):
-        return pooled
-    with open(path, newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    def live(row: dict[str, str]) -> bool:
-        # The one float() outside the guarded pooling loop below: server.csv is folded out of a live
-        # log, so a repeated header or truncated row is ordinary, and it must skip a row rather than
-        # abort the whole comparison.
-        try:
-            return float(row.get("peers") or 0.0) > 0.0
-        except ValueError:
-            return False
+    drops comes off after that -- the first full-state burst is on the server's side of the link too. A
+    later second with no peer, the teardown, is skipped for the same reason.
 
-    first_live = next((i for i, row in enumerate(rows) if live(row)), len(rows))
+    **Every per-second total is divided by that second's `peers`** (see `per_peer` and `PER_PEER_EXEMPT`).
+    The fleet joins one client at a time, so a run's seconds span every peer count from one up. A median of
+    the raw totals moves with how many of those seconds the full fleet was seated, which is join timing
+    rather than the send path.
+    """
+    def peers_of(row: dict[str, str]) -> float:
+        # server.csv is folded out of a live log, so a repeated header or truncated row is ordinary, and
+        # it must skip a row rather than abort the whole comparison.
+        try:
+            value = float(row.get("peers") or 0.0)
+        except ValueError:
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
+    pooled: dict[str, list[float]] = {}
+    first_live = next((i for i, row in enumerate(rows) if peers_of(row) > 0.0), len(rows))
     for row in rows[first_live + int(warmup_s):]:
+        peers = peers_of(row)
+        if peers <= 0.0:
+            continue
         for column, text in row.items():
             if text in (None, ""):
                 continue
@@ -211,7 +233,9 @@ def load_server(directory: str, warmup_s: float) -> dict[str, list[float]]:
                 value = float(text)
             except ValueError:
                 continue
-            pooled.setdefault(column, []).append(value)
+            if not math.isfinite(value):
+                continue
+            pooled.setdefault(column, []).append(value / peers if per_peer(column) else value)
     return pooled
 
 
@@ -351,6 +375,28 @@ FAULT_MEDIAN_CASES = [
 ]
 
 
+# The server-row rules: (name, rows, column, expected median, why it is here). `rows` is a list of
+# `(peers, tx_bytes_s, tx_peak_peer_bytes_s)` seconds, warm-up 0.
+def _server_rows(seconds: list[tuple[float, float, float]]) -> list[dict[str, str]]:
+    return [{"peers": f"{p:g}", "tx_bytes_s": f"{t:g}", "tx_peak_peer_bytes_s": f"{k:g}"}
+            for p, t, k in seconds]
+
+
+_FAST_RAMP = [(1, 1000, 1000), (2, 2000, 1000), (3, 3000, 1000)] + [(4, 4000, 1000)] * 20
+_SLOW_RAMP = [(1, 1000, 1000)] * 6 + [(2, 2000, 1000)] * 6 + [(3, 3000, 1000)] * 6 + [(4, 4000, 1000)] * 5
+
+SERVER_ROW_CASES = [
+    ("fast ramp", _server_rows(_FAST_RAMP), "tx_bytes_s", 1000.0,
+     "a total is judged per peer, so a run's join timing does not move it"),
+    ("slow ramp", _server_rows(_SLOW_RAMP), "tx_bytes_s", 1000.0,
+     "the same egress per peer behind a ramp that left the full fleet seated for 5 seconds of 23"),
+    ("peak peer", _server_rows(_FAST_RAMP), "tx_peak_peer_bytes_s", 1000.0,
+     "a column that already describes one peer is not divided again"),
+    ("teardown", _server_rows([(0, 0, 0)] + [(2, 2000, 1000)] * 3 + [(0, 0, 0)] * 9), "tx_bytes_s", 1000.0,
+     "a second with no peer after the fleet left is teardown, and is skipped like bringup"),
+]
+
+
 def tables_for(column: str):
     """The direction tables the column is judged against, or None if no table claims it."""
     for lower, higher in ((LOWER_IS_BETTER, HIGHER_IS_BETTER), (SERVER_LOWER_IS_BETTER, {})):
@@ -403,6 +449,21 @@ def self_test() -> int:
             print(f"FAIL {column} b50={b50} a50={a50}: expected {expected!r}, got {got!r}")
             failures += 1
 
+    for name, rows, column, expected, _ in SERVER_ROW_CASES:
+        got = percentile(server_columns(rows, 0.0).get(column, []), 0.50)
+        checked += 1
+        if not math.isclose(got, expected):
+            print(f"FAIL server rows, {name}: {column} median expected {expected}, got {got}")
+            failures += 1
+    # The two ramps above are one send path measured twice, so the comparison must call them equal.
+    fast = percentile(server_columns(_server_rows(_FAST_RAMP), 0.0)["tx_bytes_s"], 0.50)
+    slow = percentile(server_columns(_server_rows(_SLOW_RAMP), 0.0)["tx_bytes_s"], 0.50)
+    got = verdict("tx_bytes_s", fast, slow, 0.05, SERVER_LOWER_IS_BETTER, {})
+    checked += 1
+    if got != "same":
+        print(f"FAIL server rows: two ramps of one send path read {got!r}, expected 'same'")
+        failures += 1
+
     print(f"compare.py self-test: {checked} cases, {failures} failure(s)")
     return 1 if failures else 0
 
@@ -438,7 +499,7 @@ def main() -> int:
     server_after = load_server(args.after, args.warmup)
     if server_before and server_after:
         regressions += report(
-            "== SERVER (per-second wire lines) ==",
+            "== SERVER (per-second wire lines; each *_s total divided by that second's synced peers) ==",
             server_before, server_after,
             list(SERVER_LOWER_IS_BETTER), args.tolerance,
             SERVER_LOWER_IS_BETTER, {})
