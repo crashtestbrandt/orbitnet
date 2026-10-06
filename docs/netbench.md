@@ -106,10 +106,27 @@ denominator, which is why the delta prints `n/a` — judging it anyway made ever
 exercised look like a regression. It prints under its own verdict rather than as `not measured`, because the
 same shape is a fault counter leaving zero for the first time.
 
+**The 5% tolerance is set from same-build runs on the netbench runner.** Across 13 pairs at 4, 12 and 24
+clients, the worst move on a judged byte column was 2.2%, and no pair read anything but `same`. `compare.py`'s
+header has the table.
+
+- **Client upstream bytes are the exception on a host short of cores.** A client starved of CPU sends
+  variable input redundancy: on a 4-core VM at 12 clients, client `tx_*` moved 7 to 16% between runs of one
+  build. Widen `--tolerance` there, or read the server table.
+
 **The per-frame CPU timers carry an absolute floor as well as the relative tolerance.** They sit near
-0.02–0.03 ms, where 5% is below the spread between two runs of one binary — measured, not assumed: back-to-back
-runs of one commit moved `rollback_ms` +11.5% and `net_ms` +10.0%. A move under 0.05 ms, which is 0.15% of a
-33 ms tick, is not judged. `compare.py --self-test` asserts these rules and reads no artifacts.
+0.02–0.05 ms, where 5% is below the spread between two runs of one build: same-build pairs on the netbench runner
+moved `rollback_ms` up to 7.5% and `net_ms` up to 5.9%, at most 0.003 ms. A move under 0.05 ms, which is 0.15%
+of a 33 ms tick, is not judged. `compare.py --self-test` asserts these rules and reads no artifacts.
+
+**The server table judges per-second totals per synced peer.** Every `*_s` column in `server.csv` except
+`tx_peak_peer_bytes_s` is divided by that second's `peers` before the median.
+
+- The fleet joins one client at a time, so a run's seconds span every peer count from one up, and a median of
+  raw totals moves with how long the full fleet was seated.
+- Measured on runs of one build, server egress moved up to 16% as a raw total: on a 4-core VM at 12 clients,
+  and on the netbench runner at 24. Per peer it moved at most 2.7% on the VM and 1.7% on the runner.
+- Seconds with no peer are skipped at both ends of the run.
 
 **Resim depth is printed and not judged**, for the reason the run's own gate does not judge it: it deepens
 legitimately under latency, and prediction that is actually broken shows up as `reconcile_snap`.
