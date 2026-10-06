@@ -28,16 +28,12 @@ fi
 LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/orbitnet-lint.XXXXXX")"
 trap 'rm -f "$LOG_FILE"' EXIT HUP INT TERM
 
-# macOS headless can crash inside MoltenVK during the resource --import pass (a Metal RenderingDevice is
-# created even under --headless, regardless of --rendering-driver). The project LOAD pass still surfaces
-# GDScript compiler errors, so on macOS we render via opengl3 and treat --import as best-effort. Linux and
-# CI -- the authoritative gate -- are untouched: RENDER_ARGS word-splits to nothing and both passes stay fatal.
+# Both passes are fatal on every platform. The macOS import crash this script once excused as MoltenVK's was
+# Godot crashing at exit after loading the extension mid-session: the backtrace's `mvk::` frame was only the
+# nearest exported symbol, and the crash happened under opengl3 too. The extension list written below
+# prevents it.
 RENDER_ARGS=""
 IMPORT_FATAL=1
-if [ "$(uname)" = "Darwin" ]; then
-	RENDER_ARGS="--rendering-driver opengl3 --audio-driver Dummy"
-	IMPORT_FATAL=0
-fi
 
 run_godot() {
 	fatal="$1"; label="$2"; shift 2
@@ -55,6 +51,10 @@ run_godot() {
 		printf '   (non-fatal on this platform: %s exited %s; relying on the load pass)\n' "$label" "$status"
 	fi
 }
+
+# A cold project gets its extension list first, so Godot loads the extension at startup rather than finding it
+# mid-session and crashing at exit (tools/seed-extension-list.sh).
+"$ROOT/tools/seed-extension-list.sh" "$PROJECT_DIR"
 
 # Prime the import cache on a cold checkout BEFORE the checked passes. A GDExtension perturbs the FIRST cold
 # --import's global-class-cache build order, so autoload singleton types (e.g. `Net`) can transiently resolve

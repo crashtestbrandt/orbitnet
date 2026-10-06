@@ -88,6 +88,9 @@ CLASS_CACHE="$PROJECT/.godot/global_script_class_cache.cfg"
 # checked pass. A warm project cannot hit that, so it pays for one import rather than two.
 if [ ! -s "$CLASS_CACHE" ]; then
 	echo "netbench: $DEMO has never been imported -- priming the class cache (this takes a moment)..."
+	# The extension list first, so the library loads at startup rather than mid-session, which crashes the
+	# engine at exit (tools/seed-extension-list.sh).
+	"$ROOT/tools/seed-extension-list.sh" "$PROJECT"
 	"$GODOT" --headless --path "$PROJECT" --import >/dev/null 2>&1 || true
 fi
 echo "netbench: importing $DEMO (refreshes the global class cache; a warm project is quick)..."
