@@ -103,7 +103,11 @@ inside the addon, and the join stays a `Net` call.
   `Net.server_public_key()`, `Net.set_pinned_server_key()` and the two `has_` queries run an authenticated
   X25519 exchange on the join. A pinned client derives its session key from bytes only the holder of the
   server's secret can produce, encrypts under it the way a secret does, and refuses a join the server answered
-  without an exchange. It needs no shared secret, so the public half may ship in a build.
+  without an exchange. It needs no shared secret, so the public half may ship in a build. On the server, a
+  connection seated through an exchange refuses a later hello that offers none, so a client that restarts its
+  session unpinned on a live connection is refused until that connection drops. The pin authenticates the
+  server to the client and nobody to the server: a party that can inject on the path can still rekey a
+  connection with an exchange of its own, and only a session secret refuses that.
 - **Linux arm64 and Android arm64, arm32 and x86_64** join the published binary set, built and published but
   not run on a device; the macOS profiling library is universal.
 - **Per-peer frame assembly runs on a worker pool** at `orbitnet/assembly_pool_peers` synced peers and above,

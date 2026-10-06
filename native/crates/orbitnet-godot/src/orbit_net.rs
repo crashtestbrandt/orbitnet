@@ -7535,13 +7535,16 @@ impl OrbitNet {
                 return;
             }
         };
-        // A CONNECTION SEATED THROUGH AN EXCHANGE STAYS ON ONE. A retried confirmation repeats the
-        // exchange and a client that restarted its session runs it again, so a hello that offers
-        // none on a connection whose key was derived through one is not a client: it is something
-        // on the path presenting the two wire halves, which it can read, to move the session onto
-        // the key those halves alone derive. Refused here, by name, before anything is seated. The
-        // rule is [`exchange_downgraded`]; the other direction — a connection seated without an
-        // exchange whose client restarted with a pin — is an ordinary rekey and stays allowed.
+        // A CONNECTION SEATED THROUGH AN EXCHANGE IS NOT REKEYED ONTO A KEY A PASSIVE OBSERVER HOLDS.
+        // A hello that offers no exchange derives its key from the two wire halves alone, which
+        // anyone who read the join can compute, so on a connection whose key came through an
+        // exchange it is refused here, by name, before anything is seated. The rule is
+        // [`exchange_downgraded`], and that is the whole of what it buys: a hello that runs a fresh
+        // exchange of its own is still accepted, because under a pin alone this server authenticates
+        // nothing about the joiner, so a party that can inject on the path rekeys the connection onto
+        // a key it holds whether or not it offers an exchange. Only a session secret refuses that.
+        // The other direction — a connection seated without an exchange whose client restarted with
+        // a pin — is an ordinary rekey and stays allowed.
         if let Some(peer) = self.peers.get(&sender) {
             if exchange_downgraded(peer.auth.is_some() && peer.exchanged, exchanged.is_some()) {
                 godot_error!(
@@ -10335,10 +10338,16 @@ fn offered_static_key<'a>(
 /// exchange, and `hello_offers_exchange` whether the hello in hand ran one. Only the move from
 /// exchanged to unexchanged is a downgrade. A retried confirmation repeats the exchange it was
 /// seated with, and a connection seated without one may be rekeyed by a client that restarted with a
-/// pin, so neither of those is refused. An on-path party that can read the two wire halves can
-/// present a hello carrying no exchange and, under the game-secret-free regime, no confirm tag; this
-/// is the rule that keeps that hello from rekeying an exchanged connection onto the key those halves
-/// alone derive.
+/// pin, so neither of those is refused.
+///
+/// **What it buys is narrow.** It keeps an exchanged connection from being rekeyed onto a key a
+/// passive observer can also derive, the one the two wire halves alone produce. It does not refuse
+/// an injected rekey: under a pin alone the server authenticates nothing about the joiner, so a party
+/// that can inject on the path runs a fresh exchange with an ephemeral of its own, confirms over the
+/// fold it can compute, and rekeys the connection onto a key it holds. A session secret is what
+/// refuses that, as the README's Limits section records. A client that restarts its session unpinned
+/// on a live connection to a server holding a static key is refused by this rule until that
+/// connection drops.
 #[must_use]
 fn exchange_downgraded(seated_through_exchange: bool, hello_offers_exchange: bool) -> bool {
     seated_through_exchange && !hello_offers_exchange
