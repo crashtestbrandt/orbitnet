@@ -19,8 +19,9 @@
 # (decoupled at 30 Hz, a 128-tick ring) and the only one that can fill BenchSubject's hit-registration columns.
 #
 # SEAT COUNT BOUNDS THE FLEET. A demo seats a joining peer or admits it as an observer, and an observer drives
-# no body -- so a client past the seat count reports no samples and fails its own gate. arena seats 24 and
-# hockey 32; the RTS demo seats 2, so it takes at most two clients.
+# no body -- so a client past the seat count fails its own gate as unseated, SECONDS + 20 after it started (see
+# BenchGate.evaluate_seated). Every bench client asks for one seat: arena seats 24 and hockey 32; the RTS demo
+# seats 2, so it takes at most two clients.
 #
 # PASS = every client logs BENCH-RESULT PASS, the relay bound, no process logged a panic, and the server's
 # steady-state want_full NACK rate passes its profile's gate (tools/netbench/nack_gate.py). Exits non-zero on

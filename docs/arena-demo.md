@@ -110,6 +110,12 @@ datagram's limit, not the policy's.
 backend's sense: its own interest anchor, its own center, its own world, its own hysteresis band. The
 connection receives the **union** of its seats' sets, with the nearest seat's distance kept per entity.
 
+**A client asks for its seats.** It sends its seat count to the server when its transport comes up, and the
+server seats it once both that request and the handshake have arrived (`SeatRequests`).
+
+- One seat is the default, so 24 single-seat clients fill the arena's 24 seats.
+- A client that never asks is seated with one fighter after `ArenaNet.SEAT_REQUEST_WAIT_S`.
+
 ```gdscript
 handle.set_input_authority(peer)   # WHICH CONNECTION authors this body's input
 handle.set_seat(index)             # WHICH OF THAT CONNECTION'S BODIES this one is, for interest
@@ -242,7 +248,7 @@ owner, seat)`, and the id is a full-width hash whose varint averages 9.5 bytes.
 
 **A joining peer still costs a whole table** — it holds none to diff against, so there is nothing to send it a
 difference from. What went away is the copy that used to be re-broadcast to the peer already in the session:
-that peer's table did not change, so it now receives a **two-row** delta naming the joiner's two seats. An
+that peer's table did not change, so it now receives a delta with **one row per seat** the joiner took. An
 *observer* joining changes no row at all, and costs the existing peer nothing.
 
 It needs two processes to show anything: with no peer, there is nobody to send a manifest to.

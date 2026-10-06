@@ -21,8 +21,12 @@ configuration closest to a shooter, and the only one that fills the hit-registra
 just netbench 4 congested_wifi 20 1 strafe rts      # CLIENTS PROFILE SECONDS SEED POLICY DEMO
 ```
 
-**Seat count bounds the fleet.** A client past the demo's seats is admitted as an observer, drives no body and
-fails its own gate for having no samples. `arena` seats 24, `hockey` 32, `rts` 2.
+**Seat count bounds the fleet.** Every bench client asks for one seat. A client past the demo's seats is
+admitted as an observer and drives no body.
+
+- It fails its own gate as unseated (`BenchGate.evaluate_seated`), `SECONDS` + 20 after it started, and reports
+  before the harness stops waiting.
+- `arena` seats 24, `hockey` 32, `rts` 2.
 
 ## The one rule that shapes the design
 

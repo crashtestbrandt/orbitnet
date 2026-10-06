@@ -30,6 +30,9 @@ var _file: FileAccess = null
 var _rows_since_flush: int = 0
 var _sample_count: int = 0
 var _finished: bool = false
+# Cleared by `mark_unseated` when the probe saw no owned body in time.
+var _seated: bool = true
+var _seat_wait_s: float = 0.0
 
 # Samples kept for the gate's distribution checks (percentiles / means). reconcile_snap is monotonic -> keep last.
 var _rtt: Array[float] = []
@@ -149,11 +152,18 @@ func _on_post_tick() -> void:
 			BenchGate.mean(_rx_bytes), BenchGate.mean(_want_full),
 			shots_fired(), hits_confirmed()])
 
+## Record that the session never gave this client an owned body within `waited_s`. `finish()` then fails the
+## run on `BenchGate.evaluate_seated`.
+func mark_unseated(waited_s: float) -> void:
+	_seated = false
+	_seat_wait_s = waited_s
+
 ## Evaluate the gate over everything sampled so far, print the BENCH-RESULT marker + per-gate reasons, flush
 ## and close the CSV. Idempotent (the probe may call it on duration-end and again on teardown). Returns the
 ## verdict.
 func finish() -> BenchGate.Result:
 	var result: BenchGate.Result = BenchGate.evaluate(_profile, _rtt, _stretch, _resim, _last_snap)
+	result = BenchGate.evaluate_seated(result, _seated, _seat_wait_s)
 	result = BenchGate.evaluate_bandwidth(result, _rx_bytes, _want_full, _starve)
 	result = BenchGate.evaluate_remote_cadence(result, _cadence)
 	result = BenchGate.evaluate_hit_registration(result, shots_fired(), hits_confirmed(), _target_kind)
