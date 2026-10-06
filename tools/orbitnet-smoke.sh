@@ -427,10 +427,10 @@ func _process(_delta: float) -> bool:
 	return false
 LIFECYCLE
 
-# macOS headless creates a Metal RenderingDevice during the resource import pass and can fault inside
-# MoltenVK there, regardless of --headless and regardless of --rendering-driver. tools/lint-gdscript.sh
-# carries these two arguments for that fault and runs every pass with them; this script does the same on
-# Darwin. RENDER_ARGS word-splits to nothing everywhere else, so Linux and Windows are untouched.
+# Darwin runs with opengl3 and no audio. The import crash these arguments were added for was not MoltenVK's:
+# it was Godot crashing at exit after loading the extension mid-session, and it happens under opengl3 too.
+# The arguments stay because GitHub's macOS runners are VMs without a GPU, where Metal is untested.
+# RENDER_ARGS word-splits to nothing everywhere else.
 RENDER_ARGS=""
 if [ "$(uname)" = "Darwin" ]; then
 	RENDER_ARGS="--rendering-driver opengl3 --audio-driver Dummy"
@@ -438,11 +438,15 @@ fi
 
 # Godot discovers .gdextension files while scanning the project, and a fresh project has no scan
 # cache. Without this pass the library is never loaded and the classes simply do not exist, which
-# presents identically to a genuinely broken build. Retried once because the checked runs below have no
-# fallback of their own and a renderer fault part way through leaves the scan half done.
-"$GODOT" --headless $RENDER_ARGS --path "$WORK" --import >/dev/null 2>&1 \
-	|| "$GODOT" --headless $RENDER_ARGS --path "$WORK" --import >/dev/null 2>&1 \
-	|| true
+# presents identically to a genuinely broken build. The extension list is written first, so the import
+# loads the library at startup instead of finding it mid-session and crashing at exit
+# (tools/seed-extension-list.sh); a failed import is now a failed smoke.
+"$ROOT/tools/seed-extension-list.sh" "$WORK"
+if ! "$GODOT" --headless $RENDER_ARGS --path "$WORK" --import >"$WORK/import.log" 2>&1; then
+	echo "ORBIT-SMOKE FAIL: the import of the throwaway project failed:" >&2
+	tail -40 "$WORK/import.log" >&2
+	exit 1
+fi
 
 LOG="$WORK/smoke.log"
 set +e

@@ -394,10 +394,10 @@ jobs:
         run: |
           set -euo pipefail
           godot="${GODOT_BIN:-godot}"
-          # macOS headless creates a Metal RenderingDevice during the resource import pass and can fault
-          # inside MoltenVK there, regardless of --headless and regardless of --rendering-driver.
-          # tools/lint-gdscript.sh carries these two arguments for that exact fault and runs every pass
-          # with them; this leg does the same. They word-split to nothing on Windows.
+          # Darwin runs with opengl3 and no audio. The import crash these arguments were added for was not
+          # MoltenVK's: it was Godot crashing at exit after loading the extension mid-session, and it
+          # happens under opengl3 too. They stay because this runner is a VM without a GPU, where Metal is
+          # untested. They word-split to nothing on Windows.
           render_args=""
           if [ "$(uname)" = "Darwin" ]; then
             render_args="--rendering-driver opengl3 --audio-driver Dummy"
@@ -407,11 +407,10 @@ jobs:
             # fails to resolve the test base class it extends -- "Could not find type" on correct code that
             # loads fine on the next run. `.gitignore` ignores `.godot/` and actions/checkout removes
             # ignored files, so EVERY run here is cold and this prime is load-bearing on all of them.
-            # Best-effort but retried once: a real script error recurs on the checked pass below, while a
-            # renderer fault part way through leaves a half-built class cache that the checked pass has no
-            # fallback for.
-            "$godot" --headless --no-header $render_args --path "$project" --import >/dev/null 2>&1 \
-              || "$godot" --headless --no-header $render_args --path "$project" --import >/dev/null 2>&1 \
-              || true
+            # The extension list is written first, so the import loads the library at startup rather than
+            # finding it mid-session and crashing at exit (tools/seed-extension-list.sh). A failed prime
+            # fails the leg; it was retried and then ignored, which is what hid that crash.
+            tools/seed-extension-list.sh "$project"
+            "$godot" --headless --no-header $render_args --path "$project" --import >/dev/null
             "$godot" --headless $render_args --path "$project" --script tests/support/run_unit_tests.gd
           done

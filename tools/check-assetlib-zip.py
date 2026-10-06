@@ -323,8 +323,15 @@ MAIN_TSCN = """\
 """
 
 # The scripts the unpacked tree needs to be able to run itself. orbitnet-smoke.sh and lint-gdscript.sh both
-# resolve their root as the parent of their own directory, so a copy placed here reads the zip's files.
-STAGED_TOOLS = ("orbitnet-smoke.sh", "lint-gdscript.sh", "build-native.sh", "godot-quiet.sh")
+# resolve their root as the parent of their own directory, so a copy placed here reads the zip's files. Both
+# call seed-extension-list.sh before their first import.
+STAGED_TOOLS = (
+    "orbitnet-smoke.sh",
+    "lint-gdscript.sh",
+    "seed-extension-list.sh",
+    "build-native.sh",
+    "godot-quiet.sh",
+)
 
 
 def boot(zip_path, workdir):
