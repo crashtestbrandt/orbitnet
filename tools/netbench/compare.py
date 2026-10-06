@@ -31,11 +31,11 @@ the fleet size, so read the table when the two disagree.
 
 | Fleet | Same-build pairs | Worst move on a judged byte column | False verdicts at 5% |
 | --- | --- | --- | --- |
-| 4 clients, 25 s | 12 | 2.2% (server egress per peer) | 0 |
+| 4 clients, 25 s | 9, over two builds | 2.2% (server egress per peer) | 0 |
 | 12 clients, 60 s | 2 | 1.7% (server egress per peer) | 0 |
 | 24 clients, 60 s | 2 | 0.6% (client ingress) | 0 |
 
-- 5% is a little over twice the worst move measured, so a same-build re-run reads `same` throughout.
+- 5% is a little over twice the worst move measured. Every pair in the table read `same` on every judged column.
 - **On a host with fewer cores than the fleet needs**, a client starved of CPU sends variable input
   redundancy. On a 4-core VM at 12 clients, client upstream bytes (`tx_*` in the client table) moved 7 to 16%
   between runs of one build. Compare those at a wider `--tolerance` there, or read the server table.

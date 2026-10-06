@@ -106,7 +106,7 @@ denominator, which is why the delta prints `n/a` — judging it anyway made ever
 exercised look like a regression. It prints under its own verdict rather than as `not measured`, because the
 same shape is a fault counter leaving zero for the first time.
 
-**The 5% tolerance is set from same-build runs on the netbench runner.** Across 16 pairs at 4, 12 and 24
+**The 5% tolerance is set from same-build runs on the netbench runner.** Across 13 pairs at 4, 12 and 24
 clients, the worst move on a judged byte column was 2.2%, and no pair read anything but `same`. `compare.py`'s
 header has the table.
 
@@ -124,8 +124,8 @@ of a 33 ms tick, is not judged. `compare.py --self-test` asserts these rules and
 
 - The fleet joins one client at a time, so a run's seconds span every peer count from one up, and a median of
   raw totals moves with how long the full fleet was seated.
-- Measured on runs of one build: server egress moved up to 16% raw at 12 and 24 clients, and at most 2.7%
-  per peer.
+- Measured on runs of one build, server egress moved up to 16% as a raw total: on a 4-core VM at 12 clients,
+  and on the netbench runner at 24. Per peer it moved at most 2.7% on the VM and 1.7% on the runner.
 - Seconds with no peer are skipped at both ends of the run.
 
 **Resim depth is printed and not judged**, for the reason the run's own gate does not judge it: it deepens
