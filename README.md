@@ -130,43 +130,6 @@ Each has a page under [docs/](docs/) with its byte budget and its levers.
 | [CHANGELOG.md](CHANGELOG.md) | Every release, its protocol major, and what an upgrade costs. |
 | [ROADMAP.md](ROADMAP.md) | What is open, ranked, with an issue per row. |
 
-## Limits
-
-What is open or deliberately bounded. Each is stated in full where its code lives; this is the index.
-
-- **The addon frees nothing and releases no seat on its own.** It reports `Net.entity_left_interest`,
-  `Net.entity_entered_interest` and `Net.peer_dropped`, and `Net.set_seat_release_policy()` states the seat
-  rule; freeing a node and refusing a resume are the game's. Hide a culled entity rather than free it.
-- **No host migration.** The authority is one process for the life of a session. Whether 1.x offers migration
-  is an open row in [ROADMAP.md](ROADMAP.md).
-- **A peer that declares nothing is placed by its lowest-id body**, and one driving none receives everything
-  until `Net.set_unanchored_policy(CLOSED)` says otherwise. `Net.set_peer_anchor()` declares a center and a
-  world for an observer.
-- **A session identity is client-asserted and narrowed by a resume token** the server mints. Persist the token
-  beside the session id, or a restarted process cannot resume.
-- **With neither a session secret nor a pinned server key, nothing is encrypted, and an on-path observer can
-  forge what a client can.** `Net.set_session_secret()` closes that for a game with an authenticated channel
-  to hand a secret over; `Net.set_pinned_server_key()` closes it for a game without one, against a static key
-  the server publishes. Either encrypts every payload with ChaCha20-Poly1305, at 8 bytes and about 1.2 µs per
-  full-size datagram. A recorded join cannot be replayed under any regime.
-  [The three regimes](docs/protocol.md#three-secret-regimes-and-which-one-you-are-in) states each one's
-  guarantees.
-- **A pin authenticates the server to the client and nobody to the server.** Refusing a client is the
-  secret's, the resume token's and the transport's job. A Steam session's link is encrypted and its identity
-  authenticated by SteamNetworkingSockets whatever OrbitNet does on top;
-  [docs/steam.md](docs/steam.md#what-each-transport-authenticates-and-encrypts) has the per-transport table.
-- **The constant-time harness covers the tag compare and nothing else.** The cipher's and the curve's
-  constant-time claims are their crates' own.
-- **A refused join is silent on the joining side.** The accepting peer logs why; the joiner sees a welcome
-  that never arrives. A reject frame and a `join_refused` signal are on the roadmap.
-- **What the server believes about a peer's round trip is capped** at `Net.rtt_believed_max_ms`, 250 ms by
-  default, because a peer can acknowledge an old frame and read as slow. `Net.peer_rtt_raw_ms()` keeps a
-  scoreboard honest.
-- **A session names at most 65,536 entities on the wire**, and the server refuses the next rather than
-  wrapping a slot onto a live one.
-- **Input is checked for finiteness and nothing else.** Range, rate and plausibility are the game's, inside
-  `_rollback_tick` on the server.
-
 ## Upgrading
 
 [CHANGELOG.md](CHANGELOG.md) carries every release's upgrade notes, newest first, with the protocol major each

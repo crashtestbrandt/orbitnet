@@ -728,7 +728,6 @@ that differed between the two ends would fail a pull request there.
   datagram's membership in a session rather than a peer's identity. An attacker who cannot read the session's
   traffic cannot forge a datagram at all, whatever sender id it puts on one, and one connected peer cannot
   forge another's. **An on-path observer who can read the exchange can do everything the client can.**
-  Recorded as a limit in the [README](../README.md#limits).
 - **With a secret the halves are still in the clear and the key is not.** The secret never crosses the wire,
   so an on-path observer derives no key — it cannot forge a datagram, take a session identity, or quote a
   resume token into a session it can authenticate, and it cannot read a payload either.

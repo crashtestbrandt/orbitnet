@@ -7,8 +7,9 @@ What is open, ranked. One row per issue, so the ranking is actionable rather tha
 - **This file is a backlog.** `CONTRIBUTING.md`'s rule on decisions stands. A decision goes in the README, a
   `docs/` page, or the header comment of the file it governs. A row that resolves into a decision records it
   there.
-- **The README's [Limits](README.md#limits) section is the companion to this one.** Limits states what is known
-  and open about the shipped behavior. This file states what is planned about the project.
+- **What is known and open about the shipped behavior is stated where its code lives**, in `docs/protocol.md`
+  for the wire, the join and the secret regimes, `docs/steam.md` for the transports and `docs/api.md` for the
+  facade. This file states what is planned about the project.
 - **Every open issue sits under one parent epic, except where its row says it has none.** The tier headings
   below name the parent that owns their rows.
 
@@ -29,7 +30,7 @@ moving. 0.5.0 changed what one `Net` call does, added six key calls, and changed
 | [#157](https://github.com/crashtestbrandt/orbitnet/issues/157) | A refused join reaches the joining peer, as a reject frame and `Net.join_refused(reason)`. Today the accepting peer logs why and the joiner watches for a welcome that never arrives; `docs/protocol.md`'s misconfiguration table records two rows as "the join hangs". | nothing; batches with any pending wire major |
 | [#158](https://github.com/crashtestbrandt/orbitnet/issues/158) | The deprecation path the versioning policy describes: a warning on the first call of a deprecated method, and the marker in `docs/api.md`. `net.gd` emits none today. | nothing |
 | [#159](https://github.com/crashtestbrandt/orbitnet/issues/159) | One review of the public surface before the freeze, and the classes the freeze covers stated in `docs/api.md`. The exit condition is one release that moves none of them. | #160, for its scope |
-| [#160](https://github.com/crashtestbrandt/orbitnet/issues/160) | The recorded 1.x position on host migration and despawn, both of which the README's Limits leave to the game today. | nothing |
+| [#160](https://github.com/crashtestbrandt/orbitnet/issues/160) | The recorded 1.x position on host migration and despawn, both of which the addon leaves to the game today. | nothing |
 
 ## Tier 2 — Validation
 
@@ -93,7 +94,7 @@ Listed so the roadmap is not read as a list of oversights.
   shipped: an X25519 exchange against a server key the client pinned, which is a different trade entirely.
 - **A session that configures neither secret nor pin carries every payload in the clear.** Both nonce halves
   cross the wire, so whoever can read the payload could compute the key that hid it. Stated where a reader
-  will be standing, in [docs/protocol.md](docs/protocol.md#three-secret-regimes-and-which-one-you-are-in) and
-  the README's Limits, rather than as a backlog row.
+  will be standing, in [docs/protocol.md](docs/protocol.md#three-secret-regimes-and-which-one-you-are-in),
+  rather than as a backlog row.
 - **`reloadable` stays false.** A netcode singleton owns sockets, tick state and history, and hot reload is
   the least-exercised corner of the toolchain.
