@@ -57,9 +57,10 @@ Parent: [#104](https://github.com/crashtestbrandt/orbitnet/issues/104) `epic(ci)
 
 Parent: [#105](https://github.com/crashtestbrandt/orbitnet/issues/105) `epic(release)`.
 
-| Item | Issue | Why now |
-| --- | --- | --- |
-| The send path is single-threaded | [#91](https://github.com/crashtestbrandt/orbitnet/issues/91) | `docs/architecture.md:214` already names what is movable and why a worker pool should be feature-gated above a peer threshold. Parent [#106](https://github.com/crashtestbrandt/orbitnet/issues/106) `epic(perf)`, not this tier's: it is send-path cost. Its deliverable is a peer threshold **measured rather than picked**, so it waits on Tier 1 having netbench history the threshold can be read off. |
+**Every row here has landed.** Per-peer frame assembly runs on a worker pool at a measured peer threshold;
+`docs/architecture.md`'s threading section records the measurement. Its parent was
+[#106](https://github.com/crashtestbrandt/orbitnet/issues/106) `epic(perf)`, whose two items have now both
+landed.
 
 ## Recorded and not scheduled
 

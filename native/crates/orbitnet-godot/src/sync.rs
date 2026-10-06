@@ -321,6 +321,88 @@ pub(crate) fn integrate_input_row(
     InputIntegration::Landed(tick)
 }
 
+/// What one entity's state block is encoded from: its state ring, its property list, the tick a block
+/// describes, and which lane it rides.
+///
+/// **Plain data, so any thread may read it.** Everything here borrows out of a synchronizer, and none of
+/// it is a Godot object. `OrbitNet` takes one per entity on the main thread while the synchronizers are
+/// bound, and per-peer frame assembly then reads them from whichever thread assembles that peer.
+/// `orbit_net`'s `assembly_tests` asserts `Sync` on it, which keeps it that way.
+///
+/// **`scratch` comes back holding the block's changed mask whenever the answer is a delta**, and holds
+/// whatever a previous call left there when the answer is a full row. That is the only statement of
+/// whether the block carried a change. See `orbit_net::block_is_un_written`, which pairs the two values.
+///
+/// **A rollback block is admitted whatever that mask holds.** An empty delta decodes to the base the
+/// peer acked, which is the authoritative row, and
+/// [`OrbitRollbackSynchronizer::integrate_authoritative_row`] runs it against the receiver's own
+/// predicted row for that tick. That compare is the only thing that raises a
+/// [`StateIntegration::Mispredict`], so a client predicting against a row the server is holding still is
+/// corrected by exactly this block. The state lane un-writes its empty deltas; the rollback lane does
+/// not.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockSource<'a> {
+    history: &'a ColumnarHistory,
+    props: &'a [PropSchema],
+    /// The entity tick a block describes, or `None` while the lane has captured nothing to send.
+    tick: Option<u64>,
+    state_lane: bool,
+}
+
+impl<'a> BlockSource<'a> {
+    /// A source over `history`, for a block describing `tick` on the given lane.
+    pub(crate) fn new(
+        history: &'a ColumnarHistory,
+        props: &'a [PropSchema],
+        tick: Option<u64>,
+        state_lane: bool,
+    ) -> Self {
+        Self {
+            history,
+            props,
+            tick,
+            state_lane,
+        }
+    }
+
+    /// Whether the block rides the state lane, the one lane that un-writes an empty delta.
+    pub(crate) fn state_lane(&self) -> bool {
+        self.state_lane
+    }
+
+    /// Encode this entity's block for one peer.
+    ///
+    /// `reference_tick` is the last tick this peer applied, the delta base; `None` forces a full row.
+    /// Returns the entity tick the block describes and whether it went out as a full row, which is
+    /// what the keyframe clock is measured against. `None`, with nothing written, when the ring holds
+    /// no row for that tick.
+    pub(crate) fn encode(
+        &self,
+        writer: &mut Writer,
+        scratch: &mut Vec<bool>,
+        slot: u16,
+        frame_tick: u64,
+        reference_tick: Option<u64>,
+    ) -> Option<(u64, bool)> {
+        let tick = self.tick?;
+        let row = self.history.row(tick)?;
+        let reference = reference_tick
+            .and_then(|base_tick| self.history.row(base_tick).map(|base| (base_tick, base)));
+        let full = encode_state_block(
+            writer,
+            scratch,
+            self.props,
+            slot,
+            frame_tick,
+            tick,
+            reference,
+            row,
+            self.state_lane,
+        );
+        Some((tick, full))
+    }
+}
+
 /// The input row a tick restores from, stamping the ledger when that row is a carry-forward.
 ///
 /// **A tick with no row of its own is [`Confidence::Extrapolated`], not
@@ -1719,68 +1801,22 @@ impl OrbitRollbackSynchronizer {
         )
     }
 
-    /// Encode this entity's state block for one peer.
+    /// What this entity's state block is encoded from at `frame_tick`. See [`BlockSource`].
     ///
-    /// `reference_tick` is the last tick this peer applied (delta base) — `None` forces full.
-    /// Returns the entity tick the block describes and whether it went out as a full row, which is
-    /// what the keyframe clock is measured against.
-    ///
-    /// **`scratch` comes back holding the block's changed mask whenever the answer is a delta**, and
-    /// holds whatever a previous call left there when the answer is a full row. That is the only
-    /// statement of whether the block carried a change — see `orbit_net::block_is_un_written`, which
-    /// pairs the two values.
-    ///
-    /// **A rollback block is admitted whatever that mask holds.** An empty delta decodes to the base
-    /// the peer acked, which is the authoritative row, and
-    /// [`OrbitRollbackSynchronizer::integrate_authoritative_row`] runs it against the receiver's own
-    /// predicted row for that tick. That compare is the only thing that raises a
-    /// [`StateIntegration::Mispredict`], so a client predicting against a row the server is holding
-    /// still is corrected by exactly this block. The state lane un-writes its empty deltas; this one
-    /// does not.
-    pub(crate) fn encode_block(
-        &mut self,
-        writer: &mut Writer,
-        scratch: &mut Vec<bool>,
-        slot: u16,
-        frame_tick: u64,
-        reference_tick: Option<u64>,
-    ) -> Option<(u64, bool)> {
+    /// The block describes the newest authoritative simulation tick once there is one, and the frame
+    /// tick before that.
+    pub(crate) fn block_source(&self, frame_tick: u64) -> BlockSource<'_> {
         let tick = if self.latest_auth_sim_tick > 0 {
             self.latest_auth_sim_tick
         } else {
             frame_tick
         };
-        let row = self.state_history.row(tick)?.to_vec();
-        let reference = reference_tick.and_then(|ref_tick| {
-            self.state_history
-                .row(ref_tick)
-                .map(|base| (ref_tick, base.to_vec()))
-        });
-        let full = match reference {
-            Some((ref_tick, base)) => encode_state_block(
-                writer,
-                scratch,
-                self.state_schema.props(),
-                slot,
-                frame_tick,
-                tick,
-                Some((ref_tick, &base)),
-                &row,
-                false,
-            ),
-            None => encode_state_block(
-                writer,
-                scratch,
-                self.state_schema.props(),
-                slot,
-                frame_tick,
-                tick,
-                None,
-                &row,
-                false,
-            ),
-        };
-        Some((tick, full))
+        BlockSource::new(
+            &self.state_history,
+            self.state_schema.props(),
+            Some(tick),
+            false,
+        )
     }
 
     /// Keep a decoded wire row as a future delta base.
@@ -2641,50 +2677,19 @@ impl OrbitStateSynchronizer {
         self.scratch = row;
     }
 
-    /// Encode this entity's block for one peer (state lane flag set).
+    /// What this entity's block is encoded from (state lane flag set). See [`BlockSource`].
     ///
-    /// **`scratch` comes back holding the block's changed mask whenever the answer is a delta**, as
-    /// on the rollback lane — see `orbit_net::block_is_un_written`. This is the lane that acts on it:
-    /// an on-change channel that nothing touched is written here every tick it is visited, and that
-    /// block is the one the send path un-writes. A state row is applied and nothing else, so a row
-    /// identical to the base the peer holds changes nothing on the receiver.
-    pub(crate) fn encode_block(
-        &mut self,
-        writer: &mut Writer,
-        scratch: &mut Vec<bool>,
-        slot: u16,
-        frame_tick: u64,
-        reference_tick: Option<u64>,
-    ) -> Option<(u64, bool)> {
-        let tick = u64::try_from(self.latest_tick).ok()?;
-        let row = self.history.row(tick)?.to_vec();
-        let reference =
-            reference_tick.and_then(|t| self.history.row(t).map(|base| (t, base.to_vec())));
-        let full = match reference {
-            Some((ref_tick, base)) => encode_state_block(
-                writer,
-                scratch,
-                self.schema.props(),
-                slot,
-                frame_tick,
-                tick,
-                Some((ref_tick, &base)),
-                &row,
-                true,
-            ),
-            None => encode_state_block(
-                writer,
-                scratch,
-                self.schema.props(),
-                slot,
-                frame_tick,
-                tick,
-                None,
-                &row,
-                true,
-            ),
-        };
-        Some((tick, full))
+    /// **This is the lane that acts on the changed mask**: an on-change channel that nothing touched
+    /// is written every tick it is visited, and that block is the one the send path un-writes. A state
+    /// row is applied and nothing else, so a row identical to the base the peer holds changes nothing
+    /// on the receiver. `None` as the tick until the first capture.
+    pub(crate) fn block_source(&self) -> BlockSource<'_> {
+        BlockSource::new(
+            &self.history,
+            self.schema.props(),
+            u64::try_from(self.latest_tick).ok(),
+            true,
+        )
     }
 
     /// Decode a received block; the row is buffered and applied at the next tick boundary.

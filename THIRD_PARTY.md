@@ -30,6 +30,8 @@ Regenerate this list with `cargo tree` in `native/` after any dependency change.
 | `zeroize` | Apache-2.0 OR MIT | Wipes key material on drop, under `x25519-dalek`. |
 | `rand_core` | MIT OR Apache-2.0 | The RNG trait `x25519-dalek` names in signatures OrbitNet does not call: randomness is drawn by the host engine and handed in as bytes. |
 | `cfg-if` | MIT OR Apache-2.0 | Backend selection inside `curve25519-dalek`. |
+| `rayon`, `rayon-core` | MIT OR Apache-2.0 | The persistent worker pool per-peer frame assembly runs on at `orbitnet/assembly_pool_peers` synced peers and above (`orbit_net.rs`). Never started below it. |
+| `crossbeam-deque`, `crossbeam-epoch`, `crossbeam-utils`, `either` | MIT OR Apache-2.0 | `rayon`'s work-stealing queues, their memory reclamation, and its helpers. |
 
 `orbitnet-core` and `orbitnet-godot` are this project's own crates and carry this project's license.
 
