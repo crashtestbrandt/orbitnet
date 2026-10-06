@@ -67,7 +67,7 @@ project. Both directories are required: `Net` without the extension is a facade 
 |---|---|
 | **Godot** | 4.4+ (built against the 4.4 API; loads in anything at or above it) |
 | **Language** | GDScript. No C# bindings. |
-| **Platforms** | Linux x86_64, Windows x86_64, macOS universal; Linux arm64 and Android arm64/arm32/x86_64 from the next release, built and published but not tested on a device. iOS has no published build — see [docs/building.md](docs/building.md#ios-is-not-a-key-yet) |
+| **Platforms** | Linux x86_64, Windows x86_64, macOS universal — each runs the unit suites and the extension load smoke in CI, and Linux runs the four probes; Linux arm64 and Android arm64/arm32/x86_64 from the next release, built and published but not run on a device. iOS has no published build — see [docs/building.md](docs/building.md#ios-is-not-a-key-yet) |
 | **Transports** | ENet out of the box; Steam via [GodotSteam](https://godotsteam.com/), selected by export-preset feature tag |
 | **Not supported** | Web — Godot's web export cannot load a GDExtension |
 
@@ -241,20 +241,20 @@ are game decisions, and any default here would be wrong for somebody.
   the confirmation, and the session it would open is keyed on bytes that are not the recorded key. What this
   does not refuse is an observer that can also **inject** — answering the server's challenge in the client's
   place is authoring a fresh join, and a shared session secret is what refuses that.
-- **A session secret also encrypts every payload; without one, nothing is encrypted.** Under a secret each
-  datagram is ChaCha20-Poly1305 over a cipher key derived from that secret and the join's folded nonce, so a
-  passive observer on the path reads no position, no input and no state value. Without one every payload is
-  on the wire in the clear, unless the transport underneath encrypts the link — see the bullet below.
-  Encrypting with no secret would buy nothing: both nonce halves cross the wire, so whoever can read the
-  payload can compute the key that hid it. **The cost is 8 bytes and about 1.2 µs per full-size datagram**,
-  and it is zero for a session that configures no secret;
-  [docs/protocol.md](docs/protocol.md#what-a-session-secret-encrypts) measures it and states what a secret
+- **A session secret or a pinned server key encrypts every payload; with neither, nothing is encrypted.**
+  Under either, each datagram is ChaCha20-Poly1305 over a cipher key derived from the secret, the exchange's
+  output, or both, folded with the join's nonce, so a passive observer on the path reads no position, no
+  input and no state value. With neither, every payload is on the wire in the clear unless the transport
+  underneath encrypts the link — see the bullet below. Encrypting with neither would buy nothing: both nonce
+  halves cross the wire, so whoever can read the payload can compute the key that hid it. **The cost is 8
+  bytes and about 1.2 µs per full-size datagram**, and it is zero for a session that configures neither;
+  [docs/protocol.md](docs/protocol.md#what-a-session-secret-encrypts) measures it and states what the cipher
   still does not hide — how many datagrams go out, when, and how long each one is.
 - **A key exchange removes the out-of-band secret, and the pin is what authenticates it.** X25519 over the
   join's two existing legs derives the session key from bytes only the holder of the server's static secret
-  can produce. An **unauthenticated** exchange would not close the on-path forgery above — it is substituted
-  by exactly that attacker — which is why a client that pinned nothing runs none.
-  [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
+  can produce, and the payload cipher is keyed under it. An **unauthenticated** exchange would not close the
+  on-path forgery above — it is substituted by exactly that attacker — which is why a client that pinned
+  nothing runs none. [ROADMAP.md](ROADMAP.md) ranks what would change any of this.
 - **A harness holds the tag compare to constant time.**
   `native/crates/orbitnet-core/tests/constant_time.rs` asserts that the compare's own source, compiled on its
   own under each shipped profile's flags, emits no branch, and measures whether two refused datagrams
@@ -302,7 +302,8 @@ are game decisions, and any default here would be wrong for somebody.
 each one speaks and what an upgrade from it costs.
 
 - **`PROTOCOL_VERSION` is at major 9**, up from 8. A 0.2.x, 0.3.x or 0.4.x peer and a current one refuse each
-  other's handshake: the join grew from two frames to four and the handshake grew a 16-byte field.
+  other's handshake: the join grew from two frames to four, the handshake grew two trailing fields of 16 and
+  32 bytes, and under a secret or a pin the datagram trailer grew from 8 bytes to 16.
 - A major mismatch is refused ahead of every other compatibility rule, in both directions, so there is no
   mixed-version session to diagnose. Every end upgrades together.
 - **The last change to what an existing `Net` call means was in 0.3.0** — three calls, each of which still

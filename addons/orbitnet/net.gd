@@ -699,9 +699,11 @@ func set_session_secret(secret: PackedByteArray) -> void:
 		return
 	_orbit.set_session_secret(secret)
 
-## Whether a session secret is set, which is also whether this session's payloads are encrypted.
-## [b]There is no getter for the bytes[/b], deliberately -- the only questions a game has are "did my
-## configuration take" and "am I about to join in the clear", and both are this one.
+## Whether a session secret is set. [b]Whether this session's payloads are encrypted[/b] is this, or
+## [method has_pinned_server_key] on a client that pinned a key: either regime seats the payload cipher.
+## [b]There is no getter for the bytes[/b], deliberately -- the two questions a game has are "did my
+## configuration take", which this answers, and "am I about to join in the clear", which this and the pin
+## answer together.
 ##
 ## false against a backend that predates the call, which is the honest answer: that backend derives nothing.
 func has_session_secret() -> bool:
@@ -785,9 +787,12 @@ func generate_server_static_key() -> PackedByteArray:
 ## not fall back -- falling back would let anything on the path strip the exchange and leave this client
 ## reporting a security property it does not have.
 ##
-## [b]What it does not change.[/b] The frame sequence: the join is two round trips either way. The tag is still 64
-## bits and the key still 128. And [b]none of this encrypts anything[/b]: every payload is still on the wire in the
-## clear.
+## [b]What it does not change.[/b] The frame sequence: the join is two round trips either way, and the key is
+## still 128 bits.
+##
+## [b]What it changes beyond the key.[/b] A pinned session encrypts every payload under the exchange's output,
+## the way a session secret does: the tag becomes Poly1305's 16 bytes and the payload ChaCha20 ciphertext of
+## the same length. A pin needs no shared secret to buy that, which is the point of it.
 ##
 ## [b]A server whose key changes every session cannot be pinned.[/b] A listen server a player hosts, reached through
 ## a direct-connect address box, has no value to distribute in advance; that session stays on whichever

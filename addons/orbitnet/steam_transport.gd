@@ -995,6 +995,13 @@ class PlatformDouble extends RefCounted:
 	# The platform callbacks this file connects to. Declared with the names the vendored extension uses, so
 	# _wire_lobby_signals / _connect_auth_response connect to them unmodified; the suite fires them through
 	# the emit_* helpers below instead of naming them.
+	#
+	# WHERE A CONTAINER HERE IS UNTYPED, IT MIRRORS THE EXTENSION. `lobby_match_list` carries an untyped
+	# `Array` and `getAuthSessionTicket()` returns an untyped `Dictionary` because those are the signatures
+	# the transport's handlers were written against, and a double that typed them would connect to
+	# nothing. The per-lobby metadata rows and the lobby-creation requests are untyped for a different
+	# reason: they sit inside typed containers, and a typed container cannot name a typed container as
+	# its element type.
 	signal lobby_created(result: int, lobby_id: int)
 	signal lobby_match_list(lobbies: Array)
 	signal lobby_joined(lobby_id: int, permissions: int, locked: bool, response: int)
@@ -1122,7 +1129,7 @@ class PlatformDouble extends RefCounted:
 	func emit_lobby_created(result: int, lobby_id: int) -> void:
 		lobby_created.emit(result, lobby_id)
 
-	func emit_lobby_list(lobby_ids: Array) -> void:
+	func emit_lobby_list(lobby_ids: Array[int]) -> void:
 		lobby_match_list.emit(lobby_ids)
 
 	func emit_lobby_joined(lobby_id: int, response: int) -> void:

@@ -2,8 +2,9 @@
 //!
 //! Nothing in this crate knows about Godot. Every type is a plain-data structure with pure
 //! behavior, which is what lets the whole thing be exercised by `cargo test` in milliseconds
-//! instead of standing up a scene tree, a physics world and two peers. `x25519-dalek` is the one
-//! runtime dependency, and `Cargo.toml`'s header states what it had to clear.
+//! instead of standing up a scene tree, a physics world and two peers. `chacha20poly1305` and
+//! `x25519-dalek` are the two runtime dependencies, and `Cargo.toml`'s header states what each had to
+//! clear.
 //!
 //! The split mirrors the four costs that motivated moving off the GDScript backend (see
 //! docs/architecture.md):

@@ -9,8 +9,8 @@ What is open, ranked. One row per issue, so the ranking is actionable rather tha
   there.
 - **The README's [Limits](README.md#limits) section is the companion to this one.** Limits states what is known
   and open about the shipped behavior. This file states what is planned about the project.
-- **Every open issue also sits under one parent epic.** The tier headings below name the parent that owns
-  their rows. A row names its own parent only where it differs from its tier's — three do.
+- **Every open issue sits under one parent epic, except where its row says it has none.** The tier headings
+  below name the parent that owns their rows.
 
 ## Tier 1 — Measurement
 
@@ -43,8 +43,13 @@ self-hosted box.
 
 What did not change: a session that configures neither still carries every payload in the clear, because both
 nonce halves cross the wire and whoever can read the payload could compute the key that hid it. That is stated
-where a reader will be standing — [docs/protocol.md](docs/protocol.md#two-regimes-and-which-one-you-are-in)
-and the README's Limits section — rather than as a backlog row. The parent can close.
+where a reader will be standing — [docs/protocol.md](docs/protocol.md#three-secret-regimes-and-which-one-you-are-in)
+and the README's Limits section — rather than as a backlog row.
+
+Two of the parent's exit conditions were unmet after its rows landed: a pinned join never completed, because
+the server seated the game secret alone while the client seated the fold with the exchange, and
+`docs/steam.md` still said OrbitNet encrypts nothing. Both are fixed; the server-shape probe now runs a
+secret-only join and a pinned join on every pull request. With those landed the parent can close.
 
 ## Tier 4 — Reach
 
@@ -62,6 +67,12 @@ Parent: [#105](https://github.com/crashtestbrandt/orbitnet/issues/105) `epic(rel
 [#106](https://github.com/crashtestbrandt/orbitnet/issues/106) `epic(perf)`, whose two items have now both
 landed.
 
+One row is open, and it has no parent epic:
+
+| Issue | What it is | Waits on |
+| --- | --- | --- |
+| [#149](https://github.com/crashtestbrandt/orbitnet/issues/149) | `step_coupled` does not shift the clock's offset window by the tick a slew adds or drops, the way `step_decoupled` shifts it by its stretch. A model shows reversed slews at a 120 Hz coupled rate, where the slew cooldown ends while half the window predates the slew; at 60 Hz the cooldown outlasts the window and nothing changes. | nothing |
+
 ## Recorded and not scheduled
 
 Positions the repository already argues for, each with its reasoning recorded beside the code it governs.
@@ -69,7 +80,7 @@ Listed so the roadmap is not read as a list of oversights.
 
 - **The interest grid stays unused.** It is written and tested and applies the same rules as the flat scan,
   and it is slower at the extents a session runs at. `net.perf`'s `interest_ms` is the number that would
-  reopen it (`docs/architecture.md:114`).
+  reopen it (`docs/architecture.md`, under the interest pass).
 - **Web is out.** Godot's web export cannot load a GDExtension at all, so no build matrix reaches it.
 - **An unauthenticated X25519 exchange is declined.** It is substituted by exactly the on-path attacker it
   would defend against, so it buys a demotion to passive-only and nothing more. That reason stands on its own:
