@@ -21,7 +21,8 @@ class_name BenchProbe
 ##   --bench-metrics=<path>      stream per-tick netcode metrics to a CSV + evaluate the gate on finish
 ##   --bench-record=<path>       record the body's per-tick input to a tape (capture a human/bot session as a fixture)
 ##   --bench-replay=<path>       replay a recorded tape through the body (takes precedence over --bench-bot)
-##   --bench-duration=<seconds>  after N seconds: finish metrics, save the tape, quit (0 = run until killed)
+##   --bench-duration=<seconds>  after N seconds: finish metrics, save the tape, quit (0 = run until killed). A client
+##                               still without an owned body N + SPAWN_GRACE_S seconds after attach fails as unseated
 ##   --bench-profile=<name>      the profile this client runs under (for the metrics RTT gate; default clean)
 ##
 ## Never present in shipped play (the flags are only set by tools/netbench). Server/dedicated peers wire it
@@ -43,6 +44,12 @@ var _finished: bool = false
 var _last_tick: int = -1   # gate record/replay to ONE step per net tick (cadence-consistent under the net/physics decouple)
 var _duration: float = 0.0
 var _timer_started: bool = false
+
+## Seconds past `--bench-duration`, counted from attach, before a client with no owned body gives up. A seated
+## client's body arrives within a second or two of connecting. `bench.sh` waits `--bench-duration` plus 25 s
+## after its last client connects, so a client that gives up at duration plus 20 still reports before the
+## harness stops waiting.
+const SPAWN_GRACE_S: float = 20.0
 
 ## Whether `--bench` was passed. The game calls this before constructing the probe, so a shipped build never
 ## builds bench machinery at all.
@@ -101,6 +108,8 @@ func _ready() -> void:
 		_quit_on_finish = true
 		_duration = duration
 		summary.push_back("duration=%.0fs (from first spawn)" % duration)
+		var spawn_wait: float = duration + SPAWN_GRACE_S
+		get_tree().create_timer(spawn_wait).timeout.connect(_on_spawn_deadline.bind(spawn_wait))
 
 	if not subject.subject_ready.is_connected(_on_subject_ready):
 		subject.subject_ready.connect(_on_subject_ready)
@@ -111,6 +120,16 @@ func _ready() -> void:
 
 func _on_subject_ready(_body: Node) -> void:
 	_maybe_start_timer()
+
+# A client with no owned body by the deadline was never seated. Its window would never start, so it finishes
+# here and fails the run on `BenchGate.evaluate_seated` rather than running until the harness kills it.
+func _on_spawn_deadline(waited_s: float) -> void:
+	if _timer_started or _finished:
+		return
+	print("BENCHPROBE: no owned body after %.0fs -- the session did not seat this client" % waited_s)
+	if _metrics != null:
+		_metrics.mark_unseated(waited_s)
+	_finish()
 
 # Start the measurement window on the FIRST owned-body spawn, not at _ready -- so --bench-duration is N
 # seconds of steady-state post-connect samples, not partly spent on bringup (a slow connect would otherwise

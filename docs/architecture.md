@@ -271,7 +271,10 @@ decode batches, AOI grid rebuild.
   in every run: by 16 to 29% at 12, 25 to 48% at 16 and 42 to 56% at 24. `DEFAULT_ASSEMBLY_POOL_PEERS` in
   `orbit_net.rs` carries the measurement, including the cells above 48 peers where it lost.
 - **End to end on the netbench runner.** Measured through `bench.sh` on the self-hosted runner `netbench.yml`
-  pins: `arena`, `congested_wifi`, seed 1, 60 s, a `template_debug` build. Figures are `assembly_ms` at the stated synced-peer count, two rounds each.
+  pins: `arena`, `congested_wifi`, seed 1, 60 s, a `template_debug` build. Figures are `assembly_ms` at the
+  stated synced-peer count, two rounds each. Every client held two seats in two arenas, as the arena seated
+  every connection before it honoured a client's seat request. A single-seat client's interest set is half
+  that size: 105 entities against 210.
 
   | Peers | `assembly_pool_peers=0` | Default (12) | Saving |
   | --- | --- | --- | --- |

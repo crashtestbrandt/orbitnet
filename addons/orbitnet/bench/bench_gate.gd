@@ -198,6 +198,21 @@ static func evaluate_orientation_arm(r: Result, armed: bool, smooths: int, misse
 ## Report how often remote bodies' poses actually reached this client. INFORMATIONAL, and read the NEAR
 ## figure: the far band is what interest management is supposed to make sparser, so pooling the two reports a
 ## working cull as a regression. See [RemoteCadence] for why the reading is biased LONG and never short.
+## Whether the session gave this client a body to measure.
+##
+## - A client the session never seated has no owned body: every seat was taken, or it was admitted as an
+##   observer. It still samples the link, so every other gate can pass on a run that drove nothing.
+## - `BenchProbe` starts the measurement window on the first owned-body spawn. With no body it calls this
+##   with `seated` false once `waited_s` has passed, and the client finishes rather than running until the
+##   harness kills it.
+static func evaluate_seated(r: Result, seated: bool, waited_s: float) -> Result:
+	if seated:
+		r._record(true, "seated: the session gave this client an owned body")
+	else:
+		r._record(false, ("no owned body within %.0fs: the session did not seat this client " % waited_s)
+			+ "(every seat taken, or admitted as an observer)")
+	return r
+
 static func evaluate_remote_cadence(r: Result, cadence: RemoteCadence) -> Result:
 	var near: Array[int] = cadence.near_gaps()
 	if near.is_empty() and cadence.far_gaps().is_empty():

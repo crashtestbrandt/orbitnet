@@ -23,6 +23,11 @@ class_name ArenaNet
 ##      when the socket comes up, which is BEFORE the OrbitNet handshake -- so the peer's SESSION IDENTITY is
 ##      not known yet, and identity is the only thing that can tell a returning player from a newcomer.
 ##
+## **A client asks for its seats.** It sends `wanted_seats` and `spread_seats` through `_seat_request` when its
+## transport comes up, and the server seats it once both that request and `Net.peer_joined` have arrived, in
+## either order (`SeatRequests`). A client that never asks gets one seat after `SEAT_REQUEST_WAIT_S`. One seat
+## per connection is the ordinary case, so a fleet of single-seat clients fills every seat.
+##
 ## THE LAG-COMPENSATION ESTIMATES ARE FED FROM HERE, AND THE ADDON DOES NOT DO IT FOR YOU. `NetLagComp` holds
 ## static state a game owns; the backend has no reason to write it, because a game with no rewind never reads
 ## it. Two refreshes per tick on the authority -- the per-peer cadence and the per-band one -- and both are
@@ -61,7 +66,8 @@ var observer: ObserverDesk = ObserverDesk.new()
 ## the SESSION -- what this connection is being sent -- and every view that wants it wants the same answer.
 var interest_log: InterestLog = InterestLog.new()
 
-## How many seats this peer asks for, and whether it wants them in different arenas. Read at join time.
+## How many seats this peer asks for, and whether it wants them in different arenas. A client sends both to the
+## server when its transport comes up; a host or offline peer reads them when it seats itself.
 var wanted_seats: int = 1
 var spread_seats: bool = false
 var props_per_arena: int = -1
@@ -73,6 +79,13 @@ var _observing: bool = false
 ## SERVER-SIDE: the peers currently observing, and the identities seen to drop with their session held.
 var _observers: Dictionary[int, bool] = {}
 var _held_sessions: Dictionary[int, bool] = {}
+## SERVER-SIDE: what each connection asked for, and whether it has been seated yet.
+var _seat_requests: SeatRequests = SeatRequests.new()
+
+## How long the server waits for a joined client's seat request before seating it with one fighter. The request
+## rides the reliable channel and normally arrives before the handshake completes; this covers a lossy link's
+## retransmits, and a client that never asks.
+const SEAT_REQUEST_WAIT_S: float = 3.0
 
 func _init() -> void:
 	# Named at construction: the roster RPC below routes by node path, so this node's name is part of the wire
@@ -186,6 +199,7 @@ func leave() -> void:
 	roster.clear()
 	_observers.clear()
 	_held_sessions.clear()
+	_seat_requests.clear()
 	_observing = false
 	observer.forget_sent()
 	# Static state on classes the PROCESS shares, not the session. The ring would otherwise answer has_tick()
@@ -256,11 +270,37 @@ func _connect_peer_signals() -> void:
 func _on_net_peer_joined(peer: int, session_id: int, resumed_from: int) -> void:
 	if not Net.is_server():
 		return
+	if _seat_requests.note_joined(peer, session_id, resumed_from):
+		_seat(peer)
+		return
+	get_tree().create_timer(SEAT_REQUEST_WAIT_S).timeout.connect(_on_seat_request_timeout.bind(peer))
+
+## CLIENT -> SERVER, once, when the transport comes up. `any_peer` because every client calls it; the sender
+## id is read from the multiplayer layer rather than taken from the payload.
+@rpc("any_peer", "call_remote", "reliable")
+func _seat_request(count: int, spread: bool) -> void:
+	if not Net.is_server():
+		return
+	var peer: int = multiplayer.get_remote_sender_id()
+	if _seat_requests.note_request(peer, count, spread):
+		_seat(peer)
+
+func _on_seat_request_timeout(peer: int) -> void:
+	if _seat_requests.take_default(peer):
+		print("ARENA: peer %d sent no seat request -- seating it with %d" % [peer, SeatRequests.DEFAULT_SEATS])
+		_seat(peer)
+
+## SERVER-SIDE. Seat a connection that has both joined and said what it wants. Runs once per connection.
+func _seat(peer: int) -> void:
+	_seat_requests.mark_seated(peer)
+	var session_id: int = _seat_requests.session_id(peer)
+	var resumed_from: int = _seat_requests.resumed_from(peer)
 	# THE CONSERVATIVE RULE, and it is one line: an identity is worth seats back only if this layer watched
 	# that identity leave. `resumed_from` alone is the backend saying "somebody claimed this before", which a
 	# forger can also make true.
 	var reclaim: int = session_id if _held_sessions.has(session_id) else SeatRoster.NO_SESSION
-	var seats: PackedInt32Array = roster.assign(peer, ArenaConfig.MAX_SEATS_PER_PEER, reclaim, true)
+	var seats: PackedInt32Array = roster.assign(
+		peer, _seat_requests.count(peer), reclaim, _seat_requests.spread(peer))
 	if seats.is_empty():
 		# Every seat taken -- so this peer OBSERVES. Refusing used to be the only honest answer to a seatless
 		# peer, because it had no body, therefore no interest center, therefore no filter. Declaring its
@@ -290,6 +330,7 @@ func _on_net_peer_dropped(peer: int, session_id: int, held: bool) -> void:
 	# retract -- only this layer's own bookkeeping to forget. The cadence measured about it describes a link
 	# that no longer exists, and peer ids are reused.
 	_observers.erase(peer)
+	_seat_requests.forget(peer)
 	NetLagComp.forget_peer_interp(peer)
 	if world != null:
 		world.forget_peer(peer)
@@ -319,6 +360,7 @@ func _on_net_session_expired(session_id: int, peer: int) -> void:
 func _on_connected_to_server() -> void:
 	_set_state(State.PLAYING)
 	print("ARENA: connected as peer %d" % multiplayer.get_unique_id())
+	_seat_request.rpc_id(SeatRoster.SERVER_PEER, wanted_seats, spread_seats)
 
 func _on_connection_failed() -> void:
 	_fail("connection failed")
@@ -403,7 +445,7 @@ func _apply_observe(peer: int, on: bool, entity_id: int, point: Vector3, arena_i
 		_observers.erase(peer)
 		Net.clear_peer_anchor(peer)
 		var seats: PackedInt32Array = roster.assign(
-			peer, ArenaConfig.MAX_SEATS_PER_PEER, Net.peer_session_id(peer), true)
+			peer, _seat_requests.count(peer), Net.peer_session_id(peer), _seat_requests.spread(peer))
 		if seats.is_empty():
 			# Somebody took the seats while this peer watched. It stays a spectator rather than being
 			# disconnected: it asked to play, not to leave.

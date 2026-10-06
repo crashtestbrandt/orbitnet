@@ -61,6 +61,10 @@ MARGIN = 4.0
 # with the admission cursor stepping once per block. The nightly's runs before that fix are not a series: their
 # servers panicked about 700 times a run and dropped the rest of each panicking frame. Replace a row with a
 # longer series when one exists.
+#
+# Every client in these series held two seats in two arenas, as the arena seated every connection before it
+# honoured a client's seat request. A single-seat client's interest set is half that size. Two single-seat runs
+# on `congested_wifi`, at 4 and 14 clients, read 0.000 per peer-second, inside every threshold here.
 _VM = "3 runs on a 4-core Linux VM, 4 clients, arena, strafe_fire, seeds 1-3, 25 s"
 SERIES: dict[str, tuple[float, int, str]] = {
     "clean": (0.024, 3, _VM),
