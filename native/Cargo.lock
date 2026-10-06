@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "orbitnet-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chacha20poly1305",
  "proptest",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "orbitnet-godot"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "godot",
  "libc",
