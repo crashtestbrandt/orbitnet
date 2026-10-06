@@ -68,6 +68,8 @@ tickrate=30
 ; than by slot count.
 history_limit=128
 max_time_stretch=1.05
+; Measurement branch only: the worker pool switched off, for a pool-on against pool-off netbench pair.
+assembly_pool_peers=0
 
 [physics]
 
