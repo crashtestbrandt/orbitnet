@@ -254,13 +254,32 @@ decode batches, AOI grid rebuild.
   the main thread, and assembly reads the plain data the binding lends out: the state ring, the property list
   and the tick (`sync::BlockSource`). The transport handover stays on the main thread, after assembly.
 - **Why once per flush.** Binding at each encode binds once per candidate tried per peer, and every unchanged
-  state channel is tried. A bind measured about 7.7 µs in a `template_debug` build, where gdext runs its
-  strict checks, and 0.15 µs in `template_release`. In a live session of 315 entities and 11 peers, the send
-  path went from 18.9 to 3.4 ms a flush in a debug build and from 1.6 to 1.0 ms in release, on one thread.
+  state channel is tried.
+- **What a bind costs depends on the host.** A bind is cheap in `template_release` and goes through gdext's
+  strict checks in `template_debug`. Measured in one 315-entity session, at one synced peer:
+
+  | Host | Build | Binding | Whole flush |
+  | --- | --- | --- | --- |
+  | 4-core Linux VM | `template_release` | 0.05 ms (about 0.15 µs per bind) | 0.30 ms |
+  | 4-core Linux VM | `template_debug` | 2.5 ms (about 7.7 µs per bind) | 2.8 ms |
+  | the self-hosted runner `netbench.yml` pins | `template_debug` | not measured on its own | 0.10 ms |
+
+  On that VM at 11 peers, binding once per flush took the single-threaded send path from 18.9 to 3.4 ms a
+  flush in a debug build, and from 1.6 to 1.0 ms in release.
 - **What the split costs.** In the measurement fixture, single-threaded assembly is about 30 µs per peer and
   waking the pool costs 80 to 100 µs a flush, so at 8 peers no split helps. From 12 to 32 peers the split won
   in every run: by 16 to 29% at 12, 25 to 48% at 16 and 42 to 56% at 24. `DEFAULT_ASSEMBLY_POOL_PEERS` in
   `orbit_net.rs` carries the measurement, including the cells above 48 peers where it lost.
+- **End to end on the netbench runner.** Measured through `bench.sh` on the self-hosted runner `netbench.yml`
+  pins: `arena`, `congested_wifi`, seed 1, 60 s, a `template_debug` build. Figures are `assembly_ms` at the stated synced-peer count, two rounds each.
+
+  | Peers | `assembly_pool_peers=0` | Default (12) | Saving |
+  | --- | --- | --- | --- |
+  | 12 | 0.49 / 0.48 ms | 0.33 / 0.36 ms | 25–33% |
+  | 24 | 0.68 / 0.75 ms | 0.41 / 0.50 ms | 33–40% |
+
+  - Below 12 peers the two settings measure the same.
+  - `compare.py` reads every wire column of the 12-peer pair as unchanged. Server egress per peer moved 0.5%.
 - **How it splits.** At least 3 peers per thread and at most 4 threads, the main thread included. The threads
   persist across flushes, because spawning them per flush measured 60 to 100 µs slower.
 - **The same bytes either way.** Peers are split into contiguous chunks and the results are folded in chunk

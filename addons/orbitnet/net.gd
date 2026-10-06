@@ -1668,7 +1668,8 @@ func _backend_has(method: StringName) -> bool:
 ##   assembly_ms                    -- ms per flush spent assembling every peer's snapshot frames: binding each
 ##                                     entity, then ordering, admission, encoding and sealing. The handover to
 ##                                     the transport is not in it. The phase orbitnet/assembly_pool_peers splits
-##                                     across threads. In a template_debug build the binding is most of it.
+##                                     across threads. In a template_debug build the binding's share depends
+##                                     on the host; docs/netbench.md has the figures.
 ##   assembly_pooled                -- fraction of the window's flushes whose assembly ran on several threads:
 ##                                     0.0 all on the main thread, 1.0 all pooled. Read it beside assembly_ms.
 ##   interarrival_near/mid/far      -- mean ticks between admissions per distance band. The evidence S6 demanded

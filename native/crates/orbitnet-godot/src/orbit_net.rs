@@ -496,8 +496,8 @@ struct BandwidthMetrics {
     /// main thread whatever [`OrbitNet::assembly_pool_peers`] says. The phase the pool splits.
     assembly_ms: f64,
     /// Fraction of the window's flushes whose assembly was split across threads: `0.0` all on the
-    /// main thread, `1.0` all pooled. **The verdict, reported** -- read it beside `assembly_ms` to
-    /// know which path that figure is the cost of.
+    /// main thread, `1.0` all pooled. It says which path ran; read it beside `assembly_ms` to know
+    /// which path that figure is the cost of.
     assembly_pooled: f64,
     /// Mean ticks between admissions, per distance band. The evidence to demand before rate
     /// tiering may be turned on: it says whether the far band is genuinely far.
@@ -8732,6 +8732,9 @@ const MAX_ASSEMBLY_THREADS: usize = 4;
 ///   cell most exposed to a stolen core, so a dedicated host should see fewer of those.
 /// - Spawning threads per flush instead of keeping them measured 60 to 100 µs per flush more, and
 ///   started every flush on a cold allocator, which is why the threads persist.
+/// - End to end through `bench.sh` on the self-hosted runner `netbench.yml` pins, a `template_debug` build,
+///   two rounds each: `assembly_ms` fell 25 to 33% at 12 synced peers and 33 to 40% at 24.
+///   `docs/architecture.md` has the table.
 const DEFAULT_ASSEMBLY_POOL_PEERS: i32 = 12;
 
 /// How many threads assemble this flush's frames, the calling thread included. `1` is the
