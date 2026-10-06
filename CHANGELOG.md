@@ -17,7 +17,7 @@ Two version numbers move here and each answers a different question.
 
 | Version | Date | Protocol major | Coordinated upgrade forced |
 | --- | --- | --- | --- |
-| [Unreleased](#unreleased) | — | 9 | yes, against every earlier release |
+| [0.5.0](#050--2026-10-06) | 2026-10-06 | 9 | yes, against every earlier release |
 | [0.4.0](#040--2026-09-17) | 2026-09-17 | 8 | the major did not move |
 | [0.3.1](#031--2026-09-16) | 2026-09-16 | 8 | the major did not move |
 | [0.3.0](#030--2026-08-26) | 2026-08-26 | 8 | yes, against 0.2.x |
@@ -58,11 +58,11 @@ Subsection order within a release, omitting any that is empty: **Breaking**, **A
 consumer calls or sends. It is a short summary of the areas that moved, never a list of merged titles; the
 release page already carries those.
 
-## Unreleased
+## 0.5.0 — 2026-10-06
 
-**Protocol major 9**, up from 8. Every earlier release speaks an older major, so a peer on one and a
-current peer refuse each other's handshake. Two `Net` calls changed what they do or report, two `NetLagComp`
-members are parse-time breaks, and the per-second counters every bench reads moved; each is listed under
+[Release page](https://github.com/crashtestbrandt/orbitnet/releases/tag/v0.5.0). **Protocol major 9**, up
+from 8. Every earlier release speaks an older major, so a peer on one and a current peer refuse each other's
+handshake. Two `Net` calls changed what they do or report, two `NetLagComp` members are parse-time breaks, and the per-second counters every bench reads moved; each is listed under
 Breaking. A game that configures no secret and reads no counters needs no edit — the extra round trip is
 inside the addon, and the join stays a `Net` call.
 

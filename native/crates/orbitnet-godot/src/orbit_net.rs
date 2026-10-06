@@ -10345,7 +10345,7 @@ fn offered_static_key<'a>(
 /// an injected rekey: under a pin alone the server authenticates nothing about the joiner, so a party
 /// that can inject on the path runs a fresh exchange with an ephemeral of its own, confirms over the
 /// fold it can compute, and rekeys the connection onto a key it holds. A session secret is what
-/// refuses that, as the README's Limits section records. A client that restarts its session unpinned
+/// refuses that, as `docs/protocol.md`'s regime table records. A client that restarts its session unpinned
 /// on a live connection to a server holding a static key is refused by this rule until that
 /// connection drops.
 #[must_use]
