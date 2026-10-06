@@ -197,3 +197,6 @@ Apache-2.0 / BSD / MPL-2.0 needs a conversation first.
   [CHANGELOG.md](CHANGELOG.md#format-and-how-an-entry-is-added).
 - CI runs on GitHub-hosted runners with `pull_request`, so a fork PR gets no secrets and needs no approval to
   run.
+- A PR that changes only documentation (`docs/`, the root Markdown files, the templates under `.github/`)
+  runs the `gates` job and skips the Rust and Godot jobs. `tools/ci-changes.sh` records the rule, and any
+  doubt runs everything.

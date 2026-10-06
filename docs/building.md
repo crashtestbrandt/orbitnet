@@ -105,7 +105,7 @@ reasons:
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `check.yml` | every PR and push | Builds both descriptor profiles for Linux, confirms each is a real ELF object, and runs every gate against them. |
+| `check.yml` | every PR and push | Classifies the diff, then builds both descriptor profiles for Linux, confirms each is a real ELF object, and runs every gate against them. A change to documentation alone runs the `gates` job and skips the other two; `tools/ci-changes.sh` records the rule. |
 | `binaries.yml` | push to main touching `native/**` | Builds both descriptor profiles on every platform leg, uploads them as **artifacts**. The Windows and macOS legs then run the load smoke and the four unit suites against what they just built. |
 | `release.yml` | a `v*` tag | Builds all three profiles on every platform leg, publishes the binaries and the AssetLib zip as Release assets, stamps the version, and commits the manifest. |
 
@@ -377,6 +377,11 @@ runner**: a fork PR can modify the workflow file, and the runner would execute i
 filesystem and credentials. Every workflow uses `pull_request` rather than `pull_request_target`, so a fork PR
 gets no secrets and no write token. The cost is installing Godot and Rust per job, which the caches make
 cheap.
+
+A change to documentation alone runs the `gates` job and nothing else. `gates` classifies the diff as its
+first step, and the `native` and `godot` jobs run only on code. `tools/ci-changes.sh` records what counts as
+documentation, that a licence file or the addon's own `README.md` does not, and that any doubt counts as
+code.
 
 `native/` carries an empty `.gdignore`. Inert here — the root is not a Godot project — but it means that if
 anyone does open the root as one, a 10k-LOC cargo workspace is not scanned as game content, and it keeps a
