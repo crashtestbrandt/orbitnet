@@ -26,6 +26,20 @@ THE VERDICT IS ADVISORY. `--tolerance` (default 5%) decides which deltas print a
 than as noise, and the exit code follows the regressions -- but the right tolerance depends on the machine and
 the fleet size, so read the table when the two disagree.
 
+**The 5% default is set from runs of one build compared with each other**, on the self-hosted runner
+`netbench.yml` pins, after the admission-cursor fix:
+
+| Fleet | Same-build pairs | Worst move on a judged byte column | False verdicts at 5% |
+| --- | --- | --- | --- |
+| 4 clients, 25 s | 12 | 2.2% (server egress per peer) | 0 |
+| 12 clients, 60 s | 2 | 1.7% (server egress per peer) | 0 |
+| 24 clients, 60 s | 2 | 0.6% (client ingress) | 0 |
+
+- 5% is a little over twice the worst move measured, so a same-build re-run reads `same` throughout.
+- **On a host with fewer cores than the fleet needs**, a client starved of CPU sends variable input
+  redundancy. On a 4-core VM at 12 clients, client upstream bytes (`tx_*` in the client table) moved 7 to 16%
+  between runs of one build. Compare those at a wider `--tolerance` there, or read the server table.
+
 A RELATIVE TOLERANCE IS NOT ENOUGH ON ITS OWN. The per-frame CPU timers are sub-millisecond, so 5% of them is
 smaller than the spread between two runs of one binary; those columns carry an absolute floor as well. See
 `NOISE_FLOOR_ABS`.
@@ -84,10 +98,10 @@ HIGHER_IS_BETTER = {
 
 # AN ABSOLUTE FLOOR FOR COLUMNS WHOSE OWN REPEATABILITY IS WORSE THAN THE TOLERANCE.
 #
-# The per-frame CPU timers sit near 0.02-0.03 ms, where a 5% relative test is 0.001 ms -- below the spread
-# two runs of the SAME BINARY on the same seed produce. Measured, rather than assumed: back-to-back runs of
-# one commit moved `rollback_ms` +11.5% and `net_ms` +10.0%, and both printed REGRESSED — so every verdict
-# on these columns was untrustworthy without a floor.
+# The per-frame CPU timers sit near 0.02-0.05 ms, where a 5% relative test is 0.001 to 0.0025 ms, below the
+# spread two runs of the same build produce. Measured on the netbench runner: same-build pairs moved
+# `rollback_ms` up to 7.5% and `net_ms` up to 5.9%, while the largest absolute move was 0.003 ms. On a 4-core
+# VM at 12 clients the largest was 0.016 ms. The floor is above every one of them.
 #
 # The floor is the smaller of "what the machine can resolve" and "what a player could feel": 0.05 ms is
 # 0.15% of a 33 ms tick, so a move under it is not a regression whatever the ratio says. Columns absent
