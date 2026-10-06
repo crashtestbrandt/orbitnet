@@ -80,16 +80,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `${VAR:+...}` expands to nothing while the variable is unset. The earlier `${CARGO_HOME:-}/bin`
+          # expanded to `/bin` -- a directory every host has -- and the search stopped there before
+          # `$HOME/.cargo/bin` was tried, so this step found a toolchain only on a box where rustup was
+          # already on the service's PATH. PATH is also extended for THIS step: `$GITHUB_PATH` reaches the
+          # next step, and the `command -v cargo` below runs in this one.
           for dir in \
             "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
-            "${CARGO_HOME:-}/bin" \
-            "${USERPROFILE:-}/.cargo/bin" \
+            "${CARGO_HOME:+$CARGO_HOME/bin}" \
+            "${USERPROFILE:+$USERPROFILE/.cargo/bin}" \
             "$HOME/.cargo/bin"
           do
             [ -n "$dir" ] && [ -d "$dir" ] || continue
             echo "-- $dir"
             ls -l "$dir" || true
-            case ":$PATH:" in *":$dir:"*) ;; *) echo "$dir" >> "$GITHUB_PATH" ;; esac
+            case ":$PATH:" in *":$dir:"*) ;; *) echo "$dir" >> "$GITHUB_PATH"; PATH="$dir:$PATH" ;; esac
             break
           done
           if ! command -v cargo >/dev/null 2>&1; then
@@ -331,7 +336,12 @@ jobs:
 
   publish:
     needs: build
-    runs-on: [self-hosted, Linux, X64, legion]
+    # PINNED TO ONE BOX, the way netbench.yml and constant-time.yml are. `legion` is a pool of two Linux
+    # boxes since the timing jobs moved off it, and this job needs more of a box than a build leg does: a
+    # Godot it can download and run headless for the zip boot, python3, curl and sha256sum. Those were set
+    # up and exercised on quasitop; the second box has only ever run build legs. A tag run that lands here
+    # on an unprepared box cannot be re-pushed, so the job runs where it has run.
+    runs-on: [self-hosted, Linux, X64, quasitop]
     permissions:
       contents: write        # create the release, and push the manifest branch
       pull-requests: write   # main is protected, so the manifest arrives as a PR

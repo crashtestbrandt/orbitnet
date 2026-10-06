@@ -101,13 +101,18 @@ looks like from each side.
 
 ## What each transport authenticates and encrypts
 
-**OrbitNet encrypts nothing on any transport.** Its datagram layer authenticates; confidentiality, where a
-session has any, comes from the link underneath it and differs per transport.
+**OrbitNet's datagram layer authenticates on every transport, and it encrypts under two of its three secret
+regimes.** With neither a session secret nor a pinned server key configured, which is the default, every
+payload is in the clear and confidentiality comes from the link underneath, which differs per transport. With
+a session secret, or with a client that pinned the server's static key, every payload is ChaCha20-Poly1305
+ciphertext on every transport — see
+[protocol.md](protocol.md#three-secret-regimes-and-which-one-you-are-in).
 
 | Transport | What is authenticated | What is encrypted | By whom |
 | --- | --- | --- | --- |
-| **ENet** | every datagram but the handshake, by a 64-bit SipHash tag and a 64-entry replay window. Nothing about the peer behind the connection. | nothing. Every payload is raw UDP in the clear | OrbitNet's datagram layer, with nothing under it |
-| **Steam** | the same datagram tag, and the connection itself — each end presents a certificate signed by Valve's PKI, so a verified Steam identity is attached to the peer before a payload flows | every packet — AES-GCM-256, keyed by a Curve25519 exchange | OrbitNet for the datagram, SteamNetworkingSockets for the connection |
+| **ENet**, the default regime | every datagram but the handshake and the challenge, by a 64-bit SipHash tag and a 64-entry replay window. Nothing about the peer behind the connection. | nothing. Every payload is raw UDP in the clear | OrbitNet's datagram layer, with nothing under it |
+| **ENet**, with a session secret or a pinned server key | the same datagrams, by a 128-bit Poly1305 tag; with a pin, the server to the client as well | every payload — ChaCha20-Poly1305 under a key derived from the secret, the exchange's output, or both | OrbitNet's datagram layer |
+| **Steam**, any regime | OrbitNet's datagram tag as above, and the connection itself — each end presents a certificate signed by Valve's PKI, so a verified Steam identity is attached to the peer before a payload flows | every packet — AES-GCM-256, keyed by a Curve25519 exchange — and, under a secret or a pin, OrbitNet's own cipher inside it | OrbitNet for the datagram, SteamNetworkingSockets for the connection |
 
 **Every Steam row above rests on Valve's documentation, and none of it is exercised in this repository's
 CI.** Each claim is cited below. See [Testing without Steam](#testing-without-steam) for what confirming it
@@ -142,17 +147,21 @@ What Valve's own documentation supports, read 2026-09-24:
 
 ### What a game inherits and what it configures
 
-- **Confidentiality on Steam is inherited.** The game writes no code for it and OrbitNet contributes nothing
-  to it. The same session exported without Steam puts every payload back in the clear.
+- **Confidentiality on Steam is inherited.** The game writes no code for it. The same session exported
+  without Steam carries every payload in the clear unless a session secret or a pinned server key is
+  configured.
 - **The transport is chosen by an export preset.** `NetTransport.preferred_kind()` returns
   `STEAM` when `OS.has_feature("steam")` trips, which is the `custom_features="steam"` tag on the preset. No
   line of game code differs between the two builds, so a preset missing that tag ships a build with no link
   encryption that reads identically everywhere in the source.
-- **What a game configures on every transport is `Net.set_session_secret()`**, and it buys unforgeability
-  rather than confidentiality. See [Where a session secret comes from](#where-a-session-secret-comes-from).
-- **Encrypting OrbitNet's own payloads would buy confidentiality on the ENet path only.** On a Steam link it
-  restates a property the connection already has. The Encryption tier in [ROADMAP.md](../ROADMAP.md) is
-  scoped to the ENet path for that reason, and says why its order does not move.
+- **What a game configures on every transport is a session secret or a pinned server key**, and either buys
+  both unforgeability and confidentiality on OrbitNet's own layer. See
+  [Where a session secret comes from](#where-a-session-secret-comes-from) and the facade's documentation of
+  `Net.set_pinned_server_key()` for the regime that needs no shared secret.
+- **On a Steam link OrbitNet's cipher restates a property the connection already has.** It costs the same
+  there as anywhere, 8 bytes and about a microsecond per full-size datagram, and it keeps a payload from a
+  party that holds the Steam connection's keys and not the session's. The Encryption tier in
+  [ROADMAP.md](../ROADMAP.md) has landed; what it did not change is recorded there.
 
 ## Testing without Steam
 

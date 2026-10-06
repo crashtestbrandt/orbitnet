@@ -161,9 +161,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # `${VAR:+...}`, not `${VAR:-}/bin`: the latter expanded to `/bin` while CARGO_HOME was unset,
+          # and the search stopped at a directory every host has before trying `$HOME/.cargo/bin`.
           for dir in \
             "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
-            "${CARGO_HOME:-}/bin" \
+            "${CARGO_HOME:+$CARGO_HOME/bin}" \
             "$HOME/.cargo/bin"
           do
             [ -n "$dir" ] && [ -d "$dir" ] || continue

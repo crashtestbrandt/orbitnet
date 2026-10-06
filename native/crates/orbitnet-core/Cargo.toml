@@ -18,8 +18,8 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 #
 # What that changes. An AEAD or a key exchange is ordinary work against a reviewed implementation, where it
 # used to cost several hundred lines of hand-written constant-time field arithmetic in a crate whose only
-# constant-time groundwork is a ten-line tag compare. That cost was the argument for declining X25519, and the
-# argument was the rule. The exchange below is the first item to be built that way.
+# constant-time groundwork is a ten-line tag compare. That cost was the reason X25519 was declined, and the
+# rule recorded that reason. The exchange below is the first item built against a reviewed implementation.
 #
 # What a dependency here has to clear. A runtime dependency ships inside every export, which the
 # `[dev-dependencies]` entry below does not, so it answers for more:
@@ -37,8 +37,8 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # under the rule and why it does not need replacing now the rule is gone.
 [dependencies]
 # The **payload cipher**: ChaCha20-Poly1305 (RFC 8439), which `auth.rs` runs over every datagram of a
-# session that configured a secret. The first runtime dependency this crate has taken, against the four
-# points above:
+# session that configured a secret or pinned a server key. The first of this crate's two runtime
+# dependencies, against the four points above:
 #
 #   * **Licence.** `Apache-2.0 OR MIT`, and so is every one of the thirteen crates it pulls. Their
 #     `THIRD_PARTY.md` rows land in the same commit.
@@ -59,8 +59,8 @@ description = "OrbitNet core — engine-agnostic rollback netcode primitives"
 # platform-backend crates `getrandom` would add out of the tree entirely.
 chacha20poly1305 = { version = "0.11", default-features = false }
 
-# X25519, for the authenticated key exchange in `auth.rs`. The first entry in this list, and it clears the
-# four points above:
+# X25519, for the authenticated key exchange in `auth.rs`. The second runtime dependency, landed in the pull
+# request after the cipher's, and it clears the four points above:
 #
 #   * BSD-3-Clause, and so is everything it pulls that is not MIT / Apache-2.0. `THIRD_PARTY.md` carries the
 #     rows.
@@ -68,7 +68,7 @@ chacha20poly1305 = { version = "0.11", default-features = false }
 #     arithmetic over a 255-bit prime -- roughly 400 lines here, none of it reviewable by anyone working on
 #     this repository, in a crate whose only constant-time groundwork is a ten-line tag compare.
 #     `tests/constant_time.rs` covers that compare and says in its own header that arithmetic written later
-#     needs its own coverage. This is the case the settled rule was settled for.
+#     needs its own coverage. This is the case the dependency rule above exists for.
 #   * The test run stays in milliseconds; what this costs is a one-off build. `curve25519-dalek` carries a
 #     build script (`rustc_version` -> `semver`) that picks its arithmetic backend from the target, and on
 #     **x86-64 only** it also pulls the `curve25519-dalek-derive` proc-macro and `cpufeatures` for the simd

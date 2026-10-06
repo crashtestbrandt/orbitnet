@@ -86,8 +86,10 @@ run_shape() {
 	sleep 3   # let the server bind and start listening before the client dials
 
 	echo "server-shape-probe: joining the $label server..."
+	# The run's extra flags reach the client as well as the server: the regime flags (`--secret=`, `--pin`,
+	# `--key-file=`) have to be set on both ends, and the server-only veto is ignored by a client.
 	ORBITNET_DEBUG=1 "$GODOT" --headless --path "$PROJECT" "$SCENE" -- \
-		--role=client --shape="$shape" --address=127.0.0.1 --port="$port" --run="$CLIENT_RUN_S" \
+		--role=client --shape="$shape" --address=127.0.0.1 --port="$port" --run="$CLIENT_RUN_S" "$@" \
 		>"$CLIENT_LOG" 2>&1 &
 	CLIENT_PID=$!
 
@@ -137,12 +139,21 @@ run_shape listen listen "$((BASE_PORT + 1))"
 # back FAIL with a flat reading. A pass here would mean the two runs above cannot see a channel that delivered
 # nothing, which is the only way this gate can be green and worthless at the same time.
 run_shape veto dedicated "$((BASE_PORT + 2))" --veto-own-status
+# The two secret regimes, on the dedicated shape, judged by the same assertion as the plain runs. A session
+# secret seats the payload cipher on both ends; a pinned server key runs the X25519 exchange and seats the
+# cipher under its output. Each must deliver rows exactly as the plain run does. A pinned join that never
+# completes -- which shipped once, when the server seated the game secret alone while the client seated the
+# fold with the exchange -- reads here as a client whose own channel never rises, and fails below.
+run_shape secret dedicated "$((BASE_PORT + 3))" --secret=shape-probe-secret
+KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/shapeprobe-pin.XXXXXX")"
+run_shape pinned dedicated "$((BASE_PORT + 4))" --pin --key-file="$KEY_FILE"
+rm -f "$KEY_FILE"
 
 ok=1
 fail() { echo "server-shape-probe: $1"; ok=0; }
 value() { printf '%s' "${REPORT[$1]:-?}"; }
 
-for shape in dedicated listen; do
+for shape in dedicated listen secret pinned; do
 	case "$(value "$shape.server_verdict")" in
 		PASS) ;;
 		*) fail "the $shape SERVER did not PASS (${REPORT[$shape.server_verdict]:-no verdict at all})";;
@@ -175,7 +186,7 @@ done
 # makes any single run mean anything: three runs, one scenario, one table.
 printf '\n%-10s %-5s %-9s %-9s %-10s %-11s %-12s %-9s %-9s %-10s %-11s %-9s\n' \
 	run seat own_first own_last own_rises other_last other_rises body_own own_sims other_sims rx_skipped admitted
-for shape in dedicated listen veto; do
+for shape in dedicated listen veto secret pinned; do
 	printf '%-10s %-5s %-9s %-9s %-10s %-11s %-12s %-9s %-9s %-10s %-11s %-9s\n' \
 		"$shape" "$(value "$shape.seat")" "$(value "$shape.own_first")" "$(value "$shape.own_last")" \
 		"$(value "$shape.own_rises")" "$(value "$shape.other_last")" "$(value "$shape.other_rises")" \
@@ -210,8 +221,8 @@ fi
 
 # A cull is a deliberate withholding and a starve is not, so a run that culled anything is not evidence about
 # either. The radius the scenario sets is orders of magnitude larger than the world, so this should be 0.00 --
-# on the two real shapes. The negative control culls by construction, which is what a veto is.
-for shape in dedicated listen; do
+# on the real shapes. The negative control culls by construction, which is what a veto is.
+for shape in dedicated listen secret pinned; do
 	culled="$(value "$shape.culled")"
 	case "$culled" in
 		0|0.00|?) ;;
@@ -222,7 +233,7 @@ done
 
 if [ "$ok" -eq 1 ]; then
 	echo "server-shape-probe PASSED (both server shapes delivered a rising state-lane tick to a joining client,
-       and the vetoed control did not)."
+       so did a session-secret join and a pinned-key join, and the vetoed control did not)."
 	exit 0
 fi
 echo "server-shape-probe FAILED."

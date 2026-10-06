@@ -401,6 +401,8 @@ func _on_pre_tick(tick: int) -> void:
 	if tick >= _total_ticks():
 		_report()
 		return
+	# Untyped on purpose: `InputTape.frame_at` hands back the row as the tape stored it, and the
+	# `BenchSubject` field readers below are what narrow each value.
 	var frame: Dictionary = _tape.frame_at(tick)
 	_body.input.nin_move = BenchSubject.vec3_field(frame, BenchSubject.KEY_TRANSLATE)
 	_body.input.nin_turn = BenchSubject.vec3_field(frame, BenchSubject.KEY_ROTATE).y

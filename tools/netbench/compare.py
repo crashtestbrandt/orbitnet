@@ -69,6 +69,7 @@ import csv
 import math
 import os
 import sys
+import tempfile
 
 # Columns worth judging, and which direction is better. A column absent from these tables is printed with its
 # delta and no verdict, because a number nobody can say the sign of is not a gate.
@@ -478,8 +479,59 @@ def self_test() -> int:
         print(f"FAIL server rows: two ramps of one send path read {got!r}, expected 'same'")
         failures += 1
 
+    # Two runs are comparable only when their recorded arguments match. A missing record on either side
+    # is not a mismatch, because an older artifact carries none.
+    with tempfile.TemporaryDirectory() as scratch:
+        same_a = os.path.join(scratch, "same_a")
+        same_b = os.path.join(scratch, "same_b")
+        other = os.path.join(scratch, "other")
+        bare = os.path.join(scratch, "bare")
+        for path in (same_a, same_b, other, bare):
+            os.makedirs(path)
+        line = "clients=4 profile=congested_wifi seconds=25 seed=1 policy=strafe_fire demo=arena\n"
+        for path in (same_a, same_b):
+            with open(os.path.join(path, "params.txt"), "w", encoding="utf-8") as handle:
+                handle.write(line)
+        with open(os.path.join(other, "params.txt"), "w", encoding="utf-8") as handle:
+            handle.write(line.replace("clients=4", "clients=24"))
+        for before, after, expected, why in (
+            (same_a, same_b, None, "identical arguments compare"),
+            (same_a, other, (line.strip(), line.strip().replace("clients=4", "clients=24")),
+             "a different client count is a different network"),
+            (same_a, bare, None, "a run that recorded no arguments is not refused"),
+        ):
+            got = params_mismatch(before, after)
+            checked += 1
+            if got != expected:
+                print(f"FAIL params: {why}: expected {expected!r}, got {got!r}")
+                failures += 1
+
     print(f"compare.py self-test: {checked} cases, {failures} failure(s)")
     return 1 if failures else 0
+
+
+def read_params(run_dir: str) -> str | None:
+    """The `params.txt` line bench.sh wrote beside a run's CSVs, or None when the run has none."""
+    try:
+        with open(os.path.join(run_dir, "params.txt"), encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def params_mismatch(before: str, after: str) -> tuple[str, str] | None:
+    """The two runs' bench arguments when both recorded them and they differ, else None.
+
+    Two runs are comparable only when every argument matched, seed included: a different client count,
+    window or profile is a different network, and every column below would describe that difference
+    rather than the change under test. A run that recorded no arguments (an artifact older than
+    `params.txt`) is not refused, because nothing can be read off it either way.
+    """
+    before_params = read_params(before)
+    after_params = read_params(after)
+    if before_params is None or after_params is None or before_params == after_params:
+        return None
+    return before_params, after_params
 
 
 def main() -> int:
@@ -492,12 +544,24 @@ def main() -> int:
                         help="seconds of each client's series to drop (default 3)")
     parser.add_argument("--tolerance", type=float, default=0.05,
                         help="fractional move below which a column reads as unchanged (default 0.05)")
+    parser.add_argument("--allow-different-params", action="store_true",
+                        help="compare two runs whose params.txt differ (their columns then describe "
+                             "different networks, not the change under test)")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
     if not args.before or not args.after:
         parser.error("before and after are required unless --self-test is given")
+
+    mismatch = params_mismatch(args.before, args.after)
+    if mismatch and not args.allow_different_params:
+        print("netbench compare: the two runs took different arguments, so every column would describe "
+              "a different network rather than the change under test:")
+        print(f"  before: {mismatch[0]}")
+        print(f"  after:  {mismatch[1]}")
+        print("Pass --allow-different-params to compare them anyway.")
+        return 2
 
     print(f"netbench compare: {args.before}  ->  {args.after}")
     print(f"  warm-up dropped: {args.warmup:.1f}s per client    tolerance: {args.tolerance * 100:.0f}%")

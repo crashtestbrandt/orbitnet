@@ -162,7 +162,7 @@ of ours", and the client keeps whatever token it already stored rather than forg
 | 6 | Each entity manifest entry also carries the entity's **input owner and seat**, which is what distributes the seat roster to clients. |
 | 7 | A snapshot frame may carry a trailing **interest-delta section**, naming the slots that entered and left that one peer's interest. The handshake and the welcome each carry a trailing **resume token**, which is what a claim on a session identity has to quote. The handshake's 16-byte session key becomes the **session nonce**, and the handshake gains a trailing **confirm tag**; with a shared secret configured the key is derived from `(secret, nonce)` rather than read off the wire. The entity manifest opens with a **generation** and states a **change** rather than the whole table, on a new `EntityManifestDelta` frame kind. |
 | 8 | The interest-delta section opens with a **generation**, one peer's whole interest set has a frame kind of its own (`InterestTable`), and a client asks for one with `WANT_INTEREST` (flags bit 3). Before it, a section naming a slot the receiver could not resolve was dropped in silence and then retired on that frame's ack, so the two ends disagreed about that entity for the rest of the session. A client input frame also carries, before its blocks, the interest generation that client holds, so the server builds a section only for a peer that provably holds the baseline it is diffed against. The leading generation shifts the offsets of the section's own counts and the echo shifts every block's, which is what makes this a major rather than a trailing addition. |
-| 9 | **The join is two round trips and both ends contribute to the key.** The handshake's 16 bytes are the client's half of the session nonce; the server answers with a **challenge** frame (kind `0x05`) carrying a half of its own, and the client repeats its handshake quoting that half back in a new trailing **acceptor nonce** field. The key is derived from the fold of the two, and the confirm tag is taken over that fold. What it closes is a **replayed join**: under major 8 the nonce was the client's alone, so an on-path observer presenting a recorded handshake had the server derive the key that join had used. A peer predating this seats its own half as the key and fails every MAC, so the major is what refuses it — the new field would otherwise decode as an absent trailing value rather than a mismatch. The same major adds an **authenticated key exchange** on those two legs: the handshake gains a trailing **joiner exchange key** and the challenge a trailing **acceptor exchange key**, each an ephemeral X25519 public key or all zeroes for "no exchange offered". Both are trailing additions and would be minor changes on their own; they ride this major because it is open. **Also at this major: under a session secret every payload is encrypted**, with ChaCha20-Poly1305 over a cipher key derived from the same secret and fold, and the 8-byte SipHash trailer tag becomes a 16-byte Poly1305 one. A session that configures no secret is unchanged byte for byte. A peer predating it reads a snapshot out of ciphertext and its trailer off the wrong offset, so the major is what refuses that too. |
+| 9 | **The join is two round trips and both ends contribute to the key.** The handshake's 16 bytes are the client's half of the session nonce; the server answers with a **challenge** frame (kind `0x05`) carrying a half of its own, and the client repeats its handshake quoting that half back in a new trailing **acceptor nonce** field. The key is derived from the fold of the two, and the confirm tag is taken over that fold. What it closes is a **replayed join**: under major 8 the nonce was the client's alone, so an on-path observer presenting a recorded handshake had the server derive the key that join had used. A peer predating this seats its own half as the key and fails every MAC, so the major is what refuses it — the new field would otherwise decode as an absent trailing value rather than a mismatch. The same major adds an **authenticated key exchange** on those two legs: the handshake gains a trailing **joiner exchange key** and the challenge a trailing **acceptor exchange key**, each an ephemeral X25519 public key or all zeroes for "no exchange offered". Both are trailing additions and would be minor changes on their own; they ride this major because it is open. **Also at this major: under a session secret or a pinned server key every payload is encrypted**, with ChaCha20-Poly1305 over a cipher key derived from the same fold, and the 8-byte SipHash trailer tag becomes a 16-byte Poly1305 one. A session that configures neither is unchanged byte for byte. A peer predating it reads a snapshot out of ciphertext and its trailer off the wrong offset, so the major is what refuses that too. |
 
 **Minor is not checked and records a change no peer can misread** — the only kind that qualifies is an
 optional *trailing* field on a control frame, where an older peer stops decoding before it and gets the
@@ -707,9 +707,9 @@ or neither.
 | Where the key comes from | the fold of the two nonce halves | that fold, with the secret folded in | that fold, with the exchange's output folded in |
 | What an on-path observer learns | both halves, and therefore the key | both halves, and nothing else | both halves and both exchange keys, and nothing else |
 | Can an on-path observer forge? | **yes, anything the client can** | no | no |
-| Can an on-path observer **read a payload**? | **yes** | **no** | **yes** |
-| What authenticates a datagram | SipHash-2-4, an 8-byte tag | Poly1305, a 16-byte tag | SipHash-2-4, an 8-byte tag |
-| What the payload is | plaintext | ChaCha20 ciphertext, same length | plaintext |
+| Can an on-path observer **read a payload**? | **yes** | **no** | **no** |
+| What authenticates a datagram | SipHash-2-4, an 8-byte tag | Poly1305, a 16-byte tag | Poly1305, a 16-byte tag |
+| What the payload is | plaintext | ChaCha20 ciphertext, same length | ChaCha20 ciphertext, same length |
 | Can it replay a recorded join? | no | no | no |
 | Who may join | anyone the transport accepts | anyone holding the secret | anyone the transport accepts |
 | Who is authenticated | nobody | both ends, to each other | the server, to the client |
@@ -717,6 +717,12 @@ or neither.
 
 Setting both folds the two secrets together, so an attacker has to hold the session secret **and** break the
 exchange. A game with a lobby token and a published server key does not have to choose.
+
+**A pinned key encrypts for the same reason a secret does.** The cipher is keyed whenever the derived key
+holds bytes an on-path observer cannot compute, and the exchange's output is such a value. Both ends seat the
+same fold of the game secret and the exchange, and the cipher key is derived from that fold under labels of
+its own. The server-shape probe runs a secret-only join and a pinned join beside the plain ones, so a seat
+that differed between the two ends would fail a pull request there.
 
 - **With neither secret configured both halves cross the wire in the clear**, so this authenticates a
   datagram's membership in a session rather than a peer's identity. An attacker who cannot read the session's
@@ -804,25 +810,10 @@ reports itself, and it reports itself on the client.
 **What it costs.** Four X25519 operations per join per end — two basepoint multiplies and two
 Diffie-Hellman — plus 96 bytes on the wire per join, 32 on each of the three legs. The confirmation
 repeats the hello's shape, so it carries the joiner's public key a second time. Nothing at rest, and
-nothing at all for a session that configures no pin. `x25519-dalek` is the implementation; it is
-`orbitnet-core`'s only runtime dependency, its constant-time claims are that crate's own rather than
-anything this repository measures, and `native/crates/orbitnet-core/Cargo.toml`'s header states what it had
-to clear.
-
-### Three ceilings no secret lifts
-
-The replayed join used to be a fourth. It is closed by the nonce exchange above, under every regime, and
-these three are what is left.
-
-- **The tag is still 64 bits and the key still 128.** A secret changes *who* can forge a datagram. It does
-  not change how hard forging one is for somebody who cannot derive the key. X25519's own security level is
-  higher than both numbers, so the exchange does not move this either.
-- **A shared secret adds no strength beyond its own entropy.** A secret a lobby prints on screen, or one
-  short enough to guess, derives a key worth exactly that much. Any length is accepted and folded to 16
-  bytes; the fold cannot add entropy that was not supplied. A pinned key has no equivalent ceiling, because
-  the client never holds a secret to guess.
-- **None of this encrypts anything.** Every payload is still on the wire in the clear, under every regime. A
-  MAC says a datagram was not written by somebody outside the session, and says nothing else.
+nothing at all for a session that configures no pin. `x25519-dalek` is the implementation; it is one of
+`orbitnet-core`'s two runtime dependencies, beside `chacha20poly1305`, its constant-time claims are that
+crate's own rather than anything this repository measures, and `native/crates/orbitnet-core/Cargo.toml`'s
+header states what each had to clear.
 
 ### What a session secret encrypts
 
@@ -869,17 +860,21 @@ two, and it retires the 64-bit tag ceiling for a session that configured a secre
   under it. So the session id, the resume token a rejoining client quotes, and both nonce halves stay
   readable under either regime. What refuses a claim built on them is the confirm tag, not their secrecy.
 
-**With no secret configured, nothing here runs.** The wire is the SipHash tag and the plaintext payload it
-has always been, byte for byte. Encrypting there would buy nothing: both halves of the nonce the key is
-folded from cross the wire, so an observer that read the join computes the key that hid the payload.
+**With neither a secret nor a pin configured, nothing here runs.** The wire is the SipHash tag and the
+plaintext payload it has always been, byte for byte. Encrypting there would buy nothing: both halves of the
+nonce the key is folded from cross the wire, so an observer that read the join computes the key that hid the
+payload. A pinned key runs all of it: the exchange's output is folded into the same key, and the cipher key
+is derived from that fold exactly as it is from a secret.
 
 ### Three ceilings a secret does not lift
 
 The replayed join used to be a fourth, and so did the payload in the clear. Both are closed above, and
-these three are what is left.
+these three are what is left. A pinned key lifts none of them either, except that the second does not apply
+to it: the client never holds a secret to guess.
 
-- **The key is still 128 bits**, and the tag is 64 without a secret. A secret changes *who* can forge a
-  datagram. It does not change how hard forging one is for somebody who cannot read the secret.
+- **The key is still 128 bits**, and the tag is 64 with neither a secret nor a pin. A secret or a pin
+  changes *who* can forge a datagram. Neither changes how hard forging one is for somebody who cannot
+  derive the key; X25519's own security level is higher than both numbers.
 - **The derivation adds no strength beyond the secret's own entropy.** A secret a lobby prints on screen, or
   one short enough to guess, derives a key worth exactly that much — the MAC key, the cipher key and every
   confirmation alike. Any length is accepted and folded to 16 bytes; the fold cannot add entropy that was
@@ -890,8 +885,8 @@ these three are what is left.
 
 ### What the join costs
 
-**The cost is the second round trip, and it is charged per join under both regimes.** Nothing at rest
-changes; the payload cipher is what costs at rest, and only under a secret — [that is the next
+**The cost is the second round trip, and it is charged per join under every regime.** Nothing at rest
+changes; the payload cipher is what costs at rest, and only under a secret or a pin — [that is the next
 section](#what-the-payload-cipher-costs).
 
 | | Cost |
@@ -1094,7 +1089,7 @@ screenshot. It never saw the token.
 
 **What it does not close on its own**: an on-path observer, who reads the welcome and can then quote the token
 verbatim. That is the same boundary [a key with no secret folded into
-it](#two-secret-regimes-and-which-one-you-are-in) has, and it closes the same way — a **shared session
+it](#three-secret-regimes-and-which-one-you-are-in) has, and it closes the same way — a **shared session
 secret**. Under one the welcome is ciphertext, so the token is no longer readable there — though a rejoining
 client still quotes it in a handshake, which is never encrypted. Either way that observer cannot confirm the
 handshake that quotes it, and the claim never reaches the resume decision. **What contains the claim is the
@@ -1460,8 +1455,8 @@ offered it.
 
 ### Deprecation path for a `Net` call whose meaning changes
 
-Three 0.3 changes altered what an existing call means and raised nothing; the README's [Upgrading from
-0.2.x](../README.md#upgrading-from-02x) table is how they were communicated. From 1.0 that is not the path.
+Three 0.3 changes altered what an existing call means and raised nothing; the upgrade table now in
+[CHANGELOG.md](../CHANGELOG.md#030--2026-08-26) is how they were communicated. From 1.0 that is not the path.
 
 This is the path the next such change takes. **No `Net` call is deprecated today**, so api.md carrying no
 deprecation marker is accurate rather than an omission, and nothing in `net.gd` yet emits the warning step 2

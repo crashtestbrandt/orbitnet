@@ -361,8 +361,8 @@ version of their own.
 | `just check` | locally, before a pull request |
 | `release.yml` | at tag time, immediately after stamping — the only place a stamp can be proved, because a rewrite whose pattern stops matching exits 0 and would otherwise publish the old version |
 
-It is **not a `check.yml` step yet**, so a pull request that moves one file without the others passes CI
-and the divergence lands on main until the next tag re-stamps it.
+`check.yml` runs it in its gates job on every pull request, so a pull request that moves one file without
+the others fails there rather than landing a divergence that the next tag re-stamps.
 
 **The stamp returns to `main`.** The manifest pull request carries `plugin.cfg`, `native/Cargo.toml` and
 `native/Cargo.lock` alongside `binaries.json`. Stamped on the tag alone, the crate version would revert on

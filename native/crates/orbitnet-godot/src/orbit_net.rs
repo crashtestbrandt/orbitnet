@@ -657,6 +657,10 @@ enum PeerAnchor {
     Entity(u64),
 }
 
+/// One sent-log entry: the frame tick, the entity ticks the datagrams at that tick carried, and whether
+/// the tick went out as more than one datagram. See [`PeerState::note_sent_frame`].
+type SentFrame = (u64, Vec<(u64, u64)>, bool);
+
 #[derive(Default)]
 struct PeerState {
     /// Whether the handshake completed (server side: Hello received and answered).
@@ -897,11 +901,25 @@ struct PeerState {
     /// while the entity's rows kept arriving, and the documented repair
     /// ([`OrbitNet::entities_in_interest`]) answered a client from that same broken mirror.
     interest_full_due: bool,
-    /// Recent snapshot sends awaiting acknowledgment: (frame tick, entity ticks it carried).
-    sent_log: std::collections::VecDeque<(u64, Vec<(u64, u64)>)>,
+    /// Recent snapshot sends awaiting acknowledgment — see [`SentFrame`].
+    sent_log: std::collections::VecDeque<SentFrame>,
     /// Per-entity newest tick this peer CONFIRMED receiving (via ack_tick/ack_bits) — the only
     /// tick a masked delta may reference: the peer provably holds that base row.
     acked_base: HashMap<u64, u64>,
+    /// Entities whose `acked_base` was promoted off a tick that went out as MORE THAN ONE datagram.
+    ///
+    /// An ack names a tick. When a frame spent several datagrams on one tick, the ack proves that
+    /// one of them arrived and not which, so a base promoted from that entry may name a row the peer
+    /// never received. Such a base still serves as a delta reference — a receiver that lacks it
+    /// answers `NoBase` and NACKs, which is the repair the base rule has always relied on — but it
+    /// must not let an empty delta be UN-WRITTEN: with nothing on the wire the receiver can neither
+    /// apply nor refuse, and an entity that moved in the lost half and then came to rest would be
+    /// drawn one step short until its next keyframe. A later ack of a single-datagram tick carrying
+    /// the entity firms the base again. See [`PeerState::consume_ack`] and [`block_is_un_written`].
+    base_unproven: std::collections::HashSet<u64>,
+    /// Whether the seated session key was derived through a key exchange. A hello that offers none
+    /// on a connection seated this way is a downgrade, not a retry — see [`exchange_downgraded`].
+    exchanged: bool,
     /// Highest ack tick seen from this peer, for expiring the sent log.
     newest_ack: u64,
     /// Server: the secret this peer's frame tokens are minted from, or `None` before its handshake.
@@ -1204,6 +1222,7 @@ impl PeerState {
             self.last_sent.remove(&id);
             self.last_full.remove(&id);
             self.acked_base.remove(&id);
+            self.base_unproven.remove(&id);
             // A veto is a leave, and it is one of the two that happen BETWEEN updates — no `leaves`
             // list will ever name it. Queued only when the entity was actually in the set: vetoing
             // something this connection never held announces a departure that never happened, and a
@@ -1395,6 +1414,7 @@ impl PeerState {
         self.last_sent.remove(&id);
         self.last_full.remove(&id);
         self.acked_base.remove(&id);
+        self.base_unproven.remove(&id);
         let held = self.interest.contains(id);
         if held {
             self.note_interest_leave(id);
@@ -1511,6 +1531,7 @@ impl PeerState {
     fn note_nack(&mut self) {
         self.want_full = true;
         self.acked_base.clear();
+        self.base_unproven.clear();
     }
 
     /// File one snapshot datagram's entity ticks under the tick it carried.
@@ -1523,15 +1544,21 @@ impl PeerState {
     ///
     /// **The fold holds that denomination rather than making an ack work.**
     /// [`PeerState::consume_ack`] retains by predicate, so it already confirms every entry filed
-    /// under the acked tick and would promote both halves of a split frame.
+    /// under the acked tick and promotes both halves of a split frame.
+    ///
+    /// **A folded entry is marked split**, because the ack that confirms it proves one of its
+    /// datagrams arrived and not which. [`PeerState::consume_ack`] records every base it promotes
+    /// from such an entry in `base_unproven`, and [`block_is_un_written`] keeps writing empty deltas
+    /// against those bases so a receiver that lacks one can say so.
     fn note_sent_frame(&mut self, tick: u64, mut sent: Vec<(u64, u64)>) {
-        let same_tick = matches!(self.sent_log.back(), Some((frame, _)) if *frame == tick);
+        let same_tick = matches!(self.sent_log.back(), Some((frame, _, _)) if *frame == tick);
         if same_tick {
-            if let Some((_, entities)) = self.sent_log.back_mut() {
+            if let Some((_, entities, split)) = self.sent_log.back_mut() {
                 entities.append(&mut sent);
+                *split = true;
             }
         } else {
-            self.sent_log.push_back((tick, sent));
+            self.sent_log.push_back((tick, sent, false));
         }
         while self.sent_log.len() > SENT_LOG_DEPTH {
             self.sent_log.pop_front();
@@ -1571,22 +1598,31 @@ impl PeerState {
         // published before the send phase runs, and a peer's clock leads.
         self.note_ack(ack, current, tick_ms);
         let newest_ack = self.newest_ack;
-        let mut promoted: Vec<(u64, u64)> = Vec::new();
-        self.sent_log.retain(|(frame, entities)| {
+        let mut promoted: Vec<(u64, u64, bool)> = Vec::new();
+        self.sent_log.retain(|(frame, entities, split)| {
             let confirmed = *frame == ack
                 || (*frame < ack
                     && ack - *frame <= 32
                     && (ack_bits >> (ack - *frame - 1)) & 1 == 1);
             if confirmed {
-                promoted.extend_from_slice(entities);
+                promoted.extend(entities.iter().map(|&(id, tick)| (id, tick, *split)));
                 return false;
             }
             // Older than the ack window can reach: it will never be confirmed.
             frame.saturating_add(32) >= newest_ack
         });
-        for (id, tick) in promoted {
+        // The newest promotion decides whether the base is proven: a tick that went out whole firms
+        // it, one that went out in several datagrams leaves it unproven. See `base_unproven`.
+        for (id, tick, split) in promoted {
             let entry = self.acked_base.entry(id).or_insert(0);
-            *entry = (*entry).max(tick);
+            if tick >= *entry {
+                *entry = tick;
+                if split {
+                    self.base_unproven.insert(id);
+                } else {
+                    self.base_unproven.remove(&id);
+                }
+            }
         }
         AckOutcome::Consumed
     }
@@ -6992,6 +7028,7 @@ impl OrbitNet {
                     peer.last_sent.remove(&id);
                     peer.last_full.remove(&id);
                     peer.acked_base.remove(&id);
+                    peer.base_unproven.remove(&id);
                     peer.note_interest_leave(id);
                 }
                 // The enter half clears nothing: an entity that was never sent to this peer has no
@@ -7498,6 +7535,27 @@ impl OrbitNet {
                 return;
             }
         };
+        // A CONNECTION SEATED THROUGH AN EXCHANGE IS NOT REKEYED ONTO A KEY A PASSIVE OBSERVER HOLDS.
+        // A hello that offers no exchange derives its key from the two wire halves alone, which
+        // anyone who read the join can compute, so on a connection whose key came through an
+        // exchange it is refused here, by name, before anything is seated. The rule is
+        // [`exchange_downgraded`], and that is the whole of what it buys: a hello that runs a fresh
+        // exchange of its own is still accepted, because under a pin alone this server authenticates
+        // nothing about the joiner, so a party that can inject on the path rekeys the connection onto
+        // a key it holds whether or not it offers an exchange. Only a session secret refuses that.
+        // The other direction — a connection seated without an exchange whose client restarted with
+        // a pin — is an ordinary rekey and stays allowed.
+        if let Some(peer) = self.peers.get(&sender) {
+            if exchange_downgraded(peer.auth.is_some() && peer.exchanged, exchanged.is_some()) {
+                godot_error!(
+                    "OrbitNet: rejecting peer {sender}: this connection's session key was derived \
+                     through a key exchange and the hello offers none. A restarted client runs the \
+                     exchange again, so a hello that drops it on a live connection is refused rather \
+                     than rekeying the session onto the unexchanged key."
+                );
+                return;
+            }
+        }
         // The confirmation, which is where a peer that does not hold this session's secret is refused —
         // and where a REPLAYED one is, because the tag is over the fold of both halves and the
         // acceptor's was drawn here.
@@ -7544,11 +7602,19 @@ impl OrbitNet {
         // changes the key: one comparison covers both.
         let rekeyed = peer.auth.is_some_and(|auth| auth.key() != session_key);
         if peer.auth.is_none_or(|auth| auth.key() != session_key) {
+            // THE SEAT TAKES THE SAME FOLD THE COMPARISON AND THE CLIENT TAKE. `secret` is the game
+            // secret with the exchange folded in, and `session_key` above was derived from it. Seating
+            // from `self.session_secret` alone, as this once did, left every pinned join on two keys:
+            // the server compared the fold and seated the bare secret, so `auth.key()` never equalled
+            // `session_key`, every retried hello rekeyed the connection, and the client — seated on the
+            // fold — refused every datagram the server sent. `peer.exchanged` records which regime the
+            // seat is on, for the downgrade refusal above.
             peer.auth = Some(session_auth_from(
-                self.session_secret.as_ref(),
+                secret.as_ref(),
                 hello.joiner_nonce,
                 acceptor,
             ));
+            peer.exchanged = exchanged.is_some();
             peer.budget = ReceiveBudget::new();
             // A REKEY IS A CLIENT THAT RESTARTED ITS SESSION ON A LIVE CONNECTION, so its entity
             // manifest went with it. Zeroed in the same block that replaces the auth, because these
@@ -7565,6 +7631,7 @@ impl OrbitNet {
             // against a base the client had already dropped — a guaranteed `NoBase` and a NACK on a
             // connection that had just told the server everything was gone.
             peer.acked_base.clear();
+            peer.base_unproven.clear();
             peer.last_full.clear();
             peer.last_sent.clear();
             // The interest set went the same way, and the whole set is what re-seats it. Only on
@@ -8756,15 +8823,22 @@ const ASSEMBLY_POOL_EXIT_WAIT: std::time::Duration = std::time::Duration::from_s
 /// The persistent threads behind [`assemble_frames`]: one fewer than the most a flush may split
 /// across, because the calling thread assembles a share of its own.
 ///
-/// **Dropping it waits for its threads to exit.** A `rayon::ThreadPool` only signals its threads on drop,
-/// and they finish exiting on their own schedule. Their code is in this library, and a library the engine
-/// unloads with one of its threads still running faults the process on the way out. So every thread
-/// reports its exit, and `Drop` waits for the count to reach zero, for at most
-/// [`ASSEMBLY_POOL_EXIT_WAIT`], before the node finishes dropping.
+/// **Dropping it waits for its threads to exit, then joins them.** A `rayon::ThreadPool` only signals
+/// its threads on drop, and they finish exiting on their own schedule. Their code is in this library,
+/// and a library the engine unloads with one of its threads still running faults the process on the
+/// way out. So every thread reports its exit, `Drop` waits for the count to reach zero, for at most
+/// [`ASSEMBLY_POOL_EXIT_WAIT`], and then joins every thread that reported. The join is what the
+/// count alone cannot give: rayon runs the exit handler inside the worker, a few instructions before
+/// the thread returns through the thread-exit path linked into this library, so a count of zero says
+/// every thread is leaving and a join says every thread has left. A thread that never reports within
+/// the wait is not joined, because joining it could hold the engine's shutdown indefinitely where the
+/// wait bounds it.
 struct AssemblyPool {
     pool: Option<rayon::ThreadPool>,
     /// Threads still running, and the signal each one's exit raises.
     live: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    /// The threads themselves, spawned by this pool so their handles can be joined on drop.
+    handles: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl AssemblyPool {
@@ -8779,9 +8853,26 @@ impl AssemblyPool {
             std::sync::Condvar::new(),
         ));
         let exits = std::sync::Arc::clone(&live);
+        let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(threads - 1)));
+        let spawned = std::sync::Arc::clone(&handles);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads - 1)
             .thread_name(|index| format!("orbitnet-assembly-{index}"))
+            // Spawned here rather than by rayon so the `JoinHandle`s are kept for `Drop`.
+            .spawn_handler(move |thread| {
+                let mut builder = std::thread::Builder::new();
+                if let Some(name) = thread.name() {
+                    builder = builder.name(name.to_owned());
+                }
+                if let Some(size) = thread.stack_size() {
+                    builder = builder.stack_size(size);
+                }
+                let handle = builder.spawn(|| thread.run())?;
+                if let Ok(mut handles) = spawned.lock() {
+                    handles.push(handle);
+                }
+                Ok(())
+            })
             .exit_handler(move |_| {
                 let (count, signal) = &*exits;
                 if let Ok(mut count) = count.lock() {
@@ -8794,6 +8885,7 @@ impl AssemblyPool {
         Some(Self {
             pool: Some(pool),
             live,
+            handles,
         })
     }
 
@@ -8809,7 +8901,21 @@ impl Drop for AssemblyPool {
         let Ok(count) = count.lock() else {
             return;
         };
-        let _ = signal.wait_timeout_while(count, ASSEMBLY_POOL_EXIT_WAIT, |live| *live > 0);
+        let Ok((count, _)) =
+            signal.wait_timeout_while(count, ASSEMBLY_POOL_EXIT_WAIT, |live| *live > 0)
+        else {
+            return;
+        };
+        if *count > 0 {
+            return;
+        }
+        drop(count);
+        let Ok(mut handles) = self.handles.lock() else {
+            return;
+        };
+        for handle in std::mem::take(&mut *handles) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -9252,9 +9358,14 @@ fn assemble_peer(
             // may read into a block's absence. The mask it is handed is the one the encoder
             // just left in `mask`, which only the delta branch fills, so the `full`
             // term is required. It is the encoder's own answer, rather than an inference at
-            // this call site from having supplied a reference.
-            let un_written = tick_sent
-                .is_some_and(|(_, was_full)| block_is_un_written(state_lane, was_full, mask));
+            // this call site from having supplied a reference. `base_proven` is false while this
+            // entity's base was promoted off a tick that went out as several datagrams -- see
+            // `PeerState::base_unproven` -- and an empty delta against such a base is written so a
+            // receiver that lacks the base can refuse it and NACK.
+            let base_proven = !peer.base_unproven.contains(&id);
+            let un_written = tick_sent.is_some_and(|(_, was_full)| {
+                block_is_un_written(state_lane, was_full, base_proven, mask)
+            });
             // `block_admission` orders the un-write against the over-budget check below, so
             // that the order is a rule a test can call rather than the shape this loop happens
             // to have. The un-write leads: the oversize branch exists so a datagram with
@@ -10221,6 +10332,27 @@ fn offered_static_key<'a>(
     static_secret.filter(|_| *joiner_exchange != [0u8; EXCHANGE_KEY_LEN])
 }
 
+/// SERVER: whether a hello would move a live connection off the key exchange it was seated through.
+///
+/// `seated_through_exchange` is whether the connection's current session key was derived with an
+/// exchange, and `hello_offers_exchange` whether the hello in hand ran one. Only the move from
+/// exchanged to unexchanged is a downgrade. A retried confirmation repeats the exchange it was
+/// seated with, and a connection seated without one may be rekeyed by a client that restarted with a
+/// pin, so neither of those is refused.
+///
+/// **What it buys is narrow.** It keeps an exchanged connection from being rekeyed onto a key a
+/// passive observer can also derive, the one the two wire halves alone produce. It does not refuse
+/// an injected rekey: under a pin alone the server authenticates nothing about the joiner, so a party
+/// that can inject on the path runs a fresh exchange with an ephemeral of its own, confirms over the
+/// fold it can compute, and rekeys the connection onto a key it holds. A session secret is what
+/// refuses that, as the README's Limits section records. A client that restarts its session unpinned
+/// on a live connection to a server holding a static key is refused by this rule until that
+/// connection drops.
+#[must_use]
+fn exchange_downgraded(seated_through_exchange: bool, hello_offers_exchange: bool) -> bool {
+    seated_through_exchange && !hello_offers_exchange
+}
+
 /// SERVER: what one join's key exchange produced.
 ///
 /// **The non-contributory case is its own variant because it is an attack**, where the other two are
@@ -10771,9 +10903,20 @@ fn full_block_due(want_full: bool, id: u64, current: u64, last_full: u64, interv
 ///
 /// **Counted as culled.** The block was withheld deliberately, as a rate-tiering hold-back is, so it
 /// is kept out of `blocks_deferred_s`, which exists to measure budget pressure and nothing else.
+///
+/// **Only against a base the peer provably holds.** `base_proven` is false while the entity's
+/// `acked_base` was promoted off a tick that went out as several datagrams
+/// ([`PeerState::base_unproven`]). The ack that promoted it proved one of those datagrams arrived
+/// and not which, so the receiver may hold no row at that base. Written, the empty delta meets
+/// `NoBase` there and draws the NACK that repairs the chain within a round trip; un-written, nothing
+/// reaches the receiver until the keyframe, and an entity that moved in the lost half and then came
+/// to rest is drawn one step short for up to [`FULL_STATE_INTERVAL`]. On an authority that spends
+/// several datagrams on every tick — one rendering below its net tick rate — every base is unproven
+/// and this un-write never applies: such a host runs the send path as it was before the un-write,
+/// which costs it the block headers and buys the repair.
 #[must_use]
-fn block_is_un_written(state_lane: bool, full: bool, mask: &[bool]) -> bool {
-    state_lane && !full && !mask.iter().any(|&changed| changed)
+fn block_is_un_written(state_lane: bool, full: bool, base_proven: bool, mask: &[bool]) -> bool {
+    state_lane && !full && base_proven && !mask.iter().any(|&changed| changed)
 }
 
 /// What the admit loop does with the entity block it has just written.
@@ -10970,27 +11113,27 @@ mod tests {
         block_is_un_written, build_interest_section, candidate_for_own_row, candidate_for_row,
         challenge_answer, challenge_half, charge_window, clamp_resume_policy,
         clamp_seat_release_policy, clamp_unanchored_policy, classify_rx, delta_reference,
-        encode_interest_delta, filter_connection, frame_charge, full_block_due, hello_leg,
-        hold_on_drop, input_frame_is_owed, interest_delta_reserve, interest_table_due,
-        interest_table_to_send, is_located, manifest_owed, note_input_tick, owned_rows_into,
-        owned_rows_of, queue_seat_release, replayed_depth, resim_input_from, resolve_observer,
-        resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello, seat_observer,
-        seat_observers_into, seat_release_policy_of, section_is_news, select_interest_path,
-        send_pass_is_due, session_auth_from, session_directions, session_is_filtering,
-        session_key_from, snapshot_frame_is_skipped, state_whole_interest_set, table_is_resolvable,
-        unseeded_departures, veto_announces_leave, AckOutcome, BlockAdmission, ChallengeAnswer,
-        EntityRow, ExchangeKeyInput, ExchangeOutcome, FrameCharge, FrameHeader, HelloLeg,
-        InterestPass, ManifestOwed, OrbitNet, PeerAnchor, PeerDeclaration, PeerObserver, PeerState,
-        PendingJoin, ResolvedSeats, ResumeGrant, ResumeTable, RxOutcome, SeatId, SeatIndex,
-        SeatReleaseEvent, SeatReleasePolicy, SlotTable, StateIntegration, UnboundSlots, Writer,
-        ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED, AOI_EXIT_FACTOR, BANDWIDTH_WINDOW_SECONDS,
-        FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON, INTEREST_DELTA_PENDING_HARD_MAX,
-        INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME, INTEREST_DELTA_RETRY_TICKS,
-        MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT, MODE_HOST, MODE_OFFLINE,
-        MODE_SERVER, PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER, RESUME_ONLY_IF_DROPPED,
-        RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW, SEAT_RELEASE_HOLD,
-        SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH, UNANCHORED_CLOSED,
-        UNANCHORED_OPEN, UNLOCATABLE_CENTER,
+        encode_interest_delta, exchange_downgraded, filter_connection, frame_charge,
+        full_block_due, hello_leg, hold_on_drop, input_frame_is_owed, interest_delta_reserve,
+        interest_table_due, interest_table_to_send, is_located, manifest_owed, note_input_tick,
+        owned_rows_into, owned_rows_of, queue_seat_release, replayed_depth, resim_input_from,
+        resolve_observer, resume_grant, retire_unnamed_interest, rtt_at_ceiling_peers, seat_hello,
+        seat_observer, seat_observers_into, seat_release_policy_of, section_is_news,
+        select_interest_path, send_pass_is_due, session_auth_from, session_directions,
+        session_is_filtering, session_key_from, snapshot_frame_is_skipped,
+        state_whole_interest_set, table_is_resolvable, unseeded_departures, veto_announces_leave,
+        AckOutcome, BlockAdmission, ChallengeAnswer, EntityRow, ExchangeKeyInput, ExchangeOutcome,
+        FrameCharge, FrameHeader, HelloLeg, InterestPass, ManifestOwed, OrbitNet, PeerAnchor,
+        PeerDeclaration, PeerObserver, PeerState, PendingJoin, ResolvedSeats, ResumeGrant,
+        ResumeTable, RxOutcome, SeatId, SeatIndex, SeatReleaseEvent, SeatReleasePolicy, SlotTable,
+        StateIntegration, UnboundSlots, Writer, ANCHOR_SOURCE_FIXED, ANCHOR_SOURCE_INFERRED,
+        AOI_EXIT_FACTOR, BANDWIDTH_WINDOW_SECONDS, FULL_STATE_INTERVAL, INPUT_TICK_SEEK_HORIZON,
+        INTEREST_DELTA_PENDING_HARD_MAX, INTEREST_DELTA_PENDING_MAX, INTEREST_DELTA_PER_FRAME,
+        INTEREST_DELTA_RETRY_TICKS, MAX_FRAME_PAYLOAD, MAX_INPUT_BLOCKS_PER_TICK, MODE_CLIENT,
+        MODE_HOST, MODE_OFFLINE, MODE_SERVER, PING_INTERVAL, RESUME_ALWAYS, RESUME_NEVER,
+        RESUME_ONLY_IF_DROPPED, RTT_BELIEVED_MAX_MS_DEFAULT, RTT_SAMPLE_MAX_MS, RTT_WINDOW,
+        SEAT_RELEASE_HOLD, SEAT_RELEASE_ON_DROP, SEAT_RELEASE_ON_EXPIRY, SENT_LOG_DEPTH,
+        UNANCHORED_CLOSED, UNANCHORED_OPEN, UNLOCATABLE_CENTER,
     };
     use orbitnet_core::auth::{
         acceptor_exchange_secret, exchange_public_key, fold_secrets, joiner_exchange_secret,
@@ -14664,7 +14807,11 @@ mod tests {
     /// and the block always fits because a budget is not what these tests are about.
     fn visit(id: u64, current: u64, last_full: u64, changed: bool) -> Option<bool> {
         let full = full_block_due(false, id, current, last_full, FULL_STATE_INTERVAL);
-        match block_admission(block_is_un_written(true, full, &[changed]), true, false) {
+        match block_admission(
+            block_is_un_written(true, full, true, &[changed]),
+            true,
+            false,
+        ) {
             BlockAdmission::UnWrite => None,
             _ => Some(full),
         }
@@ -14673,12 +14820,26 @@ mod tests {
     #[test]
     fn a_state_delta_carrying_no_change_is_not_admitted() {
         assert!(
-            block_is_un_written(true, false, &[false, false, false]),
+            block_is_un_written(true, false, true, &[false, false, false]),
             "every property matches the base the peer already holds, so the block states nothing"
         );
         assert!(
-            !block_is_un_written(true, false, &[false, true, false]),
+            !block_is_un_written(true, false, true, &[false, true, false]),
             "one changed property is worth the block header"
+        );
+    }
+
+    /// An empty delta against a base promoted off a split tick is written, not un-written. The ack
+    /// that promoted that base proved one datagram of the tick arrived and not which, so the receiver
+    /// may lack the row: written, the block meets `NoBase` there and draws a NACK; un-written, the
+    /// receiver hears nothing until the keyframe.
+    #[test]
+    fn an_empty_delta_against_an_unproven_base_is_still_written() {
+        assert!(!block_is_un_written(true, false, false, &[false, false]));
+        assert!(block_is_un_written(true, false, true, &[false, false]));
+        assert!(
+            !block_is_un_written(true, false, false, &[true, false]),
+            "a changed delta was never un-written, whatever the base"
         );
     }
 
@@ -14689,8 +14850,13 @@ mod tests {
         // base, which is the authoritative row, so it is what confirms or refutes a prediction —
         // and a client predicting against a row the server is holding still has nothing else to
         // read.
-        assert!(!block_is_un_written(false, false, &[false, false, false]));
-        assert!(!block_is_un_written(false, false, &[]));
+        assert!(!block_is_un_written(
+            false,
+            false,
+            true,
+            &[false, false, false]
+        ));
+        assert!(!block_is_un_written(false, false, true, &[]));
     }
 
     #[test]
@@ -14698,15 +14864,20 @@ mod tests {
         // A full row carries no mask, so the buffer still holds whichever entity was encoded before
         // it. Deciding from the buffer alone would drop keyframes — the one block that repairs a
         // chain the receiver cannot decode — which is why the encoder's own `full` answer leads.
-        assert!(!block_is_un_written(true, true, &[false, false, false]));
-        assert!(!block_is_un_written(true, true, &[]));
+        assert!(!block_is_un_written(
+            true,
+            true,
+            true,
+            &[false, false, false]
+        ));
+        assert!(!block_is_un_written(true, true, true, &[]));
     }
 
     #[test]
     fn a_state_channel_with_no_properties_has_no_delta_to_admit() {
         // An empty mask is an empty schema: no property exists whose change could earn a block. Its
         // keyframes still go out, so the peer keeps a row for it.
-        assert!(block_is_un_written(true, false, &[]));
+        assert!(block_is_un_written(true, false, true, &[]));
     }
 
     /// The cursor moves off a candidate for every decision but `Defer`.
@@ -14736,7 +14907,7 @@ mod tests {
     #[test]
     fn a_state_delta_with_nothing_to_say_still_moves_the_cursor_on() {
         let admission = block_admission(
-            block_is_un_written(true, false, &[false, false]),
+            block_is_un_written(true, false, true, &[false, false]),
             true,
             false,
         );
@@ -14937,7 +15108,7 @@ mod tests {
                 );
                 if skip_empty
                     && block_admission(
-                        block_is_un_written(true, full, &[channel.changes]),
+                        block_is_un_written(true, full, true, &[channel.changes]),
                         true,
                         false,
                     ) == BlockAdmission::UnWrite
@@ -15331,7 +15502,7 @@ mod tests {
     #[test]
     fn an_ack_quoting_its_frames_token_is_consumed() {
         let mut peer = peer_with_salt(0x11);
-        peer.sent_log.push_back((10, vec![(7, 10)]));
+        peer.sent_log.push_back((10, vec![(7, 10)], false));
         let token = peer.frame_token(10).unwrap();
         assert_eq!(
             peer.consume_ack(10, token, 0, 13, TICK_MS),
@@ -15349,7 +15520,7 @@ mod tests {
         // peer that names a frame it never received cannot produce the token for it, and gets none of
         // the three -- the sent log still holds the frame, awaiting an ack that is real.
         let mut peer = peer_with_salt(0x11);
-        peer.sent_log.push_back((10, vec![(7, 10)]));
+        peer.sent_log.push_back((10, vec![(7, 10)], false));
         let forged = peer.frame_token(10).unwrap() ^ 1;
         assert_eq!(
             peer.consume_ack(10, forged, 0, 13, TICK_MS),
@@ -15396,8 +15567,8 @@ mod tests {
         // The bits name 32 frames older than `ack` and prove nothing themselves. They are consumed
         // because the tick they hang off was proven, and refused with it when it was not.
         let mut peer = peer_with_salt(0x44);
-        peer.sent_log.push_back((8, vec![(1, 8)]));
-        peer.sent_log.push_back((10, vec![(2, 10)]));
+        peer.sent_log.push_back((8, vec![(1, 8)], false));
+        peer.sent_log.push_back((10, vec![(2, 10)], false));
         let token = peer.frame_token(10).unwrap();
         assert_eq!(
             peer.consume_ack(10, token ^ 0xff, 0b10, 12, TICK_MS),
@@ -17054,11 +17225,13 @@ mod tests {
         peer.note_sent_frame(10, vec![(1, 10), (2, 10)]);
         peer.note_sent_frame(10, vec![(3, 10)]);
         assert_eq!(peer.sent_log.len(), 1);
-        let (tick, entities) = peer.sent_log.back().unwrap();
+        let (tick, entities, split) = peer.sent_log.back().unwrap();
         assert_eq!(*tick, 10);
         assert_eq!(entities.as_slice(), &[(1, 10), (2, 10), (3, 10)]);
+        assert!(*split, "a folded entry is marked split");
         peer.note_sent_frame(12, vec![(4, 12)]);
         assert_eq!(peer.sent_log.len(), 2, "a new tick opens a new entry");
+        assert!(!peer.sent_log.back().unwrap().2, "a tick sent whole is not");
     }
 
     /// The log's reach stays [`SENT_LOG_DEPTH`] TICKS on a catch-up frame that spends a datagram
@@ -17100,6 +17273,96 @@ mod tests {
         assert_eq!(peer.acked_base.get(&1), Some(&10));
         assert_eq!(peer.acked_base.get(&2), Some(&10));
         assert!(peer.sent_log.is_empty(), "the tick was confirmed whole");
+    }
+
+    /// A base promoted off a split tick is unproven — the ack said one datagram of that tick arrived
+    /// and not which — until a later ack of a tick sent whole carries the entity. The base still
+    /// serves as a delta reference either way; only the un-write of an empty delta reads the flag.
+    #[test]
+    fn a_base_promoted_off_a_split_tick_is_unproven_until_a_whole_tick_confirms_it() {
+        let mut peer = peer_with_salt(0x55);
+        peer.note_sent_frame(10, vec![(1, 10)]);
+        peer.note_sent_frame(10, vec![(2, 10)]);
+        let token = peer.frame_token(10).unwrap();
+        assert_eq!(
+            peer.consume_ack(10, token, 0, 12, TICK_MS),
+            AckOutcome::Consumed
+        );
+        assert_eq!(
+            peer.acked_base.get(&2),
+            Some(&10),
+            "the base is promoted all the same"
+        );
+        assert!(peer.base_unproven.contains(&1));
+        assert!(peer.base_unproven.contains(&2));
+
+        peer.note_sent_frame(12, vec![(2, 12)]);
+        let token = peer.frame_token(12).unwrap();
+        assert_eq!(
+            peer.consume_ack(12, token, 0, 14, TICK_MS),
+            AckOutcome::Consumed
+        );
+        assert_eq!(peer.acked_base.get(&2), Some(&12));
+        assert!(
+            !peer.base_unproven.contains(&2),
+            "a tick sent whole firms the base"
+        );
+        assert!(
+            peer.base_unproven.contains(&1),
+            "the other entity's base is still the split one"
+        );
+
+        peer.note_nack();
+        assert!(
+            peer.base_unproven.is_empty(),
+            "a NACK drops every base, proven or not"
+        );
+    }
+
+    /// Only the move from an exchanged seat to a hello carrying no exchange is a downgrade.
+    #[test]
+    fn only_dropping_the_exchange_a_connection_was_seated_through_is_a_downgrade() {
+        assert!(exchange_downgraded(true, false));
+        assert!(
+            !exchange_downgraded(true, true),
+            "a retried confirmation repeats the exchange it was seated with"
+        );
+        assert!(
+            !exchange_downgraded(false, true),
+            "a client that restarted with a pin may rekey onto an exchange"
+        );
+        assert!(!exchange_downgraded(false, false));
+    }
+
+    /// Both ends seat the fold of the game secret and the exchange, and that seat is the key the
+    /// rekey comparison uses. A pinned join never completed while the server seated the game secret
+    /// alone and compared the fold.
+    #[test]
+    fn an_exchanged_join_seats_the_folded_secret_on_both_ends() {
+        let exchanged = [7u8; KEY_LEN];
+        let joiner = [1u8; KEY_LEN];
+        let acceptor = [2u8; KEY_LEN];
+        for game_secret in [None, Some([9u8; KEY_LEN])] {
+            let secret = fold_secrets(game_secret.as_ref(), Some(&exchanged));
+            assert!(secret.is_some(), "an exchange alone is a secret");
+            let server = session_auth_from(secret.as_ref(), joiner, acceptor);
+            let client = session_auth_from(secret.as_ref(), joiner, acceptor);
+            assert_eq!(server.key(), client.key());
+            assert_eq!(
+                server.key(),
+                session_key_from(secret.as_ref(), joiner, acceptor),
+                "the seated key is the one the rekey comparison derives"
+            );
+            assert!(
+                server.encrypts(),
+                "an exchanged session encrypts its payloads"
+            );
+            assert_ne!(
+                server.key(),
+                session_key_from(game_secret.as_ref(), joiner, acceptor),
+                "the game secret alone derives a different key, which is the seat this fixes"
+            );
+        }
     }
 
     /// The same wall delta charges the same seconds whatever the frame ticked, and a delta that is

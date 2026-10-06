@@ -174,6 +174,16 @@ and 30. `compare.py` against such a baseline reads `tx_bytes_s`, `blocks_deferre
 every other per-second column as having risen. Re-capture the baseline rather than judging across that
 boundary.
 
+**An artifact captured before the arena seated clients as they asked is not comparable per peer either.**
+Every bench client used to hold two seats in two arenas; a client now holds one unless it asks for more, so
+its interest set, its egress and the server's per-peer figures are about half what the earlier runs recorded
+(105 interest entities against 210 in the four-client run). `compare.py` reads the client's `tx_bytes_s` and
+`rx_bytes_s` and the server's `tx_bytes_s` as improved across that boundary. Re-capture the baseline.
+
+**Two runs whose arguments differ are refused.** `compare.py` reads the `params.txt` each run recorded and
+exits 2 when they disagree, because every column would then describe a different network rather than the
+change under test; `--allow-different-params` compares them anyway.
+
 **`net_ms` covers every snapshot datagram the frame sent.** A frame that advanced two net ticks sends up to
 two per peer, so on an authority rendering below its net tick rate the column carries the admit-and-encode
 cost more than once. The interest pass and the send ordering run once per frame whatever the tick count, so
@@ -194,7 +204,10 @@ where the counter is a structural `0.00`, so `tools/netbench/nack_gate.py` reads
   `nack_gate.py`'s `SERIES` table records each series: how many runs, where they ran, and the worst one.
 - **A profile with no series is reported, not gated**, and its line says so. `torture` has none.
 
-Each series is 3 runs on a 4-core Linux VM: 4 clients, `arena`, `strafe_fire`, seeds 1 to 3, 25 s.
+Each series is 3 runs on a 4-core Linux VM: 4 clients, `arena`, `strafe_fire`, seeds 1 to 3, 25 s, recorded
+while every client held two seats in two arenas. A single-seat client's interest set is half that size, and
+two single-seat runs on `congested_wifi`, at 4 and 14 clients, read 0.000 per peer-second, inside every
+threshold below.
 
 | Profile | Runs, NACKs per peer-second | Gate |
 | --- | --- | --- |

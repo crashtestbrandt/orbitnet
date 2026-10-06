@@ -14,6 +14,15 @@ extends Node
 ##   --role=server --shape=listen      authoritative AND seat 0's local player.
 ##   --role=client --address=ADDR      joins, watches, and prints the readings.
 ##   --veto-own-status                 server-side negative control -- see `_veto_own_status`.
+##   --secret=S                        both ends: configure a shared session secret before the mode is set.
+##   --pin --key-file=F                both ends: the server draws a static key and writes its public half to
+##                                     F; the client reads F and pins it. The join then runs the key exchange.
+##
+## THE TWO SECRET REGIMES RUN THROUGH THE SAME ASSERTION. A session secret seats the payload cipher on both
+## ends and a pinned key seats it under the exchange's output, and either misconfiguration -- or a server that
+## seats one key while the client seats another -- shows here as a client whose own channel never rises. That
+## is the failure that shipped once: no probe configured a static key, so a pinned join that never completed
+## was green everywhere.
 ##
 ## WHAT THE CLIENT ASSERTS, AND WHY IT IS THE STATE LANE. Each seat body carries a `Status` child on the STATE
 ## lane -- server-authored values pushed each tick, no prediction. The client asserts that `last_known_state()`
@@ -113,6 +122,12 @@ var _run_seconds: float = 0.0
 ## assertion is not vacuous: without it, a scenario that can only ever pass is indistinguishable from one that
 ## works.
 var _veto_own_status: bool = false
+## A shared session secret for both ends, or "" for the default regime.
+var _secret: String = ""
+## Whether the server draws a static key and the client pins its public half.
+var _pin: bool = false
+## Where the server writes that public half, and where the client reads it.
+var _key_file: String = ""
 
 var _world: Node = null
 var _bodies: Array[SeatBody] = []
@@ -264,7 +279,12 @@ func _bind_channels() -> void:
 
 # --- session bring-up ------------------------------------------------------------------------------
 func _start_session() -> bool:
+	# Both regime calls go BEFORE the mode is set, which is the contract the facade states for them.
+	if not _secret.is_empty():
+		Net.set_session_secret(_secret.to_utf8_buffer())
 	if _role == "client":
+		if _pin and not _pin_server_key():
+			return false
 		var client: MultiplayerPeer = NetTransport.create_client(_address, _port)
 		if client == null:
 			printerr("SHAPE-FAIL could not create a client peer for '%s:%d'" % [_address, _port])
@@ -273,12 +293,48 @@ func _start_session() -> bool:
 		Net.set_mode(Net.Mode.CLIENT)
 		return true
 
+	if _pin and not _publish_static_key():
+		return false
 	var server: MultiplayerPeer = NetTransport.create_server(_port, SEATS)
 	if server == null:
 		printerr("SHAPE-FAIL could not bind a server peer on port %d" % _port)
 		return false
 	multiplayer.multiplayer_peer = server
 	Net.set_mode(Net.Mode.SERVER if _shape == "dedicated" else Net.Mode.HOST)
+	return true
+
+## SERVER: draw a static key, install it, and write the public half where the client will read it. The
+## draw returns the SECRET half; `server_public_key()` is what a game publishes, and what the client pins.
+func _publish_static_key() -> bool:
+	var secret: PackedByteArray = Net.generate_server_static_key()
+	Net.set_server_static_key(secret)
+	var public: PackedByteArray = Net.server_public_key()
+	if not Net.has_server_static_key() or public.size() != 32:
+		printerr("SHAPE-FAIL the backend took no static key (has=%s, public=%d bytes)" % [
+			Net.has_server_static_key(), public.size()])
+		return false
+	var file: FileAccess = FileAccess.open(_key_file, FileAccess.WRITE)
+	if file == null:
+		printerr("SHAPE-FAIL could not write the public key to '%s'" % _key_file)
+		return false
+	file.store_string(public.hex_encode())
+	file.close()
+	print("SHAPE-PIN role=server static_key=1 public=%s" % public.hex_encode())
+	return true
+
+## CLIENT: read the public half the server wrote and pin it.
+func _pin_server_key() -> bool:
+	var file: FileAccess = FileAccess.open(_key_file, FileAccess.READ)
+	if file == null:
+		printerr("SHAPE-FAIL could not read the server's public key from '%s'" % _key_file)
+		return false
+	var hex: String = file.get_as_text().strip_edges()
+	file.close()
+	Net.set_pinned_server_key(hex.hex_decode())
+	if not Net.has_pinned_server_key():
+		printerr("SHAPE-FAIL the backend took no pinned key (%d hex chars read)" % hex.length())
+		return false
+	print("SHAPE-PIN role=client pinned=1 public=%s" % hex)
 	return true
 
 ## A peer finished the OrbitNet handshake. Seated here rather than on the transport's `peer_connected`, which
@@ -469,6 +525,9 @@ func _parse_args() -> void:
 	var port: String = _flag("--port=", "")
 	if port.is_valid_int():
 		_port = port.to_int()
+	_secret = _flag("--secret=", _secret)
+	_key_file = _flag("--key-file=", _key_file)
+	_pin = _has_flag("--pin")
 	var run: String = _flag("--run=", "")
 	if run.is_valid_float():
 		_run_seconds = run.to_float()

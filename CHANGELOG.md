@@ -61,8 +61,10 @@ release page already carries those.
 ## Unreleased
 
 **Protocol major 9**, up from 8. Every earlier release speaks an older major, so a peer on one and a
-current peer refuse each other's handshake. No `Net` call changed meaning, and game code needs no edit — the
-extra round trip is inside the addon, and the join stays a `Net` call.
+current peer refuse each other's handshake. Two `Net` calls changed what they do or report, two `NetLagComp`
+members are parse-time breaks, and the per-second counters every bench reads moved; each is listed under
+Breaking. A game that configures no secret and reads no counters needs no edit — the extra round trip is
+inside the addon, and the join stays a `Net` call.
 
 ### Breaking
 
@@ -72,26 +74,70 @@ extra round trip is inside the addon, and the join stays a `Net` call.
   key is derived from the fold of the two. This closes a replayed join: under major 8 the nonce was the
   joiner's alone, so an on-path observer presenting a recorded handshake had the acceptor derive the key that
   join had used. A peer predating the change fails every MAC, and the major is what refuses it at the
-  handshake instead.
+  handshake instead. The handshake also carries a trailing 32-byte exchange key, zero unless the client pinned
+  a server key, and the challenge carries the server's.
+- **`Net.set_session_secret()` now also encrypts every payload.** Under a secret each datagram is
+  ChaCha20-Poly1305 ciphertext and its trailer is 16 bytes rather than 8. A session that configures no secret
+  is unchanged on the wire apart from the join. It costs 8 bytes and about a microsecond per full-size
+  datagram at each end.
+- **`Net.bandwidth_metrics()` and the bench's per-second columns are exact.** Every `*_s` figure was deflated
+  by `1 / (1 + idle_frame_wall_fraction)` on an authority rendering above its net tick rate, by 0.63 at about
+  145 fps against a 60 Hz tick. A threshold or a baseline captured on an earlier release reads every
+  per-second column as having risen; re-capture it.
+- **A state-lane block whose delta carries no change is no longer sent**, and three counters moved with it:
+  `blocks_culled_s` counts those un-writes, `starve_ticks_max` has a floor near the keyframe interval for an
+  idle channel, and `blocks_full_s` approaches `blocks_admitted_s` on a quiet session. A client that
+  overwrote a state-lane property locally now waits for the next keyframe rather than the next visit.
+- **One snapshot datagram per net tick.** An authority rendering below its net tick rate used to send one per
+  rendered frame; it now sends one per tick it advanced, so its egress rises to what the tick rate implies.
 - **Two `NetLagComp` members changed, and neither is on `Net`.** `MAX_INTERP_TICKS` is removed and
   `observed_interp_for_band()` takes the tick rate as a third argument. The interpolation ceiling is derived
   from `max_delay_ms` at the rate the loop is running rather than being a flat count of ticks, so it cannot be
-  named without a rate. Both are parse-time breaks in a game that calls them. The `Net` surface did not move;
-  this one is open to change until 1.0 freezes it.
+  named without a rate. Both are parse-time breaks in a game that calls them, and the ceiling moved for every
+  game: a shooter whose measured cadence is above eight ticks is rewound deeper, up to `max_delay_ms`, with no
+  call changed. The `Net` surface did not move; this one is open to change until 1.0 freezes it.
 
 ### Added
 
-- **Linux arm64** joins the published binary set, and the macOS profiling library is universal.
-- `netbench` gains a **relayed link profile**, and its multi-host gauntlet is exercisable on one box.
+- **A pinned server key.** `Net.set_server_static_key()`, `Net.generate_server_static_key()`,
+  `Net.server_public_key()`, `Net.set_pinned_server_key()` and the two `has_` queries run an authenticated
+  X25519 exchange on the join. A pinned client derives its session key from bytes only the holder of the
+  server's secret can produce, encrypts under it the way a secret does, and refuses a join the server answered
+  without an exchange. It needs no shared secret, so the public half may ship in a build. On the server, a
+  connection seated through an exchange refuses a later hello that offers none, so a client that restarts its
+  session unpinned on a live connection is refused until that connection drops. The pin authenticates the
+  server to the client and nobody to the server: a party that can inject on the path can still rekey a
+  connection with an exchange of its own, and only a session secret refuses that.
+- **Linux arm64 and Android arm64, arm32 and x86_64** join the published binary set, built and published but
+  not run on a device; the macOS profiling library is universal.
+- **Per-peer frame assembly runs on a worker pool** at `orbitnet/assembly_pool_peers` synced peers and above,
+  12 by default and 0 to disable. `Net.bandwidth_metrics()` gains `assembly_ms` and `assembly_pooled`.
+- `NetTransport.target_address()`, `NetTransport.target_port()` and `NetTransport.describe_connections()`;
+  `NetLagComp.max_interp_ticks(tick_hz)`.
+- `netbench` gains a **relayed link profile**, a per-profile gate on the server's steady-state NACK rate, a
+  fleet manifest for runs across machines, and a comparator that refuses two runs whose arguments differ.
 
 ### Changed
 
 - A join target is parsed in one place on the transport rather than in four.
+- An arena bench client is seated with the seats it asks for, one by default, and a client the session never
+  seats fails its own gate. Per-peer figures from runs where every client held two seats are not comparable
+  with later ones.
+
+### Fixed
+
+- A decoupled client clock converges on a loaded host instead of hunting between its stretch bounds.
+- The send rota no longer skips the candidate after every admitted block, which also removes the server
+  panic that skip caused.
+- A far body measured past eight ticks of cadence was rewound short; the ceiling now follows `max_delay_ms`.
+- The windowed timers and the ping interval are charged one wall base per frame.
 
 ### Internal
 
-- Coverage grew on the codec, the determinism path, the synchronizer and the Steam transport.
-- CI gained the Windows and macOS test legs, version stamping gated against `plugin.cfg`, and a nightly bench.
+- Coverage grew on the codec, the determinism path, the synchronizer, the Steam transport, the facade's key
+  calls, and both secret regimes in the server-shape probe.
+- CI gained the Windows and macOS test legs, a version-parity step on every pull request, version stamping
+  gated against `plugin.cfg`, a nightly bench and a nightly timing measurement.
 - Documentation gained the wire-compatibility policy, the per-transport security statement, and the
   dependency rule for `orbitnet-core`.
 

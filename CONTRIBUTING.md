@@ -15,9 +15,8 @@ probe.
 **One version, three files.** `addons/orbitnet/plugin.cfg`, the `[workspace.package]` version in
 `native/Cargo.toml` and the member entries in `native/Cargo.lock` must agree. `tools/version-parity.sh` is
 the only thing that writes them — `just version-stamp <version>` locally, and `release.yml` from the tag.
-`just version-parity` fails a tree that moves one without the others. It runs inside `just check` and
-inside `release.yml`; it is **not a `check.yml` step yet**, so a pull request that diverges the three is
-green until the next tag.
+`just version-parity` fails a tree that moves one without the others. It runs inside `just check`, in
+`check.yml`'s gates job on every pull request, and inside `release.yml` after the stamp.
 
 ## Layout, and where to edit
 
@@ -145,8 +144,9 @@ One rule: **`orbitnet-core` never sees a `Variant`**, and never depends on `godo
 function of plain data, which is why its tests run in milliseconds. A `godot` type in a core signature means
 logic has leaked across the boundary.
 
-**That crate may take a vetted dependency.** Its `[dependencies]` held nothing until two landed together:
-`chacha20poly1305`, the payload cipher, and `x25519-dalek`, behind the authenticated key exchange. Keeping it
+**That crate may take a vetted dependency.** Its `[dependencies]` held nothing until two landed in
+consecutive pull requests: `chacha20poly1305`, the payload cipher, then `x25519-dalek`, behind the
+authenticated key exchange. Keeping it
 empty had been read as a rule, and under that reading the only way to add cryptography was to hand-write it —
 which is how a key exchange came to be priced at several hundred lines of constant-time field arithmetic and
 declined. The list describes the crate and carries no veto.

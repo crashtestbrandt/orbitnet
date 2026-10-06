@@ -273,8 +273,11 @@ decode batches, AOI grid rebuild.
 - **End to end on the netbench runner.** Measured through `bench.sh` on the self-hosted runner `netbench.yml`
   pins: `arena`, `congested_wifi`, seed 1, 60 s, a `template_debug` build. Figures are `assembly_ms` at the
   stated synced-peer count, two rounds each. Every client held two seats in two arenas, as the arena seated
-  every connection before it honoured a client's seat request. A single-seat client's interest set is half
-  that size: 105 entities against 210.
+  every connection before it honoured a client's seat request, and the arena has 24 seats: in the 24-peer
+  arm the first 12 clients took every seat, so the other 12 peers were synced with no body and an empty
+  interest set. The 24-peer row therefore understates a session of 24 seated peers, and the threshold rests
+  on the 12-peer row, whose clients were all seated. A single-seat client's interest set is half the
+  two-seat size: 105 entities against 210.
 
   | Peers | `assembly_pool_peers=0` | Default (12) | Saving |
   | --- | --- | --- | --- |
