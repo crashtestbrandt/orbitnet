@@ -27,7 +27,7 @@ than as noise, and the exit code follows the regressions -- but the right tolera
 the fleet size, so read the table when the two disagree.
 
 **The 5% default is set from runs of one build compared with each other**, on the self-hosted runner
-`netbench.yml` pins, after the admission-cursor fix:
+`netbench.yml` pins, after the admission-cursor fix, with every client holding two seats:
 
 | Fleet | Same-build pairs | Worst move on a judged byte column | False verdicts at 5% |
 | --- | --- | --- | --- |
