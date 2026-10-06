@@ -129,7 +129,7 @@ per window.
 | `blocks_admitted_s` / `blocks_deferred_s` / `blocks_culled_s` / `blocks_oversize_s` / `blocks_full_s` | what the admit loop did with each block |
 | `starve_ticks_max` / `unsent_backlog_max` | worst in-interest staleness, and the re-entry backlog it cannot see |
 | `interest_ms` / `interest_grid` / `interest_entities` | the interest pass's cost, which path ran, and the mean set size |
-| `assembly_ms` / `assembly_pooled` | per-peer frame assembly's cost per flush, and the fraction of flushes it ran on the worker pool. Binding each entity is in it. In a `template_debug` build its share depends on the host: 2.4 ms of a 3.5 ms flush on a 4-core VM, against 0.10 ms for a whole one-peer flush on quasitop. |
+| `assembly_ms` / `assembly_pooled` | per-peer frame assembly's cost per flush, and the fraction of flushes it ran on the worker pool. Binding each entity is in it. In a `template_debug` build its share depends on the host. At one synced peer, a flush took 2.8 ms on a 4-core VM, 2.5 ms of it binding, and 0.10 ms in all on this workflow's self-hosted runner. |
 | `interarrival_near` / `_mid` / `_far` / `_all` | mean ticks between admissions, per distance band. The candidacy count is weighted by the ticks each frame advanced, so the unit stays ticks whatever the authority's frame rate. |
 | `blocks_s` | entity blocks admitted per second, from the debug counter. Printed, never judged: more blocks at the same byte count is a better refresh rate, more blocks at a higher byte count is worse. Read the pair. |
 | `rx_applied_s` / `rx_rejected_s` / `rx_skipped_s` | inbound rows applied, refused, and unplaceable |

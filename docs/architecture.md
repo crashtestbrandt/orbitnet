@@ -256,13 +256,13 @@ decode batches, AOI grid rebuild.
 - **Why once per flush.** Binding at each encode binds once per candidate tried per peer, and every unchanged
   state channel is tried.
 - **What a bind costs depends on the host.** A bind is cheap in `template_release` and goes through gdext's
-  strict checks in `template_debug`. Measured in one 315-entity session:
+  strict checks in `template_debug`. Measured in one 315-entity session, at one synced peer:
 
-  | Host | Build | Cost |
-  | --- | --- | --- |
-  | 4-core Linux VM | `template_release` | about 0.15 µs per bind |
-  | 4-core Linux VM | `template_debug` | about 7.7 µs per bind |
-  | quasitop, the netbench host | `template_debug` | 0.10 ms for a whole one-peer flush, all 315 binds included |
+  | Host | Build | Binding | Whole flush |
+  | --- | --- | --- | --- |
+  | 4-core Linux VM | `template_release` | 0.05 ms (about 0.15 µs per bind) | 0.30 ms |
+  | 4-core Linux VM | `template_debug` | 2.5 ms (about 7.7 µs per bind) | 2.8 ms |
+  | the self-hosted runner `netbench.yml` pins | `template_debug` | not measured on its own | 0.10 ms |
 
   On that VM at 11 peers, binding once per flush took the single-threaded send path from 18.9 to 3.4 ms a
   flush in a debug build, and from 1.6 to 1.0 ms in release.
@@ -270,8 +270,8 @@ decode batches, AOI grid rebuild.
   waking the pool costs 80 to 100 µs a flush, so at 8 peers no split helps. From 12 to 32 peers the split won
   in every run: by 16 to 29% at 12, 25 to 48% at 16 and 42 to 56% at 24. `DEFAULT_ASSEMBLY_POOL_PEERS` in
   `orbit_net.rs` carries the measurement, including the cells above 48 peers where it lost.
-- **End to end on quasitop.** Measured through `bench.sh`: `arena`, `congested_wifi`, seed 1, 60 s, a
-  `template_debug` build. Figures are `assembly_ms` at the stated synced-peer count, two rounds each.
+- **End to end on the netbench runner.** Measured through `bench.sh` on the self-hosted runner `netbench.yml`
+  pins: `arena`, `congested_wifi`, seed 1, 60 s, a `template_debug` build. Figures are `assembly_ms` at the stated synced-peer count, two rounds each.
 
   | Peers | `assembly_pool_peers=0` | Default (12) | Saving |
   | --- | --- | --- | --- |
