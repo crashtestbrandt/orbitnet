@@ -95,6 +95,10 @@ const _LOBBY_KEY_OWNER_NAME: String = "owner_name"
 const _LOBBY_KEY_PLAYERS: String = "players"
 const _LOBBY_KEY_MAX: String = "max"
 const _LOBBY_KEY_FRIENDS: String = "friends_only"
+# The game's free-form row ([method set_session_detail]), stamped only when the game set one.
+const _LOBBY_KEY_DETAIL: String = "detail"
+# Steam's cap on one lobby metadata value, in UTF-8 bytes. Steam drops a longer value without telling the caller.
+const DETAIL_MAX_BYTES: int = 8192
 
 # Lobby-query knobs, inlined as ints like the enums above. Steam's DEFAULT distance filter restricts results
 # to the caller's own region, which silently hides every session hosted on another continent -- a browser is
@@ -146,6 +150,8 @@ var _peer_steam: Dictionary[int, int] = {}
 var _hosted_lobby_id: int = 0
 var _advertise_max: int = 0             # the "max players" to publish as lobby metadata once the lobby is created
 var _advertise_friends_only: bool = false
+# The game's free-form lobby row, kept so a lobby created after the call still carries it. "" stamps nothing.
+var _advertise_detail: String = ""
 # A host opened with `advertise = false` and not yet published: advertise_session() creates the lobby (listen host)
 # or turns the game-server listing on (dedicated host) from the settings stored at creation.
 var _advertise_pending: bool = false
@@ -637,6 +643,8 @@ func _on_lobby_created(result: int, lobby_id: int) -> void:
 	_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_OWNER_NAME, local_persona_name()])
 	_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_MAX, str(_advertise_max)])
 	_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_FRIENDS, "1" if _advertise_friends_only else "0"])
+	if _advertise_detail != "":
+		_call_first(_steam_obj, [&"setLobbyData"], [lobby_id, _LOBBY_KEY_DETAIL, _advertise_detail])
 	if _advertise_max > 0:
 		_call_first(_steam_obj, [&"setLobbyMemberLimit"], [lobby_id, _advertise_max])
 	_publish_player_count()
@@ -646,6 +654,20 @@ func _on_lobby_created(result: int, lobby_id: int) -> void:
 	_call_first(_steam_obj, [&"setRichPresence"],
 		[_RICH_PRESENCE_CONNECT, "%s %d" % [_CONNECT_LOBBY_FLAG, lobby_id]])
 	_call_first(_steam_obj, [&"setRichPresence"], [_RICH_PRESENCE_DISPLAY, _RICH_PRESENCE_DISPLAY_VALUE])
+
+# HOST: the game's free-form lobby row. Kept for a lobby not created yet, and stamped at once on one that exists, so
+# a later call replaces what the browser shows. A value over DETAIL_MAX_BYTES is refused with a warning and clears
+# the row, so the browser never shows the previous detail as if it were current.
+func set_session_detail(text: String) -> void:
+	var size: int = text.to_utf8_buffer().size()
+	if size > DETAIL_MAX_BYTES:
+		push_warning("SteamTransport.set_session_detail: %d bytes is over Steam's %d-byte cap; the row is cleared" %
+			[size, DETAIL_MAX_BYTES])
+		text = ""
+	_advertise_detail = text
+	if _steam_obj == null or _hosted_lobby_id == 0:
+		return
+	_call_first(_steam_obj, [&"setLobbyData"], [_hosted_lobby_id, _LOBBY_KEY_DETAIL, text])
 
 # HOST: republish the live session headcount onto the advertised lobby so the browser's "3/8" tracks reality.
 # Counts MULTIPLAYER peers (+1 for the host itself), not lobby members -- clients never join the Steam lobby, so
@@ -699,7 +721,9 @@ func _read_lobby(lobby_id: int) -> NetSessionInfo:
 		var limit: Variant = _call_first(_steam_obj, [&"getLobbyMemberLimit"], [lobby_id])
 		max_members = limit if limit is int else 0
 	var friends_only: bool = _lobby_data(lobby_id, _LOBBY_KEY_FRIENDS) == "1"
-	return NetSessionInfo.make(owner_id, name, member_count, max_members, friends_only)
+	var info: NetSessionInfo = NetSessionInfo.make(owner_id, name, member_count, max_members, friends_only)
+	info.detail = _lobby_data(lobby_id, _LOBBY_KEY_DETAIL)
+	return info
 
 # Read a lobby metadata string, "" when absent. getLobbyData(lobby_id, key) -> String on GodotSteam.
 func _lobby_data(lobby_id: int, key: String) -> String:
@@ -830,6 +854,7 @@ func _on_connection_failed() -> void:
 ## leaks a second lobby. Safe to call on any build, in any state.
 func release_session() -> void:
 	_advertise_pending = false
+	_advertise_detail = ""   # the next session starts with no row until its game sets one
 	if _steam_obj == null:
 		return
 	if _hosting_dedicated:

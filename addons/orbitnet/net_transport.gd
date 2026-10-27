@@ -96,6 +96,15 @@ static func advertise_session() -> void:
 	if preferred_kind() == Kind.STEAM:
 		SteamTransport.service().advertise_session()
 
+## Publish a free-form string beside the host's session listing, read back on a browser row as
+## [member NetSessionInfo.detail]. A later call replaces it, for example when the host changes map.
+## - A listen Steam host stamps it on its lobby, at once or when the lobby is created.
+## - A dedicated Steam host keeps it and publishes nothing: its server-browser listing has no such row.
+## - ENet lists no sessions, so the call is a no-op there.
+static func set_session_detail(text: String) -> void:
+	if preferred_kind() == Kind.STEAM:
+		SteamTransport.service().set_session_detail(text)
+
 ## Whether the open host session has been published. False with no host session open.
 static func is_session_advertised() -> bool:
 	return _host_open and _advertised

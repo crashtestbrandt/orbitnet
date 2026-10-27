@@ -36,7 +36,7 @@ so it registers as a game server rather than creating a client-owned matchmaking
 
 ## What the Steam arm provides
 
-Beyond the peer itself, four Steam-blind seams — each degrading cleanly to nothing on ENet, so your UI needs
+Beyond the peer itself, five Steam-blind seams — each degrading cleanly to nothing on ENet, so your UI needs
 no branches:
 
 | Seam | On Steam | On ENet |
@@ -44,6 +44,7 @@ no branches:
 | `local_display_name()` | the persona name | `""`, or the local override |
 | `local_steam_id()` | the account id | `0` |
 | `request_sessions()` / `sessions()` | discovered joinable lobbies | always empty — you join by address |
+| `set_session_detail(text)` / `NetSessionInfo.detail` | a free-form lobby row a browser reads back verbatim | a no-op |
 | invites | accept + send, wired through the overlay | never fire; `can_invite()` is false |
 
 `set_local_display_name()` overrides the name on any build, so the whole name pipeline is exercisable offline
@@ -63,6 +64,16 @@ the peer and publishes nothing: no lobby for a listen host, no server-browser li
 `advertise_session()` publishes it. A game whose world has to be built with the peer already set calls it once
 that world exists, so no browser row points at a host with nothing to join. `is_session_advertised()` records
 the same state on ENet, where nothing is published, so the order is testable without Steam.
+
+**A host can say what it is playing.** `set_session_detail(text)` stamps one free-form `detail` row on the
+listen host's lobby, and each browser row reads it back as `NetSessionInfo.detail`.
+
+- It may be called before the lobby exists; the create stamps it.
+- A later call replaces the row, so a map change reaches the browser.
+- `release_session()` clears it, so set the next session's detail after the previous session's release.
+- A dedicated host publishes no detail: its server-browser listing has no such row.
+- The string is opaque to OrbitNet.
+- A value over 8192 UTF-8 bytes (Steam's cap on one lobby value) is refused with a warning and clears the row.
 
 ## Auth tickets
 

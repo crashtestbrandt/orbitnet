@@ -97,6 +97,46 @@ func test_a_friends_only_host_asks_for_the_narrower_lobby_type() -> void:
 	assert_eq(double.row(_LOBBY, "friends_only"), "1", "and the row says so")
 	_done(transport)
 
+func test_the_session_detail_row_outlives_the_lobby_create_and_ends_with_the_session() -> void:
+	# A game sets the detail when it knows what it is playing, which can be before the lobby callback lands or
+	# long after it. Both orders have to reach the row, and a released session must not hand its detail on.
+	var double: SteamTransport.PlatformDouble = _platform()
+	var transport: SteamTransport = _transport(double)
+	assert_true(transport.create_listen_host(0, 8, false, true) != null, "the host peer opens")
+	transport.set_session_detail("map one")
+	assert_eq(double.row(_LOBBY, "detail"), "", "nothing is stamped before the lobby exists")
+	double.emit_lobby_created(double.ok_result(), _LOBBY)
+	assert_eq(double.row(_LOBBY, "detail"), "map one", "a detail set before the create is stamped by it")
+	transport.set_session_detail("map two")
+	assert_eq(double.row(_LOBBY, "detail"), "map two", "a later call replaces the row at once")
+	transport.release_session()
+	assert_eq(transport._advertise_detail, "", "a released session keeps no detail for the next one")
+	_done(transport)
+
+func test_a_detail_over_the_steam_cap_is_refused_and_clears_the_row() -> void:
+	# Steam drops an oversized value silently, which would leave the previous detail on the row. The transport
+	# refuses it itself and clears the row instead.
+	var double: SteamTransport.PlatformDouble = _platform()
+	var transport: SteamTransport = _transport(double)
+	assert_true(transport.create_listen_host(0, 8, false, true) != null, "the host peer opens")
+	double.emit_lobby_created(double.ok_result(), _LOBBY)
+	transport.set_session_detail("map one")
+	transport.set_session_detail("x".repeat(SteamTransport.DETAIL_MAX_BYTES))
+	assert_eq(double.row(_LOBBY, "detail").length(), SteamTransport.DETAIL_MAX_BYTES, "a value at the cap is stamped")
+	transport.set_session_detail("x".repeat(SteamTransport.DETAIL_MAX_BYTES + 1))
+	assert_eq(double.row(_LOBBY, "detail"), "", "one byte over the cap clears the row")
+	transport.set_session_detail("é".repeat((SteamTransport.DETAIL_MAX_BYTES >> 1) + 1))
+	assert_eq(double.row(_LOBBY, "detail"), "", "and the cap counts UTF-8 bytes, not characters")
+	_done(transport)
+
+func test_a_host_that_sets_no_detail_stamps_no_detail_row() -> void:
+	var double: SteamTransport.PlatformDouble = _platform()
+	var transport: SteamTransport = _transport(double)
+	assert_true(transport.create_listen_host(0, 8, false, true) != null, "the host peer opens")
+	double.emit_lobby_created(double.ok_result(), _LOBBY)
+	assert_false(double.rows(_LOBBY).has("detail"), "no detail row unless the game sets one")
+	_done(transport)
+
 func test_an_extra_row_reads_back_verbatim_and_an_unstamped_one_reads_empty() -> void:
 	# The session-secret row. docs/steam.md's first source for `Net.set_session_secret()` is a per-lobby value
 	# the host writes beside the cap and the game tag, read off the same row that carried the headcount. So
@@ -131,6 +171,7 @@ func test_discovery_turns_lobby_rows_into_platform_blind_session_records() -> vo
 	double.publish_row(11, "players", "3")
 	double.publish_row(11, "max", "8")
 	double.publish_row(11, "friends_only", "1")
+	double.publish_row(11, "detail", "{\"map\": \"one\"}")
 	double.owners[12] = 5552                 # no host_id row: the members-only owner lookup is the fallback
 	double.member_counts[12] = 2
 	double.member_limits[12] = 4
@@ -146,6 +187,8 @@ func test_discovery_turns_lobby_rows_into_platform_blind_session_records() -> vo
 	assert_eq(rows[0].players, 3, "and the published headcount")
 	assert_eq(rows[0].max_players, 8, "and the published cap")
 	assert_true(rows[0].friends_only, "and the friends-only flag")
+	assert_eq(rows[0].detail, "{\"map\": \"one\"}", "and the game's detail, verbatim")
+	assert_eq(rows[1].detail, "", "an unstamped detail reads empty")
 	assert_eq(rows[1].host_id, 5552, "an unstamped host id falls back to the owner lookup")
 	assert_eq(rows[1].owner_name, "Cyd", "an unstamped owner name falls back to the cached display name")
 	assert_eq(rows[1].players, 2, "an unpublished headcount falls back to the live member count")
