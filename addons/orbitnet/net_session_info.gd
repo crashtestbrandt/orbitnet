@@ -20,6 +20,9 @@ var players: int = 0
 var max_players: int = 0
 ## Whether the host toggled friends-only (the session is invite/friends-restricted). Presentational here.
 var friends_only: bool = false
+## A free-form string the host published with [method NetTransport.set_session_detail], such as the map or mode it
+## is playing. Opaque here: the game encodes and decodes it. "" when the host published none.
+var detail: String = ""
 
 ## Build a fully-populated record in one call (the SteamTransport lobby-metadata reader + the unit tests use this).
 static func make(p_host_id: int, p_owner_name: String, p_players: int, p_max_players: int,
