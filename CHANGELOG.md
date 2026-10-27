@@ -17,6 +17,7 @@ Two version numbers move here and each answers a different question.
 
 | Version | Date | Protocol major | Coordinated upgrade forced |
 | --- | --- | --- | --- |
+| [0.6.0](#060--2026-10-27) | 2026-10-27 | 9 | the major did not move |
 | [0.5.0](#050--2026-10-06) | 2026-10-06 | 9 | yes, against every earlier release |
 | [0.4.0](#040--2026-09-17) | 2026-09-17 | 8 | the major did not move |
 | [0.3.1](#031--2026-09-16) | 2026-09-16 | 8 | the major did not move |
@@ -57,6 +58,23 @@ Subsection order within a release, omitting any that is empty: **Breaking**, **A
 **Fixed**, **Internal**. `Internal` covers tests, CI and documentation — changes that alter nothing a
 consumer calls or sends. It is a short summary of the areas that moved, never a list of merged titles; the
 release page already carries those.
+
+## 0.6.0 — 2026-10-27
+
+[Release page](https://github.com/crashtestbrandt/orbitnet/releases/tag/v0.6.0). **Protocol major 9**,
+unchanged from 0.5.0. No existing `Net` call changed, so a game upgrades with no edit.
+
+### Added
+
+- **A host can say what its session is playing.** `NetTransport.set_session_detail(text)` publishes a free-form
+  string on a listen Steam host's lobby, and each browser row reads it back as `NetSessionInfo.detail`. A later
+  call replaces it and `release_session()` clears it. A value over 8192 UTF-8 bytes is refused and clears the
+  row. A no-op on ENet and on a dedicated host.
+
+### Internal
+
+- CI runs the Rust and Godot jobs only on a change that touches code.
+- The README was rewritten and the 1.0 epics ranked in `ROADMAP.md`.
 
 ## 0.5.0 — 2026-10-06
 
