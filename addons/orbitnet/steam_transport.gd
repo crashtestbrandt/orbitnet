@@ -97,6 +97,8 @@ const _LOBBY_KEY_MAX: String = "max"
 const _LOBBY_KEY_FRIENDS: String = "friends_only"
 # The game's free-form row ([method set_session_detail]), stamped only when the game set one.
 const _LOBBY_KEY_DETAIL: String = "detail"
+# Steam's cap on one lobby metadata value, in UTF-8 bytes. Steam drops a longer value without telling the caller.
+const DETAIL_MAX_BYTES: int = 8192
 
 # Lobby-query knobs, inlined as ints like the enums above. Steam's DEFAULT distance filter restricts results
 # to the caller's own region, which silently hides every session hosted on another continent -- a browser is
@@ -654,8 +656,14 @@ func _on_lobby_created(result: int, lobby_id: int) -> void:
 	_call_first(_steam_obj, [&"setRichPresence"], [_RICH_PRESENCE_DISPLAY, _RICH_PRESENCE_DISPLAY_VALUE])
 
 # HOST: the game's free-form lobby row. Kept for a lobby not created yet, and stamped at once on one that exists, so
-# a later call replaces what the browser shows.
+# a later call replaces what the browser shows. A value over DETAIL_MAX_BYTES is refused with a warning and clears
+# the row, so the browser never shows the previous detail as if it were current.
 func set_session_detail(text: String) -> void:
+	var size: int = text.to_utf8_buffer().size()
+	if size > DETAIL_MAX_BYTES:
+		push_warning("SteamTransport.set_session_detail: %d bytes is over Steam's %d-byte cap; the row is cleared" %
+			[size, DETAIL_MAX_BYTES])
+		text = ""
 	_advertise_detail = text
 	if _steam_obj == null or _hosted_lobby_id == 0:
 		return

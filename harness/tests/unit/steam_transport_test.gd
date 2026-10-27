@@ -113,6 +113,22 @@ func test_the_session_detail_row_outlives_the_lobby_create_and_ends_with_the_ses
 	assert_eq(transport._advertise_detail, "", "a released session keeps no detail for the next one")
 	_done(transport)
 
+func test_a_detail_over_the_steam_cap_is_refused_and_clears_the_row() -> void:
+	# Steam drops an oversized value silently, which would leave the previous detail on the row. The transport
+	# refuses it itself and clears the row instead.
+	var double: SteamTransport.PlatformDouble = _platform()
+	var transport: SteamTransport = _transport(double)
+	assert_true(transport.create_listen_host(0, 8, false, true) != null, "the host peer opens")
+	double.emit_lobby_created(double.ok_result(), _LOBBY)
+	transport.set_session_detail("map one")
+	transport.set_session_detail("x".repeat(SteamTransport.DETAIL_MAX_BYTES))
+	assert_eq(double.row(_LOBBY, "detail").length(), SteamTransport.DETAIL_MAX_BYTES, "a value at the cap is stamped")
+	transport.set_session_detail("x".repeat(SteamTransport.DETAIL_MAX_BYTES + 1))
+	assert_eq(double.row(_LOBBY, "detail"), "", "one byte over the cap clears the row")
+	transport.set_session_detail("é".repeat((SteamTransport.DETAIL_MAX_BYTES >> 1) + 1))
+	assert_eq(double.row(_LOBBY, "detail"), "", "and the cap counts UTF-8 bytes, not characters")
+	_done(transport)
+
 func test_a_host_that_sets_no_detail_stamps_no_detail_row() -> void:
 	var double: SteamTransport.PlatformDouble = _platform()
 	var transport: SteamTransport = _transport(double)

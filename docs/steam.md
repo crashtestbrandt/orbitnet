@@ -70,9 +70,10 @@ listen host's lobby, and each browser row reads it back as `NetSessionInfo.detai
 
 - It may be called before the lobby exists; the create stamps it.
 - A later call replaces the row, so a map change reaches the browser.
-- `release_session()` clears it.
+- `release_session()` clears it, so set the next session's detail after the previous session's release.
 - A dedicated host publishes no detail: its server-browser listing has no such row.
-- The string is opaque to OrbitNet. Steam caps a lobby metadata value at 8 KB.
+- The string is opaque to OrbitNet.
+- A value over 8192 UTF-8 bytes (Steam's cap on one lobby value) is refused with a warning and clears the row.
 
 ## Auth tickets
 
